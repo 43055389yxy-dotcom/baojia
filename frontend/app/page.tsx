@@ -464,7 +464,7 @@ export default function Home() {
     if (confirmationRecoveryStarted.current) return;
     confirmationRecoveryStarted.current = true;
     try {
-      const saved = window.localStorage.getItem(CONFIRMATION_CONTEXT_KEY);
+      const saved = window.sessionStorage.getItem(CONFIRMATION_CONTEXT_KEY);
       if (!saved) return;
       const context = JSON.parse(saved) as PendingConfirmationContext;
       if (!context.token || !context.draftId || !context.customerRequest) return;
@@ -480,7 +480,7 @@ export default function Home() {
         250,
       );
     } catch {
-      window.localStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
+      window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
     }
   }, []);
 
@@ -488,7 +488,7 @@ export default function Home() {
     if (quoteRecoveryStarted.current) return;
     quoteRecoveryStarted.current = true;
     try {
-      if (window.localStorage.getItem(CONFIRMATION_CONTEXT_KEY)) return;
+      if (window.sessionStorage.getItem(CONFIRMATION_CONTEXT_KEY)) return;
       const saved = window.sessionStorage.getItem(QUOTE_JOB_CONTEXT_KEY);
       if (!saved) return;
       const context = JSON.parse(saved) as { jobId?: string; customerRequest?: string };
@@ -596,7 +596,7 @@ export default function Home() {
       selections: [],
       execution_trace: [],
     };
-    window.localStorage.setItem(
+    window.sessionStorage.setItem(
       CONFIRMATION_CONTEXT_KEY,
       JSON.stringify({
         token,
@@ -734,7 +734,7 @@ export default function Home() {
       if (session.status === "approved") {
         setConfirmationToken(null);
         setSalesReview(null);
-        window.localStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
+        window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
         await startQuote(customerRequest, draftId, [
           { stage: "customer", message: "客户已确认完整配置清单，开始官方报价", time: "刚刚" },
         ]);
@@ -742,10 +742,10 @@ export default function Home() {
       }
       if ((session.status === "reviewing" || session.status === "submitted") && session.answers) {
         setReceivedCustomerAnswers(session.answers);
-        const saved = window.localStorage.getItem(CONFIRMATION_CONTEXT_KEY);
+        const saved = window.sessionStorage.getItem(CONFIRMATION_CONTEXT_KEY);
         if (saved) {
           const context = JSON.parse(saved) as PendingConfirmationContext;
-          window.localStorage.setItem(
+          window.sessionStorage.setItem(
             CONFIRMATION_CONTEXT_KEY,
             JSON.stringify({ ...context, answers: session.answers }),
           );
@@ -786,7 +786,7 @@ export default function Home() {
         events: previewEvents,
         error: null,
       });
-      window.localStorage.setItem(
+      window.sessionStorage.setItem(
         CONFIRMATION_CONTEXT_KEY,
         JSON.stringify({
           token: preview.confirmation_token,
@@ -846,7 +846,7 @@ export default function Home() {
         error: null,
       });
       if (preview.confirmation_token) {
-        window.localStorage.setItem(
+        window.sessionStorage.setItem(
           CONFIRMATION_CONTEXT_KEY,
           JSON.stringify({
             token: preview.confirmation_token,
@@ -863,7 +863,7 @@ export default function Home() {
       }
       return;
     }
-    window.localStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
+    window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
     if (stopForSalesReview) {
       setSalesReview(null);
       setReceivedCustomerAnswers({});
@@ -1045,7 +1045,7 @@ export default function Home() {
     setSalesReview(null);
     setPreviewDraftId(null);
     setReceivedCustomerAnswers({});
-    window.localStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
+    window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
     window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY);
     await runPreflight(requirement);
   }
@@ -1198,7 +1198,7 @@ export default function Home() {
     setConfirmationToken(null);
     setSalesReview(null);
     setReceivedCustomerAnswers({});
-    window.localStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
+    window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
     window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY);
     window.scrollTo({ top: 0, behavior: "smooth" });
     window.setTimeout(() => requirementInput.current?.focus(), 350);
@@ -1461,7 +1461,7 @@ export default function Home() {
               const draftId = salesReview.draft_id;
               setSalesReview(null);
               setReceivedCustomerAnswers({});
-              window.localStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
+              window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
               void startQuote(requirement, draftId, [
                 { stage: "customer", message: "完整配置已确认，开始官方报价", time: "刚刚" },
               ]);

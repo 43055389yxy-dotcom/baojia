@@ -565,6 +565,13 @@ class QuoteService:
                     ),
                     None,
                 )
+            confirmation_reason = None
+            if selection.requires_confirmation:
+                confirmation_reason = self._customer_confirmation_question(
+                    display_name,
+                    requirement,
+                    selection.confirmation_reason or "当前配置需要您确认。",
+                )
             selection = selection.model_copy(
                 update={
                     "component_id": str(index),
@@ -575,11 +582,8 @@ class QuoteService:
                     "status": (
                         "customer_issue" if selection.requires_confirmation else "ready"
                     ),
-                    "issue_message": (
-                        selection.confirmation_reason
-                        if selection.requires_confirmation
-                        else None
-                    ),
+                    "confirmation_reason": confirmation_reason,
+                    "issue_message": confirmation_reason,
                 }
             )
             elapsed = time.perf_counter() - item_started_at
@@ -1111,21 +1115,47 @@ class QuoteService:
 
     @staticmethod
     def _region_confirmation_options() -> list[ConfirmationOption]:
-        """Offer common AWS regions as a searchable, official-code list."""
+        """Offer the complete AWS commercial-region catalog.
+
+        China and GovCloud use separate account partitions and credentials, so
+        they intentionally do not appear in a commercial-account quote.
+        """
 
         regions = (
             ("美国东部（弗吉尼亚北部）", "us-east-1"),
             ("美国东部（俄亥俄）", "us-east-2"),
             ("美国西部（加利福尼亚北部）", "us-west-1"),
             ("美国西部（俄勒冈）", "us-west-2"),
+            ("非洲（开普敦）", "af-south-1"),
             ("香港", "ap-east-1"),
+            ("台北", "ap-east-2"),
+            ("孟买", "ap-south-1"),
+            ("海得拉巴", "ap-south-2"),
             ("新加坡", "ap-southeast-1"),
             ("悉尼", "ap-southeast-2"),
+            ("雅加达", "ap-southeast-3"),
+            ("墨尔本", "ap-southeast-4"),
+            ("马来西亚", "ap-southeast-5"),
+            ("新西兰", "ap-southeast-6"),
+            ("泰国", "ap-southeast-7"),
             ("东京", "ap-northeast-1"),
             ("首尔", "ap-northeast-2"),
+            ("大阪", "ap-northeast-3"),
+            ("加拿大（中部）", "ca-central-1"),
+            ("加拿大西部（卡尔加里）", "ca-west-1"),
             ("法兰克福", "eu-central-1"),
+            ("苏黎世", "eu-central-2"),
             ("爱尔兰", "eu-west-1"),
             ("伦敦", "eu-west-2"),
+            ("巴黎", "eu-west-3"),
+            ("斯德哥尔摩", "eu-north-1"),
+            ("米兰", "eu-south-1"),
+            ("西班牙", "eu-south-2"),
+            ("以色列（特拉维夫）", "il-central-1"),
+            ("墨西哥（中部）", "mx-central-1"),
+            ("中东（巴林）", "me-south-1"),
+            ("中东（阿联酋）", "me-central-1"),
+            ("南美洲（圣保罗）", "sa-east-1"),
         )
         return [
             ConfirmationOption(label=f"{name}（{code}）", value=code)
@@ -2551,7 +2581,31 @@ class QuoteService:
         return f"{compact}？"
 
     @staticmethod
+    def _compact_customer_source(requirement: object) -> str:
+        source = str(getattr(requirement, "source_text", "") or "")
+        source = re.sub(r"\s+", " ", source).strip()
+        if len(source) > 140:
+            return source[:137].rstrip() + "…"
+        return source
+
+    @classmethod
+    def _customer_confirmation_question(
+        cls,
+        display_name: str,
+        requirement: object,
+        notice: str,
+    ) -> str:
+        clean = re.sub(r"(?:请|由)?销售(?:人员)?确认", "请您确认", notice or "")
+        clean = clean.replace("找销售确认", "请您确认")
+        clean = clean.strip().lstrip("。；; ")
+        source = cls._compact_customer_source(requirement)
+        if source:
+            return f"您之前要求【{display_name}】：{source}。{clean}"
+        return f"关于【{display_name}】：{clean}"
+
+    @classmethod
     def _plugin_confirmation_question(
+        cls,
         display_name: str,
         requirement: object,
         error: ManualConfirmationRequired,
@@ -2565,12 +2619,17 @@ class QuoteService:
                 replicas = requirements.get("replicas_per_shard")
                 if shards == 1 and replicas is not None:
                     topology = f"您已选 Redis 1 主 {int(replicas)} 从，"
-            return (
+            question = (
                 f"{topology}但还缺少单节点容量。每节点大概需要 1G、4G 还是 8G 内存？"
                 "型号由系统自动选择。"
             )
-        if code in {"insufficient_ec2_requirements", "ec2_specification_not_found"}:
-            return "服务器还缺少 CPU 和内存需求，请确认每台需要几核、多少内存，型号由系统自动选择。"
+            return cls._customer_confirmation_question(display_name, requirement, question)
+        if code == "insufficient_ec2_requirements":
+            question = "还缺少处理器或内存要求，请补充每台需要几核、多少内存。"
+            return cls._customer_confirmation_question(display_name, requirement, question)
+        if code == "ec2_specification_not_found":
+            question = "AWS 在当前区域没有与该处理器和内存完全一致的可购买规格，请从下方当前区域支持的配置中重新选择。"
+            return cls._customer_confirmation_question(display_name, requirement, question)
         if code in {"insufficient_rds_requirements", "rds_specification_not_found"}:
             if isinstance(requirements, dict):
                 engine = requirements.get("engine")
@@ -2584,15 +2643,23 @@ class QuoteService:
                 if memory in (None, ""):
                     missing.append("内存")
                 if missing:
-                    return (
+                    question = (
                         f"数据库还缺少{'、'.join(missing)}。请确认大概需要几核、多少内存，"
                         "型号由系统自动选择。"
                         if engine not in (None, "")
                         else "请确认数据库类型，以及大概需要几核、多少内存；型号由系统自动选择。"
                     )
-            return "请确认数据库大概需要几核、多少内存；型号由系统自动选择。"
+                    return cls._customer_confirmation_question(display_name, requirement, question)
+            question = (
+                "AWS 在当前区域没有与该数据库处理器和内存完全一致的可购买规格，"
+                "请从下方当前区域支持的配置中重新选择。"
+                if code == "rds_specification_not_found"
+                else "请确认数据库大概需要几核、多少内存。"
+            )
+            return cls._customer_confirmation_question(display_name, requirement, question)
         message = error.message.strip().rstrip("。；; ")
-        return f"{display_name} 暂时无法确定配置：{message}。请补充业务规格，不需要提供 AWS 型号。"
+        question = f"当前配置尚不能直接核价：{message}。请从下方可用配置中选择，或补充业务规格。"
+        return cls._customer_confirmation_question(display_name, requirement, question)
 
     @staticmethod
     def _is_technical_catalog_error(error: ManualConfirmationRequired) -> bool:

@@ -251,7 +251,7 @@ class Ec2Plugin(ServicePlugin):
                 f"最接近的规格是 {default.specifications.get('vCPU'):g} vCPU、"
                 f"{default.specifications.get('memoryGiB'):g} GiB。"
                 if min_vcpu is not None and min_memory is not None
-                else "推荐规格与客户原始要求不是完全匹配，请销售确认。"
+                else "推荐规格与客户原始要求不是完全匹配，请您确认。"
             )
         return PreviewSelection(
             component_id="component",

@@ -68,11 +68,21 @@ const FIELD_LABELS: Record<string, string> = {
 };
 
 const REGION_LABELS: Record<string, string> = {
-  "ap-east-1": "香港（ap-east-1）", "ap-southeast-1": "新加坡（ap-southeast-1）",
-  "ap-southeast-2": "悉尼（ap-southeast-2）", "ap-northeast-1": "东京（ap-northeast-1）",
-  "ap-northeast-2": "首尔（ap-northeast-2）", "eu-central-1": "法兰克福（eu-central-1）",
-  "eu-west-1": "爱尔兰（eu-west-1）", "us-east-1": "美国东部（弗吉尼亚北部）",
-  "us-east-2": "美国东部（俄亥俄）", "us-west-2": "美国西部（俄勒冈）",
+  "us-east-1": "美国东部（弗吉尼亚北部）（us-east-1）", "us-east-2": "美国东部（俄亥俄）（us-east-2）",
+  "us-west-1": "美国西部（加利福尼亚北部）（us-west-1）", "us-west-2": "美国西部（俄勒冈）（us-west-2）",
+  "af-south-1": "开普敦（af-south-1）", "ap-east-1": "香港（ap-east-1）", "ap-east-2": "台北（ap-east-2）",
+  "ap-south-1": "孟买（ap-south-1）", "ap-south-2": "海得拉巴（ap-south-2）",
+  "ap-southeast-1": "新加坡（ap-southeast-1）", "ap-southeast-2": "悉尼（ap-southeast-2）",
+  "ap-southeast-3": "雅加达（ap-southeast-3）", "ap-southeast-4": "墨尔本（ap-southeast-4）",
+  "ap-southeast-5": "马来西亚（ap-southeast-5）", "ap-southeast-6": "新西兰（ap-southeast-6）",
+  "ap-southeast-7": "泰国（ap-southeast-7）", "ap-northeast-1": "东京（ap-northeast-1）",
+  "ap-northeast-2": "首尔（ap-northeast-2）", "ap-northeast-3": "大阪（ap-northeast-3）",
+  "ca-central-1": "加拿大中部（ca-central-1）", "ca-west-1": "卡尔加里（ca-west-1）",
+  "eu-central-1": "法兰克福（eu-central-1）", "eu-central-2": "苏黎世（eu-central-2）",
+  "eu-west-1": "爱尔兰（eu-west-1）", "eu-west-2": "伦敦（eu-west-2）", "eu-west-3": "巴黎（eu-west-3）",
+  "eu-north-1": "斯德哥尔摩（eu-north-1）", "eu-south-1": "米兰（eu-south-1）", "eu-south-2": "西班牙（eu-south-2）",
+  "il-central-1": "特拉维夫（il-central-1）", "mx-central-1": "墨西哥中部（mx-central-1）",
+  "me-south-1": "巴林（me-south-1）", "me-central-1": "阿联酋（me-central-1）", "sa-east-1": "圣保罗（sa-east-1）",
   global: "全球",
 };
 
@@ -441,7 +451,7 @@ export default function CustomerConfirmationPage() {
 
   return (
     <main className={`customer-confirm-page ${showConfigurationReview ? "configuration-review-page" : ""}`}>
-      <header><span>A</span><strong>AstraQuote</strong><small>AWS 配置确认</small></header>
+      <header><span>A</span><strong>AstraQuote</strong></header>
       <section>
         {loading ? <div className="customer-confirm-state">正在读取确认单…</div> : error && !session ? (
           <div className="customer-confirm-state error">{error}</div>
