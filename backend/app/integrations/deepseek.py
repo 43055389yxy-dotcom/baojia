@@ -209,6 +209,40 @@ class DeepSeekIntentParser:
             return AiGateway(recovery_settings)
         return self._gateway
 
+    def _component_ai_gateways(self) -> list[AiGateway]:
+        """Return the single stable route used for customer revisions."""
+
+        if type(self._gateway) is not AiGateway:
+            return [self._gateway]
+        if self._settings.bedrock_api_key:
+            stable_settings = self._settings.model_copy(
+                update={
+                    "ai_provider": "bedrock",
+                    "bedrock_model": self._settings.component_revision_model,
+                }
+            )
+            return [AiGateway(stable_settings)]
+        return [self._gateway]
+
+    async def _complete_component_json(
+        self,
+        *,
+        system_prompt: str,
+        user_content: str,
+        timeout_seconds: float,
+        reporter: AiTranscriptReporter | None,
+        component_number: int,
+    ) -> dict[str, object]:
+        """Run one component on the fixed revision model without route races."""
+
+        gateway = self._component_ai_gateways()[0]
+        return await gateway.complete_json(
+            system_prompt=system_prompt,
+            user_content=user_content,
+            timeout_seconds=self._settings.component_revision_timeout_seconds,
+            max_attempts=1,
+        )
+
     async def repair_quote_component(
         self,
         original_text: str,
@@ -513,6 +547,23 @@ class DeepSeekIntentParser:
         editing_component = component.model_copy(
             deep=True, update={"source_text": corrected_source}
         )
+        previous_review_model = str(
+            component.requirements.get("_review_selected_model")
+            or (
+                component.requirements.get("requested_model")
+                if component.field_sources.get("requirements.requested_model")
+                == "customer_confirmation"
+                else ""
+            )
+            or ""
+        ).strip()
+        previous_review_specs = (
+            dict(component.requirements.get("_review_selected_specifications"))
+            if isinstance(
+                component.requirements.get("_review_selected_specifications"), dict
+            )
+            else {}
+        )
         # A previous preview may have attached an internal catalogue choice.
         # It is derived state, not customer input. Keeping it during a later
         # correction can silently overwrite the customer's new model/spec.
@@ -544,9 +595,7 @@ class DeepSeekIntentParser:
         )
         deterministic_edit = exact_model_edit or purchase_only
         # The target shown to the model is blank by design: this is a complete
-        # re-recognition, not an in-place patch of an old JSON object.  The old
-        # structured result is provided separately and may only fill fields
-        # absent from both the original text and the latest correction.
+        # re-recognition, not an in-place patch of an old JSON object.
         template = component_template(editing_component)
         allowed = allowed_requirement_fields(component.service)
         template["requirements"] = {
@@ -562,16 +611,14 @@ class DeepSeekIntentParser:
             build_component_extraction_prompt(component.service, corrected_source)
             + "\n\n这是单个组件的重新识别任务。请从头重新构建完整组件，"
             "不是在旧 JSON 上局部打补丁。信息优先级固定为："
-            "客户最新修改 > 客户原始配置 > 当前旧配置。"
+            "客户最新修改 > 该组件已经确认的历史。"
             "发生冲突时必须采用客户最新修改并删除冲突旧值；"
-            "当前旧配置只能补充前两者都未提及的字段。"
             "不得改变服务类型，不得增加其他组件。返回完整模板 JSON。"
         )
         content = (
             f"客户最新修改（最高优先级）：\n{feedback.strip()}\n\n"
-            f"该组件客户原话：\n{component.source_text}\n\n"
-            f"当前旧配置（仅作缺失字段兜底，不得覆盖以上内容）：\n"
-            f"{component.model_dump_json()}\n\n"
+            f"该组件已经确认的历史（只用于补全未修改字段）：\n"
+            f"{component.source_text}\n\n"
             "按编号逐项从原话和最新修改重新提取：\n"
             + "\n".join(
                 f"{number}. {field}"
@@ -584,9 +631,8 @@ class DeepSeekIntentParser:
             revised = editing_component.model_copy(deep=True)
             if exact_model_edit and selected_model is not None:
                 revised.requirements["requested_model"] = selected_model
-                if re.search(r"相邻规格|请选择|最接近|没有恰好", feedback):
-                    revised.requirements.pop("vcpu", None)
-                    revised.requirements.pop("memory_gib", None)
+                revised.requirements.pop("vcpu", None)
+                revised.requirements.pop("memory_gib", None)
         else:
             revised = await self._fill_component_template_with_retries(
                 index=0,
@@ -711,18 +757,47 @@ class DeepSeekIntentParser:
             target=revised,
             feedback=feedback,
         )
+        changes_model = bool(
+            selected_model
+            or re.search(r"型号|机型|实例类型|sku", feedback, re.IGNORECASE)
+        )
+        changes_shape = bool(
+            re.search(
+                r"(?:vcpu|cpu|处理器|核数|\d+\s*核|内存|ram)",
+                feedback,
+                re.IGNORECASE,
+            )
+        )
+        if exact_model_edit:
+            # The new official model replaces the old descriptive shape for
+            # every component. The next official preview writes back the exact
+            # CPU/memory of that model.
+            revised.requirements.pop("vcpu", None)
+            revised.requirements.pop("memory_gib", None)
+        elif previous_review_model and not changes_model and not changes_shape:
+            # An unrelated edit (quantity, region, purchase plan, storage,
+            # topology...) rebuilds the component but preserves the model the
+            # customer already approved. Its official specifications overwrite
+            # stale CPU/memory recovered from historical prose.
+            revised.requirements["requested_model"] = previous_review_model
+            official_vcpu = previous_review_specs.get("vCPU")
+            official_memory = previous_review_specs.get("memoryGiB")
+            if "vcpu" in allowed and isinstance(official_vcpu, (int, float)) and not isinstance(
+                official_vcpu, bool
+            ):
+                revised.requirements["vcpu"] = float(official_vcpu)
+            if "memory_gib" in allowed and isinstance(official_memory, (int, float)) and not isinstance(
+                official_memory, bool
+            ):
+                revised.requirements["memory_gib"] = float(official_memory)
+        elif changes_shape and not changes_model:
+            # A new CPU/memory request invalidates the old model. Let the
+            # official catalog choose or ask again from the rebuilt component.
+            revised.requirements.pop("requested_model", None)
         revised.requirements = canonicalize_requirement_fields(
             revised.requirements,
             service=revised.service,
         )
-        if exact_model_edit and re.search(
-            r"相邻规格|请选择|最接近|没有恰好", feedback
-        ):
-            # Literal preservation sees the historical requested memory in the
-            # original component. The customer's explicit model choice is the
-            # newer fact and therefore wins over that approximate shape.
-            revised.requirements.pop("vcpu", None)
-            revised.requirements.pop("memory_gib", None)
         # Persist newest facts first. Future corrections and literal guards
         # must encounter the latest answer before historical source text.
         revised.source_text = effective_source
@@ -927,14 +1002,14 @@ class DeepSeekIntentParser:
             match = re.search(
                 rf"(?:{label_pattern})(?:容量|大小)?\s*"
                 rf"(?:改成|改为|修改为|调整为|设为|设置为|变成|为|到|[:：])?\s*"
-                rf"(\d+(?:\.\d+)?)\s*(gib|gb|g|tib|tb|t)",
+                rf"(\d+(?:\.\d+)?)\s*(?:个)?\s*(gib|gb|g|tib|tb|t)",
                 feedback,
                 re.I,
             )
             return to_gib(match.group(1), match.group(2)) if match else None
 
         size_pattern = (
-            r"(\d+(?:\.\d+)?)\s*(gib|gb|g|tib|tb|t)"
+            r"(\d+(?:\.\d+)?)\s*(?:个)?\s*(gib|gb|g|tib|tb|t)"
         )
         size_matches = list(re.finditer(size_pattern, normalized_feedback, re.I))
         single_size = (
@@ -977,6 +1052,12 @@ class DeepSeekIntentParser:
             elif service == "ec2":
                 if re.search(r"系统盘|启动盘|根卷", folded, re.I):
                     target.requirements["system_disk_gib"] = single_size
+                elif has_storage_label:
+                    # An EC2 component has one built-in disk field.  Generic
+                    # wording such as “硬盘10T” therefore means its system
+                    # disk unless the customer explicitly created a separate
+                    # EBS/data-disk component.
+                    target.requirements["system_disk_gib"] = single_size
                 elif has_memory_label:
                     target.requirements["memory_gib"] = single_size
             elif service in {"cloudfront", "data_transfer", "global_accelerator"} and re.search(
@@ -994,7 +1075,7 @@ class DeepSeekIntentParser:
             target.requirements["memory_gib"] = memory
 
         storage = explicit_size(
-            "单项存储", "托管存储", "总存储", "存储容量", "存储", "磁盘容量", "磁盘"
+            "单项存储", "托管存储", "总存储", "存储容量", "存储", "磁盘容量", "磁盘", "硬盘"
         )
         if storage is not None:
             storage_field = next(
@@ -1013,6 +1094,8 @@ class DeepSeekIntentParser:
             )
             if storage_field:
                 target.requirements[storage_field] = storage
+            elif service == "ec2" and "system_disk_gib" in allowed:
+                target.requirements["system_disk_gib"] = storage
             # Redshift RA3 exposes customer capacity as managed storage. Keep
             # the neutral storage field in sync so display and pricing cannot
             # disagree after a customer correction.
@@ -1029,6 +1112,17 @@ class DeepSeekIntentParser:
                     target.requirements["managed_storage_gib"] = storage
 
         vcpu = explicit_number("vCPU", "CPU", "处理器", "核数")
+        compact_shape = re.search(
+            r"(\d+(?:\.\d+)?)\s*核\s*(\d+(?:\.\d+)?)\s*(gib|gb|g)\b",
+            feedback,
+            re.I,
+        )
+        if compact_shape:
+            vcpu = float(compact_shape.group(1))
+            if "memory_gib" in allowed:
+                target.requirements["memory_gib"] = to_gib(
+                    compact_shape.group(2), compact_shape.group(3)
+                )
         if vcpu is not None and "vcpu" in allowed:
             target.requirements["vcpu"] = int(vcpu)
 
@@ -1242,6 +1336,8 @@ class DeepSeekIntentParser:
             self._reconcile_repeated_unit_storage(parsed)
             self._normalize_database_group_quantity(parsed)
             self._normalize_cluster_group_quantities(parsed)
+            self._normalize_prometheus_managed_service(parsed)
+            self._append_third_party_managed_decisions(parsed)
             self._drop_unrequested_section_services(ai_text, parsed)
             self._merge_duplicate_service_fragments(parsed)
             self._sanitize_parsed_requirements(parsed)
@@ -1254,6 +1350,7 @@ class DeepSeekIntentParser:
             # different source ownership remain separate.
             self._merge_duplicate_service_fragments(parsed)
             self._drop_embedded_ebs_duplicates(parsed)
+            self._normalize_cluster_group_quantities(parsed)
             self._drop_specs_inferred_from_models(ai_text, parsed)
             self._normalize_invalid_global_regions(parsed)
             self._inherit_single_workload_region(parsed, ai_text)
@@ -1778,11 +1875,12 @@ class DeepSeekIntentParser:
                     ),
                 )
             async with semaphore:
-                raw = await self._recovery_gateway().complete_json(
+                raw = await self._complete_component_json(
                     system_prompt=prompt,
                     user_content=attempt_content,
                     timeout_seconds=timeout_seconds,
-                    max_attempts=1,
+                    reporter=reporter,
+                    component_number=index + 1,
                 )
             if reporter:
                 await reporter(
@@ -2010,6 +2108,19 @@ class DeepSeekIntentParser:
                 normalized_evidence[path] = value
         payload["field_evidence"] = normalized_evidence
         provided_payload["field_evidence"] = normalized_evidence
+        # A complete rebuild must not fail merely because the model returned
+        # two sides of an arithmetic identity.  Fill the third side locally
+        # before validation (for example 8 EC2 × 10 TiB = 81920 GiB total).
+        # This is calculation, not interpretation, and applies uniformly to
+        # every repeated-storage component.
+        self._complete_repeated_storage_template(
+            payload,
+            quantity_is_explicit="quantity" in provided_payload,
+        )
+        provided_payload["requirements"] = dict(payload["requirements"])
+        provided_payload["field_evidence"] = dict(payload["field_evidence"])
+        if "quantity" in payload:
+            provided_payload["quantity"] = payload["quantity"]
         result = ServiceRequirement.model_validate(payload)
         self._validate_component_evidence(
             result,
@@ -2022,6 +2133,61 @@ class DeepSeekIntentParser:
             provided_payload=provided_payload,
         )
         return result
+
+    @classmethod
+    def _complete_repeated_storage_template(
+        cls,
+        payload: dict[str, object],
+        *,
+        quantity_is_explicit: bool = True,
+    ) -> None:
+        service = cls._service_key(str(payload.get("service") or ""))
+        contracts = {
+            "ebs": ("quantity", "storage_gib", "total_storage_gib"),
+            "ec2": ("quantity", "system_disk_gib", "total_system_disk_gib"),
+            "msk": ("broker_count", "storage_gib_per_broker", "total_storage_gib"),
+            "opensearch": ("data_nodes", "storage_gib_per_node", "total_storage_gib"),
+            "mq": ("broker_count", "storage_gib_per_broker", "total_storage_gib"),
+        }
+        contract = contracts.get(service)
+        requirements = payload.get("requirements")
+        if contract is None or not isinstance(requirements, dict):
+            return
+        count_field, per_field, total_field = contract
+        count_raw = (
+            payload.get("quantity") if quantity_is_explicit else None
+        ) if count_field == "quantity" else requirements.get(count_field)
+        values = [count_raw, requirements.get(per_field), requirements.get(total_field)]
+        present = [value not in (None, "") and not isinstance(value, bool) for value in values]
+        if sum(present) != 2:
+            return
+        try:
+            numeric = [float(value) if is_present else None for value, is_present in zip(values, present, strict=True)]
+        except (TypeError, ValueError):
+            return
+        count, per, total = numeric
+        evidence = payload.get("field_evidence")
+        if not isinstance(evidence, dict):
+            evidence = {}
+            payload["field_evidence"] = evidence
+        if count is None and per and total:
+            derived = total / per
+            if derived <= 0 or abs(derived - round(derived)) > 1e-9:
+                return
+            if count_field == "quantity":
+                payload["quantity"] = int(round(derived))
+                evidence["quantity"] = "system_derived"
+            else:
+                requirements[count_field] = int(round(derived))
+                evidence[f"requirements.{count_field}"] = "system_derived"
+        elif per is None and count and total:
+            if count <= 0:
+                return
+            requirements[per_field] = total / count
+            evidence[f"requirements.{per_field}"] = "system_derived"
+        elif total is None and count and per:
+            requirements[total_field] = count * per
+            evidence[f"requirements.{total_field}"] = "system_derived"
 
     @staticmethod
     def _validate_component_evidence(
@@ -2879,6 +3045,13 @@ class DeepSeekIntentParser:
             return "ses"
         if canonical in {"cloudwatch", "amazoncloudwatch"}:
             return "cloudwatch"
+        if canonical in {
+            "amp",
+            "prometheus",
+            "amazonprometheus",
+            "amazonmanagedserviceforprometheus",
+        }:
+            return "amp"
         if canonical in {"ebs", "amazonebs", "elasticblockstore"}:
             return "ebs"
         if canonical in {"datatransfer", "awsdatatransfer", "internetegress"}:
@@ -2951,7 +3124,7 @@ class DeepSeekIntentParser:
     _INVENTORY_DEFINITIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("ecs", "Amazon ECS", ("amazon ecs", "ecs 集群", "elastic container service")),
         ("fargate", "AWS Fargate", ("aws fargate", "amazon fargate", "fargate 任务")),
-        ("ec2", "Amazon EC2", ("amazon ec2", " ec2", "ec2 ", "ec2：", "ec2｜")),
+        ("ec2", "Amazon EC2", ("amazon ec2", " ec2", "ec2 ", "ec2：", "ec2｜", "nacos", "xxl-job")),
         # RDS and Aurora share one AWS pricing family, but inventory labels are
         # customer-facing.  Aurora identity is restored from the explicit
         # engine/source by preserve_customer_configuration().
@@ -3020,6 +3193,11 @@ class DeepSeekIntentParser:
         ("route53", "Amazon Route 53", ("route 53", "route53", "域名解析")),
         ("waf", "AWS WAF", ("aws waf", "web 应用防火墙", "web 防火墙")),
         ("cloudwatch", "Amazon CloudWatch", ("amazon cloudwatch", "cloudwatch")),
+        (
+            "amp",
+            "Amazon Managed Service for Prometheus (AMP)",
+            ("amazon managed service for prometheus", "prometheus", " amp：", "amp｜"),
+        ),
         ("backup", "AWS Backup", ("aws backup",)),
         ("ebs", "Amazon Elastic Block Store (EBS)", ("amazon ebs", "ebs 云硬盘", "独立 ebs", "云硬盘")),
         (
@@ -3045,7 +3223,8 @@ class DeepSeekIntentParser:
             ("aws step functions", "step functions", "stepfunctions", "状态机工作流"),
         ),
         ("bedrock", "Amazon Bedrock", ("amazon bedrock", "bedrock 模型")),
-        ("cloud_map", "AWS Cloud Map", ("aws cloud map", "cloud map", "服务注册发现")),
+        ("cloud_map", "AWS Cloud Map", ("aws cloud map", "cloud map")),
+        ("appconfig", "AWS AppConfig", ("aws appconfig", "appconfig")),
         (
             "eventbridge",
             "Amazon EventBridge",
@@ -3087,6 +3266,14 @@ class DeepSeekIntentParser:
         for key, display, markers in cls._INVENTORY_DEFINITIONS:
             if any(cls._inventory_marker_matches(line, marker) for marker in markers):
                 found.append((key, display))
+        # An explicitly named third-party product is authoritative. Capability
+        # words such as “服务注册发现” must never silently replace Nacos with a
+        # partial AWS product and discard its configuration-center function or
+        # node topology.
+        if re.search(r"(?<![a-z0-9])nacos(?![a-z0-9])", folded, re.I):
+            found = [item for item in found if item[0] not in {"cloud_map", "appconfig"}]
+            if not any(key == "ec2" for key, _ in found):
+                found.append(("ec2", "Amazon EC2"))
         # Common customer shorthand must still bind the complete numbered
         # component block. Without this boundary, a model may return only the
         # first clause and silently drop later fields such as per-node storage
@@ -3366,6 +3553,8 @@ class DeepSeekIntentParser:
             add("route53", "Amazon Route 53")
         if re.search(r"日志.*监控|监控.*日志|cloudwatch", folded, re.I):
             add("cloudwatch", "Amazon CloudWatch")
+        if re.search(r"(?<![a-z0-9])prometheus(?![a-z0-9])", folded, re.I):
+            add("amp", "Amazon Managed Service for Prometheus (AMP)")
 
         # “Redis 服务器”“数据库服务器”等口语仍然表示托管服务。只有客户
         # 明确写了 EC2 型号或自建/运行在 EC2 上，才同时保留 EC2，避免一个
@@ -3682,6 +3871,102 @@ class DeepSeekIntentParser:
                 parsed.ambiguities.append(question)
 
     @classmethod
+    def _append_third_party_managed_decisions(cls, parsed: ParsedIntent) -> None:
+        """Preserve third-party identity when AWS only offers partial coverage.
+
+        Product identity is stronger evidence than capability prose.  A
+        compound replacement is a customer architecture decision, not an
+        inventory synonym, so keep the self-hosted component intact until the
+        customer explicitly chooses the managed combination.
+        """
+
+        for item in parsed.services:
+            source = item.source_text or ""
+            if not re.search(r"(?<![a-z0-9])nacos(?![a-z0-9])", source, re.I):
+                continue
+            if item.field_sources.get("_architecture_decision"):
+                continue
+            item.service = "ec2"
+            item.calculator_service_name = "Amazon EC2（自建 Nacos）"
+            item.requirements.setdefault("operating_system", "linux")
+            item.field_sources["_pending_architecture_decision"] = "system_policy"
+            node_match = re.search(
+                r"(?:部署数量|节点数量|数量)\s*[：:]?\s*(\d+)\s*(?:个)?\s*节点",
+                source,
+                re.I,
+            )
+            if node_match:
+                item.quantity = max(int(node_match.group(1)), 1)
+            node_count = item.quantity
+            question = (
+                f"您需要 Nacos 的服务发现和配置中心。是继续自建 Nacos（{node_count} 个节点），"
+                "还是改用 AWS 托管的 Cloud Map + AppConfig？托管方案不再按 Nacos 节点部署。"
+            )
+            # AI may return an explanatory Nacos note instead of an actual
+            # customer question. Replace every such note with one stable,
+            # actionable choice so the UI can always render the two buttons.
+            parsed.ambiguities = [
+                notice
+                for notice in parsed.ambiguities
+                if "nacos" not in notice.casefold()
+            ]
+            parsed.ambiguities.append(question)
+
+        # Apply the same staged customer flow to every third-party workload
+        # that the parser preserved as a named self-hosted EC2 component and
+        # explicitly marked as only partially replaceable by AWS managed
+        # services. This keeps the workflow generic without guessing that an
+        # ordinary application EC2 server is third-party middleware.
+        architecture_notices = [
+            notice
+            for notice in parsed.ambiguities
+            if "自建" in notice
+            and any(
+                marker in notice.casefold()
+                for marker in ("托管", "managed", "aws")
+            )
+        ]
+        for item in parsed.services:
+            if cls._service_key(item.service) != "ec2":
+                continue
+            display = item.calculator_service_name or ""
+            products = re.findall(r"自建\s*([^）)]+)", display)
+            if not products or item.field_sources.get("_architecture_decision"):
+                continue
+            if any(
+                product.casefold() in notice.casefold()
+                for product in products
+                for notice in architecture_notices
+            ):
+                item.field_sources.setdefault(
+                    "_pending_architecture_decision", "system_policy"
+                )
+
+    @classmethod
+    def _normalize_prometheus_managed_service(cls, parsed: ParsedIntent) -> None:
+        """Make explicit Prometheus identity authoritative over generic monitoring prose."""
+
+        for item in parsed.services:
+            evidence = " ".join(
+                filter(
+                    None,
+                    (
+                        item.source_text,
+                        item.product_identity,
+                        item.calculator_service_name,
+                        item.service,
+                    ),
+                )
+            )
+            if not re.search(r"(?<![a-z0-9])prometheus(?![a-z0-9])", evidence, re.I):
+                continue
+            item.service = "amp"
+            item.calculator_service_name = (
+                "Amazon Managed Service for Prometheus (AMP)"
+            )
+            item.product_identity = "Prometheus"
+
+    @classmethod
     def _append_explicit_minimum_services(cls, text: str, parsed: ParsedIntent) -> None:
         """Keep explicitly requested simple metered services even when AI omits them."""
 
@@ -3697,6 +3982,10 @@ class DeepSeekIntentParser:
             "sqs": ("Amazon SQS", ("amazon sqs", "sqs：", "sqs｜", "异步队列")),
             "ses": ("Amazon SES", ("amazon ses", "ses", "邮件验证码", "邮件通知")),
             "cloudwatch": ("Amazon CloudWatch", ("cloudwatch", "日志和监控", "日志监控")),
+            "amp": (
+                "Amazon Managed Service for Prometheus (AMP)",
+                ("prometheus", "amazon managed service for prometheus"),
+            ),
             "ebs": (
                 "Amazon Elastic Block Store (EBS)",
                 ("amazon ebs", "独立 ebs", "云硬盘"),
@@ -4089,15 +4378,42 @@ class DeepSeekIntentParser:
 
     @classmethod
     def _normalize_cluster_group_quantities(cls, parsed: ParsedIntent) -> None:
-        """Separate cluster count from the node count inside one cluster."""
+        """Separate outer deployments from resources inside one deployment.
+
+        ``quantity`` always means independent billable deployments. Product
+        topology belongs to service-specific fields such as ``broker_count``,
+        ``data_nodes`` or ``tasks``. This shared boundary runs after initial AI
+        extraction, customer edits, saved-draft confirmation and immediately
+        before pricing, so no component can multiply an internal count into a
+        second copy of the complete service.
+        """
 
         chinese_counts = {
             "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
             "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
         }
+        internal_topology_fields: dict[str, tuple[str, ...]] = {
+            "msk": ("broker_count",),
+            "mq": ("broker_count",),
+            "opensearch": ("data_nodes", "master_nodes", "warm_node_count"),
+            # ElastiCache's existing adapter intentionally prices ``quantity``
+            # as cache nodes. Its shards/replicas contract is normalized by
+            # the dedicated Redis topology guard instead of this deployment
+            # multiplier guard.
+            "eks": ("worker_node_count", "worker_nodes_per_cluster"),
+            "documentdb": ("instance_count",),
+            "rds": ("cluster_members", "read_replica_count"),
+            "redshift": ("nodes",),
+            "emr": ("master_nodes", "core_nodes", "task_nodes"),
+            "ecs": ("tasks",),
+            "fargate": ("tasks",),
+            "dms": ("replication_instances",),
+            "sagemaker": ("instance_count",),
+        }
         for item in parsed.services:
             key = cls._service_key(item.service)
-            if key not in {"msk", "mq", "opensearch"}:
+            topology_fields = internal_topology_fields.get(key)
+            if topology_fields is None:
                 continue
             source = item.source_text or ""
             if key in {"msk", "mq"}:
@@ -4126,7 +4442,8 @@ class DeepSeekIntentParser:
                             set(item.locked_fields) | {"requirements.broker_count"}
                         )
             explicit_cluster_count = re.search(
-                r"(?:集群数量|部署数量)\s*[:：]?\s*(\d+)\s*(?:套|个集群)?|"
+                r"集群(?:数量|数|总数)\s*[:：]?\s*(\d+)|"
+                r"部署数量\s*[:：]?\s*(\d+)\s*(?:套|个集群)|"
                 r"(\d+)\s*(?:套|个)\s*(?:msk|kafka|rabbitmq|activemq|"
                 r"amazon\s*mq|opensearch|es)?\s*(?:集群|部署)",
                 source,
@@ -4140,11 +4457,16 @@ class DeepSeekIntentParser:
                 )
                 item.quantity = max(value, 1)
                 continue
-            node_field = "broker_count" if key in {"msk", "mq"} else "data_nodes"
-            node_count = item.requirements.get(node_field)
-            if isinstance(node_count, (int, float)) and node_count > 0:
-                # ``3个节点`` describes one cluster containing three nodes,
-                # not three copies of a three-node cluster.
+            has_internal_topology = any(
+                isinstance(item.requirements.get(field), (int, float))
+                and not isinstance(item.requirements.get(field), bool)
+                and float(item.requirements[field]) > 0
+                for field in topology_fields
+            )
+            if has_internal_topology:
+                # ``3 Broker``, ``3 data nodes`` or ``6 tasks`` describes one
+                # deployment containing those resources, not that many copies
+                # of the complete managed service.
                 item.quantity = 1
 
     @classmethod
@@ -5404,7 +5726,7 @@ class DeepSeekIntentParser:
             )
             per_cluster_count = re.search(
                 r"每\s*(?:套|个集群)[^。；,，\n]{0,20}?"
-                r"(?:worker|工作)?\s*节点\s*[:：]?\s*(\d+)\s*(?:台|个)?|"
+                r"(?:worker|工作)?\s*节点(?:数量)?\s*[:：]?\s*(\d+)\s*(?:台|个)?|"
                 r"每\s*(?:套|个集群)[^。；,，\n]{0,20}?"
                 r"(\d+)\s*(?:台|个)?\s*(?:worker|工作)\s*节点",
                 source,

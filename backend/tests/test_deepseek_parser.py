@@ -210,7 +210,81 @@ async def test_component_feedback_sends_only_the_changed_component_to_ai() -> No
     assert "RDS MySQL" not in gateway.user_contents[0]
     assert "EC2 4 台" not in gateway.user_contents[0]
     assert "客户最新修改（最高优先级）" in gateway.user_contents[0]
-    assert "当前旧配置（仅作缺失字段兜底" in gateway.user_contents[0]
+    assert "该组件已经确认的历史（只用于补全未修改字段）" in gateway.user_contents[0]
+    assert "当前旧配置" not in gateway.user_contents[0]
+
+
+def test_component_feedback_uses_only_configured_stable_ai() -> None:
+    parser = DeepSeekIntentParser(
+        Settings(
+            ai_provider="bedrock",
+            bedrock_api_key="test",
+            bedrock_model="zai.glm-4.7-flash",
+            component_revision_model="deepseek.v3.2",
+        )
+    )
+    gateways = parser._component_ai_gateways()
+
+    assert len(gateways) == 1
+    assert gateways[0]._settings.ai_model == "deepseek.v3.2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("feedback", "expected"),
+    [
+        ("硬盘10个T", {"system_disk_gib": 10240}),
+        ("改成4核8G", {"vcpu": 4, "memory_gib": 8}),
+    ],
+)
+async def test_ec2_literal_revision_is_never_lost(
+    feedback: str, expected: dict[str, float]
+) -> None:
+    component = ServiceRequirement(
+        service="ec2",
+        calculator_service_name="Amazon EC2",
+        region="ap-northeast-1",
+        quantity=3,
+        requirements={
+            "requested_model": "t4g.small",
+            "vcpu": 2,
+            "memory_gib": 2,
+            "operating_system": "linux",
+        },
+        source_text="EC2 3台，t4g.small",
+    )
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid")
+    )
+    parser._gateway = UnchangedComponentCorrectionGateway(component)  # type: ignore[assignment]
+
+    revised = await parser.revise_component_from_feedback(
+        component.source_text, component, feedback
+    )
+
+    for field, value in expected.items():
+        assert revised.requirements[field] == value
+        assert revised.field_sources[f"requirements.{field}"] == "customer_confirmation"
+
+
+def test_component_template_derives_missing_ec2_total_disk() -> None:
+    payload: dict[str, object] = {
+        "service": "ec2",
+        "quantity": 8,
+        "requirements": {"system_disk_gib": 10240},
+        "field_evidence": {"requirements.system_disk_gib": "硬盘10个T"},
+    }
+
+    DeepSeekIntentParser._complete_repeated_storage_template(payload)
+
+    assert payload["requirements"] == {
+        "system_disk_gib": 10240,
+        "total_system_disk_gib": 81920,
+    }
+    assert payload["field_evidence"] == {
+        "requirements.system_disk_gib": "硬盘10个T",
+        "requirements.total_system_disk_gib": "system_derived",
+    }
 
 
 @pytest.mark.asyncio
@@ -545,6 +619,223 @@ async def test_exact_model_confirmation_does_not_wait_for_ai() -> None:
     assert "memory_gib" not in revised.requirements
     assert "_review_selected_model" not in revised.requirements
     assert "_review_selected_specifications" not in revised.requirements
+
+
+@pytest.mark.asyncio
+async def test_exact_model_answer_always_replaces_old_cpu_and_memory() -> None:
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid")
+    )
+
+    class FailingGateway:
+        async def complete_json(self, **_: object) -> dict[str, object]:
+            raise AssertionError("closed model choice must not call the model")
+
+    parser._gateway = FailingGateway()  # type: ignore[assignment]
+    component = ServiceRequirement(
+        service="ec2",
+        calculator_service_name="Amazon EC2",
+        region="ap-northeast-1",
+        requirements={"vcpu": 6, "memory_gib": 24},
+        source_text="EC2 6核24GB",
+    )
+
+    revised = await parser.revise_component_from_feedback(
+        component.source_text,
+        component,
+        (
+            "问题：AWS 没有完全相同的型号，请在下方重新选择您需要的型号。\n"
+            "客户回答：选择 t2.micro"
+        ),
+    )
+
+    assert revised.requirements["requested_model"] == "t2.micro"
+    assert "vcpu" not in revised.requirements
+    assert "memory_gib" not in revised.requirements
+
+
+@pytest.mark.asyncio
+async def test_unrelated_component_edit_preserves_review_model_and_overwrites_old_shape() -> None:
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid")
+    )
+
+    class QuantityGateway:
+        async def complete_json(self, **_: object) -> dict[str, object]:
+            return {
+                "component": {
+                    "service": "ec2",
+                    "calculator_service_name": "Amazon EC2",
+                    "region": "ap-northeast-1",
+                    "quantity": 8,
+                    "hours_per_month": 730,
+                    "requirements": {
+                        "requested_model": "t2.micro",
+                        "vcpu": 6,
+                        "memory_gib": 24,
+                        "operating_system": "linux",
+                    },
+                    "field_evidence": {"quantity": "8台"},
+                    "source_text": "EC2 6核24GB，选择 t2.micro",
+                    "query_action": None,
+                }
+            }
+
+    parser._gateway = QuantityGateway()  # type: ignore[assignment]
+    component = ServiceRequirement(
+        service="ec2",
+        calculator_service_name="Amazon EC2",
+        region="ap-northeast-1",
+        quantity=3,
+        requirements={
+            "requested_model": "t2.micro",
+            "vcpu": 6,
+            "memory_gib": 24,
+            "operating_system": "linux",
+            "_review_selected_model": "t2.micro",
+            "_review_selected_specifications": {
+                "vCPU": 1,
+                "memoryGiB": 1,
+            },
+        },
+        source_text="EC2 6核24GB，客户已选择 t2.micro",
+    )
+
+    revised = await parser.revise_component_from_feedback(
+        component.source_text,
+        component,
+        "改成8台机器吧",
+    )
+
+    assert revised.quantity == 8
+    assert revised.requirements["requested_model"] == "t2.micro"
+    assert revised.requirements["vcpu"] == 1
+    assert revised.requirements["memory_gib"] == 1
+    assert "_review_selected_model" not in revised.requirements
+    assert "_review_selected_specifications" not in revised.requirements
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("service", "model", "base_requirements", "official_vcpu", "official_memory"),
+    [
+        ("rds", "db.m5.large", {"engine": "mysql"}, 2, 8),
+        ("elasticache", "cache.m7g.large", {"engine": "redis"}, 2, 6.38),
+        ("opensearch", "r6g.large.search", {}, 2, 16),
+    ],
+)
+async def test_quantity_edit_rebuilds_any_component_from_latest_confirmed_model(
+    service: str,
+    model: str,
+    base_requirements: dict[str, object],
+    official_vcpu: float,
+    official_memory: float,
+) -> None:
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid")
+    )
+    old_requirements = {
+        **base_requirements,
+        "requested_model": model,
+        "memory_gib": 999,
+    }
+    if service != "elasticache":
+        old_requirements["vcpu"] = 99
+
+    class QuantityGateway:
+        async def complete_json(self, **_: object) -> dict[str, object]:
+            return {
+                "component": {
+                    "service": service,
+                    "region": "ap-southeast-1",
+                    "quantity": 2,
+                    "hours_per_month": 730,
+                    "requirements": old_requirements,
+                    "field_evidence": {"quantity": "数量改成2台"},
+                    "source_text": f"{service} 数量1，已选择 {model}",
+                    "query_action": None,
+                }
+            }
+
+    parser._gateway = QuantityGateway()  # type: ignore[assignment]
+    component = ServiceRequirement(
+        service=service,
+        region="ap-southeast-1",
+        quantity=1,
+        requirements={
+            **old_requirements,
+            "_review_selected_model": model,
+            "_review_selected_specifications": {
+                "vCPU": official_vcpu,
+                "memoryGiB": official_memory,
+            },
+        },
+        source_text=f"{service} 数量1，已选择 {model}",
+    )
+
+    revised = await parser.revise_component_from_feedback(
+        component.source_text,
+        component,
+        "数量改成2台",
+    )
+
+    assert revised.quantity == 2
+    assert revised.requirements["requested_model"] == model
+    if service == "elasticache":
+        assert "vcpu" not in revised.requirements
+    else:
+        assert revised.requirements["vcpu"] == official_vcpu
+    assert revised.requirements["memory_gib"] == official_memory
+
+
+@pytest.mark.asyncio
+async def test_repeated_component_edits_rebuild_from_the_latest_result() -> None:
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid")
+    )
+
+    class SequentialStorageGateway:
+        def __init__(self) -> None:
+            self.values = iter((30720, 40960))
+
+        async def complete_json(self, **_: object) -> dict[str, object]:
+            storage = next(self.values)
+            return {
+                "component": {
+                    "service": "s3",
+                    "region": "ap-southeast-1",
+                    "quantity": 1,
+                    "hours_per_month": 730,
+                    "requirements": {
+                        "storage_gib": storage,
+                        "storage_class": "standard",
+                    },
+                    "field_evidence": {
+                        "requirements.storage_gib": f"{storage / 1024:g}TB"
+                    },
+                    "source_text": f"S3 {storage / 1024:g}TB",
+                    "query_action": None,
+                }
+            }
+
+    parser._gateway = SequentialStorageGateway()  # type: ignore[assignment]
+    original = ServiceRequirement(
+        service="s3",
+        region="ap-southeast-1",
+        requirements={"storage_gib": 20480, "storage_class": "standard"},
+        source_text="S3 20TB",
+    )
+
+    first = await parser.revise_component_from_feedback(
+        original.source_text, original, "容量改成30TB"
+    )
+    second = await parser.revise_component_from_feedback(
+        first.source_text, first, "容量再改成40TB"
+    )
+
+    assert first.requirements["storage_gib"] == 30720
+    assert second.requirements["storage_gib"] == 40960
+    assert second.source_text.startswith("客户最新修改：容量再改成40TB")
 
 
 @pytest.mark.asyncio
@@ -2014,7 +2305,7 @@ def test_selective_audit_only_flags_suspicious_incomplete_repeated_component() -
     assert not DeepSeekIntentParser._needs_selective_component_audit(original, complete)
 
 
-def test_component_template_rejects_missing_ai_derived_disk_count() -> None:
+def test_component_template_derives_missing_ai_disk_count() -> None:
     parser = DeepSeekIntentParser(
         Settings(ai_api_key="test", ai_base_url="https://example.invalid")
     )
@@ -2045,8 +2336,10 @@ def test_component_template_rejects_missing_ai_derived_disk_count() -> None:
         }
     }
 
-    with pytest.raises(ValueError, match="缺少可由另外两个值计算的字段"):
-        parser._component_from_template_output(raw, component)
+    result = parser._component_from_template_output(raw, component)
+
+    assert result.quantity == 2
+    assert result.field_evidence["quantity"] == "system_derived"
 
 
 def test_component_template_accepts_ai_derived_disk_count_after_self_correction() -> None:
@@ -2394,6 +2687,63 @@ def test_service_identity_guard_enforces_managed_first_and_api_direction() -> No
 
     assert [key for key, _ in self_hosted] == ["mq"]
     assert "apigateway" not in {key for key, _ in outbound_only}
+
+
+def test_nacos_product_identity_beats_partial_capability_match() -> None:
+    keys = DeepSeekIntentParser._inventory_keys_for_line(
+        "Nacos：服务注册发现和配置中心，部署数量：3个节点"
+    )
+
+    assert keys == [("ec2", "Amazon EC2")]
+
+
+def test_nacos_requires_clear_managed_or_self_hosted_decision_and_keeps_nodes() -> None:
+    parsed = ParsedIntent(
+        customer_summary="Nacos",
+        services=[
+            ServiceRequirement(
+                service="cloud_map",
+                calculator_service_name="AWS Cloud Map",
+                quantity=1,
+                region="ap-southeast-1",
+                source_text="Nacos：服务注册发现和配置中心，部署数量：3个节点",
+            )
+        ],
+    )
+
+    DeepSeekIntentParser._append_third_party_managed_decisions(parsed)
+
+    assert parsed.services[0].service == "ec2"
+    assert parsed.services[0].quantity == 3
+    assert parsed.services[0].requirements["operating_system"] == "linux"
+    assert parsed.services[0].field_sources["_pending_architecture_decision"] == "system_policy"
+    assert len(parsed.ambiguities) == 1
+    assert "Cloud Map + AppConfig" in parsed.ambiguities[0]
+    assert "3 个节点" in parsed.ambiguities[0]
+
+
+def test_all_named_self_hosted_partial_replacements_enter_staged_workflow() -> None:
+    parsed = ParsedIntent(
+        customer_summary="XXL-JOB",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                calculator_service_name="Amazon EC2（自建 XXL-JOB）",
+                quantity=2,
+                source_text="XXL-JOB 调度中心，部署 2 个节点",
+            )
+        ],
+        ambiguities=[
+            "XXL-JOB 没有完全等价的 AWS 托管服务，请选择 AWS 托管方案还是保留原产品自建。"
+        ],
+    )
+
+    DeepSeekIntentParser._append_third_party_managed_decisions(parsed)
+
+    assert (
+        parsed.services[0].field_sources["_pending_architecture_decision"]
+        == "system_policy"
+    )
 
 
 def test_multiline_blocks_repair_units_and_split_eks_worker_nodes() -> None:
@@ -3043,6 +3393,52 @@ def test_eks_workers_per_cluster_are_multiplied_without_losing_shape() -> None:
     assert worker.source_text == source
 
 
+def test_eks_worker_quantity_word_is_multiplied_by_cluster_count() -> None:
+    source = (
+        "Amazon EKS：区域：东京（ap-northeast-1），用途：微服务容器平台，"
+        "集群数量：2个，每个集群Worker节点数量：3台"
+    )
+    parsed = ParsedIntent(
+        customer_summary="EKS",
+        services=[
+            ServiceRequirement(
+                service="eks",
+                region="ap-northeast-1",
+                quantity=2,
+                source_text=source,
+                requirements={"cluster_count": 2},
+            )
+        ],
+    )
+
+    DeepSeekIntentParser._split_eks_worker_nodes(parsed)
+
+    worker = next(item for item in parsed.services if item.service == "ec2")
+    assert worker.quantity == 6
+
+
+def test_prometheus_identity_overrides_cloudwatch_mapping() -> None:
+    parsed = ParsedIntent(
+        customer_summary="Prometheus",
+        services=[
+            ServiceRequirement(
+                service="cloudwatch",
+                calculator_service_name="Amazon CloudWatch",
+                source_text="Prometheus：用于 Kubernetes 指标监控",
+            )
+        ],
+    )
+
+    DeepSeekIntentParser._normalize_prometheus_managed_service(parsed)
+
+    component = parsed.services[0]
+    assert component.service == "amp"
+    assert component.calculator_service_name == (
+        "Amazon Managed Service for Prometheus (AMP)"
+    )
+    assert component.product_identity == "Prometheus"
+
+
 def test_numbered_shorthand_blocks_restore_opensearch_storage_and_unsized_eks_workers() -> None:
     """A partial first-pass result cannot discard later facts in its numbered block."""
 
@@ -3307,6 +3703,78 @@ def test_msk_literal_node_count_overrides_generic_quantity_and_minimum_default()
     assert parsed.services[0].quantity == 1
     assert parsed.services[0].requirements["broker_count"] == 3
     assert "requirements.broker_count" in parsed.services[0].locked_fields
+
+
+def test_msk_deployment_quantity_label_with_broker_suffix_is_not_cluster_count() -> None:
+    parsed = ParsedIntent(
+        customer_summary="Kafka",
+        services=[
+            ServiceRequirement(
+                service="msk",
+                quantity=3,
+                source_text=(
+                    "Apache Kafka：区域：新加坡，用途：业务消息队列和实时数据流处理，"
+                    "部署数量：3个Broker节点"
+                ),
+                requirements={"broker_count": 3},
+            )
+        ],
+    )
+
+    DeepSeekIntentParser._normalize_cluster_group_quantities(parsed)
+
+    assert parsed.services[0].quantity == 1
+    assert parsed.services[0].requirements["broker_count"] == 3
+
+
+@pytest.mark.parametrize(
+    ("service", "field", "source"),
+    [
+        ("mq", "broker_count", "RabbitMQ 部署数量：3个 Broker 节点"),
+        ("opensearch", "data_nodes", "OpenSearch 部署数量：4个数据节点"),
+        ("eks", "worker_node_count", "EKS 包含 6 个 Worker 节点"),
+        ("documentdb", "instance_count", "DocumentDB 集群包含 3 个数据库实例"),
+        ("redshift", "nodes", "Redshift 集群包含 2 个计算节点"),
+        ("ecs", "tasks", "ECS 服务运行 8 个任务"),
+    ],
+)
+def test_internal_topology_never_becomes_complete_deployment_quantity(
+    service: str, field: str, source: str
+) -> None:
+    parsed = ParsedIntent(
+        customer_summary=service,
+        services=[
+            ServiceRequirement(
+                service=service,
+                quantity=3,
+                source_text=source,
+                requirements={field: 3},
+            )
+        ],
+    )
+
+    DeepSeekIntentParser._normalize_cluster_group_quantities(parsed)
+
+    assert parsed.services[0].quantity == 1
+
+
+def test_explicit_independent_cluster_count_is_preserved() -> None:
+    parsed = ParsedIntent(
+        customer_summary="Kafka",
+        services=[
+            ServiceRequirement(
+                service="msk",
+                quantity=3,
+                source_text="Kafka 集群数量：2，每个集群 3 个 Broker 节点",
+                requirements={"broker_count": 3},
+            )
+        ],
+    )
+
+    DeepSeekIntentParser._normalize_cluster_group_quantities(parsed)
+
+    assert parsed.services[0].quantity == 2
+    assert parsed.services[0].requirements["broker_count"] == 3
 
 
 def test_rabbitmq_nodes_shape_and_deployment_quantity_are_reconciled_together() -> None:

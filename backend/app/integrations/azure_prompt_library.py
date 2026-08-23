@@ -4,7 +4,6 @@ import json
 import threading
 from pathlib import Path
 
-
 AZURE_CORE_PROMPT = """你是 Microsoft Azure 零售价格报价的需求整理员。
 把客户原文整理成 Azure Retail Prices API 可查询的严格结构化数据。只理解需求，不编造 SKU、不计算价格。
 
@@ -15,6 +14,12 @@ AZURE_CORE_PROMPT = """你是 Microsoft Azure 零售价格报价的需求整理�
 4. 只有需求冲突、明确 SKU 在目标区域不可用、或缺少会改变价格的核心信息时才要求客户确认。
 5. 每项服务保留客户原话，区域统一使用 Azure armRegionName；不得把 displayName 当作 armRegionName。
 6. 输出前核对服务、区域、SKU、数量、操作系统、磁盘、数据库层级、存储与出站流量，禁止遗漏或新增服务。
+7. 不限制 Azure 服务种类。即使是规则库中没见过的新组件，也必须保留为独立组件；service 使用稳定小写标识，calculator_service_name 填写 Microsoft Retail Prices 目录中的官方服务名称，交给官方目录自动建档，禁止改成已有但无关的服务。
+"""
+
+AZURE_GENERIC_SERVICE_PROMPT = """【其他 Azure 组件通用规则】
+这是一个尚未建立专用模板的 Azure 组件。先识别 Microsoft 官方产品名称，再仅提取客户明确给出的 SKU、层级、月用量、计费单位、存储、请求量和出站流量。
+不得因为没有专用插件而丢弃组件，也不得选择最便宜但语义无关的 Meter。程序会使用 Retail Prices 官方 serviceName、armSkuName、meterName 和 unitOfMeasure 自动建立只读报价档案；若计费维度不能唯一确定，必须给客户官方候选项。
 """
 
 AZURE_SERVICE_PROMPTS: dict[str, str] = {
@@ -35,7 +40,7 @@ _LOCK = threading.RLock()
 
 
 def _defaults() -> dict[str, str]:
-    return {"azure_intake_format": AZURE_CORE_PROMPT, **{
+    return {"azure_intake_format": AZURE_CORE_PROMPT, "azure_generic_service": AZURE_GENERIC_SERVICE_PROMPT, **{
         f"azure_{key}": value for key, value in AZURE_SERVICE_PROMPTS.items()
     }}
 
@@ -88,6 +93,14 @@ def azure_prompt_library_payload() -> dict[str, object]:
             "content": overrides.get(f"azure_{key}", content),
             "is_overridden": f"azure_{key}" in overrides,
         })
+    items.append({
+        "key": "azure_generic_service",
+        "title": "其他 Azure 组件通用规则",
+        "category": "Microsoft Azure · 扩展组件",
+        "order": 99,
+        "content": overrides.get("azure_generic_service", AZURE_GENERIC_SERVICE_PROMPT),
+        "is_overridden": "azure_generic_service" in overrides,
+    })
     return {
         "provider": "azure",
         "items": items,

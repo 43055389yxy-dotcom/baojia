@@ -34,13 +34,19 @@ class QuoteJob:
 class QuoteJobManager:
     """Small in-memory queue for official API quote jobs."""
 
-    def __init__(self, quote_service: QuoteService, provider_name: str = "AWS"):
+    def __init__(
+        self,
+        quote_service: QuoteService,
+        provider_name: str = "AWS",
+        provider_key: Literal["aws", "azure"] = "aws",
+    ):
         self._quote_service = quote_service
         self._provider_name = provider_name
+        self._provider_key = provider_key
         self._jobs: dict[str, QuoteJob] = {}
 
     def start(self, request: QuoteRequest) -> QuoteJob:
-        job = QuoteJob(job_id=uuid.uuid4().hex[:12])
+        job = QuoteJob(job_id=f"{self._provider_key}-{uuid.uuid4().hex[:12]}")
         self._jobs[job.job_id] = job
         asyncio.create_task(self._run(job, request))
         return job
@@ -48,7 +54,7 @@ class QuoteJobManager:
     def start_preview(self, request: QuoteRequest) -> QuoteJob:
         """Run configuration parsing/preflight as a pollable live job."""
 
-        job = QuoteJob(job_id=uuid.uuid4().hex[:12])
+        job = QuoteJob(job_id=f"{self._provider_key}-{uuid.uuid4().hex[:12]}")
         self._jobs[job.job_id] = job
         asyncio.create_task(self._run_preview(job, request))
         return job
@@ -106,6 +112,7 @@ class QuoteJobManager:
             job.status = "completed"
             await self._event(job, "done", "全部组件已完成配置核验")
         except QuoteError as exc:
+            self._recover_configuration_review(request)
             job.status = "failed"
             job.error = {
                 "status": "manual_confirmation",
@@ -115,6 +122,7 @@ class QuoteJobManager:
             }
             await self._event(job, "error", exc.message)
         except Exception as exc:  # pragma: no cover - API safety boundary
+            self._recover_configuration_review(request)
             job.status = "failed"
             job.error = {
                 "status": "manual_confirmation",
@@ -123,6 +131,13 @@ class QuoteJobManager:
                 "details": {"error_type": type(exc).__name__},
             }
             await self._event(job, "error", "配置核验发生内部错误")
+
+    def _recover_configuration_review(self, request: QuoteRequest) -> None:
+        recover = getattr(
+            self._quote_service, "recover_configuration_review_after_failure", None
+        )
+        if callable(recover):
+            recover(request.draft_id)
 
     @staticmethod
     async def _event(job: QuoteJob, stage: str, message: str) -> None:

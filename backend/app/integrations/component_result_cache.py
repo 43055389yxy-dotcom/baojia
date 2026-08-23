@@ -11,7 +11,7 @@ from pathlib import Path
 from app.domain.models import ServiceRequirement
 
 COMPONENT_RESULT_TTL_SECONDS = 90 * 24 * 60 * 60
-COMPONENT_RESULT_CACHE_VERSION = "component-template-v1"
+COMPONENT_RESULT_CACHE_VERSION = "component-template-v2-customer-rebuild"
 
 
 class ValidatedComponentResultCache:

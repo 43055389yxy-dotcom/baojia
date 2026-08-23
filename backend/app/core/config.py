@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     bedrock_api_key: str = ""
     bedrock_base_url: str = "https://bedrock-mantle.us-east-1.api.aws/v1"
     bedrock_model: str = "zai.glm-4.7-flash"
+    # Customer edits use one deliberately stable model.  Intake keeps using
+    # ``bedrock_model`` so fast first-pass recognition and reliable revisions
+    # can be tuned independently.
+    component_revision_model: str = "deepseek.v3.2"
+    component_revision_timeout_seconds: float = 30.0
     # Compatibility override for local tests and deployments that previously
     # supplied a single AI_API_KEY instead of a provider-specific key.
     ai_api_key_override: str = Field(
@@ -77,6 +82,25 @@ class Settings(BaseSettings):
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
     aws_session_token: str = ""
+
+    # Optional Azure subscription connection. Public retail quotes do not need
+    # these values; when all four are configured the engine can additionally
+    # validate VM capabilities and restrictions for that subscription.
+    azure_tenant_id: str = ""
+    azure_client_id: str = ""
+    azure_client_secret: str = ""
+    azure_subscription_id: str = ""
+
+    @property
+    def azure_account_configured(self) -> bool:
+        return all(
+            (
+                self.azure_tenant_id,
+                self.azure_client_id,
+                self.azure_client_secret,
+                self.azure_subscription_id,
+            )
+        )
 
     bcm_workload_estimate_ids: Annotated[list[str], NoDecode] = Field(default_factory=list)
     bcm_allow_estimate_create: bool = True

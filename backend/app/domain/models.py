@@ -100,9 +100,22 @@ class QuoteRequest(BaseModel):
     payment_option: Literal["no_upfront", "partial_upfront", "all_upfront"] | None = None
     include_on_demand_scenario: bool = False
     utilization_percent: int = Field(default=100, ge=1, le=100)
+    azure_pricing_mode: Literal[
+        "pay_as_you_go", "reservation", "savings_plan", "spot"
+    ] = "pay_as_you_go"
+    azure_term_years: Literal[1, 3] | None = None
+    azure_payment_option: Literal["monthly", "upfront"] | None = None
 
     @model_validator(mode="after")
     def normalize_sales_pricing_choice(self) -> QuoteRequest:
+        if self.cloud_provider == "azure":
+            if self.azure_pricing_mode in {"reservation", "savings_plan"}:
+                self.azure_term_years = self.azure_term_years or 1
+                self.azure_payment_option = self.azure_payment_option or "monthly"
+            else:
+                self.azure_term_years = None
+                self.azure_payment_option = None
+            return self
         if self.pricing_mode == "on_demand":
             self.reserved_term_years = None
             self.reserved_term_options = None
@@ -201,6 +214,8 @@ class ConfirmationOption(BaseModel):
 class ConfirmationItem(BaseModel):
     question: str
     options: list[ConfirmationOption] = Field(default_factory=list)
+    dependent_options: list[ConfirmationOption] = Field(default_factory=list)
+    dependent_on_values: list[str] = Field(default_factory=list)
     component_id: str | None = None
     service: str | None = None
     selection_mode: Literal["buttons", "catalog"] = "buttons"
@@ -285,6 +300,7 @@ class ConfigurationReviewItem(BaseModel):
 
 class ConfirmationSessionResponse(BaseModel):
     token: str
+    cloud_provider: Literal["aws", "azure"] = "aws"
     status: Literal[
         "pending",
         "submitted",
@@ -341,7 +357,8 @@ class QuoteResponse(BaseModel):
 class PricingScenario(BaseModel):
     label: str
     pricing_mode: Literal[
-        "on_demand", "standard_reserved", "convertible_reserved"
+        "on_demand", "standard_reserved", "convertible_reserved",
+        "pay_as_you_go", "reservation", "savings_plan", "spot",
     ]
     reserved_term_years: Literal[1, 3] | None = None
     payment_option: Literal["no_upfront", "partial_upfront", "all_upfront"] | None = None

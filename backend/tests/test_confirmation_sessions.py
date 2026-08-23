@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -49,6 +50,41 @@ def test_confirmation_session_round_trip(tmp_path: Path) -> None:
     completed = store.get(token)
     assert completed is not None
     assert completed.status == "completed"
+
+
+def test_aws_and_azure_confirmation_storage_are_physically_isolated(
+    tmp_path: Path,
+) -> None:
+    aws_store = ConfirmationSessionStore(tmp_path / "aws.sqlite3", "aws")
+    azure_store = ConfirmationSessionStore(tmp_path / "azure.sqlite3", "azure")
+    azure_intent = ParsedIntent(
+        customer_summary="Azure Redis",
+        services=[
+            ServiceRequirement(
+                service="azure_cache",
+                calculator_service_name="Azure Cache for Redis",
+                product_identity="azure_cache",
+                source_text="Azure Cache for Redis Standard C1",
+            )
+        ],
+    )
+    token = azure_store.create_or_replace(
+        draft_id="az0000000001",
+        customer_request="Azure Cache for Redis",
+        customer_summary="Azure Redis",
+        intent=azure_intent,
+        confirmation_text="请确认",
+        items=[],
+    )
+
+    assert token.startswith("azure_")
+    assert aws_store.get(token) is None
+    assert aws_store.restore_draft("az0000000001") is None
+    restored = azure_store.get(token)
+    assert restored is not None
+    assert restored.cloud_provider == "azure"
+    assert restored.configuration_items[0].service == "azure_cache"
+    assert restored.configuration_items[0].display_name == "Azure Cache for Redis"
 
 
 def test_confirmation_session_requires_every_answer(tmp_path: Path) -> None:
@@ -163,6 +199,36 @@ def test_configuration_feedback_reuses_link_and_returns_to_reviewing(tmp_path: P
     assert submitted.answers == {
         CONFIGURATION_FEEDBACK_QUESTION: "CloudFront 重复了，只保留一个。"
     }
+
+
+def test_stale_configuration_update_returns_to_editable_table(tmp_path: Path) -> None:
+    store = ConfirmationSessionStore(tmp_path / "sessions.sqlite3")
+    intent = ParsedIntent(
+        customer_summary="test",
+        services=[ServiceRequirement(service="ec2", source_text="EC2 2台")],
+    )
+    token = store.create_or_replace(
+        draft_id="draft-stale-feedback",
+        customer_request="EC2 2台",
+        customer_summary="test",
+        intent=intent,
+        confirmation_text="最终配置",
+        items=[],
+    )
+    store.prepare_configuration_review(draft_id="draft-stale-feedback", intent=intent)
+    store.submit_configuration_feedback(token, component_feedback={"0": "改成4核8G"})
+    stale_time = (datetime.now(UTC) - timedelta(minutes=3)).isoformat()
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE confirmation_sessions SET submitted_at = ? WHERE token = ?",
+            (stale_time, token),
+        )
+
+    recovered = store.get(token)
+
+    assert recovered is not None
+    assert recovered.status == "configuration_review"
+    assert "原配置已保留" in recovered.confirmation_text
 
 
 def test_configuration_feedback_targets_only_selected_components(tmp_path: Path) -> None:

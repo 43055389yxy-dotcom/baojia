@@ -1,6 +1,12 @@
-# AWS 智能报价
+# AWS 与 Microsoft Azure 智能报价
 
 面向销售场景的 AWS 自然语言报价系统。AI 只把客户描述转换成结构化需求；产品型号、规格、区域支持、`usageType`、`operation` 均由 AWS 官方 API 发现；最终金额仅采用 AWS Billing and Cost Management Pricing Calculator 返回的 `cost` / `totalCost`。
+
+同一页面也提供独立的 Microsoft Azure 报价引擎。销售编号会被视为组件硬边界；系统为每个组件启动隔离的 AI 参数解析，再由 Azure 服务插件查询 Microsoft Azure Retail Prices API。公开报价无需 Azure 账号；可选连接 Azure 订阅后，系统还能通过 Resource SKUs API 验证订阅级 VM 规格与区域限制。
+
+Azure 支持 Pay-as-you-go、1/3 年预留、1/3 年 Savings Plan 和 Spot。最终报价展示 `productId`、`skuId`、`meterId`、`armSkuName`、单位价格、月用量和组件小计，并明确标注不包含 EA/MCA/CSP 协议折扣。
+
+两套引擎共享销售工作流、客户确认、任务进度和报价数据模型，但提示词、字段模板、官方目录、服务插件、计费规则与缓存命名空间完全隔离。Azure 官方目录和已验证组件结果使用独立 SQLite 持久化缓存，后台预热常用区域与服务。
 
 当前首批插件：
 

@@ -174,15 +174,42 @@ class Ec2Plugin(ServicePlugin):
             min_vcpu=min_vcpu,
             min_memory=min_memory,
         )
+        # If the requested CPU/memory shape does not exist, this page is an
+        # explicit replacement picker, not an automatic minimum-size match.
+        # Keep smaller regional models visible as well so the customer can
+        # deliberately revise the original requirement (for example from
+        # 6 vCPU down to 2 or 4 vCPU). Normal automatic selection below still
+        # uses only ``eligible`` models and never under-provisions silently.
+        exact_shape_exists = bool(
+            min_vcpu is not None
+            and min_memory is not None
+            and any(
+                item["vcpu"] == min_vcpu and item["memory_gib"] == min_memory
+                for item in official
+            )
+        )
+        candidate_items = eligible
+        if requested_model is None and not exact_shape_exists:
+            candidate_items = _rank_reasonable_ec2(
+                official,
+                business_type=_optional_string(requested.get("business_type"))
+                or "general_purpose",
+                architecture=_optional_string(requested.get("architecture")),
+                min_vcpu=min_vcpu,
+                min_memory=min_memory,
+            )
         operating_system = _pricing_operating_system(
             _optional_string(requested.get("operating_system"))
         )
         tenancy = _pricing_tenancy(_optional_string(requested.get("tenancy")))
         options: list[CandidateOption] = []
         price_list_enabled = requested_model is None
-        for item in eligible:
+        for item in candidate_items:
             product = None
-            if price_list_enabled:
+            # Smaller replacement choices do not need a speculative price at
+            # this stage. Once selected, the normal quote pass prices that
+            # exact official model.
+            if price_list_enabled and _fits(item, min_vcpu, min_memory):
                 try:
                     product = self._compute_product(
                         region, item["model"], operating_system, tenancy
@@ -239,13 +266,26 @@ class Ec2Plugin(ServicePlugin):
                     option.model,
                 )
             )
-        default = options[0]
+        default_model = eligible[0]["model"]
+        default = next(option for option in options if option.model == default_model)
         default.is_default = True
-        # When no exact model was supplied, let the customer choose from the
-        # complete regional catalog instead of silently fixing a model.
-        requires_confirmation = bool(exact is None and len(options) > 1)
+        # Multiple official models can share the exact requested CPU/memory
+        # shape. That means AWS *does* support the configuration; select the
+        # cheapest ranked exact model automatically instead of incorrectly
+        # telling the customer that the shape does not exist. Ask for a
+        # replacement only when the requested shape itself is unavailable.
+        customer_must_select = bool(
+            requirement.field_sources.get("_customer_select_configuration")
+        )
+        requires_confirmation = customer_must_select or bool(
+            exact is None and len(options) > 1 and not exact_shape_exists
+        )
         confirmation_reason = None
-        if requires_confirmation:
+        if customer_must_select:
+            confirmation_reason = (
+                f"请选择自建服务的机器台数和每台 EC2 配置（当前 {requirement.quantity} 台）。"
+            )
+        elif requires_confirmation:
             confirmation_reason = (
                 f"客户要求至少 {min_vcpu:g} vCPU、{min_memory:g} GiB，AWS 合适系列中"
                 f"最接近的规格是 {default.specifications.get('vCPU'):g} vCPU、"
@@ -283,11 +323,18 @@ class Ec2Plugin(ServicePlugin):
         tenancy = _pricing_tenancy(_optional_string(requested.get("tenancy")))
         purchase_option = _optional_string(requested.get("purchase_option")) or "on_demand"
         candidates = self._official_candidates(region, requested_model, min_vcpu, min_memory)
+        # A model explicitly chosen on the confirmation page is authoritative.
+        # Later edits such as changing quantity may restore descriptive CPU or
+        # memory from the original request; those old values must not reject or
+        # silently replace the customer's exact official model.
+        confirmed = next(
+            (item for item in candidates if item["model"] == requested_model),
+            None,
+        )
         eligible = [item for item in candidates if _fits(item, min_vcpu, min_memory)]
         substitution = False
-        exact = next((item for item in eligible if item["model"] == requested_model), None)
-        if requested_model and exact:
-            selected = exact
+        if requested_model and confirmed:
+            selected = confirmed
         else:
             if requested_model:
                 substitution = True

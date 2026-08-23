@@ -38,6 +38,7 @@ _SERVICE_CODE_ALIASES = {
     "stepfunctions": "AWSStepFunctions",
     "bedrock": "AmazonBedrock",
     "cloudmap": "AWSCloudMap",
+    "appconfig": "AWSAppConfig",
     "documentdb": "AmazonDocDB",
     "docdb": "AmazonDocDB",
     "mongodb": "AmazonDocDB",
@@ -47,6 +48,9 @@ _SERVICE_CODE_ALIASES = {
     "xray": "AWSXRay",
     "grafana": "AmazonGrafana",
     "managedgrafana": "AmazonGrafana",
+    "amp": "AmazonPrometheus",
+    "prometheus": "AmazonPrometheus",
+    "managedprometheus": "AmazonPrometheus",
 }
 
 

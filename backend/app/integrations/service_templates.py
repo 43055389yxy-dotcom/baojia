@@ -65,6 +65,10 @@ SERVICE_TEMPLATE_FIELDS: dict[str, tuple[str, ...]] = {
         "log_ingestion_gib", "log_storage_gib", "custom_metrics", "alarms",
         "include_logs", "include_metrics",
     ),
+    "amp": (
+        "active_series", "samples_ingested", "query_samples_processed",
+        "collector_hours", "storage_gib",
+    ),
     "backup": (
         "backup_storage_gib", "warm_storage_gib", "cold_storage_gib",
         "restore_gib", "backup_frequency", "backup_retention_days", "protected_service",
@@ -175,6 +179,10 @@ SERVICE_TEMPLATE_FIELDS: dict[str, tuple[str, ...]] = {
         "provisioned_throughput_units",
     ),
     "cloud_map": ("namespaces", "service_instances", "api_calls", "dns_queries"),
+    "appconfig": (
+        "configuration_requests", "configuration_retrievals",
+        "targets_receiving_configuration",
+    ),
     "eventbridge": ("events", "event_buses", "schema_discovery_events", "pipes_requests"),
 }
 

@@ -67,6 +67,17 @@ class RedisPlugin(ServicePlugin):
             for index, item in enumerate(candidates)
         ]
         selected = options[default_index]
+        exact_shape_exists = bool(
+            min_memory is not None
+            and any(
+                option.specifications.get("memoryGiB") == min_memory
+                and (
+                    min_vcpu is None
+                    or option.specifications.get("vCPU") == min_vcpu
+                )
+                for option in options
+            )
+        )
         # A requested model can also come from the customer's answer to the
         # lower/upper choice. Once that exact official model is available, the
         # choice is resolved even when its memory is not numerically identical
@@ -79,7 +90,11 @@ class RedisPlugin(ServicePlugin):
         # and this question is resolved.
         requires_confirmation = bool(
             (requested_model and selected.model != requested_model)
-            or (not requested_model and len(options) > 1)
+            or (
+                not requested_model
+                and len(options) > 1
+                and not exact_shape_exists
+            )
         )
         # A lower/upper sizing question is a real customer decision.  Do not
         # preselect either answer or persist a provisional model as if the

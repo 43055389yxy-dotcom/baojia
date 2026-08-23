@@ -71,6 +71,7 @@ type Selection = {
   substitution_notice?: string | null;
   remarks?: string[];
   reference_rates?: ReferenceRate[];
+  usage_lines?: Array<{ key: string; amount: number; group?: string | null }>;
 };
 type ReferenceRate = {
   description: string;
@@ -107,7 +108,7 @@ type Quote = {
 };
 type PricingScenario = {
   label: string;
-  pricing_mode: PricingMode;
+  pricing_mode: PricingMode | AzurePricingMode;
   reserved_term_years?: 1 | 3 | null;
   payment_option?: PaymentOption | null;
   quote_id: string;
@@ -126,6 +127,8 @@ type Job = {
 };
 type PricingMode = "on_demand" | "standard_reserved" | "convertible_reserved";
 type PaymentOption = "no_upfront" | "partial_upfront" | "all_upfront";
+type AzurePricingMode = "pay_as_you_go" | "reservation" | "savings_plan" | "spot";
+type AzurePaymentOption = "monthly" | "upfront";
 type CloudProvider = "aws" | "azure";
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "/api/backend";
 const CONFIRMATION_CONTEXT_KEY = "astraquote.pending-confirmation.v1";
@@ -135,6 +138,7 @@ type PendingConfirmationContext = {
   token: string;
   draftId: string;
   customerRequest: string;
+  cloudProvider: CloudProvider;
   preview: Preview;
   answers?: Record<string, string>;
   latePricingConfirmation?: boolean;
@@ -165,6 +169,22 @@ const serviceNames: Record<string, string> = {
   dms: "AWS DMS",
   kms: "AWS KMS",
   xray: "AWS X-Ray",
+  cloud_map: "AWS Cloud Map",
+  appconfig: "AWS AppConfig",
+  azure_vm: "Azure Virtual Machines",
+  managed_disks: "Azure Managed Disks",
+  azure_sql: "Azure SQL Database",
+  azure_postgresql: "Azure Database for PostgreSQL",
+  azure_mysql: "Azure Database for MySQL",
+  azure_cache: "Azure Managed Redis",
+  blob_storage: "Azure Blob Storage",
+  load_balancer: "Azure Load Balancer",
+  application_gateway: "Azure Application Gateway",
+  front_door: "Azure Front Door",
+  bandwidth: "Azure Bandwidth",
+  aks: "Azure Kubernetes Service",
+  monitor: "Azure Monitor",
+  api_management: "Azure API Management",
 };
 
 function serviceDisplayName(selection: { service: string; display_name: string }): string {
@@ -195,6 +215,10 @@ const specificationNames: Record<string, string> = {
   dataNodes: "数据节点", storageGiBPerNode: "每节点存储", brokerCount: "Broker 节点",
   storageGiBPerBroker: "每个 Broker 存储", storageClass: "存储类型",
   processedGiB: "处理流量", scheduledInvocations: "每月调用量",
+  requested_sku: "Azure SKU", service_tier: "服务层级", compute_model: "计算模式",
+  access_tier: "访问层", redundancy: "冗余方式", disk_type: "磁盘类型",
+  disk_size_gib: "磁盘容量", vcore: "vCore", high_availability: "高可用",
+  capacity_units: "容量单位", log_ingestion_gib: "日志写入", retention_days: "保留天数",
 };
 
 function formatPreviewValue(key: string, value: unknown): string {
@@ -298,6 +322,8 @@ const stageName: Record<string, string> = {
   catalog: "产品目录同步",
   aws_start: "官方规格核验",
   aws_done: "规格核验完成",
+  official_start: "Microsoft 官方核验",
+  official_done: "Microsoft 核验完成",
   agent: "报价编排",
   aws: "官方产品匹配",
   browser: "官方数据通道",
@@ -316,9 +342,9 @@ function customerFacingNotices(notices: string[] = []) {
 }
 
 function serviceCost(quote: Quote, index: number) {
-  const prefix = `s${index + 1}l`;
+  const prefixes = [`s${index + 1}l`, `az${index + 1}l`];
   return (quote.priced_lines ?? [])
-    .filter((line) => line.key.startsWith(prefix))
+    .filter((line) => prefixes.some((prefix) => line.key.startsWith(prefix)))
     .reduce((sum, line) => sum + Number(line.cost || 0), 0);
 }
 
@@ -336,9 +362,9 @@ function quoteScenarios(quote: Quote): PricingScenario[] {
 }
 
 function scenarioServiceCost(scenario: PricingScenario, index: number) {
-  const prefix = `s${index + 1}`;
+  const prefixes = [`s${index + 1}`, `az${index + 1}`];
   return (scenario.priced_lines ?? [])
-    .filter((line) => line.key.startsWith(prefix))
+    .filter((line) => prefixes.some((prefix) => line.key.startsWith(prefix)))
     .reduce((sum, line) => sum + Number(line.cost || 0), 0);
 }
 
@@ -402,7 +428,23 @@ function quotationRemark(selection: Selection) {
 }
 
 function compactSpecifications(selection: Selection) {
-  return Object.entries(selection.specifications)
+  const specifications = { ...selection.specifications };
+  // Keep already-generated quotes readable after the backend fix: older RDS
+  // selections priced storage in usage_lines but omitted its capacity from
+  // the display object.
+  if (selection.service === "rds" && specifications.storageGiB == null) {
+    const storageLine = selection.usage_lines?.find(
+      (line) => line.key === "rdsstg" || line.group === "rds-storage",
+    );
+    if (storageLine) {
+      const isAurora = /aurora/i.test(`${selection.display_name} ${selection.model}`);
+      const instanceCount = Math.max(1, selection.quantity ?? 1);
+      specifications.storageGiB = isAurora
+        ? storageLine.amount
+        : storageLine.amount / instanceCount;
+    }
+  }
+  return Object.entries(specifications)
     .filter(([, value]) => value != null)
     .map(([key, value]) => {
       const numericValue = typeof value === "number" ? value.toLocaleString("zh-CN") : String(value);
@@ -433,6 +475,9 @@ export default function Home() {
   const [reservedTermYears, setReservedTermYears] = useState<(1 | 3)[]>([1, 3]);
   const [paymentOption, setPaymentOption] = useState<PaymentOption>("all_upfront");
   const [utilizationPercent, setUtilizationPercent] = useState(100);
+  const [azurePricingMode, setAzurePricingMode] = useState<AzurePricingMode>("pay_as_you_go");
+  const [azureTermYears, setAzureTermYears] = useState<1 | 3>(1);
+  const [azurePaymentOption, setAzurePaymentOption] = useState<AzurePaymentOption>("monthly");
   const [previewDraftId, setPreviewDraftId] = useState<string | null>(null);
   const [confirmationToken, setConfirmationToken] = useState<string | null>(null);
   const [salesReview, setSalesReview] = useState<Preview | null>(null);
@@ -442,6 +487,8 @@ export default function Home() {
   const confirmationRecoveryStarted = useRef(false);
   const quoteRecoveryStarted = useRef(false);
   const lateConfirmationTokenStarted = useRef<string | null>(null);
+  const previewPollFailures = useRef<Map<string, number>>(new Map());
+  const previewRestartedJobs = useRef<Set<string>>(new Set());
   // Async preview, customer-confirmation polling and official pricing can all
   // finish out of order. Keep the workflow monotonic so an older response can
   // never replace a newer official-pricing screen.
@@ -467,7 +514,11 @@ export default function Home() {
       const saved = window.sessionStorage.getItem(CONFIRMATION_CONTEXT_KEY);
       if (!saved) return;
       const context = JSON.parse(saved) as PendingConfirmationContext;
-      if (!context.token || !context.draftId || !context.customerRequest) return;
+      if (!context.token || !context.draftId || !context.customerRequest || !context.cloudProvider) {
+        window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
+        return;
+      }
+      setCloudProvider(context.cloudProvider);
       setRequirement(context.customerRequest);
       workflowPhase.current = "confirmation";
       setPreviewDraftId(context.draftId);
@@ -476,7 +527,12 @@ export default function Home() {
       setReceivedCustomerAnswers(context.answers ?? {});
       setJob({ job_id: "confirmation-waiting", status: "failed", events: [], error: null });
       confirmationTimer.current = setTimeout(
-        () => pollConfirmation(context.token, context.draftId, context.customerRequest),
+        () => pollConfirmation(
+          context.token,
+          context.draftId,
+          context.customerRequest,
+          context.cloudProvider,
+        ),
         250,
       );
     } catch {
@@ -491,8 +547,9 @@ export default function Home() {
       if (window.sessionStorage.getItem(CONFIRMATION_CONTEXT_KEY)) return;
       const saved = window.sessionStorage.getItem(QUOTE_JOB_CONTEXT_KEY);
       if (!saved) return;
-      const context = JSON.parse(saved) as { jobId?: string; customerRequest?: string };
-      if (!context.jobId || !context.customerRequest) return;
+      const context = JSON.parse(saved) as { jobId?: string; customerRequest?: string; cloudProvider?: CloudProvider };
+      if (!context.jobId || !context.customerRequest || !context.cloudProvider) return;
+      setCloudProvider(context.cloudProvider);
       workflowPhase.current = "quote";
       setRequirement(context.customerRequest);
       setJob({
@@ -524,11 +581,11 @@ export default function Home() {
       const [, id, name, message] = match;
       const state = event.stage === "ai_repair"
         ? "repair"
-        : event.stage === "component_done" || event.stage === "aws_done"
+        : event.stage === "component_done" || event.stage === "aws_done" || event.stage === "official_done"
           ? "done"
           : "running";
       if (event.stage === "component_done") templateDone.add(id);
-      if (event.stage === "aws_done") officialDone.add(id);
+      if (event.stage === "aws_done" || event.stage === "official_done") officialDone.add(id);
       const previous = channels.get(id);
       const history = previous?.history ?? [];
       if (history.at(-1) !== message) history.push(message);
@@ -602,16 +659,17 @@ export default function Home() {
         token,
         draftId,
         customerRequest: requirement,
+        cloudProvider,
         preview: latePreview,
         latePricingConfirmation: true,
       } satisfies PendingConfirmationContext),
     );
     if (confirmationTimer.current) clearTimeout(confirmationTimer.current);
     confirmationTimer.current = setTimeout(
-      () => pollConfirmation(token, draftId, requirement),
+      () => pollConfirmation(token, draftId, requirement, cloudProvider),
       250,
     );
-  }, [job?.status, job?.error, confirmationItems, confirmationText, requirement]);
+  }, [job?.status, job?.error, confirmationItems, confirmationText, requirement, cloudProvider]);
 
   useEffect(() => {
     if (!running) return;
@@ -673,6 +731,7 @@ export default function Home() {
     requestText = requirement,
     draftId?: string,
     prefixEvents: JobEvent[] = [],
+    provider: CloudProvider = cloudProvider,
   ) {
     workflowPhase.current = "quote";
     if (timer.current) clearTimeout(timer.current);
@@ -690,7 +749,7 @@ export default function Home() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          cloud_provider: cloudProvider,
+          cloud_provider: provider,
           customer_request: requestText,
           draft_id: draftId,
           pricing_mode: pricingMode ?? "on_demand",
@@ -699,13 +758,19 @@ export default function Home() {
           payment_option: pricingMode ? paymentOption : null,
           include_on_demand_scenario: pricingMode ? includeOnDemandScenario : true,
           utilization_percent: utilizationPercent,
+          azure_pricing_mode: azurePricingMode,
+          azure_term_years: ["reservation", "savings_plan"].includes(azurePricingMode) ? azureTermYears : null,
+          azure_payment_option: ["reservation", "savings_plan"].includes(azurePricingMode) ? azurePaymentOption : null,
         }),
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.message ?? "任务提交失败");
+      if (!String(payload.job_id ?? "").startsWith(`${provider}-`)) {
+        throw new Error("报价任务的云厂商标识不一致，系统已阻止继续处理。");
+      }
       window.sessionStorage.setItem(
         QUOTE_JOB_CONTEXT_KEY,
-        JSON.stringify({ jobId: payload.job_id, customerRequest: requestText }),
+        JSON.stringify({ jobId: payload.job_id, customerRequest: requestText, cloudProvider: provider }),
       );
       await poll(payload.job_id, prefixEvents);
     } catch (error) {
@@ -722,14 +787,36 @@ export default function Home() {
     }
   }
 
-  async function pollConfirmation(token: string, draftId: string, customerRequest = requirement) {
+  async function pollConfirmation(
+    token: string,
+    draftId: string,
+    customerRequest: string,
+    provider: CloudProvider,
+  ) {
     if (workflowPhase.current === "quote") return;
     try {
       const response = await fetch(`${API_BASE}/api/confirmation-sessions/${token}`, {
         cache: "no-store",
       });
       if (!response.ok) return;
-      const session = await response.json() as { status: string; answers?: Record<string, string> };
+      const session = await response.json() as {
+        status: string;
+        cloud_provider?: CloudProvider;
+        answers?: Record<string, string>;
+      };
+      if (session.cloud_provider !== provider) {
+        setJob({
+          job_id: "provider-boundary-violation",
+          status: "failed",
+          events: [],
+          error: {
+            code: "cloud_provider_boundary_violation",
+            message: "确认链接与当前云厂商不一致，系统已停止处理。",
+          },
+        });
+        window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
+        return;
+      }
       if (workflowPhase.current === "quote") return;
       if (session.status === "approved") {
         setConfirmationToken(null);
@@ -737,7 +824,7 @@ export default function Home() {
         window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
         await startQuote(customerRequest, draftId, [
           { stage: "customer", message: "客户已确认完整配置清单，开始官方报价", time: "刚刚" },
-        ]);
+        ], provider);
         return;
       }
       if ((session.status === "reviewing" || session.status === "submitted") && session.answers) {
@@ -751,12 +838,18 @@ export default function Home() {
           );
         }
         setConfirmationToken(null);
-        await runPreflight(customerRequest, draftId, session.answers, true);
+        await runPreflight(customerRequest, draftId, session.answers, true, provider);
         return;
       }
-      confirmationTimer.current = setTimeout(() => pollConfirmation(token, draftId, customerRequest), 2500);
+      confirmationTimer.current = setTimeout(
+        () => pollConfirmation(token, draftId, customerRequest, provider),
+        2500,
+      );
     } catch {
-      confirmationTimer.current = setTimeout(() => pollConfirmation(token, draftId, customerRequest), 5000);
+      confirmationTimer.current = setTimeout(
+        () => pollConfirmation(token, draftId, customerRequest, provider),
+        5000,
+      );
     }
   }
 
@@ -766,8 +859,29 @@ export default function Home() {
     confirmationResponses: Record<string, string>,
     stopForSalesReview: boolean,
     liveEvents: JobEvent[] = [],
+    provider: CloudProvider = cloudProvider,
   ) {
     if (workflowPhase.current === "quote") return;
+    const expectedTokenPrefix = provider === "azure" ? "azure_" : "aws_";
+    const expectedDraftPrefix = provider === "azure" ? "az" : "aw";
+    if (
+      !preview.draft_id.startsWith(expectedDraftPrefix)
+      || (
+        preview.confirmation_token
+        && !preview.confirmation_token.startsWith(expectedTokenPrefix)
+      )
+    ) {
+      setJob({
+        job_id: "provider-boundary-violation",
+        status: "failed",
+        events: [],
+        error: {
+          code: "cloud_provider_boundary_violation",
+          message: "检测到跨云草稿或确认链接，系统已阻止展示。",
+        },
+      });
+      return;
+    }
     const previewEvents: JobEvent[] = liveEvents.length
       ? liveEvents
       : (preview.execution_trace ?? []).map((event) => ({
@@ -792,11 +906,17 @@ export default function Home() {
           token: preview.confirmation_token,
           draftId: preview.draft_id,
           customerRequest: requestText,
+          cloudProvider: provider,
           preview,
         } satisfies PendingConfirmationContext),
       );
       confirmationTimer.current = setTimeout(
-        () => pollConfirmation(preview.confirmation_token as string, preview.draft_id, requestText),
+        () => pollConfirmation(
+          preview.confirmation_token as string,
+          preview.draft_id,
+          requestText,
+          provider,
+        ),
         1200,
       );
       return;
@@ -852,12 +972,18 @@ export default function Home() {
             token: preview.confirmation_token,
             draftId: preview.draft_id,
             customerRequest: requestText,
+            cloudProvider: provider,
             preview: { ...preview, confirmation_items: items },
             answers: Object.keys(confirmationResponses).length ? confirmationResponses : undefined,
           } satisfies PendingConfirmationContext),
         );
         confirmationTimer.current = setTimeout(
-          () => pollConfirmation(preview.confirmation_token as string, preview.draft_id, requestText),
+          () => pollConfirmation(
+            preview.confirmation_token as string,
+            preview.draft_id,
+            requestText,
+            provider,
+          ),
           1200,
         );
       }
@@ -873,7 +999,7 @@ export default function Home() {
           message: "客户回复已合并并通过配置复核，开始官方报价",
           time: "刚刚",
         },
-      ]);
+      ], provider);
       return;
     }
     setSalesReview(preview);
@@ -883,8 +1009,10 @@ export default function Home() {
   async function pollPreviewJob(
     jobId: string,
     requestText: string,
+    draftId: string | undefined,
     confirmationResponses: Record<string, string>,
     stopForSalesReview: boolean,
+    provider: CloudProvider,
   ) {
     if (workflowPhase.current === "quote") return;
     try {
@@ -895,6 +1023,18 @@ export default function Home() {
       );
       const next = await response.json() as Job;
       if (workflowPhase.current === "quote") return;
+      if (response.status === 404 && !previewRestartedJobs.current.has(jobId)) {
+        previewRestartedJobs.current.add(jobId);
+        previewPollFailures.current.delete(jobId);
+        await runPreflight(
+          requestText,
+          undefined,
+          confirmationResponses,
+          stopForSalesReview,
+          provider,
+        );
+        return;
+      }
       if (!response.ok) {
         throw new Error(
           response.status === 404
@@ -902,10 +1042,18 @@ export default function Home() {
             : "配置核验任务状态读取失败。",
         );
       }
+      previewPollFailures.current.delete(jobId);
       setJob({ ...next, kind: "preview" });
       if (next.status === "queued" || next.status === "running") {
         timer.current = setTimeout(
-          () => pollPreviewJob(jobId, requestText, confirmationResponses, stopForSalesReview),
+          () => pollPreviewJob(
+            jobId,
+            requestText,
+            draftId,
+            confirmationResponses,
+            stopForSalesReview,
+            provider,
+          ),
           700,
         );
         return;
@@ -918,9 +1066,33 @@ export default function Home() {
           confirmationResponses,
           stopForSalesReview,
           next.events,
+          provider,
         );
       }
     } catch (error) {
+      const failures = (previewPollFailures.current.get(jobId) ?? 0) + 1;
+      previewPollFailures.current.set(jobId, failures);
+      if (failures <= 12 && workflowPhase.current !== "quote") {
+        setJob((current) => ({
+          job_id: jobId,
+          kind: "preview",
+          status: "running",
+          events: current?.events ?? [],
+          error: null,
+        }));
+        timer.current = setTimeout(
+          () => pollPreviewJob(
+            jobId,
+            requestText,
+            draftId,
+            confirmationResponses,
+            stopForSalesReview,
+            provider,
+          ),
+          Math.min(5000, 1000 + failures * 500),
+        );
+        return;
+      }
       setJob({
         job_id: jobId,
         kind: "preview",
@@ -939,6 +1111,7 @@ export default function Home() {
     draftId?: string,
     confirmationResponses: Record<string, string> = {},
     stopForSalesReview = false,
+    provider: CloudProvider = cloudProvider,
   ) {
     if (workflowPhase.current === "quote") return;
     workflowPhase.current = "preview";
@@ -949,12 +1122,12 @@ export default function Home() {
       kind: "preview",
       status: "running",
       events: [
-        { stage: "ai", message: "正在解析需求并查询 AWS 官方规格", time: "刚刚" },
+        { stage: "ai", message: `正在解析需求并查询 ${provider === "aws" ? "AWS" : "Microsoft Azure"} 官方规格`, time: "刚刚" },
       ],
     });
     try {
       const requestPayload = {
-        cloud_provider: cloudProvider,
+        cloud_provider: provider,
         customer_request: requestText,
         draft_id: draftId,
         confirmation_responses: confirmationResponses,
@@ -964,8 +1137,11 @@ export default function Home() {
         payment_option: pricingMode ? paymentOption : null,
         include_on_demand_scenario: pricingMode ? includeOnDemandScenario : true,
         utilization_percent: utilizationPercent,
+        azure_pricing_mode: azurePricingMode,
+        azure_term_years: ["reservation", "savings_plan"].includes(azurePricingMode) ? azureTermYears : null,
+        azure_payment_option: ["reservation", "savings_plan"].includes(azurePricingMode) ? azurePaymentOption : null,
       };
-      if (cloudProvider === "aws") {
+      {
         const startResponse = await fetch(`${API_BASE}/api/preview-jobs`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -973,51 +1149,39 @@ export default function Home() {
         });
         const started = await startResponse.json() as { job_id?: string; message?: string };
         if (!startResponse.ok || !started.job_id) {
-          throw new Error(started.message ?? "配置核验任务启动失败");
+          const fallbackResponse = await fetchWithTimeout(`${API_BASE}/api/quotes/preview`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(requestPayload),
+          }, 180000);
+          const fallback = await fallbackResponse.json();
+          if (!fallbackResponse.ok) {
+            throw new Error(fallback.message ?? started.message ?? "配置核验任务启动失败");
+          }
+          await handlePreviewResult(
+            fallback as Preview,
+            requestText,
+            confirmationResponses,
+            stopForSalesReview,
+            [],
+            provider,
+          );
+          return;
+        }
+        if (!started.job_id.startsWith(`${provider}-`)) {
+          throw new Error("配置任务的云厂商标识不一致，系统已阻止继续处理。");
         }
         setJob({ job_id: started.job_id, kind: "preview", status: "queued", events: [] });
         await pollPreviewJob(
           started.job_id,
           requestText,
+          draftId,
           confirmationResponses,
           stopForSalesReview,
+          provider,
         );
         return;
       }
-      const response = await fetchWithTimeout(`${API_BASE}/api/quotes/preview`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(requestPayload),
-      }, 180000);
-      const payload = await response.json();
-      if (!response.ok) {
-        const errorTrace = Array.isArray(payload.details?.execution_trace)
-          ? payload.details.execution_trace.map((event: { stage: string; message: string }) => ({
-              stage: event.stage,
-              message: event.message,
-              time: "刚刚",
-            }))
-          : [];
-        setJob({
-          job_id: "preflight-failed",
-          kind: "preview",
-          status: "failed",
-          events: errorTrace,
-          error: {
-            code: payload.code ?? "preflight_failed",
-            message: payload.message ?? "配置预检失败",
-            details: payload.details,
-          },
-        });
-        return;
-      }
-      await handlePreviewResult(
-        payload as Preview,
-        requestText,
-        confirmationResponses,
-        stopForSalesReview,
-      );
-      return;
     } catch (error) {
       setJob({
         job_id: "preflight-error",
@@ -1235,7 +1399,7 @@ export default function Home() {
           setJob(null);
           setSalesReview(null);
         }}>AWS 报价</button>
-        <button type="button" className={cloudProvider === "azure" ? "selected" : ""} onClick={() => { workflowPhase.current = "idle"; window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY); setCloudProvider("azure"); setPricingMode(null); setJob(null); setSalesReview(null); }}>Microsoft Azure 报价</button>
+        <button type="button" className={cloudProvider === "azure" ? "selected" : ""} onClick={() => { workflowPhase.current = "idle"; window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY); setCloudProvider("azure"); setPricingMode(null); setAzurePricingMode("pay_as_you_go"); setAzureTermYears(1); setAzurePaymentOption("monthly"); setJob(null); setSalesReview(null); }}>Microsoft Azure 报价</button>
       </nav>}
 
       <nav className="quote-steps" aria-label="报价步骤">
@@ -1355,7 +1519,47 @@ export default function Home() {
                 </div>
               </div>
             )}
-          </fieldset> : <div className="azure-pricing-note"><strong>公开零售价</strong><span>无需 Azure 登录或密钥，通过 Azure Retail Prices API 查询 Pay-as-you-go 价格</span></div>}
+          </fieldset> : <fieldset className="pricing-choice">
+            <legend>Azure 报价方案 <small>公开零售价；无需登录 Azure 账号</small></legend>
+            <div className="pricing-mode-grid">
+              {([
+                ["pay_as_you_go", "按量付费", "按实际使用量计费"],
+                ["reservation", "预留", "1 年或 3 年承诺"],
+                ["savings_plan", "Savings Plan", "按小时消费承诺"],
+                ["spot", "Spot", "可中断的低价计算资源"],
+              ] as const).map(([value, label, description]) => (
+                <button
+                  type="button"
+                  className={azurePricingMode === value ? "selected" : ""}
+                  key={value}
+                  onClick={() => setAzurePricingMode(value)}
+                >
+                  <i aria-hidden="true" />
+                  <span><strong>{label}</strong><small>{description}</small></span>
+                </button>
+              ))}
+            </div>
+            {["reservation", "savings_plan"].includes(azurePricingMode) && (
+              <div className="pricing-details">
+                <div>
+                  <span>承诺期限</span>
+                  <div className="segmented">
+                    {([1, 3] as const).map((year) => (
+                      <button type="button" className={azureTermYears === year ? "selected" : ""} key={year} onClick={() => setAzureTermYears(year)}>{year} 年</button>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <span>付款方式</span>
+                  <div className="segmented">
+                    <button type="button" className={azurePaymentOption === "monthly" ? "selected" : ""} onClick={() => setAzurePaymentOption("monthly")}>月付</button>
+                    <button type="button" className={azurePaymentOption === "upfront" ? "selected" : ""} onClick={() => setAzurePaymentOption("upfront")}>一次性支付</button>
+                  </div>
+                </div>
+              </div>
+            )}
+            <div className="azure-pricing-note"><strong>Microsoft 官方公开价</strong><span>不包含 EA/MCA/CSP 协议折扣、税费和抵扣</span></div>
+          </fieldset>}
         </form>
       </section>
       )}
@@ -1663,8 +1867,13 @@ export default function Home() {
             <h2>本次没有生成价格</h2>
             <p>{job.error.message}</p>
             {job.error.code === "backend_unavailable" && (
-              <button className="reconnect-button" type="button" onClick={() => window.location.reload()}>
-                重新连接
+              <button
+                className="reconnect-button"
+                type="button"
+                disabled={!requirement.trim()}
+                onClick={() => void runPreflight(requirement, undefined, {}, false, cloudProvider)}
+              >
+                重新开始核验
               </button>
             )}
           </div>

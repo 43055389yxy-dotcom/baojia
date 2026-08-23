@@ -3,7 +3,23 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { ConfigurationOptionPicker, type ConfigurationChoice } from "../../components/configuration-option-picker";
 
-type Item = { question: string; options: ConfigurationChoice[]; selection_mode?: "buttons" | "catalog" };
+type Item = {
+  question: string;
+  options: ConfigurationChoice[];
+  dependent_options?: ConfigurationChoice[];
+  dependent_on_values?: string[];
+  component_id?: string | null;
+  service?: string | null;
+  selection_mode?: "buttons" | "catalog";
+};
+
+function confirmationComplete(item: Item, answer?: string): boolean {
+  const compact = answer?.trim() ?? "";
+  if (!compact) return false;
+  const baseValue = compact.split("；", 1)[0];
+  const requiresDependentChoice = (item.dependent_on_values ?? []).includes(baseValue);
+  return !requiresDependentChoice || /；选择\s+[^；]+；机器数量\s+\d+/.test(compact);
+}
 type ConfigurationItem = {
   component_id: string;
   service: string;
@@ -19,8 +35,10 @@ type ConfigurationItem = {
 };
 type Session = {
   token: string;
+  cloud_provider: "aws" | "azure";
   status: "pending" | "submitted" | "reviewing" | "configuration_review" | "approved" | "completed";
   customer_summary: string;
+  confirmation_text?: string | null;
   confirmation_items: Item[];
   answers: Record<string, string>;
   configuration_items: ConfigurationItem[];
@@ -57,6 +75,10 @@ const FIELD_LABELS: Record<string, string> = {
   rpu: "计算容量（RPU）", hours_per_month: "每月运行时长",
   data_scanned_gib: "查询扫描数据量", queries: "查询次数",
   provisioned_dpu_hours: "预置容量（DPU 小时）",
+  requested_sku: "Azure SKU", service_tier: "服务层级", compute_model: "计算模式",
+  disk_type: "磁盘类型", disk_size_gib: "磁盘容量", capacity: "容量等级",
+  replicas: "副本数", high_availability: "高可用", license_model: "许可模式",
+  data_retrieval_gib: "数据读取量", log_ingestion_gib: "日志摄入量",
   secret_count: "密钥数量", key_count: "KMS 密钥数量", vpc_count: "VPC 数量",
   public_subnets: "公有子网数量", private_subnets: "私有子网数量", availability_zones: "可用区数量",
   data_transfer_out_gib: "每月出站流量", data_processed_gib: "每月处理数据量",
@@ -83,6 +105,10 @@ const REGION_LABELS: Record<string, string> = {
   "eu-north-1": "斯德哥尔摩（eu-north-1）", "eu-south-1": "米兰（eu-south-1）", "eu-south-2": "西班牙（eu-south-2）",
   "il-central-1": "特拉维夫（il-central-1）", "mx-central-1": "墨西哥中部（mx-central-1）",
   "me-south-1": "巴林（me-south-1）", "me-central-1": "阿联酋（me-central-1）", "sa-east-1": "圣保罗（sa-east-1）",
+  southeastasia: "东南亚（新加坡）（southeastasia）", eastasia: "东亚（香港）（eastasia）",
+  japaneast: "日本东部（东京）（japaneast）", eastus: "美国东部（eastus）",
+  westus: "美国西部（westus）", westeurope: "西欧（westeurope）",
+  uksouth: "英国南部（伦敦）（uksouth）",
   global: "全球",
 };
 
@@ -95,6 +121,7 @@ const VALUE_LABELS: Record<string, string> = {
   linux: "Linux", windows: "Windows", standard: "标准存储", http: "HTTP API", rest: "REST API",
   ebs: "EBS 云硬盘", redis: "Redis", mysql: "MySQL", postgresql: "PostgreSQL",
   aurora_mysql: "Aurora MySQL", aurora_postgresql: "Aurora PostgreSQL",
+  pay_as_you_go: "按量付费", reservation: "预留", savings_plan: "Savings Plan", spot: "Spot",
 };
 
 const HIDDEN_CONFIGURATION_FIELDS = new Set([
@@ -185,18 +212,25 @@ function displayServiceName(item: ConfigurationItem): string {
     ec2: "Amazon EC2 云服务器", rds: "Amazon RDS 数据库", elasticache: "Amazon ElastiCache Redis",
     msk: "Amazon MSK", opensearch: "Amazon OpenSearch Service", eks: "Amazon EKS",
     elb: "Elastic Load Balancing", cloudfront: "Amazon CloudFront", s3: "Amazon S3",
+    azure_vm: "Azure 虚拟机", managed_disks: "Azure 托管磁盘",
+    azure_sql: "Azure SQL Database", azure_postgresql: "Azure Database for PostgreSQL",
+    azure_mysql: "Azure Database for MySQL", azure_cache: "Azure Cache for Redis",
+    blob_storage: "Azure Blob Storage", load_balancer: "Azure Load Balancer",
+    application_gateway: "Azure Application Gateway", front_door: "Azure Front Door",
+    bandwidth: "Azure 公网流量", aks: "Azure Kubernetes Service",
+    monitor: "Azure Monitor", api_management: "Azure API Management",
   };
   if (/\baurora\b/i.test(item.display_name)) return item.display_name;
   return names[item.service] ?? item.display_name;
 }
 
 function displayRegion(item: ConfigurationItem): string {
-  if (["cloudfront", "route53", "global_accelerator"].includes(item.service)) return "全球";
+  if (["cloudfront", "route53", "global_accelerator", "front_door"].includes(item.service)) return "全球";
   return item.region ? REGION_LABELS[item.region] ?? item.region : "使用本次报价区域";
 }
 
 function isGlobalService(item: ConfigurationItem): boolean {
-  return ["cloudfront", "route53", "global_accelerator"].includes(item.service)
+  return ["cloudfront", "route53", "global_accelerator", "front_door"].includes(item.service)
     || ["global", "全球"].includes(String(item.region ?? "").toLowerCase());
 }
 
@@ -253,6 +287,10 @@ export default function CustomerConfirmationPage() {
   const [approvalSubmitted, setApprovalSubmitted] = useState(false);
   const [refreshingComponentIds, setRefreshingComponentIds] = useState<string[]>([]);
   const [submittingComponentIds, setSubmittingComponentIds] = useState<string[]>([]);
+  const [queuedComponentIds, setQueuedComponentIds] = useState<string[]>([]);
+  const [submittedComponentSnapshots, setSubmittedComponentSnapshots] = useState<Record<string, string>>({});
+  const [failedComponentIds, setFailedComponentIds] = useState<string[]>([]);
+  const [transientNotice, setTransientNotice] = useState("");
   const [recentlyUpdatedComponentIds, setRecentlyUpdatedComponentIds] = useState<string[]>([]);
   const [addingConfigurationInProgress, setAddingConfigurationInProgress] = useState(false);
   const regionalRegions = useMemo(() => Array.from(new Set(
@@ -273,6 +311,7 @@ export default function CustomerConfirmationPage() {
   const showConfigurationReview = session?.status === "configuration_review"
     || (isConfigurationRefreshActive && Boolean(session?.configuration_items.length));
   const isSessionReviewing = ["reviewing", "submitted"].includes(session?.status ?? "");
+  const isAzureConfirmation = session?.cloud_provider === "azure";
 
   useEffect(() => {
     if (!token) return;
@@ -280,6 +319,10 @@ export default function CustomerConfirmationPage() {
       .then(async (response) => {
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.message ?? "确认单不存在或已失效");
+        const expectedPrefix = payload.cloud_provider === "azure" ? "azure_" : "aws_";
+        if (!token.startsWith(expectedPrefix)) {
+          throw new Error("确认链接的云厂商标识不一致，系统已阻止打开。");
+        }
         return payload as Session;
       })
       .then((payload) => {
@@ -289,6 +332,33 @@ export default function CustomerConfirmationPage() {
       .catch((reason) => setError(reason instanceof Error ? reason.message : "无法读取确认单"))
       .finally(() => setLoading(false));
   }, [token]);
+
+  useEffect(() => {
+    if (!token || session?.status !== "configuration_review") return;
+    const validate = () => {
+      fetch(`${API_BASE}/api/confirmation-sessions/${token}`, { cache: "no-store" })
+        .then(async (response) => {
+          const payload = await response.json();
+          if (!response.ok) throw new Error(payload.message ?? "确认单不存在或已失效");
+          const expectedPrefix = payload.cloud_provider === "azure" ? "azure_" : "aws_";
+          if (!token.startsWith(expectedPrefix)) {
+            throw new Error("确认链接的云厂商标识不一致，系统已阻止继续操作。");
+          }
+          return payload as Session;
+        })
+        .then((payload) => setSession(payload))
+        .catch((reason) => {
+          setSession(null);
+          setError(
+            reason instanceof Error
+              ? reason.message
+              : "旧版确认链接已经隔离，请让销售重新生成。",
+          );
+        });
+    };
+    const timer = window.setInterval(validate, 3000);
+    return () => window.clearInterval(timer);
+  }, [token, session?.status]);
 
   useEffect(() => {
     if (
@@ -308,7 +378,63 @@ export default function CustomerConfirmationPage() {
           if (payload.status === "configuration_review" && (
             refreshingComponentIds.length > 0 || addingConfigurationInProgress
           )) {
-            setRecentlyUpdatedComponentIds(refreshingComponentIds);
+            const failedIds = refreshingComponentIds.filter((componentId) => {
+              const updated = payload.configuration_items?.find(
+                (item) => item.component_id === componentId,
+              );
+              if (!updated) return !deletedComponents[componentId];
+              return Boolean(
+                updated.pricing_status !== "ready"
+                || (
+                  submittedComponentSnapshots[componentId]
+                  && JSON.stringify(updated) === submittedComponentSnapshots[componentId]
+                ),
+              );
+            });
+            const updatedIds = refreshingComponentIds.filter((id) => !failedIds.includes(id));
+            setRecentlyUpdatedComponentIds(updatedIds);
+            if (updatedIds.length > 0) {
+              setComponentFeedback((current) => {
+                const next = { ...current };
+                updatedIds.forEach((id) => delete next[id]);
+                return next;
+              });
+              setEditingComponents((current) => {
+                const next = { ...current };
+                updatedIds.forEach((id) => { next[id] = false; });
+                return next;
+              });
+              setDeletedComponents((current) => {
+                const next = { ...current };
+                updatedIds.forEach((id) => delete next[id]);
+                return next;
+              });
+            }
+            if (failedIds.length > 0) {
+              setEditingComponents((current) => {
+                const next = { ...current };
+                failedIds.forEach((id) => { next[id] = true; });
+                return next;
+              });
+              const invalidItem = payload.configuration_items?.find(
+                (item) => failedIds.includes(item.component_id) && item.pricing_notice,
+              );
+              if (invalidItem?.pricing_notice) {
+                setError("");
+                setTransientNotice(invalidItem.pricing_notice);
+              } else if (payload.confirmation_text?.includes("已保留原配置")) {
+                setError("");
+                setTransientNotice(payload.confirmation_text);
+              } else {
+                setError("AI 没有完成这次修改，原内容已保留，请点击“重新尝试”。");
+              }
+            }
+            setFailedComponentIds(failedIds);
+            setSubmittedComponentSnapshots((current) => {
+              const next = { ...current };
+              refreshingComponentIds.forEach((id) => delete next[id]);
+              return next;
+            });
             setRefreshingComponentIds([]);
             setAddingConfigurationInProgress(false);
           }
@@ -318,7 +444,7 @@ export default function CustomerConfirmationPage() {
     };
     const timer = window.setInterval(refresh, 1800);
     return () => window.clearInterval(timer);
-  }, [token, session?.status, refreshingComponentIds, addingConfigurationInProgress]);
+  }, [token, session?.status, refreshingComponentIds, addingConfigurationInProgress, submittedComponentSnapshots, deletedComponents]);
 
   useEffect(() => {
     if (recentlyUpdatedComponentIds.length === 0) return;
@@ -327,13 +453,21 @@ export default function CustomerConfirmationPage() {
   }, [recentlyUpdatedComponentIds]);
 
   useEffect(() => {
+    if (!transientNotice) return;
+    const timer = window.setTimeout(() => setTransientNotice(""), 4200);
+    return () => window.clearTimeout(timer);
+  }, [transientNotice]);
+
+  useEffect(() => {
     if (!isSessionReviewing) return;
     const timer = window.setInterval(() => setReviewSeconds((value) => value + 1), 1000);
     return () => window.clearInterval(timer);
   }, [isSessionReviewing]);
 
   async function submit() {
-    if (!session || session.confirmation_items.some((item) => !answers[item.question]?.trim())) return;
+    if (!session || session.confirmation_items.some(
+      (item) => !confirmationComplete(item, answers[item.question]),
+    )) return;
     setReviewSeconds(0);
     setSubmitting(true);
     setError("");
@@ -372,7 +506,7 @@ export default function CustomerConfirmationPage() {
     }
   }
 
-  async function submitConfigurationFeedback(componentId?: string) {
+  async function submitConfigurationFeedback(componentId?: string, fromQueue = false) {
     if (!session) return;
     const componentChanges: Record<string, string> = {};
     const candidateIds = componentId
@@ -385,6 +519,27 @@ export default function CustomerConfirmationPage() {
     });
     const addedConfiguration = componentId ? "" : additionFeedback.trim();
     if (Object.keys(componentChanges).length === 0 && !addedConfiguration) return;
+    // Only one revision can own the server-side confirmation draft at a time.
+    // Keep later row submissions locally and send them as soon as the current
+    // component returns to configuration review. This avoids a 409 response
+    // and, more importantly, prevents the customer's second edit being lost.
+    if (componentId && isConfigurationRefreshActive && !fromQueue) {
+      setQueuedComponentIds((current) => Array.from(new Set([...current, componentId])));
+      setEditingComponents((current) => ({ ...current, [componentId]: false }));
+      return;
+    }
+    if (componentId) {
+      setFailedComponentIds((current) => current.filter((id) => id !== componentId));
+      const currentItem = session.configuration_items.find(
+        (item) => item.component_id === componentId,
+      );
+      if (currentItem) {
+        setSubmittedComponentSnapshots((current) => ({
+          ...current,
+          [componentId]: JSON.stringify(currentItem),
+        }));
+      }
+    }
     const affectedComponentIds = Object.keys(componentChanges);
     setRefreshingComponentIds((current) => Array.from(new Set([...current, ...affectedComponentIds])));
     setAddingConfigurationInProgress(Boolean(addedConfiguration));
@@ -412,19 +567,7 @@ export default function CustomerConfirmationPage() {
           ? current.configuration_items
           : (payload as Session).configuration_items,
       }));
-      if (componentId) {
-        setComponentFeedback((current) => {
-          const next = { ...current };
-          delete next[componentId];
-          return next;
-        });
-        setEditingComponents((current) => ({ ...current, [componentId]: false }));
-        setDeletedComponents((current) => {
-          const next = { ...current };
-          delete next[componentId];
-          return next;
-        });
-      } else {
+      if (!componentId) {
         setComponentFeedback({});
         setEditingComponents({});
         setDeletedComponents({});
@@ -444,6 +587,24 @@ export default function CustomerConfirmationPage() {
     }
   }
 
+  useEffect(() => {
+    if (
+      session?.status !== "configuration_review"
+      || queuedComponentIds.length === 0
+      || submittingComponentIds.length > 0
+    ) return;
+    const nextComponentId = queuedComponentIds[0];
+    const timer = window.setTimeout(() => {
+      setQueuedComponentIds((current) => current.filter((id) => id !== nextComponentId));
+      void submitConfigurationFeedback(nextComponentId, true);
+    }, 0);
+    return () => window.clearTimeout(timer);
+    // submitConfigurationFeedback intentionally reads the latest form state
+    // when the queued turn starts; recreating this effect for its function
+    // identity would submit the same queued edit more than once.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.status, queuedComponentIds, submittingComponentIds]);
+
   return (
     <main className={`customer-confirm-page ${showConfigurationReview ? "configuration-review-page" : ""}`}>
       <header><span>A</span><strong>AstraQuote</strong></header>
@@ -458,19 +619,17 @@ export default function CustomerConfirmationPage() {
             <p>销售人员稍后会向您发送正式报价单，感谢您的配合。</p>
             <span>本页面无需继续操作，您可以直接关闭。</span>
           </div>
-        ) : (session?.status === "reviewing" || session?.status === "submitted") && !isConfigurationRefreshActive ? (
-          <div className="customer-confirm-state">
-            <h1>正在复核，请稍等</h1>
-            <div className="customer-review-progress" role="progressbar" aria-label="配置复核处理中"><i /></div>
-            <p>系统正在只处理您填写了修改意见的组件，其他配置保持不变。</p>
-            <small>已等待 {reviewSeconds} 秒，请不要关闭本页面</small>
-          </div>
         ) : showConfigurationReview && session ? (
           <>
             <div className="customer-confirm-title customer-review-heading">
               <h1>请核对配置信息</h1>
               <p>如有不符，请直接修改、添加或删除。</p>
             </div>
+            {transientNotice && (
+              <div className="customer-transient-toast" role="alert">
+                {transientNotice}
+              </div>
+            )}
             {isConfigurationRefreshActive && (
               <div className="configuration-refresh-status" role="status">
                 <i />
@@ -480,6 +639,12 @@ export default function CustomerConfirmationPage() {
                     : `正在更新 ${refreshingComponentIds.length} 项配置`}
                 </span>
                 <small>未修改的配置保持不变</small>
+              </div>
+            )}
+            {isSessionReviewing && reviewSeconds >= 15 && (
+              <div className="customer-ai-retry-notice" role="alert">
+                <strong>AI 响应较慢，正在自动重试</strong>
+                <span>系统正在切换备用 AI，您的修改已经保存，不需要重复填写。</span>
               </div>
             )}
             <div className="customer-configuration-toolbar">
@@ -495,7 +660,9 @@ export default function CustomerConfirmationPage() {
                   id="add-configuration"
                   value={additionFeedback}
                   onChange={(event) => setAdditionFeedback(event.target.value)}
-                  placeholder="例如：新增 Amazon EC2，新加坡区域，2 台，4 核 16GB，Linux。"
+                  placeholder={isAzureConfirmation
+                    ? "例如：新增 Azure 虚拟机，新加坡区域，2台，Standard_D4s_v5，Linux。"
+                    : "例如：新增 Amazon EC2，新加坡区域，2台，4核16GB，Linux。"}
                   rows={2}
                 />
               </div>
@@ -503,7 +670,7 @@ export default function CustomerConfirmationPage() {
             <div className="customer-configuration-table customer-review-table">
               <table>
                 <colgroup><col className="review-index-column" /><col className="review-service-column" /><col className="review-detail-column" /><col className="review-action-column" /></colgroup>
-                <thead><tr><th>序号</th><th>AWS 服务</th><th>配置详情</th><th>操作</th></tr></thead>
+                <thead><tr><th>序号</th><th>{isAzureConfirmation ? "Azure 服务" : "AWS 服务"}</th><th>配置详情</th><th>操作</th></tr></thead>
                 <tbody>
                   {session.configuration_items.map((item, index) => {
                     const feedback = componentFeedback[item.component_id] ?? "";
@@ -511,6 +678,7 @@ export default function CustomerConfirmationPage() {
                     const isDeleted = deletedComponents[item.component_id] === true;
                     const isRefreshing = refreshingComponentIds.includes(item.component_id);
                     const isSubmittingComponent = submittingComponentIds.includes(item.component_id);
+                    const isQueuedComponent = queuedComponentIds.includes(item.component_id);
                     const wasUpdated = recentlyUpdatedComponentIds.includes(item.component_id);
                     const rowClassName = [
                       isDeleted ? "pending-delete" : feedback.trim() ? "needs-change" : "",
@@ -527,7 +695,7 @@ export default function CustomerConfirmationPage() {
                             <small>{configurationText(item.requirements, item.service, item.official_specifications)}</small>
                           </td>
                           <td className="review-action-cell">
-                            {isRefreshing ? <span className="row-refresh-state"><i />更新中</span> : <div className="review-action-buttons">
+                            {isRefreshing ? <span className="row-refresh-state"><i />更新中</span> : isQueuedComponent ? <span className="row-refresh-state queued"><i />等待提交</span> : <div className="review-action-buttons">
                               {!isDeleted && <button
                                 type="button"
                                 className={feedback.trim() ? "has-feedback" : ""}
@@ -577,9 +745,10 @@ export default function CustomerConfirmationPage() {
                                   />
                                   <button
                                     type="button"
-                                    disabled={!feedback.trim() || isSubmittingComponent}
+                                    className={isRefreshing ? "is-refreshing" : ""}
+                                    disabled={!feedback.trim() || isSubmittingComponent || isQueuedComponent || isRefreshing}
                                     onClick={() => void submitConfigurationFeedback(item.component_id)}
-                                  >{isSubmittingComponent ? "提交中…" : "提交本项"}</button>
+                                  >{isRefreshing ? "更新中…" : isSubmittingComponent ? "提交中…" : isQueuedComponent ? "等待提交" : failedComponentIds.includes(item.component_id) ? "重新尝试" : "提交本项"}</button>
                                 </div>
                               </div>
                             </td>
@@ -591,11 +760,6 @@ export default function CustomerConfirmationPage() {
                 </tbody>
               </table>
             </div>
-            {session.configuration_items.some((item) => item.pricing_status !== "ready") && (
-              <p className="customer-submit-error">
-                这份确认单仍有组件未完成官方预检，不能提交报价。请返回报价页面重新分析，系统会先集中询问不确定项。
-              </p>
-            )}
             <div className="customer-configuration-actions">
               {hasPendingConfigurationChanges ? (
                 <button
@@ -610,7 +774,7 @@ export default function CustomerConfirmationPage() {
                   type="button"
                   disabled={submitting || isConfigurationRefreshActive || session.configuration_items.some((item) => item.pricing_status !== "ready")}
                   onClick={() => void approveConfiguration()}
-                >{submitting ? "正在确认…" : session.configuration_items.some((item) => item.pricing_status !== "ready") ? "等待规格核验完成" : "下一步：报价确认"}</button>
+                >{submitting ? "正在确认…" : session.configuration_items.some((item) => item.pricing_status !== "ready") ? "请先修改不可用配置" : "最终确认并开始报价"}</button>
               )}
             </div>
             {hasPendingConfigurationChanges && (
@@ -621,23 +785,51 @@ export default function CustomerConfirmationPage() {
         ) : session ? (
           <>
             <div className="customer-confirm-title"><h1>请选择配置</h1><p>请完成下面每个组件的选择。</p></div>
+            {isSessionReviewing && <div className="configuration-refresh-status customer-inline-review" role="status">
+              <i />
+              <span>正在处理您刚才提交的选择</span>
+              <small>当前内容保留在本页，不需要重新填写</small>
+            </div>}
             <div className="customer-questions">
-              {session.confirmation_items.map((item, index) => (
-                <article key={item.question}>
+              {session.confirmation_items.map((item, index) => {
+                const answer = answers[item.question] ?? "";
+                const baseValue = answer.split("；", 1)[0];
+                const showDependentConfiguration = (
+                  item.dependent_on_values ?? []
+                ).includes(baseValue) && (item.dependent_options?.length ?? 0) > 0;
+                return <article key={item.question}>
                   <label><b>{index + 1}</b><span>{item.question}</span></label>
                   {item.options.length > 0 && <ConfigurationOptionPicker
                     className="customer-options"
                     options={item.options}
                     value={answers[item.question]}
                     catalog={item.selection_mode === "catalog" || item.options.some((option) => Boolean(option.model))}
+                    requireMachineCount={/自建/.test(item.question) && item.options.some((option) => Boolean(option.model))}
+                    initialMachineCount={session.configuration_items.find(
+                      (configuration) => configuration.component_id === item.component_id,
+                    )?.quantity ?? Number(item.question.match(/当前\s*(\d+)\s*台/)?.[1] ?? 1)}
                     onChange={(selected) => setAnswers((current) => ({ ...current, [item.question]: selected }))}
+                  />}
+                  {showDependentConfiguration && <ConfigurationOptionPicker
+                    className="customer-options dependent-configuration-picker"
+                    options={item.dependent_options ?? []}
+                    value={answer.includes("；") ? answer.slice(answer.indexOf("；") + 1) : ""}
+                    catalog
+                    requireMachineCount
+                    initialMachineCount={session.configuration_items.find(
+                      (configuration) => configuration.component_id === item.component_id,
+                    )?.quantity ?? 1}
+                    onChange={(selected) => setAnswers((current) => ({
+                      ...current,
+                      [item.question]: selected ? `${baseValue}；${selected}` : baseValue,
+                    }))}
                   />}
                   {item.options.length === 0 && <input value={answers[item.question] ?? ""} onChange={(event) => setAnswers((current) => ({ ...current, [item.question]: event.target.value }))} placeholder="填写您的选择" />}
                 </article>
-              ))}
+              })}
             </div>
             {error && <p className="customer-submit-error">{error}</p>}
-            <button className="customer-submit" type="button" disabled={submitting || session.confirmation_items.some((item) => !answers[item.question]?.trim())} onClick={() => void submit()}>{submitting ? "正在提交…" : "全部填写完成，统一提交"}</button>
+            <button className="customer-submit" type="button" disabled={submitting || isSessionReviewing || session.confirmation_items.some((item) => !confirmationComplete(item, answers[item.question]))} onClick={() => void submit()}>{submitting || isSessionReviewing ? "正在处理…" : "全部填写完成，统一提交"}</button>
           </>
         ) : null}
       </section>

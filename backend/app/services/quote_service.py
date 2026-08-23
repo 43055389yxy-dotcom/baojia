@@ -71,6 +71,11 @@ class QuoteService:
         self._estimator = estimator
         self._calculator = calculator
         self._confirmation_sessions = confirmation_sessions
+        if (
+            confirmation_sessions is not None
+            and confirmation_sessions.cloud_provider != "aws"
+        ):
+            raise ValueError("AWS 报价系统只能连接 AWS 专用确认存储")
         self._ai_provider = ai_provider
         self._generic_plugin = generic_plugin
         self._drafts: dict[str, tuple[str, ParsedIntent]] = {}
@@ -82,11 +87,37 @@ class QuoteService:
         self._asked_confirmation_questions: dict[str, set[str]] = {}
         self._confirmation_rounds: dict[str, int] = {}
 
+    def recover_configuration_review_after_failure(self, draft_id: str | None) -> None:
+        """Return a failed customer edit to the editable table immediately."""
+
+        if not draft_id or self._confirmation_sessions is None:
+            return
+        if self._confirmation_sessions.status_by_draft(draft_id) not in {
+            "reviewing", "submitted"
+        }:
+            return
+        restored = self._confirmation_sessions.restore_draft(draft_id)
+        if restored is None:
+            return
+        customer_request, intent = restored
+        self._drafts[draft_id] = (customer_request, intent.model_copy(deep=True))
+        self._confirmation_sessions.prepare_configuration_review(
+            draft_id=draft_id,
+            intent=intent,
+            confirmation_text="这次修改没有完成，原配置已保留，请重新提交。",
+        )
+
     async def preview(
         self,
         request: QuoteRequest,
         reporter: ProgressReporter | None = None,
     ) -> QuotePreviewResponse:
+        if request.draft_id and request.draft_id.startswith("az"):
+            raise ManualConfirmationRequired(
+                "检测到 Azure 草稿被提交到 AWS 报价系统，已阻止处理",
+                code="cloud_provider_boundary_violation",
+                provider="aws",
+            )
         started_at = time.perf_counter()
         ai_trace: list[ExecutionEvent] = []
 
@@ -107,12 +138,27 @@ class QuoteService:
                 await reporter(stage, message)
 
         accepted_current_page = False
+        configuration_revision_requested = False
+        configuration_revision_component_ids: set[int] = set()
+        configuration_revision_original_intent: ParsedIntent | None = None
         cached = self._drafts.get(request.draft_id) if request.draft_id else None
         if cached is None and request.draft_id and self._confirmation_sessions is not None:
             cached = self._confirmation_sessions.restore_draft(request.draft_id)
         if cached and cached[0] == request.customer_request:
             intent = cached[1].model_copy(deep=True)
             confirmation_responses = dict(request.confirmation_responses)
+            structured_response_components: dict[str, int] = {}
+            configuration_revision_requested = any(
+                question.startswith(CONFIGURATION_COMPONENT_FEEDBACK_PREFIX)
+                or question == CONFIGURATION_FEEDBACK_QUESTION
+                for question in confirmation_responses
+            )
+            if configuration_revision_requested:
+                # Customer edits are transactional. AI always works on this
+                # temporary copy; a result that cannot pass the official
+                # catalog must never replace or partially erase the last
+                # confirmed configuration.
+                configuration_revision_original_intent = intent.model_copy(deep=True)
             component_feedback: dict[int, str] = {}
             answered_component_questions: dict[int, set[str]] = {}
             for question in list(confirmation_responses):
@@ -124,6 +170,7 @@ class QuoteService:
                 feedback = confirmation_responses.pop(question, "").strip()
                 if component_id.isdigit() and feedback:
                     component_feedback[int(component_id)] = feedback
+                    configuration_revision_component_ids.add(int(component_id))
 
             deleted_component_indices = {
                 index
@@ -145,12 +192,26 @@ class QuoteService:
             }
 
             if request.draft_id and self._confirmation_sessions is not None:
+                # Workflow controls are structured customer decisions, not
+                # free-form component edits. Keep them out of the AI revision
+                # lane. Partition first so the component id remains attached;
+                # a quote may contain several EC2 rows and question wording is
+                # not a safe way to guess which one the customer selected.
                 component_answers, confirmation_responses = (
                     self._confirmation_sessions.partition_answers_by_component(
                         request.draft_id, confirmation_responses
                     )
                 )
                 for index, answers in component_answers.items():
+                    structured_answers = {
+                        question: answer
+                        for question, answer in answers.items()
+                        if self._is_structured_workflow_answer(answer)
+                    }
+                    for question, answer in structured_answers.items():
+                        confirmation_responses[question] = answer
+                        structured_response_components[question] = index
+                        answers.pop(question, None)
                     answered_component_questions[index] = set(answers)
                     answer_text = "\n".join(
                         f"问题：{question}\n客户回答：{answer}"
@@ -258,7 +319,9 @@ class QuoteService:
                         **reviser_arguments,
                     )
             await self._apply_confirmation_responses(
-                intent, confirmation_responses
+                intent,
+                confirmation_responses,
+                response_components=structured_response_components,
             )
             logger.info("Quote preview reused structured draft %s", request.draft_id)
         else:
@@ -428,6 +491,9 @@ class QuoteService:
             display_name = self._calculator_service_name(
                 service.service, service.calculator_service_name
             )
+            pending_architecture = bool(
+                service.field_sources.get("_pending_architecture_decision")
+            )
             if kind is None and self._generic_plugin is None:
                 message = f"{display_name} 尚未接入官方报价适配器，本次暂不计价"
                 return (
@@ -451,6 +517,14 @@ class QuoteService:
             plugin = self._plugins.get(kind) if kind is not None else self._generic_plugin
             assert plugin is not None
             current = service.model_copy(deep=True)
+            if pending_architecture:
+                # Fetch the official EC2 catalog during the first page load so
+                # choosing self-hosted can expand its machine controls
+                # immediately, without a second submit/wait/page cycle.
+                current.field_sources.pop("_pending_architecture_decision", None)
+                current.field_sources[
+                    "_customer_select_configuration"
+                ] = "customer_confirmation"
             repair_count = 0
             while True:
                 failure: ManualConfirmationRequired | None = None
@@ -705,13 +779,52 @@ class QuoteService:
             confirmation_components,
             confirmation_options,
         )
-        notices = self._simplify_model_selection_notices(
+        notices = self._simplify_component_confirmation_notices(
             intent,
             selections,
             notices,
             confirmation_components,
             confirmation_options,
         )
+        # Managed-vs-self-hosted decisions are a staged workflow. Do not show
+        # machine sizing or unrelated questions until architecture is chosen;
+        # if self-hosting is chosen, show only its machine count/shape next.
+        pending_architecture = {
+            str(index)
+            for index, component in enumerate(intent.services)
+            if component.field_sources.get("_pending_architecture_decision")
+        }
+        if pending_architecture:
+            first_pending = sorted(pending_architecture, key=int)[0]
+            for notice in notices:
+                if notice in confirmation_components:
+                    continue
+                folded_notice = notice.casefold()
+                if "自建" in notice and any(
+                    marker in folded_notice for marker in ("托管", "managed", "aws")
+                ):
+                    component = intent.services[int(first_pending)]
+                    confirmation_components[notice] = (
+                        first_pending,
+                        component.service,
+                    )
+        if pending_architecture:
+            # The architecture question owns the dependent EC2 picker. Drop
+            # only the duplicate standalone machine question; keep unrelated
+            # component questions visible on this same page.
+            notices = [
+                notice
+                for notice in notices
+                if confirmation_components.get(notice, (None, None))[0]
+                not in pending_architecture
+                or (
+                    "自建" in notice
+                    and any(
+                        marker in notice.casefold()
+                        for marker in ("托管", "managed", "aws")
+                    )
+                )
+            ]
         # A cross-field/design conflict can be discovered before an individual
         # adapter previews successfully (for example Windows on an ARM EC2
         # model). Reflect that conflict on the corresponding component card.
@@ -816,6 +929,43 @@ class QuoteService:
             ConfirmationItem(
                 question=notice,
                 options=confirmation_options.get(notice, []),
+                dependent_options=(
+                    self._compact_candidate_options(
+                        next(
+                            selection.candidates
+                            for selection in selections
+                            if selection.component_id
+                            == confirmation_components.get(notice, (None, None))[0]
+                        ),
+                        intent.services[
+                            int(confirmation_components[notice][0])
+                        ],
+                    )
+                    if (
+                        "自建" in notice
+                        and any(
+                            marker in notice.casefold()
+                            for marker in ("托管", "managed", "aws")
+                        )
+                        and notice in confirmation_components
+                        and any(
+                            selection.component_id
+                            == confirmation_components[notice][0]
+                            and selection.candidates
+                            for selection in selections
+                        )
+                    )
+                    else []
+                ),
+                dependent_on_values=(
+                    ["nacos_self_hosted", "self_hosted"]
+                    if "自建" in notice
+                    and any(
+                        marker in notice.casefold()
+                        for marker in ("托管", "managed", "aws")
+                    )
+                    else []
+                ),
                 component_id=confirmation_components.get(notice, (None, None))[0],
                 service=confirmation_components.get(notice, (None, None))[1],
                 selection_mode=(
@@ -831,7 +981,7 @@ class QuoteService:
         ]
         # A quote task owns one stable draft and therefore one stable customer
         # confirmation URL across every review round.
-        draft_id = request.draft_id or uuid.uuid4().hex[:12]
+        draft_id = request.draft_id or f"aw{uuid.uuid4().hex[:10]}"
         if len(self._drafts) >= 100:
             self._drafts.pop(next(iter(self._drafts)))
         # Persist drafts even when confirmation is required.  The next answer
@@ -863,14 +1013,50 @@ class QuoteService:
         configuration_review_required = False
         if self._confirmation_sessions is not None:
             if confirmation_text:
-                confirmation_token = self._confirmation_sessions.create_or_replace(
-                    draft_id=draft_id,
-                    customer_request=request.customer_request,
-                    customer_summary=intent.customer_summary,
-                    intent=intent,
-                    confirmation_text=confirmation_text,
-                    items=confirmation_items,
-                )
+                if configuration_revision_requested:
+                    # A later edit belongs to the final configuration table.
+                    # Never throw the customer back into the full-page initial
+                    # questionnaire and never publish the AI's unvalidated
+                    # working copy. Roll back the whole edit transaction so
+                    # model, deployment, storage and every other old field stay
+                    # intact together.
+                    if configuration_revision_original_intent is not None:
+                        intent = configuration_revision_original_intent.model_copy(
+                            deep=True
+                        )
+                    rollback_notice = (
+                        "当前区域没有完全相同的规格，已保留原配置，请重新修改。"
+                    )
+                    self._drafts[draft_id] = (
+                        request.customer_request,
+                        intent.model_copy(deep=True),
+                    )
+                    confirmation_token = self._confirmation_sessions.create_or_replace(
+                        draft_id=draft_id,
+                        customer_request=request.customer_request,
+                        customer_summary=intent.customer_summary,
+                        intent=intent,
+                        confirmation_text=rollback_notice,
+                        items=[],
+                    )
+                    confirmation_token = self._confirmation_sessions.prepare_configuration_review(
+                        draft_id=draft_id,
+                        intent=intent,
+                        confirmation_text=rollback_notice,
+                    )
+                    configuration_review_required = confirmation_token is not None
+                    confirmation_items = []
+                    notices = []
+                    confirmation_text = None
+                else:
+                    confirmation_token = self._confirmation_sessions.create_or_replace(
+                        draft_id=draft_id,
+                        customer_request=request.customer_request,
+                        customer_summary=intent.customer_summary,
+                        intent=intent,
+                        confirmation_text=confirmation_text,
+                        items=confirmation_items,
+                    )
             else:
                 # Once all customer questions are resolved, always return the
                 # same confirmation link to the final configuration table.
@@ -1114,6 +1300,26 @@ class QuoteService:
         """
 
         folded = notice.casefold()
+        if "nacos" in folded and "cloud map" in folded and "appconfig" in folded:
+            node_match = re.search(r"(\d+)\s*个节点", notice)
+            node_count = node_match.group(1) if node_match else "原"
+            return [
+                ConfirmationOption(
+                    label=f"继续使用 Nacos（自建 {node_count} 个节点）",
+                    value="nacos_self_hosted",
+                ),
+                ConfirmationOption(
+                    label="改用 AWS 托管（Cloud Map + AppConfig）",
+                    value="aws_managed_cloudmap_appconfig",
+                ),
+            ]
+        if "自建" in notice and any(
+            marker in folded for marker in ("托管", "managed", "aws")
+        ):
+            return [
+                ConfirmationOption(label="采用 AWS 托管方案", value="aws_managed"),
+                ConfirmationOption(label="保留原产品自建", value="self_hosted"),
+            ]
         if (
             any(marker in folded for marker in ("rds", "数据库"))
             and any(marker in folded for marker in ("部署方式", "单可用区", "主备", "multi-az", "multi_az"))
@@ -1184,7 +1390,11 @@ class QuoteService:
         ]
 
     async def _apply_confirmation_responses(
-        self, intent: ParsedIntent, responses: dict[str, str]
+        self,
+        intent: ParsedIntent,
+        responses: dict[str, str],
+        *,
+        response_components: dict[str, int] | None = None,
     ) -> None:
         """Apply customer decisions to the saved structured draft.
 
@@ -1197,21 +1407,141 @@ class QuoteService:
         if not responses:
             return
 
-        before = [
-            {
+        before = {
+            id(service): {
                 "region": service.region,
                 "quantity": service.quantity,
                 "requirements": dict(service.requirements),
             }
             for service in intent.services
-        ]
+        }
         resolved_markers: list[tuple[str, ...]] = []
+        response_components = response_components or {}
         for question, raw_answer in responses.items():
             answer = raw_answer.strip()
             if not answer:
                 continue
             question_folded = question.casefold()
             answer_folded = answer.casefold()
+
+            if any(
+                marker in answer_folded
+                for marker in (
+                    "self_hosted",
+                    "self-hosted",
+                    "保留原产品自建",
+                    "继续自建",
+                )
+            ):
+                component_index = response_components.get(question)
+                current = (
+                    intent.services[component_index]
+                    if component_index is not None
+                    and 0 <= component_index < len(intent.services)
+                    else next(
+                        (
+                            service
+                            for service in intent.services
+                            if service.field_sources.get(
+                                "_pending_architecture_decision"
+                            )
+                        ),
+                        None,
+                    )
+                )
+                if current is not None:
+                    current.service = "ec2"
+                    current.field_sources.pop("_pending_architecture_decision", None)
+                    current.field_sources["_architecture_decision"] = "self_hosted"
+                    current.requirements.setdefault("operating_system", "linux")
+                    selected_model = self._model_from_confirmation_answer(answer)
+                    if selected_model:
+                        current.requirements["requested_model"] = selected_model
+                        current.field_sources.pop(
+                            "_customer_select_configuration", None
+                        )
+                    else:
+                        current.field_sources[
+                            "_customer_select_configuration"
+                        ] = "customer_confirmation"
+                    machine_count = re.search(
+                        r"机器(?:数量|台数)\s*[:：]?\s*(\d+)", answer, re.I
+                    )
+                    if machine_count:
+                        current.quantity = max(int(machine_count.group(1)), 1)
+                    resolved_markers.append(("自建", "托管"))
+                    continue
+
+            if "nacos" in question_folded:
+                component_index = next(
+                    (
+                        index
+                        for index, service in enumerate(intent.services)
+                        if "nacos" in (service.source_text or "").casefold()
+                        or "nacos" in (service.calculator_service_name or "").casefold()
+                    ),
+                    None,
+                )
+                if component_index is not None:
+                    current = intent.services[component_index]
+                    if any(
+                        marker in answer_folded
+                        for marker in ("nacos_self_hosted", "继续", "自建", "保留 nacos")
+                    ):
+                        current.service = "ec2"
+                        current.calculator_service_name = "Amazon EC2（自建 Nacos）"
+                        current.field_sources.pop(
+                            "_pending_architecture_decision", None
+                        )
+                        current.field_sources[
+                            "_architecture_decision"
+                        ] = "self_hosted"
+                        current.requirements.setdefault("operating_system", "linux")
+                        count_match = re.search(r"(\d+)\s*个节点", question)
+                        if count_match:
+                            current.quantity = max(int(count_match.group(1)), 1)
+                        if not any(
+                            current.field_sources.get(f"requirements.{field}")
+                            in {"customer_text", "customer_confirmation"}
+                            for field in ("requested_model", "vcpu", "memory_gib")
+                        ):
+                            current.field_sources[
+                                "_customer_select_configuration"
+                            ] = "customer_confirmation"
+                        resolved_markers.append(("nacos",))
+                        continue
+                    if any(
+                        marker in answer_folded
+                        for marker in (
+                            "aws_managed_cloudmap_appconfig",
+                            "cloud map",
+                            "appconfig",
+                            "aws 托管",
+                        )
+                    ):
+                        shared = {
+                            "region": current.region,
+                            "hours_per_month": current.hours_per_month,
+                            "source_text": current.source_text,
+                        }
+                        intent.services[component_index : component_index + 1] = [
+                            ServiceRequirement(
+                                service="cloud_map",
+                                calculator_service_name="AWS Cloud Map",
+                                quantity=1,
+                                requirements={},
+                                **shared,
+                            ),
+                            ServiceRequirement(
+                                service="appconfig",
+                                calculator_service_name="AWS AppConfig",
+                                quantity=1,
+                                requirements={},
+                                **shared,
+                            ),
+                        ]
+                        resolved_markers.append(("nacos",))
+                        continue
 
             if (
                 any(marker in question_folded for marker in ("rds", "数据库"))
@@ -1389,13 +1719,37 @@ class QuoteService:
             selected_model = self._model_from_confirmation_answer(answer)
             if selected_model:
                 kind = self._confirmation_service_kind(question, selected_model)
+                component_index = response_components.get(question)
                 service = (
-                    self._service_for_confirmation(intent, kind, question)
-                    if kind
-                    else None
+                    intent.services[component_index]
+                    if component_index is not None
+                    and 0 <= component_index < len(intent.services)
+                    else (
+                        self._service_for_confirmation(intent, kind, question)
+                        if kind
+                        else None
+                    )
                 )
+                staged_service = next(
+                    (
+                        component
+                        for component in intent.services
+                        if component.field_sources.get(
+                            "_customer_select_configuration"
+                        )
+                    ),
+                    None,
+                )
+                if component_index is None and staged_service is not None:
+                    service = staged_service
                 if service is not None:
                     service.requirements["requested_model"] = selected_model
+                    service.field_sources.pop("_customer_select_configuration", None)
+                    machine_count = re.search(
+                        r"机器(?:数量|台数)\s*[:：]?\s*(\d+)", answer, re.I
+                    )
+                    if machine_count:
+                        service.quantity = max(int(machine_count.group(1)), 1)
                     service.requirements.pop("_review_selected_model", None)
                     service.requirements.pop("_review_selected_specifications", None)
                     # A replacement-model answer is the customer's decision
@@ -1467,7 +1821,11 @@ class QuoteService:
                     for markers in resolved_markers
                 )
             ]
-        for service, previous in zip(intent.services, before, strict=True):
+        for service in intent.services:
+            previous = before.get(
+                id(service),
+                {"region": None, "quantity": None, "requirements": {}},
+            )
             sources = dict(service.field_sources)
             locked = set(service.locked_fields)
             if service.region != previous["region"]:
@@ -1490,6 +1848,26 @@ class QuoteService:
                 locked.discard(path)
             service.field_sources = sources
             service.locked_fields = sorted(locked)
+
+    @classmethod
+    def _is_structured_workflow_answer(cls, answer: str) -> bool:
+        """Return whether an answer must bypass free-form AI revision."""
+
+        folded = answer.strip().casefold()
+        return bool(
+            cls._model_from_confirmation_answer(answer)
+            or any(
+                marker in folded
+                for marker in (
+                    "self_hosted",
+                    "self-hosted",
+                    "nacos_self_hosted",
+                    "aws_managed_cloudmap_appconfig",
+                    "保留原产品自建",
+                    "继续自建",
+                )
+            )
+        )
 
     @staticmethod
     def _region_from_confirmation(answer: str) -> str | None:
@@ -1821,6 +2199,16 @@ class QuoteService:
         service_name = cls._customer_service_name(selection, requirement)
         vcpu = cls._plain_spec_value(requirement.requirements.get("vcpu"))
         memory = cls._plain_spec_value(requirement.requirements.get("memory_gib"))
+        requested_model = str(
+            requirement.requirements.get("requested_model")
+            or selection.requested_model
+            or ""
+        ).strip()
+        if requested_model:
+            return (
+                f"您要求 {service_name} 使用 {requested_model}，但 AWS 当前区域没有这个型号，"
+                "请在下方重新选择您需要的型号。"
+            )
         if service_name == "EKS 工作节点" and not vcpu and not memory:
             return (
                 "您还没有指定 EKS 工作节点的 CPU 和内存，"
@@ -1849,7 +2237,7 @@ class QuoteService:
         return f"{service_name} 还没有指定型号，请在下方选择您需要的型号。"
 
     @classmethod
-    def _simplify_model_selection_notices(
+    def _simplify_component_confirmation_notices(
         cls,
         intent: ParsedIntent,
         selections: list[PreviewSelection],
@@ -1857,14 +2245,21 @@ class QuoteService:
         confirmation_components: dict[str, tuple[str, str]],
         confirmation_options: dict[str, list[ConfirmationOption]],
     ) -> list[str]:
-        """Replace internal matching explanations with one clear customer action."""
+        """Apply one customer-language policy to every component question.
+
+        Plugins and parsers may keep detailed technical reasons for logging, but
+        the confirmation page has one presentation boundary. Model questions
+        explain the requested shape and next action; every other component
+        question loses internal prefixes and repeated source paragraphs here.
+        This keeps the behavior consistent for existing and future plugins.
+        """
 
         selections_by_id = {item.component_id: item for item in selections}
         result: list[str] = []
         for notice in notices:
             component = confirmation_components.get(notice)
             options = confirmation_options.get(notice, [])
-            if not component or not any(option.model for option in options):
+            if not component:
                 result.append(notice)
                 continue
             selection = selections_by_id.get(component[0])
@@ -1875,7 +2270,13 @@ class QuoteService:
             if selection is None or requirement is None:
                 result.append(notice)
                 continue
-            plain = cls._plain_model_selection_question(selection, requirement)
+            plain = (
+                cls._plain_model_selection_question(selection, requirement)
+                if any(option.model for option in options)
+                else cls._customer_confirmation_question(
+                    selection.display_name, requirement, notice
+                )
+            )
             confirmation_components.pop(notice, None)
             confirmation_options.pop(notice, None)
             confirmation_components[plain] = component
@@ -2314,6 +2715,12 @@ class QuoteService:
         request: QuoteRequest,
         reporter: ProgressReporter | None = None,
     ) -> QuoteResponse:
+        if request.draft_id and request.draft_id.startswith("az"):
+            raise ManualConfirmationRequired(
+                "检测到 Azure 草稿被提交到 AWS 报价系统，已阻止报价",
+                code="cloud_provider_boundary_violation",
+                provider="aws",
+            )
         if request.draft_id and self._confirmation_sessions is not None:
             review_status = self._confirmation_sessions.status_by_draft(request.draft_id)
             if review_status is not None and review_status != "approved":
@@ -2817,10 +3224,30 @@ class QuoteService:
         clean = re.sub(r"(?:请|由)?销售(?:人员)?确认", "请您确认", notice or "")
         clean = clean.replace("找销售确认", "请您确认")
         clean = clean.strip().lstrip("。；; ")
-        source = cls._compact_customer_source(requirement)
-        if source:
-            return f"您之前要求【{display_name}】：{source}。{clean}"
-        return f"关于【{display_name}】：{clean}"
+        clean = re.sub(r"^当前配置尚不能直接核价[：:]\s*", "", clean)
+        if not clean:
+            clean = "还缺少必要信息，请在下方补充。"
+        # A well-formed causal sentence already identifies the request and the
+        # action. Do not wrap it in another product prefix.
+        if clean.startswith(("您", "请")):
+            return clean
+
+        identity = display_name.casefold()
+        if "eks worker" in identity or "worker nodes" in identity:
+            customer_name = "EKS 工作节点"
+        elif "elasticache" in identity or "redis" in identity:
+            customer_name = "Redis"
+        elif "postgres" in identity:
+            customer_name = "RDS PostgreSQL"
+        elif "mysql" in identity:
+            customer_name = "RDS MySQL"
+        elif "opensearch" in identity:
+            customer_name = "OpenSearch"
+        else:
+            customer_name = display_name.removeprefix("Amazon ").strip() or "该组件"
+        if customer_name.casefold() in clean.casefold():
+            return clean
+        return f"{customer_name}：{clean}"
 
     @classmethod
     def _plugin_confirmation_question(
@@ -3236,6 +3663,10 @@ class QuoteService:
                 update={
                     "display_name": display_name,
                     "quantity": service.quantity,
+                    "specifications": self._complete_selection_specifications(
+                        service,
+                        selection.specifications,
+                    ),
                     "remarks": list(
                         dict.fromkeys(
                             [
@@ -3838,6 +4269,57 @@ class QuoteService:
         elif key == "nat_gateway":
             notes.append("NAT Gateway 后端工作负载及其公网数据传输费用独立计算，不在本项重复计费。")
         return notes
+
+    @staticmethod
+    def _complete_selection_specifications(
+        service: ServiceRequirement,
+        official_specifications: dict[str, object],
+    ) -> dict[str, object]:
+        """Keep every confirmed customer field in the final quote display.
+
+        Plugins own AWS validation and pricing, but they must not also become
+        the only source for presentation fields. A plugin may expose a compact
+        official shape and accidentally omit storage, traffic, node counts, or
+        another confirmed value. Build one complete display object here for
+        every service, then let authoritative AWS values override aliases such
+        as CPU and memory.
+        """
+
+        aliases = {
+            "vcpu": "vCPU",
+            "memory_gib": "memoryGiB",
+            "operating_system": "operatingSystem",
+            "engine": "engine",
+            "deployment": "deploymentOption",
+            "storage_gib": "storageGiB",
+            "storage_type": "storageType",
+            "data_nodes": "dataNodes",
+            "storage_gib_per_node": "storageGiBPerNode",
+            "broker_count": "brokerCount",
+            "storage_gib_per_broker": "storageGiBPerBroker",
+            "storage_class": "storageClass",
+            "data_transfer_out_gib": "dataTransferOutGiB",
+            "processed_bytes_gib": "processedBytesGiB",
+        }
+        presentation_only_exclusions = {
+            "requested_model",
+            "system_default_assumption",
+            "calculator_adjustment_notices",
+            "ebs_storage_breakdown",
+        }
+        complete: dict[str, object] = {}
+        for key, value in service.requirements.items():
+            if key.startswith("_") or key in presentation_only_exclusions or value is None:
+                continue
+            complete[aliases.get(key, key)] = value
+        complete.update(
+            {
+                key: value
+                for key, value in official_specifications.items()
+                if value is not None
+            }
+        )
+        return complete
 
     @staticmethod
     def _calculator_requirements(

@@ -74,6 +74,14 @@ class RdsPlugin(ServicePlugin):
             min_vcpu=min_vcpu,
             min_memory=min_memory,
         )
+        exact_shape_exists = bool(
+            min_vcpu is not None
+            and min_memory is not None
+            and any(
+                item["vcpu"] == min_vcpu and item["memory_gib"] == min_memory
+                for item in eligible
+            )
+        )
         if requested_model:
             exact = next((item for item in eligible if item["model"] == requested_model), None)
             if exact:
@@ -165,7 +173,11 @@ class RdsPlugin(ServicePlugin):
         # ranks non-underprovisioned official products by monthly price, so a
         # non-exact shape must not be sent back to the customer.
         requires_confirmation = bool(
-            (not requested_model and len(options) > 1)
+            (
+                not requested_model
+                and len(options) > 1
+                and not exact_shape_exists
+            )
             or (requested_model and default.model != requested_model)
         )
         if requires_confirmation:
@@ -324,6 +336,7 @@ class RdsPlugin(ServicePlugin):
                 "vCPU": selected["vcpu"],
                 "memoryGiB": selected["memory_gib"],
                 "storageType": storage_type_used,
+                "storageGiB": storage_gib,
                 **(
                     {
                         "customerDeployment": _text(requested.get("deployment")) or "single_az",

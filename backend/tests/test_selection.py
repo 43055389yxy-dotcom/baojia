@@ -1,7 +1,9 @@
 import pytest
 
+import app.services.plugins.rds as rds_module
+
 from app.core.errors import ManualConfirmationRequired
-from app.domain.models import QueryAction, ServiceKind, ServiceRequirement
+from app.domain.models import QueryAction, ServiceKind, ServiceRequirement, UsageLine
 from app.services.plugins.ec2 import (
     Ec2Plugin,
     _pricing_operating_system,
@@ -10,6 +12,7 @@ from app.services.plugins.ec2 import (
     _select_instance,
 )
 from app.services.plugins.rds import (
+    RdsPlugin,
     _billing_deployment,
     _deployment_matches,
     _display_name,
@@ -94,6 +97,74 @@ def test_explicit_rds_provisioned_iops_is_not_replaced_by_gp3() -> None:
     values = ["General Purpose-GP3", "Provisioned IOPS-IO2"]
 
     assert _resolve_volume_type("io2", values) == "Provisioned IOPS-IO2"
+
+
+def test_rds_quote_keeps_priced_storage_capacity_in_display_specifications(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    product = {
+        "serviceCode": "AmazonRDS",
+        "product": {
+            "sku": "rds-test-sku",
+            "attributes": {
+                "usagetype": "APN1-Multi-AZUsage:db.m6g.4xl",
+                "operation": "CreateDBInstance:0002",
+                "databaseEngine": "MySQL",
+                "deploymentOption": "Multi-AZ",
+                "regionCode": "ap-northeast-1",
+            },
+        },
+    }
+
+    class Catalog:
+        def products(self, *_args: object, **_kwargs: object) -> list[dict[str, object]]:
+            return [product]
+
+    plugin = RdsPlugin(None, Catalog())  # type: ignore[arg-type]
+    monkeypatch.setattr(plugin, "_orderable_classes", lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(
+        rds_module,
+        "_rds_candidates",
+        lambda *_args, **_kwargs: [
+            {
+                "model": "db.m6g.4xlarge",
+                "vcpu": 16.0,
+                "memory_gib": 64.0,
+                "products": [product],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        plugin,
+        "_storage_usage",
+        lambda *_args, **_kwargs: (
+            UsageLine(
+                key="rdsstg",
+                service_code="AmazonRDS",
+                usage_type="APN1-RDS:Multi-AZ-GP3-Storage",
+                operation="CreateDBInstance:0002",
+                amount=300,
+                group="rds-storage",
+            ),
+            "General Purpose-GP3",
+        ),
+    )
+    requirement = ServiceRequirement(
+        service="rds",
+        region="ap-northeast-1",
+        requirements={
+            "engine": "mysql",
+            "deployment": "multi_az",
+            "requested_model": "db.m6g.4xlarge",
+            "storage_gib": 300,
+        },
+    )
+
+    selection = plugin.select(requirement, "ap-northeast-1")
+
+    assert selection.specifications["storageType"] == "General Purpose-GP3"
+    assert selection.specifications["storageGiB"] == 300
+    assert selection.usage_lines[-1].amount == 300
 
 
 def test_ec2_user_os_maps_to_price_list_family() -> None:
@@ -193,6 +264,57 @@ def test_ec2_requested_model_does_not_query_price_list(monkeypatch: pytest.Monke
     assert selection.usage_lines[0].usage_type == "APS2-BoxUsage:c5a.4xlarge"
 
 
+def test_confirmed_ec2_model_wins_over_restored_original_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = Ec2Plugin(None, None)  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        plugin,
+        "_official_candidates",
+        lambda *_args: [
+            {
+                "model": "t2.micro",
+                "vcpu": 1.0,
+                "memory_gib": 1.0,
+                "current_generation": True,
+                "family": "general_purpose",
+                "architectures": ["x86_64"],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        plugin,
+        "_compute_product",
+        lambda *_args, **_kwargs: {
+            "serviceCode": "AmazonEC2",
+            "product": {
+                "sku": "t2-micro-sku",
+                "attributes": {
+                    "usagetype": "APN1-BoxUsage:t2.micro",
+                    "operation": "RunInstances",
+                },
+            },
+        },
+    )
+    requirement = ServiceRequirement(
+        service="ec2",
+        region="ap-northeast-1",
+        quantity=8,
+        requirements={
+            "requested_model": "t2.micro",
+            "vcpu": 6,
+            "memory_gib": 24,
+            "operating_system": "linux",
+        },
+    )
+
+    selection = plugin.select(requirement, "ap-southeast-1")
+
+    assert selection.model == "t2.micro"
+    assert selection.specifications["vCPU"] == 1.0
+    assert selection.specifications["memoryGiB"] == 1.0
+
+
 def test_windows_on_arm_instance_is_customer_conflict_before_pricing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -279,6 +401,147 @@ def test_ec2_nonstandard_shape_returns_lower_and_upper_official_options(
         (2.0, 8.0),
         (4.0, 16.0),
     ]
+
+
+def test_ec2_replacement_picker_keeps_smaller_official_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = Ec2Plugin(None, None)  # type: ignore[arg-type]
+    official = [
+        {
+            "model": "m7g.large",
+            "vcpu": 2.0,
+            "memory_gib": 8.0,
+            "current_generation": True,
+            "family": "general_purpose",
+            "architectures": ["arm64"],
+        },
+        {
+            "model": "m7g.xlarge",
+            "vcpu": 4.0,
+            "memory_gib": 16.0,
+            "current_generation": True,
+            "family": "general_purpose",
+            "architectures": ["arm64"],
+        },
+        {
+            "model": "m7g.2xlarge",
+            "vcpu": 8.0,
+            "memory_gib": 32.0,
+            "current_generation": True,
+            "family": "general_purpose",
+            "architectures": ["arm64"],
+        },
+        {
+            "model": "m7i.2xlarge",
+            "vcpu": 8.0,
+            "memory_gib": 32.0,
+            "current_generation": True,
+            "family": "general_purpose",
+            "architectures": ["x86_64"],
+        },
+    ]
+    monkeypatch.setattr(plugin, "_official_candidates", lambda *_args: official)
+    monkeypatch.setattr(plugin, "_compute_product", lambda *_args: None)
+
+    preview = plugin.preview(
+        ServiceRequirement(
+            service="ec2",
+            region="ap-northeast-1",
+            requirements={"vcpu": 6, "memory_gib": 24},
+        ),
+        "ap-southeast-1",
+    )
+
+    assert preview.requires_confirmation is True
+    assert {option.specifications["vCPU"] for option in preview.candidates} == {
+        2.0,
+        4.0,
+        8.0,
+    }
+
+
+def test_ec2_exact_shape_with_multiple_models_does_not_ask_customer_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = Ec2Plugin(None, None)  # type: ignore[arg-type]
+    official = [
+        {
+            "model": "c7g.xlarge",
+            "vcpu": 4.0,
+            "memory_gib": 8.0,
+            "current_generation": True,
+            "family": "compute_optimized",
+            "architectures": ["arm64"],
+        },
+        {
+            "model": "c6i.xlarge",
+            "vcpu": 4.0,
+            "memory_gib": 8.0,
+            "current_generation": True,
+            "family": "compute_optimized",
+            "architectures": ["x86_64"],
+        },
+    ]
+    monkeypatch.setattr(plugin, "_official_candidates", lambda *_args: official)
+    monkeypatch.setattr(plugin, "_compute_product", lambda *_args: None)
+
+    preview = plugin.preview(
+        ServiceRequirement(
+            service="ec2",
+            region="ap-southeast-1",
+            requirements={"vcpu": 4, "memory_gib": 8},
+        ),
+        "ap-southeast-1",
+    )
+
+    assert preview.requires_confirmation is False
+    assert preview.selected_model in {"c7g.xlarge", "c6i.xlarge"}
+    assert len(preview.candidates) == 2
+
+
+def test_self_hosted_workload_requires_customer_to_choose_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = Ec2Plugin(None, None)  # type: ignore[arg-type]
+    official = [
+        {
+            "model": "t4g.small",
+            "vcpu": 2.0,
+            "memory_gib": 2.0,
+            "current_generation": True,
+            "family": "general_purpose",
+            "architectures": ["arm64"],
+        },
+        {
+            "model": "t4g.medium",
+            "vcpu": 2.0,
+            "memory_gib": 4.0,
+            "current_generation": True,
+            "family": "general_purpose",
+            "architectures": ["arm64"],
+        },
+    ]
+    monkeypatch.setattr(plugin, "_official_candidates", lambda *_args: official)
+    monkeypatch.setattr(plugin, "_compute_product", lambda *_args: None)
+
+    preview = plugin.preview(
+        ServiceRequirement(
+            service="ec2",
+            region="ap-southeast-1",
+            requirements={"vcpu": 2, "memory_gib": 2},
+            field_sources={
+                "requirements.vcpu": "system_minimum",
+                "requirements.memory_gib": "system_minimum",
+                "_customer_select_configuration": "customer_confirmation",
+            },
+        ),
+        "ap-southeast-1",
+    )
+
+    assert preview.requires_confirmation is True
+    assert preview.selected_model is None
+    assert preview.confirmation_reason == "请选择自建服务的机器台数和每台 EC2 配置（当前 1 台）。"
 
 
 def test_ec2_rejects_invalid_model_without_replacement_basis() -> None:
@@ -513,6 +776,31 @@ def test_redis_shape_without_exact_official_size_requires_customer_choice(
     assert all(option.is_default is False for option in preview.candidates)
     assert "客户需要 Redis 每节点约 8G" in (preview.confirmation_reason or "")
     assert "当前区域支持的配置" in (preview.confirmation_reason or "")
+
+
+def test_redis_exact_memory_with_multiple_models_does_not_ask_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = RedisPlugin(None, None)  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        plugin,
+        "nearby_candidates",
+        lambda *_args, **_kwargs: [
+            {"model": "cache.c7g.large", "memory_gib": 8.0, "vcpu": 2.0},
+            {"model": "cache.m7g.large", "memory_gib": 8.0, "vcpu": 4.0},
+        ],
+    )
+
+    preview = plugin.preview(
+        ServiceRequirement(
+            service="elasticache",
+            requirements={"engine": "redis", "memory_gib": 8},
+        ),
+        "ap-southeast-1",
+    )
+
+    assert preview.requires_confirmation is False
+    assert preview.selected_model in {"cache.c7g.large", "cache.m7g.large"}
 
 
 def test_redis_reserved_selection_excludes_old_family_without_requested_offer() -> None:

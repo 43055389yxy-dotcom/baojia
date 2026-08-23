@@ -19,7 +19,10 @@ from app.integrations.calculator_web import (
     GenericCalculatorInput,
 )
 from app.services.bcm_estimator import BcmQuoteResult
-from app.services.confirmation_sessions import ConfirmationSessionStore
+from app.services.confirmation_sessions import (
+    CONFIGURATION_COMPONENT_FEEDBACK_PREFIX,
+    ConfirmationSessionStore,
+)
 from app.services.plugins.base import PluginRegistry
 from app.services.plugins.common import (
     CloudFrontPlugin,
@@ -373,6 +376,15 @@ async def test_mixed_services_use_one_bcm_estimate() -> None:
     assert quote.total_cost == 300.0
     assert len(quote.selections) == 3
     assert quote.pricing_source == "AWS BCM Pricing Calculator API"
+    # Every plugin in this test deliberately returns an empty specification
+    # object. The quote service must still carry the complete confirmed config
+    # for all component types into the page and Excel export.
+    assert quote.selections[0].specifications["vCPU"] == 4
+    assert quote.selections[0].specifications["memoryGiB"] == 16
+    assert quote.selections[1].specifications["deploymentOption"] == "multi_az"
+    assert quote.selections[1].specifications["storageGiB"] == 500
+    assert quote.selections[2].specifications["engine"] == "redis"
+    assert quote.selections[2].specifications["memoryGiB"] == 4
 
 
 @pytest.mark.asyncio
@@ -659,6 +671,111 @@ async def test_customer_must_approve_complete_configuration_before_pricing(tmp_p
     completed = store.get(preview.confirmation_token)
     assert completed is not None
     assert completed.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_later_invalid_component_edit_stays_on_configuration_table(tmp_path) -> None:
+    class RevisionParser:
+        async def parse(self, _: str) -> ParsedIntent:
+            raise AssertionError("saved draft must be reused")
+
+        async def revise_component_from_feedback(
+            self, _original: str, component: ServiceRequirement, _feedback: str
+        ) -> ServiceRequirement:
+            revised = component.model_copy(deep=True)
+            revised.requirements = {"vcpu": 7, "memory_gib": 28}
+            revised.source_text = "客户把规格改为7核28G"
+            return revised
+
+    class UnavailableShapePlugin(ApiPlugin):
+        def preview(
+            self, requirement: ServiceRequirement, default_region: str
+        ) -> PreviewSelection:
+            return PreviewSelection(
+                component_id="component",
+                service=ServiceKind.EC2,
+                display_name="Amazon EC2",
+                region=requirement.region or default_region,
+                candidates=[
+                    CandidateOption(
+                        model="m7i.xlarge",
+                        family="general_purpose",
+                        specifications={"vCPU": 4, "memoryGiB": 16},
+                        rationale="official",
+                    ),
+                    CandidateOption(
+                        model="m7i.2xlarge",
+                        family="general_purpose",
+                        specifications={"vCPU": 8, "memoryGiB": 32},
+                        rationale="official",
+                    ),
+                ],
+                requires_confirmation=True,
+                confirmation_reason="AWS 没有完全相同的规格",
+            )
+
+    store = ConfirmationSessionStore(tmp_path / "edit-stays-on-table.sqlite3")
+    service = QuoteService(
+        RevisionParser(),  # type: ignore[arg-type]
+        PluginRegistry([UnavailableShapePlugin(ServiceKind.EC2, "m7i.xlarge")]),
+        FailingEstimator(),  # type: ignore[arg-type]
+        confirmation_sessions=store,
+    )
+    original = ParsedIntent(
+        customer_summary="EC2",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                region="ap-southeast-1",
+                quantity=3,
+                requirements={
+                    "requested_model": "m7i.xlarge",
+                    "_review_selected_model": "m7i.xlarge",
+                    "_review_selected_specifications": {
+                        "vCPU": 4,
+                        "memoryGiB": 16,
+                    },
+                    "vcpu": 4,
+                    "memory_gib": 16,
+                    "operating_system": "linux",
+                    "storage_gib": 500,
+                },
+                source_text="EC2 m7i.xlarge，4核16G，3台，500G磁盘",
+            )
+        ],
+    )
+    service._drafts["bad-edit-001"] = ("EC2", original)
+
+    preview = await service.preview(
+        QuoteRequest(
+            customer_request="EC2",
+            draft_id="bad-edit-001",
+            confirmation_responses={
+                f"{CONFIGURATION_COMPONENT_FEEDBACK_PREFIX}0": "规格改成7核28G"
+            },
+        )
+    )
+
+    assert preview.configuration_review_required is True
+    assert preview.confirmation_items == []
+    assert preview.confirmation_text is None
+    session = store.get(preview.confirmation_token or "")
+    assert session is not None
+    assert session.status == "configuration_review"
+    assert session.confirmation_text == (
+        "当前区域没有完全相同的规格，已保留原配置，请重新修改。"
+    )
+    restored_item = session.configuration_items[0]
+    assert restored_item.pricing_status == "ready"
+    assert restored_item.selected_model == "m7i.xlarge"
+    assert restored_item.quantity == 3
+    assert restored_item.requirements["vcpu"] == 4
+    assert restored_item.requirements["memory_gib"] == 16
+    assert restored_item.requirements["operating_system"] == "linux"
+    assert restored_item.requirements["storage_gib"] == 500
+    saved_draft = service._drafts["bad-edit-001"][1].services[0]
+    assert saved_draft.requirements["requested_model"] == "m7i.xlarge"
+    assert saved_draft.requirements["memory_gib"] == 16
 
 
 @pytest.mark.asyncio
@@ -1776,6 +1893,24 @@ def test_every_confirmation_card_gets_a_component_question() -> None:
             ServiceRequirement(service="ec2", region="ap-southeast-1"),
             "您还没有指定 EKS 工作节点的 CPU 和内存，请在下方选择您需要的型号。",
         ),
+        (
+            PreviewSelection(
+                component_id="2",
+                service="future_database",
+                display_name="Amazon Neptune",
+                region="ap-southeast-1",
+                requested_model="db.example.large",
+            ),
+            ServiceRequirement(
+                service="future_database",
+                region="ap-southeast-1",
+                requirements={"requested_model": "db.example.large"},
+            ),
+            (
+                "您要求 Neptune 使用 db.example.large，但 AWS 当前区域没有这个型号，"
+                "请在下方重新选择您需要的型号。"
+            ),
+        ),
     ],
 )
 def test_model_questions_use_plain_customer_language(
@@ -1788,6 +1923,22 @@ def test_model_questions_use_plain_customer_language(
     assert question == expected
     assert "您之前要求" not in question
     assert "推荐规格与客户原始要求不是完全匹配" not in question
+
+
+def test_every_component_question_uses_the_same_customer_language_boundary() -> None:
+    requirement = ServiceRequirement(
+        service="future_queue",
+        source_text="一整段很长的客户原始需求，不应重复显示在问题页面。",
+    )
+
+    question = QuoteService._customer_confirmation_question(
+        "Amazon MQ",
+        requirement,
+        "还缺少 Broker 数量，请填写需要几个节点。",
+    )
+
+    assert question == "MQ：还缺少 Broker 数量，请填写需要几个节点。"
+    assert requirement.source_text not in question
 
 
 def test_component_region_variants_and_optional_product_choices_do_not_repeat() -> None:
@@ -2669,6 +2820,261 @@ def test_missing_rds_deployment_question_has_customer_choices() -> None:
     assert [(item.label, item.value) for item in options] == [
         ("单可用区", "single_az"),
         ("主备高可用（Multi-AZ）", "multi_az"),
+    ]
+
+
+def test_nacos_partial_managed_replacement_has_two_clear_choices() -> None:
+    options = QuoteService._default_confirmation_options(
+        "您需要 Nacos 的服务发现和配置中心。是继续自建 Nacos（3 个节点），"
+        "还是改用 AWS 托管的 Cloud Map + AppConfig？托管方案不再按 Nacos 节点部署。"
+    )
+
+    assert [item.value for item in options] == [
+        "nacos_self_hosted",
+        "aws_managed_cloudmap_appconfig",
+    ]
+
+
+def test_all_partial_managed_replacements_use_the_same_two_step_choice() -> None:
+    options = QuoteService._default_confirmation_options(
+        "XXL-JOB 没有完全等价的 AWS 托管服务，请选择采用 AWS 托管方案还是保留原产品自建。"
+    )
+
+    assert [(item.label, item.value) for item in options] == [
+        ("采用 AWS 托管方案", "aws_managed"),
+        ("保留原产品自建", "self_hosted"),
+    ]
+
+
+def test_workflow_controls_bypass_free_form_ai_revision() -> None:
+    assert QuoteService._is_structured_workflow_answer("self_hosted")
+    assert QuoteService._is_structured_workflow_answer(
+        "选择 m7g.large；机器数量 3"
+    )
+    assert not QuoteService._is_structured_workflow_answer("改成单可用区")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "expected_services", "expected_quantities"),
+    [
+        ("nacos_self_hosted", ["ec2"], [3]),
+        (
+            "aws_managed_cloudmap_appconfig",
+            ["cloud_map", "appconfig"],
+            [1, 1],
+        ),
+    ],
+)
+async def test_nacos_confirmation_preserves_self_host_topology_or_splits_managed_services(
+    answer: str,
+    expected_services: list[str],
+    expected_quantities: list[int],
+) -> None:
+    question = (
+        "您需要 Nacos 的服务发现和配置中心。是继续自建 Nacos（3 个节点），"
+        "还是改用 AWS 托管的 Cloud Map + AppConfig？托管方案不再按 Nacos 节点部署。"
+    )
+    intent = ParsedIntent(
+        customer_summary="Nacos",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                calculator_service_name="Amazon EC2（自建 Nacos）",
+                region="ap-southeast-1",
+                quantity=3,
+                requirements={
+                    "operating_system": "linux",
+                    "vcpu": 1,
+                    "memory_gib": 2,
+                },
+                field_sources={
+                    "requirements.vcpu": "system_minimum",
+                    "requirements.memory_gib": "system_minimum",
+                },
+                source_text="Nacos：服务注册发现和配置中心，部署数量：3个节点",
+            )
+        ],
+        ambiguities=[question],
+    )
+    service = QuoteService(
+        MixedParser(),  # type: ignore[arg-type]
+        PluginRegistry([]),
+        FailingEstimator(),  # type: ignore[arg-type]
+        None,
+    )
+
+    await service._apply_confirmation_responses(intent, {question: answer})
+
+    assert [item.service for item in intent.services] == expected_services
+    assert [item.quantity for item in intent.services] == expected_quantities
+    assert all(item.region == "ap-southeast-1" for item in intent.services)
+    if answer == "nacos_self_hosted":
+        assert "_pending_architecture_decision" not in intent.services[0].field_sources
+        assert (
+            intent.services[0].field_sources["_customer_select_configuration"]
+            == "customer_confirmation"
+        )
+    else:
+        assert all(
+            "_pending_architecture_decision" not in item.field_sources
+            for item in intent.services
+        )
+    assert intent.ambiguities == []
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_machine_selection_applies_model_and_machine_count() -> None:
+    intent = ParsedIntent(
+        customer_summary="自建服务",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                calculator_service_name="Amazon EC2（自建服务）",
+                quantity=3,
+                field_sources={
+                    "_customer_select_configuration": "customer_confirmation"
+                },
+            )
+        ],
+    )
+    service = QuoteService(
+        MixedParser(),  # type: ignore[arg-type]
+        PluginRegistry([]),
+        FailingEstimator(),  # type: ignore[arg-type]
+        None,
+    )
+
+    await service._apply_confirmation_responses(
+        intent,
+        {
+            "EC2 自建服务：请选择自建服务的机器台数和每台 EC2 配置。":
+                "选择 m7g.large；机器数量 5"
+        },
+    )
+
+    component = intent.services[0]
+    assert component.quantity == 5
+    assert component.requirements["requested_model"] == "m7g.large"
+    assert "_customer_select_configuration" not in component.field_sources
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_choice_and_machine_configuration_apply_in_one_answer() -> None:
+    question = "请选择 AWS 托管方案还是保留原产品自建。"
+    intent = ParsedIntent(
+        customer_summary="自建产品",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                calculator_service_name="Amazon EC2（自建产品）",
+                quantity=3,
+                field_sources={
+                    "_pending_architecture_decision": "system_policy"
+                },
+            )
+        ],
+        ambiguities=[question],
+    )
+    service = QuoteService(
+        MixedParser(),  # type: ignore[arg-type]
+        PluginRegistry([]),
+        FailingEstimator(),  # type: ignore[arg-type]
+        None,
+    )
+
+    await service._apply_confirmation_responses(
+        intent,
+        {question: "self_hosted；选择 m7g.large；机器数量 5"},
+    )
+
+    component = intent.services[0]
+    assert component.quantity == 5
+    assert component.requirements["requested_model"] == "m7g.large"
+    assert "_pending_architecture_decision" not in component.field_sources
+    assert "_customer_select_configuration" not in component.field_sources
+
+
+@pytest.mark.asyncio
+async def test_selected_model_uses_confirmation_component_id_with_multiple_ec2() -> None:
+    question = "您还没有指定 EKS 工作节点的 CPU 和内存，请选择型号。"
+    intent = ParsedIntent(
+        customer_summary="应用服务器和 EKS",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                calculator_service_name="Amazon EC2",
+                requirements={"requested_model": "t4g.micro"},
+            ),
+            ServiceRequirement(
+                service="ec2",
+                calculator_service_name="Amazon EC2 (EKS Worker Nodes)",
+            ),
+        ],
+    )
+    service = QuoteService(
+        MixedParser(),  # type: ignore[arg-type]
+        PluginRegistry([]),
+        FailingEstimator(),  # type: ignore[arg-type]
+        None,
+    )
+
+    await service._apply_confirmation_responses(
+        intent,
+        {question: "选择 m7g.xlarge"},
+        response_components={question: 1},
+    )
+
+    assert intent.services[0].requirements["requested_model"] == "t4g.micro"
+    assert intent.services[1].requirements["requested_model"] == "m7g.xlarge"
+
+
+@pytest.mark.asyncio
+async def test_pending_managed_decision_embeds_self_hosted_configuration() -> None:
+    question = (
+        "您需要 Nacos 的服务发现和配置中心。是继续自建 Nacos（3 个节点），"
+        "还是改用 AWS 托管的 Cloud Map + AppConfig？托管方案不再按 Nacos 节点部署。"
+    )
+
+    class PendingArchitectureParser:
+        async def parse(self, _: str) -> ParsedIntent:
+            return ParsedIntent(
+                customer_summary="Nacos",
+                services=[
+                    ServiceRequirement(
+                        service="ec2",
+                        calculator_service_name="Amazon EC2（自建 Nacos）",
+                        region="ap-southeast-1",
+                        quantity=3,
+                        source_text="Nacos，3个节点",
+                        field_sources={
+                            "_pending_architecture_decision": "system_policy"
+                        },
+                    )
+                ],
+                ambiguities=[question],
+            )
+
+    service = QuoteService(
+        PendingArchitectureParser(),  # type: ignore[arg-type]
+        PluginRegistry([ApiPlugin(ServiceKind.EC2, "t4g.small")]),
+        FailingEstimator(),  # type: ignore[arg-type]
+        None,
+    )
+
+    preview = await service.preview(QuoteRequest(customer_request="Nacos 3个节点"))
+
+    assert [item.question for item in preview.confirmation_items] == [question]
+    assert [option.value for option in preview.confirmation_items[0].options] == [
+        "nacos_self_hosted",
+        "aws_managed_cloudmap_appconfig",
+    ]
+    assert [
+        option.model for option in preview.confirmation_items[0].dependent_options
+    ] == ["t4g.small"]
+    assert preview.confirmation_items[0].dependent_on_values == [
+        "nacos_self_hosted",
+        "self_hosted",
     ]
 
 

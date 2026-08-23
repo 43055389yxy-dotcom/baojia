@@ -253,6 +253,7 @@ def test_extended_services_are_independent_editable_prompt_cards() -> None:
         "step_functions",
         "bedrock",
         "cloud_map",
+        "appconfig",
         "eventbridge",
     }
     items = prompt_library_payload()["items"]
@@ -268,7 +269,7 @@ def test_extended_services_are_independent_editable_prompt_cards() -> None:
 def test_extended_service_keywords_load_only_their_own_modules() -> None:
     text = (
         "AWS Lambda 函数；Amazon DynamoDB；Amazon EFS；Amazon Redshift；"
-        "AWS Step Functions；Amazon Bedrock；AWS Cloud Map"
+        "AWS Step Functions；Amazon Bedrock；AWS Cloud Map；AWS AppConfig"
     )
 
     assert prompt_keys_for_request(text) == [
@@ -279,6 +280,7 @@ def test_extended_service_keywords_load_only_their_own_modules() -> None:
         "step_functions",
         "bedrock",
         "cloud_map",
+        "appconfig",
     ]
 
 

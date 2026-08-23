@@ -25,7 +25,7 @@ CORE_PROMPT = """你是 AWS 官方成本报价的需求整理员。
    ec2, eks, ecr, rds, elasticache, elb, s3, cloudfront, route53, waf, cloudwatch, backup,
    sqs, ses, ebs, data_transfer, global_accelerator, msk, mq, apigateway, scheduler,
    opensearch, documentdb, nat_gateway, secrets_manager, lambda, ecs, fargate, dynamodb, efs, fsx, sns,
-   kinesis, emr, redshift, athena, glue, step_functions, bedrock, cloud_map, eventbridge。
+   kinesis, emr, redshift, athena, glue, step_functions, bedrock, cloud_map, appconfig, eventbridge。
    遇到列表外的真实 AWS 服务时不得遗漏，使用简短、全小写的
    snake_case 官方服务简称（例如 lambda、dynamodb、step_functions、bedrock），由通用官方目录适配器核价。
    calculator_service_name 使用 AWS 官方服务名；
@@ -62,11 +62,15 @@ Worker Node 行中的 gp3 是该 EC2 的系统盘，必须写 system_disk_gib，
 Ubuntu、Amazon Linux、CentOS 均按 Linux。只有客户明确写 Windows 或其他收费系统时才保留该系统。
 16. 客户写“Kafka 消息队列/服务/集群”时，采用 AWS 托管的 Amazon MSK，输出 service=msk，
 不得询问“托管还是自建”，也不得输出 EC2 自建 Kafka。
-17. 客户只写常见软件或开源组件时必须使用可对应的 AWS 托管服务：K8S/Kubernetes 使用 EKS，
-   Kafka 使用 MSK，ES/Elasticsearch/ELK 的搜索与日志分析部分使用 OpenSearch Service；Nacos、XXL-JOB
-   等没有直接 AWS 托管等价服务的软件按 EC2 工作负载整理；MongoDB 默认使用兼容 MongoDB 的 Amazon
-   DocumentDB。只要 AWS 有对应托管服务，即使原文写“自建”或“部署在 EC2”，报价方案仍采用托管服务；
-   只有 AWS 没有对应托管产品时才使用 EC2。ELK 必须保留为独立 OpenSearch 组件，不能降级成普通 EC2。
+17. 客户只写常见软件或开源组件时，只要 AWS 托管方案能够完整覆盖原产品主要功能，就直接使用托管方案：
+   K8S/Kubernetes 使用 EKS，Kafka 使用 MSK，ES/Elasticsearch/ELK 的搜索与日志分析部分使用
+   OpenSearch Service，MongoDB 默认使用兼容 MongoDB 的 Amazon DocumentDB，Prometheus 使用
+   Amazon Managed Service for Prometheus（AMP），绝不能降级映射为 CloudWatch。完整方案可以由一个或多个
+   AWS 托管产品组成，不能只根据产品数量判断。若托管方案只能覆盖部分能力、系统无法可靠确认是否完整，
+   或会改变客户明确写出的业务含义，必须在 ambiguities 中说明主要差异，让客户选择“采用 AWS 托管方案”
+   或“保留原产品自建”，绝不能静默替换。客户选择自建后保留原产品、数量和区域，并让客户选择运行配置
+   后再报价。原文产品名的证据高于用途描述，数量、节点、区域必须原样保留。
+   ELK 必须保留为独立 OpenSearch 组件，不能降级成普通 EC2。
    RabbitMQ/ActiveMQ 使用 Amazon MQ，绝不能因为客户写了节点数量而降级成 EC2。
    客户明确要求向外部或第三方系统提供 API 公网入口时使用 API Gateway；
    “调用外部 API”仅表示出站调用，不能据此新增 API Gateway。
@@ -88,8 +92,9 @@ AWS/API/目录/缓存/字段/程序异常绝不能变成客户问题；未说明
 Redis 版本、MSK Standard/Serverless、MSK 存储类型、API Gateway REST/HTTP/WebSocket 未指定时也不要
 提问：分别保留为空或采用最低计费默认值，由后端在报价中说明。多个组件都缺区域时只问一次整单部署区域。
 凡是存在操作系统维度的计算资源，客户未指定时直接采用 Linux，不得提问；不具有操作系统维度的托管服务
-不得虚构 operating_system 字段。Kafka、RabbitMQ、Elasticsearch、MongoDB、Kubernetes 等存在 AWS
-托管服务的工作负载直接采用对应托管产品，不属于客户问题，也不提供 EC2 自建分支。
+不得虚构 operating_system 字段。完整等价的 AWS 托管产品可直接采用；只能覆盖部分能力、需要多个托管
+产品组合、或会改变客户明确节点拓扑时，必须用一句口语问题让客户选择托管组合还是保留原产品自建。
+原产品名优先于“服务发现、配置中心、消息队列”等用途词，所有数量和节点信息必须保留。
 所有客户问题必须在 ambiguities 中一次列完，不得分多轮遗漏提问。
 客户只写工作负载名称/用途而没写 CPU、内存或型号时，不得因此提问；按最低可运行配置规则补齐下限。
 """
@@ -118,8 +123,9 @@ HARD_LOWEST_COST_GUARD = """【不可覆盖的最低成本硬规则】
 可选功能未明确要求一律不启用。按量项目未给用量时只显示官方最小计费单位的单价，不虚构用量，
 也不把虚构用量计入合计。客户明确指定有效型号时才原样保留；不得为了便宜降到客户明确要求以下。
 凡报价资源具有操作系统维度且客户未指定时，一律使用 Linux，不得生成操作系统确认问题；托管服务没有
-操作系统维度时不得虚构系统字段。凡 AWS 存在对应托管产品，必须采用托管服务，不得生成 EC2 自建方案，
-也不得询问“托管还是自建”。
+操作系统维度时不得虚构系统字段。只要 AWS 托管方案能够完整等价覆盖客户原产品就自动采用，方案可以包含
+一个或多个托管产品。只能部分覆盖、系统无法可靠判断是否完整、或改变客户明确业务含义时必须询问客户；
+客户选择自建后保留原产品、数量和区域，让客户选择运行配置后再报价。客户原文信息不得因服务映射而丢失。
 这条规则适用于每一个组件，任何组件提示、模型习惯或历史报价都不得覆盖。
 """
 
@@ -196,6 +202,8 @@ worker_memory_gib, worker_system_disk_gib, total_worker_system_disk_gib。
 列出 Worker Node 而省略。原文写“每套 4 台 Worker、8核32G”时，分别填写
 worker_nodes_per_cluster=4、worker_vcpu=8、worker_memory_gib=32；程序会按集群数生成独立 EC2
 Worker 报价项。原文给总节点数时写 worker_node_count，不能把“每套数量”误当总数。
+Worker 总数必须等于 cluster_count × worker_nodes_per_cluster，例如 2 个集群、每个集群 3 台
+Worker，生成的 EC2 Worker 数量必须是 6，绝不能写成 3。
 节点型号、数量、规格、系统盘只写 worker_* 字段，不得写入控制面的 vcpu/memory，也不得额外生成 EBS。
 客户未指定 Kubernetes 版本或支持层级时不提问，采用当前标准支持的最低计费控制面方案；
 未指定 Worker 型号时，由 EC2 任务在满足节点规格后选择官方单价最低型号。
@@ -510,6 +518,17 @@ total_storage_gib 是每套全部 Broker 总容量，两者与 broker_count 必�
 字段：namespaces, service_instances, api_calls, dns_queries。没给实例数、调用量或查询量时不提问，
 只展示官方最低计费单位单价；不得把 ECS 任务数量自动复制为 Cloud Map 实例数量。
 """,
+        "appconfig": """【AWS AppConfig】
+字段：configuration_requests, configuration_retrievals, targets_receiving_configuration。
+只在客户明确要求 AWS AppConfig，或客户确认用 Cloud Map + AppConfig 替代第三方服务后使用。
+没给请求、配置获取次数或目标数量时不虚构用量，只展示官方最低计费单位参考价。
+""",
+        "amp": """【Amazon Managed Service for Prometheus（AMP）】
+service 必须写 amp。字段：active_series, samples_ingested, query_samples_processed,
+collector_hours, storage_gib。客户写 Prometheus 时优先使用 AMP，绝不能映射成 CloudWatch；
+CloudWatch 只有在客户另行明确要求日志、CloudWatch 指标或告警时才作为独立组件保留。
+客户未给指标样本、活跃序列或查询用量时不虚构，只展示官方最低计费单位参考价。
+""",
         "eventbridge": """【Amazon EventBridge】
 字段：events, event_buses, schema_discovery_events, pipes_requests。普通 EventBridge 与 Scheduler 必须分开；
 定时任务使用 scheduler。没给事件量时仅展示官方单位价，不虚构事件数或 Pipes 请求。
@@ -545,6 +564,7 @@ PROMPT_META: dict[str, dict[str, str | int]] = {
     "elb": {"title": "Elastic Load Balancing", "category": "常用组件", "order": 14},
     "cloudfront": {"title": "Amazon CloudFront", "category": "常用组件", "order": 15},
     "cloudwatch": {"title": "Amazon CloudWatch", "category": "常用组件", "order": 16},
+    "amp": {"title": "Amazon Managed Service for Prometheus", "category": "常用组件", "order": 17},
     "backup": {"title": "AWS Backup", "category": "常用组件", "order": 17},
     "route53": {"title": "Amazon Route 53", "category": "网络与安全", "order": 20},
     "waf": {"title": "AWS WAF", "category": "网络与安全", "order": 21},
@@ -587,7 +607,8 @@ PROMPT_META.update(
         "step_functions": {"title": "AWS Step Functions", "category": "应用集成", "order": 72},
         "bedrock": {"title": "Amazon Bedrock", "category": "AI 与机器学习", "order": 73},
         "cloud_map": {"title": "AWS Cloud Map", "category": "网络与安全", "order": 74},
-        "eventbridge": {"title": "Amazon EventBridge", "category": "应用集成", "order": 75},
+        "appconfig": {"title": "AWS AppConfig", "category": "应用集成", "order": 75},
+        "eventbridge": {"title": "Amazon EventBridge", "category": "应用集成", "order": 76},
     }
 )
 
@@ -732,6 +753,12 @@ SERVICE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "sqs": ("amazon sqs", "sqs", "异步队列"),
     "ses": ("amazon ses", "ses", "邮件验证码", "邮件通知"),
     "cloudwatch": ("cloudwatch", "日志和监控", "日志监控"),
+    "amp": (
+        "amazon managed service for prometheus",
+        "managed prometheus",
+        "prometheus",
+        "amp 监控",
+    ),
     "backup": ("aws backup", "集中备份", "业务数据备份"),
     "ebs": ("amazon ebs", "ebs", "云硬盘", "云盘"),
     "data_transfer": ("公网出网流量", "公网出站流量", "aws data transfer"),
@@ -782,7 +809,8 @@ SERVICE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "mq": ("amazon mq", "rabbitmq", "active mq", "activemq", "mq."),
     "step_functions": ("aws step functions", "step functions", "stepfunctions", "状态机工作流"),
     "bedrock": ("amazon bedrock", "bedrock 模型"),
-    "cloud_map": ("aws cloud map", "cloud map", "服务注册发现"),
+    "cloud_map": ("aws cloud map", "cloud map"),
+    "appconfig": ("aws appconfig", "appconfig"),
     # Scheduler has its own rule. Avoid a bare "eventbridge" keyword here so
     # an EventBridge Scheduler request does not load two competing modules.
     "eventbridge": ("eventbridge event bus", "eventbridge 事件总线", "eventbridge 事件规则"),
@@ -808,8 +836,10 @@ INVENTORY_RUNTIME_PROMPT = """你只负责把客户原文按独立组件拆开�
 2. source_text 必须复制足以理解该组件的完整原话；不要改写，不要混入其他组件内容。
 3. requirements 固定为空对象。未写区域用 null；未写数量用 1；不得猜测或补充。
 4. Kafka 识别为 msk；RabbitMQ/ActiveMQ 识别为 mq；K8S/Kubernetes 为 eks；
-   ES/ELK 为 opensearch；MongoDB 为 documentdb；Nacos、XXL-JOB 等无对应托管服务的软件为 ec2。
-   凡 AWS 存在对应托管服务都必须使用托管产品，不生成 EC2 自建替代方案。
+   ES/ELK 为 opensearch；MongoDB 为 documentdb。原文明确写出的第三方产品名高于用途词：没有完整等价
+   托管方案时识别为 ec2；托管方案只能部分覆盖或系统无法确认完整性时，先保留原产品自建组件及原节点数，
+   并在 ambiguities 说明差异，让客户选择 AWS 托管方案还是自建。Nacos 是其中一个例子：不能因为
+   “服务注册发现”几个字直接改成只包含 Cloud Map，而丢掉配置中心能力和节点数。
    向外部/第三方系统提供 API 入口识别为 apigateway；
    调用外部 API 不等于 API Gateway。
 5. VPC、子网等零基础费组件也不能遗漏。组合写法如“Secrets Manager / KMS”、

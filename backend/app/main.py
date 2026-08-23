@@ -5,61 +5,69 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError
 from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
 from app.core.errors import QuoteError
 from app.domain.models import (
+    ConfigurationFeedbackSubmission,
     ConfirmationSessionResponse,
     ConfirmationSubmission,
-    ConfigurationFeedbackSubmission,
     ErrorResponse,
     QuotePreviewResponse,
     QuoteRequest,
     QuoteResponse,
 )
+from app.integrations.ai_gateway import AiGateway
+from app.integrations.auto_service_discovery import AutoServiceDiscovery
 from app.integrations.aws import AwsClients, PricingCatalog, RegionResolver
+from app.integrations.azure_auto_service_discovery import AzureAutoServiceDiscovery
+from app.integrations.azure_catalog import AzureOfficialCatalog
+from app.integrations.azure_intent import AzureIntentParser
+from app.integrations.azure_prompt_library import (
+    azure_prompt_library_payload,
+    update_azure_prompt_text,
+)
+from app.integrations.azure_warmup import AzureCatalogWarmer
 from app.integrations.catalog_warmup import CommonCatalogWarmer
+from app.integrations.component_result_cache import ValidatedComponentResultCache
 from app.integrations.deepseek import DeepSeekIntentParser
 from app.integrations.ec2_calculator_capabilities import EC2_CALCULATOR_CAPABILITIES
 from app.integrations.prompt_library import prompt_library_payload, update_prompt_text
-from app.integrations.azure_prompt_library import azure_prompt_library_payload, update_azure_prompt_text
+from app.services.azure_plugins import AzurePluginRegistry
+from app.services.azure_quote_service import AzureQuoteService
 from app.services.bcm_estimator import BcmWorkloadEstimator
 from app.services.confirmation_sessions import ConfirmationSessionStore
 from app.services.plugins import (
     AlbPlugin,
+    ApiGatewayPlugin,
     CloudFrontPlugin,
+    CloudWatchPlugin,
+    DataTransferPlugin,
+    EbsPlugin,
     Ec2Plugin,
+    EventBridgeSchedulerPlugin,
+    GlobalAcceleratorPlugin,
+    MskPlugin,
+    NatGatewayPlugin,
+    OpenSearchPlugin,
     PluginRegistry,
     RdsPlugin,
     RedisPlugin,
-    S3Plugin,
-    CloudWatchPlugin,
     Route53Plugin,
+    S3Plugin,
     SesPlugin,
     SqsPlugin,
     WafPlugin,
-    DataTransferPlugin,
-    EbsPlugin,
-    GlobalAcceleratorPlugin,
-    MskPlugin,
-    ApiGatewayPlugin,
-    EventBridgeSchedulerPlugin,
-    OpenSearchPlugin,
-    NatGatewayPlugin,
 )
+from app.services.plugins.generic_official import GenericOfficialPlugin
 from app.services.quote_jobs import QuoteJobManager
 from app.services.quote_service import QuoteService
-from app.services.azure_quote_service import AzureQuoteService
-from app.integrations.ai_gateway import AiGateway
-from app.integrations.auto_service_discovery import AutoServiceDiscovery
-from app.integrations.component_result_cache import ValidatedComponentResultCache
-from app.services.plugins.generic_official import GenericOfficialPlugin
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -91,8 +99,13 @@ plugins = PluginRegistry(
     ]
 )
 estimator = BcmWorkloadEstimator(clients, settings)
-confirmation_sessions = ConfirmationSessionStore(
-    Path(__file__).resolve().parents[1] / ".cache" / "confirmation_sessions.sqlite3"
+aws_confirmation_sessions = ConfirmationSessionStore(
+    Path(__file__).resolve().parents[1] / ".cache" / "aws_confirmation_sessions.sqlite3",
+    "aws",
+)
+azure_confirmation_sessions = ConfirmationSessionStore(
+    Path(__file__).resolve().parents[1] / ".cache" / "azure_confirmation_sessions.sqlite3",
+    "azure",
 )
 quote_service = QuoteService(
     DeepSeekIntentParser(
@@ -103,13 +116,31 @@ quote_service = QuoteService(
     plugins,
     estimator,
     None,
-    confirmation_sessions,
+    aws_confirmation_sessions,
     settings.ai_display_name,
     GenericOfficialPlugin(clients, catalog, auto_service_discovery),
 )
-quote_jobs = QuoteJobManager(quote_service)
-azure_quote_service = AzureQuoteService(AiGateway(settings))
-azure_quote_jobs = QuoteJobManager(azure_quote_service, "Microsoft Azure")
+quote_jobs = QuoteJobManager(quote_service, "AWS", "aws")
+azure_catalog = AzureOfficialCatalog(settings)
+azure_auto_service_discovery = AzureAutoServiceDiscovery(azure_catalog)
+azure_component_cache = ValidatedComponentResultCache(
+    Path(__file__).resolve().parents[1]
+    / ".cache"
+    / "azure_validated_component_results.sqlite3"
+)
+azure_quote_service = AzureQuoteService(
+    AzureIntentParser(
+        AiGateway(settings),
+        azure_component_cache,
+        settings.ai_model,
+        azure_auto_service_discovery,
+    ),
+    AzurePluginRegistry(azure_catalog, azure_auto_service_discovery),
+    azure_confirmation_sessions,
+    settings.ai_display_name,
+)
+azure_quote_jobs = QuoteJobManager(azure_quote_service, "Microsoft Azure", "azure")
+azure_catalog_warmer = AzureCatalogWarmer(azure_catalog)
 # Keep background prewarming on separate boto3 clients. This prevents its
 # adaptive retry state and HTTP connection pool from delaying foreground quotes.
 warmup_clients = AwsClients.from_settings(settings)
@@ -143,6 +174,12 @@ async def warm_common_aws_catalogs() -> None:
 
     asyncio.create_task(delayed_warmup())
 
+    async def delayed_azure_warmup() -> None:
+        await asyncio.sleep(30)
+        await azure_catalog_warmer.warm()
+
+    asyncio.create_task(delayed_azure_warmup())
+
     async def maintain_official_field_profiles() -> None:
         # Scan periodically, but only refresh rows older than ten days (or
         # failed rows whose shorter retry window has elapsed). Quoting remains
@@ -155,6 +192,13 @@ async def warm_common_aws_catalogs() -> None:
                 )
                 if result["refreshed"] or result["failed"]:
                     logger.info("Official field profile maintenance: %s", result)
+                await azure_catalog_warmer.warm(refresh_profiles=True)
+                dynamic_result = await azure_auto_service_discovery.refresh_used_profiles()
+                logger.info(
+                    "Azure official field profile maintenance: fixed=%s dynamic=%s",
+                    azure_catalog_warmer.status.as_dict(),
+                    dynamic_result,
+                )
             except Exception:
                 logger.exception("Official field profile maintenance failed")
             await asyncio.sleep(6 * 60 * 60)
@@ -279,7 +323,10 @@ async def update_prompt_library_item(key: str, request: PromptUpdate, provider: 
 
 @app.get("/api/cache/status")
 async def cache_status() -> dict[str, object]:
-    return catalog_warmer.status.as_dict()
+    return {
+        "aws": catalog_warmer.status.as_dict(),
+        "azure": azure_catalog_warmer.status.as_dict(),
+    }
 
 
 @app.get("/api/capabilities/ec2")
@@ -298,12 +345,28 @@ async def preview_quote(request: QuoteRequest) -> QuotePreviewResponse:
     return await quote_service.preview(request)
 
 
+def _confirmation_store_for_token(token: str) -> ConfirmationSessionStore | None:
+    if token.startswith("aws_"):
+        return aws_confirmation_sessions
+    if token.startswith("azure_"):
+        return azure_confirmation_sessions
+    # Keep an already-open customer link usable after the stores were split.
+    # An unprefixed token is accepted only when it has been explicitly placed
+    # in exactly one provider store, so it can never cross cloud engines.
+    in_aws = aws_confirmation_sessions.get(token) is not None
+    in_azure = azure_confirmation_sessions.get(token) is not None
+    if in_aws != in_azure:
+        return aws_confirmation_sessions if in_aws else azure_confirmation_sessions
+    return None
+
+
 @app.get(
     "/api/confirmation-sessions/{token}",
     response_model=ConfirmationSessionResponse,
 )
 async def get_confirmation_session(token: str) -> ConfirmationSessionResponse | JSONResponse:
-    session = confirmation_sessions.get(token)
+    store = _confirmation_store_for_token(token)
+    session = store.get(token) if store is not None else None
     if session is None:
         return JSONResponse(status_code=404, content={"message": "确认单不存在或已失效"})
     return session
@@ -316,8 +379,11 @@ async def get_confirmation_session(token: str) -> ConfirmationSessionResponse | 
 async def submit_confirmation_session(
     token: str, submission: ConfirmationSubmission
 ) -> ConfirmationSessionResponse | JSONResponse:
+    store = _confirmation_store_for_token(token)
+    if store is None:
+        return JSONResponse(status_code=404, content={"message": "确认单不存在或已失效"})
     try:
-        session = confirmation_sessions.submit(token, submission.answers)
+        session = store.submit(token, submission.answers)
     except ValueError as exc:
         return JSONResponse(status_code=422, content={"message": str(exc)})
     if session is None:
@@ -332,8 +398,11 @@ async def submit_confirmation_session(
 async def approve_confirmation_configuration(
     token: str,
 ) -> ConfirmationSessionResponse | JSONResponse:
+    store = _confirmation_store_for_token(token)
+    if store is None:
+        return JSONResponse(status_code=404, content={"message": "确认单不存在或已失效"})
     try:
-        session = confirmation_sessions.approve_configuration(token)
+        session = store.approve_configuration(token)
     except ValueError as exc:
         return JSONResponse(status_code=409, content={"message": str(exc)})
     if session is None:
@@ -348,8 +417,11 @@ async def approve_confirmation_configuration(
 async def submit_configuration_feedback(
     token: str, submission: ConfigurationFeedbackSubmission
 ) -> ConfirmationSessionResponse | JSONResponse:
+    store = _confirmation_store_for_token(token)
+    if store is None:
+        return JSONResponse(status_code=404, content={"message": "确认单不存在或已失效"})
     try:
-        session = confirmation_sessions.submit_configuration_feedback(
+        session = store.submit_configuration_feedback(
             token,
             feedback=submission.feedback,
             component_feedback=submission.component_feedback,
@@ -385,18 +457,23 @@ async def start_quote_job(request: QuoteRequest) -> dict[str, str]:
 async def start_preview_job(request: QuoteRequest) -> dict[str, str]:
     """Start AWS configuration review with live component progress."""
 
-    if request.cloud_provider == "azure":
-        return JSONResponse(
-            status_code=422,
-            content={"message": "Azure 配置核验暂不支持实时任务"},
-        )
-    job = quote_jobs.start_preview(request)
+    job = (
+        azure_quote_jobs.start_preview(request)
+        if request.cloud_provider == "azure"
+        else quote_jobs.start_preview(request)
+    )
     return {"job_id": job.job_id, "status": job.status}
 
 
 @app.get("/api/quote-jobs/{job_id}")
 async def get_quote_job(job_id: str) -> JSONResponse:
-    job = quote_jobs.get(job_id) or azure_quote_jobs.get(job_id)
+    job = (
+        quote_jobs.get(job_id)
+        if job_id.startswith("aws-")
+        else azure_quote_jobs.get(job_id)
+        if job_id.startswith("azure-")
+        else None
+    )
     if job is None:
         return JSONResponse(status_code=404, content={"message": "报价任务不存在"})
     return JSONResponse(content=job.public())

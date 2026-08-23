@@ -7,6 +7,7 @@ import sqlite3
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from app.domain.customer_configuration import preserve_customer_configuration
 from app.domain.models import (
@@ -25,8 +26,13 @@ CONFIGURATION_COMPONENT_DELETE = "__DELETE_COMPONENT__"
 class ConfirmationSessionStore:
     """Persistent customer-confirmation forms tied to structured quote drafts."""
 
-    def __init__(self, database_path: Path):
+    def __init__(
+        self,
+        database_path: Path,
+        cloud_provider: Literal["aws", "azure"] = "aws",
+    ):
         self._database_path = database_path
+        self.cloud_provider = cloud_provider
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._initialize()
@@ -72,7 +78,11 @@ class ConfirmationSessionStore:
                 "SELECT token FROM confirmation_sessions WHERE draft_id = ?",
                 (draft_id,),
             ).fetchone()
-            token = str(existing["token"]) if existing else secrets.token_urlsafe(18)
+            token = (
+                str(existing["token"])
+                if existing
+                else f"{self.cloud_provider}_{secrets.token_urlsafe(18)}"
+            )
             connection.execute(
                 """
                 INSERT INTO confirmation_sessions (
@@ -104,9 +114,29 @@ class ConfirmationSessionStore:
         row = self._row(token)
         if row is None:
             return None
+        # A worker can be interrupted after the row was marked ``reviewing``.
+        # Never strand the customer on a permanent spinner: after the maximum
+        # bounded revision window, restore the same saved configuration table.
+        if str(row["status"]) in {"reviewing", "submitted"} and row["submitted_at"]:
+            submitted_at = datetime.fromisoformat(str(row["submitted_at"]))
+            if (datetime.now(UTC) - submitted_at).total_seconds() > 90:
+                with self._lock, self._connect() as connection:
+                    connection.execute(
+                        """
+                        UPDATE confirmation_sessions
+                        SET status = 'configuration_review',
+                            confirmation_text = ?
+                        WHERE token = ? AND status IN ('reviewing', 'submitted')
+                        """,
+                        ("这次修改没有完成，原配置已保留，请重新提交。", token),
+                    )
+                row = self._row(token)
+                if row is None:
+                    return None
         intent = ParsedIntent.model_validate_json(str(row["intent_json"]))
-        preserve_customer_configuration(intent)
-        self._normalize_review_group_quantities(intent)
+        if self.cloud_provider == "aws":
+            preserve_customer_configuration(intent)
+            self._normalize_review_group_quantities(intent)
         configuration_items = [
             ConfigurationReviewItem(
                 component_id=str(index),
@@ -153,6 +183,7 @@ class ConfirmationSessionStore:
         )
         return ConfirmationSessionResponse(
             token=str(row["token"]),
+            cloud_provider=self.cloud_provider,
             status=str(row["status"]),
             customer_summary=(
                 self._configuration_summary(intent)
@@ -217,6 +248,7 @@ class ConfirmationSessionStore:
         *,
         draft_id: str,
         intent: ParsedIntent,
+        confirmation_text: str | None = None,
     ) -> str | None:
         """Reuse the same link for the final, price-free configuration review."""
 
@@ -238,7 +270,8 @@ class ConfirmationSessionStore:
                 """,
                 (
                     intent.model_dump_json(),
-                    "请确认最终配置清单，确认后系统才会开始报价。",
+                    confirmation_text
+                    or "请确认最终配置清单，确认后系统才会开始报价。",
                     now,
                     draft_id,
                 ),
@@ -331,7 +364,8 @@ class ConfirmationSessionStore:
         if row is None:
             return None
         intent = ParsedIntent.model_validate_json(str(row["intent_json"]))
-        preserve_customer_configuration(intent)
+        if self.cloud_provider == "aws":
+            preserve_customer_configuration(intent)
         return str(row["customer_request"]), intent
 
     def partition_answers_by_component(
