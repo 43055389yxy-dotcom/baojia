@@ -1,21 +1,19 @@
 #!/bin/bash
 set -euo pipefail
 
-APP_DIR=/home/ec2-user/astraquote/source
-REPO_URL=https://github.com/43055389yxy-dotcom/baojia.git
+APP_DIR="${WORKSPACE:?Jenkins workspace is unavailable}"
 
-mkdir -p /home/ec2-user/astraquote/data /home/ec2-user/astraquote/config
+test -f /home/ec2-user/astraquote/config/backend.env
+test -d /home/ec2-user/astraquote/data
 
-if [ ! -d "$APP_DIR/.git" ]; then
-  git clone "$REPO_URL" "$APP_DIR"
-fi
+# Jenkins 已通过“源码管理”检出代码。将工作区打包送入 Docker，
+# 避免容器内工作区路径与宿主机路径不同导致构建失败。
+tar -C "$APP_DIR" -cf - . \
+  | docker build --pull -f deploy/Dockerfile -t astraquote:production -
 
-git -C "$APP_DIR" fetch --prune origin
-git -C "$APP_DIR" checkout main
-git -C "$APP_DIR" pull --ff-only origin main
-
-docker compose -f "$APP_DIR/deploy/compose.production.yml" build --pull
-docker compose -p astraquote -f "$APP_DIR/deploy/compose.production.yml" up -d
+docker compose -p astraquote \
+  -f "$APP_DIR/deploy/compose.production.yml" \
+  up -d --no-build
 docker image prune -f --filter "until=168h"
 
 for attempt in {1..24}; do
