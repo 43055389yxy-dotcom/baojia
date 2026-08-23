@@ -1,0 +1,30 @@
+services:
+  astraquote:
+    image: astraquote:production
+    container_name: astraquote
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - /home/ec2-user/astraquote/config/backend.env
+    environment:
+      BACKEND_API_URL: http://127.0.0.1:8000
+      CALCULATOR_BROWSER_CHANNEL: chrome
+    volumes:
+      - /home/ec2-user/astraquote/data:/app/backend/.cache
+    networks:
+      - caddy-net
+    deploy:
+      resources:
+        limits:
+          memory: 1800M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  caddy-net:
+    external: true

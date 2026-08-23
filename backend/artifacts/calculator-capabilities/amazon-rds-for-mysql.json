@@ -1,0 +1,6222 @@
+{
+  "schema_version": 1,
+  "service": "Amazon RDS for MySQL",
+  "source": "https://calculator.aws/#/addService",
+  "observed_at": "2026-08-08T21:39:10.050050+00:00",
+  "state_count": 8,
+  "branch_attempt_count": 131,
+  "truncated": true,
+  "branch_attempts": [
+    {
+      "path": [],
+      "success": true,
+      "fingerprint": "294660e96fabe353"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "选择位置类型信息",
+          "occurrence": 0,
+          "position": 0,
+          "choice": "本地区域"
+        }
+      ],
+      "success": true,
+      "fingerprint": "5bb18b88579465ea"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "利用率（仅限按需） 单位",
+          "occurrence": 0,
+          "position": 1,
+          "choice": "Hours/Day"
+        }
+      ],
+      "success": true,
+      "fingerprint": "294660e96fabe353"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "利用率（仅限按需） 单位",
+          "occurrence": 0,
+          "position": 1,
+          "choice": "Hours/Week"
+        }
+      ],
+      "success": true,
+      "fingerprint": "294660e96fabe353"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "利用率（仅限按需） 单位",
+          "occurrence": 0,
+          "position": 1,
+          "choice": "Hours/Month"
+        }
+      ],
+      "success": true,
+      "fingerprint": "294660e96fabe353"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "部署选项",
+          "occurrence": 0,
+          "position": 2,
+          "choice": "Single-AZ"
+        }
+      ],
+      "success": true,
+      "fingerprint": "294660e96fabe353"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "您希望使用数据库创建 RDS 代理吗？",
+          "occurrence": 0,
+          "position": 4,
+          "choice": "否"
+        }
+      ],
+      "success": true,
+      "fingerprint": "294660e96fabe353"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "通用型 SSD（gp3）"
+        }
+      ],
+      "success": true,
+      "fingerprint": "294660e96fabe353"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        }
+      ],
+      "success": true,
+      "fingerprint": "220c6054257aeeb1"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        }
+      ],
+      "success": true,
+      "fingerprint": "d93527962525d384"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "磁介质（上一代）"
+        }
+      ],
+      "success": true,
+      "fingerprint": "294660e96fabe353"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "单位 存储量",
+          "occurrence": 0,
+          "position": 6,
+          "choice": "MB"
+        }
+      ],
+      "success": true,
+      "fingerprint": "294660e96fabe353"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "单位 存储量",
+          "occurrence": 0,
+          "position": 6,
+          "choice": "TB"
+        }
+      ],
+      "success": true,
+      "fingerprint": "294660e96fabe353"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "您会为数据库启用 Database Insights 吗？",
+          "occurrence": 0,
+          "position": 7,
+          "choice": "否"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 您会为数据库启用 Database Insights 吗？ key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "1 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "2 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "3 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "4 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "5 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "6 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "7 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "8 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "9 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "10 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "11 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "12 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "13 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "14 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "15 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "16 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "17 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "18 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "19 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "20 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "21 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "22 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "23 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "24 个月"
+        }
+      ],
+      "success": false,
+      "error": "control_not_found: 性能详情的保留期 key=None count=0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "否"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for get_by_role(\"button\", name=re.compile(r\"^您是否计划运行扩展支持主要版本（例如\\ MySQL\\ 5\\.7\\ 或更高版本）？(?:\\s|$)\", re.IGNORECASE)).and_(locator(\"button[aria-haspopup=\\\"listbox\\\"]\")).first\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\""
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价）",
+          "occurrence": 0,
+          "position": 10,
+          "choice": "第 3 年的费用"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for get_by_role(\"button\", name=re.compile(r\"^请选择\\ RDS\\ 扩展支持的定价年份（第\\ 3\\ 年的定价高于前\\ 2\\ 年的定价）(?:\\s|$)\", re.IGNORECASE)).and_(locator(\"button[aria-haspopup=\\\"listbox\\\"]\")).first\n    - locator resolved to <button type=\"button\" aria-expanded=\"fal"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "occurrence": 0,
+          "position": 11,
+          "choice": "每天"
+        }
+      ],
+      "success": true,
+      "fingerprint": "4882d1933c6e8674"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "occurrence": 0,
+          "position": 11,
+          "choice": "每周"
+        }
+      ],
+      "success": true,
+      "fingerprint": "e06a08ef71c395bc"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "选择位置类型信息",
+          "occurrence": 0,
+          "position": 0,
+          "choice": "本地区域"
+        },
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 4,
+          "choice": "预调配 IOPS SSD（io1）"
+        }
+      ],
+      "success": false,
+      "error": "option_not_found: 每个 RDS 实例的存储 -> 预调配 IOPS SSD（io1）; visible=['每天', '每周', '每月']"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "选择位置类型信息",
+          "occurrence": 0,
+          "position": 0,
+          "choice": "本地区域"
+        },
+        {
+          "kind": "dropdown",
+          "control": "单位 存储量",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "MB"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for get_by_role(\"button\", name=re.compile(r\"^单位\\ 存储量(?:\\s|$)\", re.IGNORECASE)).and_(locator(\"button[aria-haspopup=\\\"listbox\\\"]\")).first\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"form"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "选择位置类型信息",
+          "occurrence": 0,
+          "position": 0,
+          "choice": "本地区域"
+        },
+        {
+          "kind": "dropdown",
+          "control": "单位 存储量",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "TB"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for get_by_role(\"button\", name=re.compile(r\"^单位\\ 存储量(?:\\s|$)\", re.IGNORECASE)).and_(locator(\"button[aria-haspopup=\\\"listbox\\\"]\")).first\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"form"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "选择位置类型信息",
+          "occurrence": 0,
+          "position": 0,
+          "choice": "本地区域"
+        },
+        {
+          "kind": "dropdown",
+          "control": "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+          "occurrence": 0,
+          "position": 6,
+          "choice": "否"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for get_by_role(\"button\", name=re.compile(r\"^您是否计划运行扩展支持主要版本（例如\\ MySQL\\ 5\\.7\\ 或更高版本）？(?:\\s|$)\", re.IGNORECASE)).and_(locator(\"button[aria-haspopup=\\\"listbox\\\"]\")).first\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\""
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "选择位置类型信息",
+          "occurrence": 0,
+          "position": 0,
+          "choice": "本地区域"
+        },
+        {
+          "kind": "dropdown",
+          "control": "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价）",
+          "occurrence": 0,
+          "position": 7,
+          "choice": "第 3 年的费用"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for get_by_role(\"button\", name=re.compile(r\"^请选择\\ RDS\\ 扩展支持的定价年份（第\\ 3\\ 年的定价高于前\\ 2\\ 年的定价）(?:\\s|$)\", re.IGNORECASE)).and_(locator(\"button[aria-haspopup=\\\"listbox\\\"]\")).first\n    - locator resolved to <button type=\"button\" aria-expanded=\"fal"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "选择位置类型信息",
+          "occurrence": 0,
+          "position": 0,
+          "choice": "本地区域"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225083888-9821\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "利用率（仅限按需） 单位",
+          "occurrence": 0,
+          "position": 1,
+          "choice": "Hours/Day"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225083908-8236\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "利用率（仅限按需） 单位",
+          "occurrence": 0,
+          "position": 1,
+          "choice": "Hours/Week"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225092075-1618\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "利用率（仅限按需） 单位",
+          "occurrence": 0,
+          "position": 1,
+          "choice": "Hours/Month"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225092070-8769\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "部署选项",
+          "occurrence": 0,
+          "position": 2,
+          "choice": "Single-AZ"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225092162-3711\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "您希望使用数据库创建 RDS 代理吗？",
+          "occurrence": 0,
+          "position": 4,
+          "choice": "否"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225092346-8542\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "单位 存储量",
+          "occurrence": 0,
+          "position": 6,
+          "choice": "MB"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225092471-6939\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "单位 存储量",
+          "occurrence": 0,
+          "position": 6,
+          "choice": "TB"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225092491-4883\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "专用日志卷",
+          "occurrence": 0,
+          "position": 7,
+          "choice": "是"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225092689-3782\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "您会为数据库启用 Database Insights 吗？",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "否"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225092911-141\" class=\"awsui_button-trigger_18eso_plnu9_161 aws"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "1 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225092911-2046\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "2 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225093050-7513\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "3 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225093159-9346\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "4 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225093124-86\" class=\"awsui_button-trigger_18eso_plnu9_161 awsu"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "5 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225100596-1632\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "6 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225100568-5884\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "7 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225100551-3407\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "8 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225100576-5903\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "9 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225100590-286\" class=\"awsui_button-trigger_18eso_plnu9_161 aws"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "10 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225100953-6270\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "11 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225101010-6698\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "12 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225101233-653\" class=\"awsui_button-trigger_18eso_plnu9_161 aws"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "13 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225101104-4332\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "14 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225101448-811\" class=\"awsui_button-trigger_18eso_plnu9_161 aws"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "15 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225101609-7168\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "16 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225101328-2308\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "17 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225108785-2741\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "18 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225108836-8320\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "19 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225108895-3711\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "20 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225109009-1400\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "21 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225109114-5257\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "22 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225109194-2393\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "23 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225109278-566\" class=\"awsui_button-trigger_18eso_plnu9_161 aws"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "24 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225110035-5112\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+          "occurrence": 0,
+          "position": 10,
+          "choice": "否"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225109743-9733\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价）",
+          "occurrence": 0,
+          "position": 11,
+          "choice": "第 3 年的费用"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225110040-9409\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "occurrence": 0,
+          "position": 12,
+          "choice": "每天"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225110006-9910\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "occurrence": 0,
+          "position": 12,
+          "choice": "每周"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225109720-7799\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "选择位置类型信息",
+          "occurrence": 0,
+          "position": 0,
+          "choice": "本地区域"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225117570-5247\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "利用率（仅限按需） 单位",
+          "occurrence": 0,
+          "position": 1,
+          "choice": "Hours/Day"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225117752-5300\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "利用率（仅限按需） 单位",
+          "occurrence": 0,
+          "position": 1,
+          "choice": "Hours/Week"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225117718-2716\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "利用率（仅限按需） 单位",
+          "occurrence": 0,
+          "position": 1,
+          "choice": "Hours/Month"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225117784-4263\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "部署选项",
+          "occurrence": 0,
+          "position": 2,
+          "choice": "Single-AZ"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225117962-5127\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "您希望使用数据库创建 RDS 代理吗？",
+          "occurrence": 0,
+          "position": 4,
+          "choice": "否"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225118067-7008\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "单位 存储量",
+          "occurrence": 0,
+          "position": 6,
+          "choice": "MB"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225118101-1115\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "单位 存储量",
+          "occurrence": 0,
+          "position": 6,
+          "choice": "TB"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225118109-2446\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "专用日志卷",
+          "occurrence": 0,
+          "position": 7,
+          "choice": "是"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225118809-2806\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "您会为数据库启用 Database Insights 吗？",
+          "occurrence": 0,
+          "position": 8,
+          "choice": "否"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225118376-6626\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "1 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225118527-9429\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "2 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225118337-7364\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "3 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225125995-3430\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "4 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225125997-3543\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "5 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225126064-2139\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "6 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225126193-4461\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "7 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225126331-3451\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "8 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225126539-3482\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "9 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225126635-7190\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "10 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225126716-6102\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "11 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225127131-7973\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "12 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225126981-5283\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "13 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225127113-7467\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "14 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225126982-6260\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "15 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225134453-3084\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "16 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225134489-9755\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "17 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225134517-6549\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "18 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225134759-5044\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "19 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225134845-2873\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "20 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225134905-4102\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "21 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225135151-3929\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "22 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225135780-522\" class=\"awsui_button-trigger_18eso_plnu9_161 aws"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "23 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225135625-2854\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "性能详情的保留期",
+          "occurrence": 0,
+          "position": 9,
+          "choice": "24 个月"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225135668-4165\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+          "occurrence": 0,
+          "position": 10,
+          "choice": "否"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225135884-183\" class=\"awsui_button-trigger_18eso_plnu9_161 aws"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价）",
+          "occurrence": 0,
+          "position": 11,
+          "choice": "第 3 年的费用"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225135375-2011\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "occurrence": 0,
+          "position": 12,
+          "choice": "每天"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225142923-3482\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        },
+        {
+          "kind": "dropdown",
+          "control": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "occurrence": 0,
+          "position": 12,
+          "choice": "每周"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"main button[aria-haspopup=\\\"listbox\\\"]\").nth(5)\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"formField329-1786225143072-5749\" class=\"awsui_button-trigger_18eso_plnu9_161 aw"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "occurrence": 0,
+          "position": 11,
+          "choice": "每天"
+        },
+        {
+          "kind": "dropdown",
+          "control": "选择位置类型信息",
+          "occurrence": 0,
+          "position": 0,
+          "choice": "区域"
+        }
+      ],
+      "success": true,
+      "fingerprint": "43ec10f3365176bf"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "occurrence": 0,
+          "position": 11,
+          "choice": "每天"
+        },
+        {
+          "kind": "dropdown",
+          "control": "单位 存储量",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "MB"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for get_by_role(\"button\", name=re.compile(r\"^单位\\ 存储量(?:\\s|$)\", re.IGNORECASE)).and_(locator(\"button[aria-haspopup=\\\"listbox\\\"]\")).first\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"form"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "occurrence": 0,
+          "position": 11,
+          "choice": "每天"
+        },
+        {
+          "kind": "dropdown",
+          "control": "单位 存储量",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "TB"
+        }
+      ],
+      "success": true,
+      "fingerprint": "f51985322cb93db0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "occurrence": 0,
+          "position": 11,
+          "choice": "每天"
+        },
+        {
+          "kind": "dropdown",
+          "control": "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+          "occurrence": 0,
+          "position": 6,
+          "choice": "否"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for get_by_role(\"button\", name=re.compile(r\"^您是否计划运行扩展支持主要版本（例如\\ MySQL\\ 5\\.7\\ 或更高版本）？(?:\\s|$)\", re.IGNORECASE)).and_(locator(\"button[aria-haspopup=\\\"listbox\\\"]\")).first\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\""
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "occurrence": 0,
+          "position": 11,
+          "choice": "每周"
+        },
+        {
+          "kind": "dropdown",
+          "control": "选择位置类型信息",
+          "occurrence": 0,
+          "position": 0,
+          "choice": "区域"
+        }
+      ],
+      "success": true,
+      "fingerprint": "43ec10f3365176bf"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "occurrence": 0,
+          "position": 11,
+          "choice": "每周"
+        },
+        {
+          "kind": "dropdown",
+          "control": "单位 存储量",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "MB"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for get_by_role(\"button\", name=re.compile(r\"^单位\\ 存储量(?:\\s|$)\", re.IGNORECASE)).and_(locator(\"button[aria-haspopup=\\\"listbox\\\"]\")).first\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\" aria-haspopup=\"listbox\" id=\"form"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "occurrence": 0,
+          "position": 11,
+          "choice": "每周"
+        },
+        {
+          "kind": "dropdown",
+          "control": "单位 存储量",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "TB"
+        }
+      ],
+      "success": true,
+      "fingerprint": "f51985322cb93db0"
+    },
+    {
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "occurrence": 0,
+          "position": 11,
+          "choice": "每周"
+        },
+        {
+          "kind": "dropdown",
+          "control": "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+          "occurrence": 0,
+          "position": 6,
+          "choice": "否"
+        }
+      ],
+      "success": false,
+      "error": "TimeoutError: Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for get_by_role(\"button\", name=re.compile(r\"^您是否计划运行扩展支持主要版本（例如\\ MySQL\\ 5\\.7\\ 或更高版本）？(?:\\s|$)\", re.IGNORECASE)).and_(locator(\"button[aria-haspopup=\\\"listbox\\\"]\")).first\n    - locator resolved to <button type=\"button\" aria-expanded=\"false\""
+    }
+  ],
+  "states": [
+    {
+      "fingerprint": "294660e96fabe353",
+      "path": [],
+      "controls": [
+        {
+          "key": "formField1268-1786225055740-5729",
+          "name": "Description - optional",
+          "role": "input",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "输入估算的描述",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1269-1786225055740-9907",
+          "name": "选择位置类型信息",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "区域",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 0,
+          "choices": [
+            {
+              "label": "区域",
+              "selected": true
+            },
+            {
+              "label": "本地区域",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1282-1786225055740-6798",
+          "name": "选择一个区域 美国东部（俄亥俄州）",
+          "role": "button",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": true,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "input:3:",
+          "name": "",
+          "role": "combobox",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": true,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1504-1786225056187-4263",
+          "name": "节点",
+          "role": "input",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "1",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "input1505-1786225056188-4817",
+          "name": "Select an instance",
+          "role": "combobox",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "db.m4.10xlarge",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "Select an instance",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "button:6:清除输入",
+          "name": "清除输入",
+          "role": "button",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1514-1786225056189-1514",
+          "name": "利用率（仅限按需） 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "100",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1515-1786225056189-9755",
+          "name": "利用率（仅限按需） 单位",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "%Utilized/Month",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 1,
+          "choices": [
+            {
+              "label": "%Utilized/Month",
+              "selected": true
+            },
+            {
+              "label": "Hours/Day",
+              "selected": false
+            },
+            {
+              "label": "Hours/Week",
+              "selected": false
+            },
+            {
+              "label": "Hours/Month",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1525-1786225056190-2752",
+          "name": "部署选项",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "Multi-AZ",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 2,
+          "choices": [
+            {
+              "label": "Multi-AZ",
+              "selected": true
+            },
+            {
+              "label": "Single-AZ",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1535-1786225056190-8634",
+          "name": "定价模型",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "OnDemand",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 3,
+          "choices": [
+            {
+              "label": "OnDemand",
+              "selected": true
+            }
+          ]
+        },
+        {
+          "key": "formField1363-1786225055764-4722",
+          "name": "您希望使用数据库创建 RDS 代理吗？",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "是",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 4,
+          "choices": [
+            {
+              "label": "是",
+              "selected": true
+            },
+            {
+              "label": "否",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1432-1786225055862-982",
+          "name": "每个 RDS 实例的存储",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "通用型 SSD（gp2）",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 5,
+          "choices": [
+            {
+              "label": "通用型 SSD（gp2）",
+              "selected": true
+            },
+            {
+              "label": "通用型 SSD（gp3）",
+              "selected": false
+            },
+            {
+              "label": "预调配 IOPS SSD（io1）",
+              "selected": false
+            },
+            {
+              "label": "预调配 IOPS SSD（io2）",
+              "selected": false
+            },
+            {
+              "label": "磁介质（上一代）",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1311-1786225055748-5952",
+          "name": "存储量 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "100",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "输入数量",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1312-1786225055748-9877",
+          "name": "单位 存储量",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "GB",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 6,
+          "choices": [
+            {
+              "label": "MB",
+              "selected": false
+            },
+            {
+              "label": "GB",
+              "selected": true
+            },
+            {
+              "label": "TB",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1442-1786225055862-2036",
+          "name": "您会为数据库启用 Database Insights 吗？",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "是",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 7,
+          "choices": [
+            {
+              "label": "是",
+              "selected": true
+            },
+            {
+              "label": "否",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1453-1786225055863-5395",
+          "name": "性能详情的保留期",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "7 天（免费套餐）",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 8,
+          "choices": [
+            {
+              "label": "7 天（免费套餐）",
+              "selected": true
+            },
+            {
+              "label": "1 个月",
+              "selected": false
+            },
+            {
+              "label": "2 个月",
+              "selected": false
+            },
+            {
+              "label": "3 个月",
+              "selected": false
+            },
+            {
+              "label": "4 个月",
+              "selected": false
+            },
+            {
+              "label": "5 个月",
+              "selected": false
+            },
+            {
+              "label": "6 个月",
+              "selected": false
+            },
+            {
+              "label": "7 个月",
+              "selected": false
+            },
+            {
+              "label": "8 个月",
+              "selected": false
+            },
+            {
+              "label": "9 个月",
+              "selected": false
+            },
+            {
+              "label": "10 个月",
+              "selected": false
+            },
+            {
+              "label": "11 个月",
+              "selected": false
+            },
+            {
+              "label": "12 个月",
+              "selected": false
+            },
+            {
+              "label": "13 个月",
+              "selected": false
+            },
+            {
+              "label": "14 个月",
+              "selected": false
+            },
+            {
+              "label": "15 个月",
+              "selected": false
+            },
+            {
+              "label": "16 个月",
+              "selected": false
+            },
+            {
+              "label": "17 个月",
+              "selected": false
+            },
+            {
+              "label": "18 个月",
+              "selected": false
+            },
+            {
+              "label": "19 个月",
+              "selected": false
+            },
+            {
+              "label": "20 个月",
+              "selected": false
+            },
+            {
+              "label": "21 个月",
+              "selected": false
+            },
+            {
+              "label": "22 个月",
+              "selected": false
+            },
+            {
+              "label": "23 个月",
+              "selected": false
+            },
+            {
+              "label": "24 个月",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1464-1786225055864-1090",
+          "name": "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "是",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 9,
+          "choices": [
+            {
+              "label": "是",
+              "selected": true
+            },
+            {
+              "label": "否",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1474-1786225055864-2135",
+          "name": "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价）",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "第 1 年和第 2 年的费用",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 10,
+          "choices": [
+            {
+              "label": "第 1 年和第 2 年的费用",
+              "selected": true
+            },
+            {
+              "label": "第 3 年的费用",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1421-1786225055853-18",
+          "name": "在 Amazon RDS 扩展支持上运行的小时数 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1422-1786225055854-3646",
+          "name": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "每月",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 11,
+          "choices": [
+            {
+              "label": "每天",
+              "selected": false
+            },
+            {
+              "label": "每周",
+              "selected": false
+            },
+            {
+              "label": "每月",
+              "selected": true
+            }
+          ]
+        }
+      ],
+      "visible_text": [
+        "Create estimate: Configure Amazon RDS for MySQL",
+        "选择位置类型信息",
+        "选择一个区域",
+        "MySQL 实例规格",
+        "节点",
+        "利用率（仅限按需）",
+        "值",
+        "单位",
+        "部署选项",
+        "定价模型",
+        "显示计算结果",
+        "RDS 代理",
+        "您希望使用数据库创建 RDS 代理吗？",
+        "存储",
+        "每个 RDS 实例的存储",
+        "存储量",
+        "RDS 预置实例的 CloudWatch Database Insights 定价",
+        "您会为数据库启用 Database Insights 吗？",
+        "RDS 性能详情",
+        "性能详情的保留期",
+        "RDS 扩展支持",
+        "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+        "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价）",
+        "在 Amazon RDS 扩展支持上运行的小时数",
+        "备份存储",
+        "额外备份存储",
+        "快照导出",
+        "已处理待导出的备份总大小（GB）"
+      ]
+    },
+    {
+      "fingerprint": "5bb18b88579465ea",
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "选择位置类型信息",
+          "occurrence": 0,
+          "position": 0,
+          "choice": "本地区域"
+        }
+      ],
+      "controls": [
+        {
+          "key": "formField1268-1786225061347-4740",
+          "name": "Description - optional",
+          "role": "input",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "输入估算的描述",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1269-1786225061352-2560",
+          "name": "选择位置类型信息",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "本地区域",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 0,
+          "choices": [
+            {
+              "label": "区域",
+              "selected": false
+            },
+            {
+              "label": "本地区域",
+              "selected": true
+            }
+          ]
+        },
+        {
+          "key": "formField1282-1786225061353-9936",
+          "name": "选择 Local Zone 美国西部（洛杉矶）",
+          "role": "button",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": true,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "input:3:",
+          "name": "",
+          "role": "combobox",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": true,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1666-1786225063559-5955",
+          "name": "每个 RDS 实例的存储",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "通用型 SSD（gp2）",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 4,
+          "choices": [
+            {
+              "label": "通用型 SSD（gp2）",
+              "selected": true
+            },
+            {
+              "label": "预调配 IOPS SSD（io1）",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1597-1786225063539-155",
+          "name": "存储量 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "100",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "输入数量",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1598-1786225063539-1810",
+          "name": "单位 存储量",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "GB",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 5,
+          "choices": [
+            {
+              "label": "MB",
+              "selected": false
+            },
+            {
+              "label": "GB",
+              "selected": true
+            },
+            {
+              "label": "TB",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1677-1786225063561-2494",
+          "name": "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "是",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 6,
+          "choices": [
+            {
+              "label": "是",
+              "selected": true
+            },
+            {
+              "label": "否",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1687-1786225063561-6657",
+          "name": "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价）",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "第 1 年和第 2 年的费用",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 7,
+          "choices": [
+            {
+              "label": "第 1 年和第 2 年的费用",
+              "selected": true
+            },
+            {
+              "label": "第 3 年的费用",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1617-1786225063541-7478",
+          "name": "在 Amazon RDS 扩展支持上运行的小时数 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1618-1786225063541-2290",
+          "name": "单位 在 Amazon RDS 扩展支持上运行的小时数 每月",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        }
+      ],
+      "visible_text": [
+        "Create estimate: Configure Amazon RDS for MySQL",
+        "选择位置类型信息",
+        "选择 Local Zone",
+        "MySQL 实例规格",
+        "节点",
+        "利用率（仅限按需）",
+        "值",
+        "单位",
+        "部署选项",
+        "定价模型",
+        "显示计算结果",
+        "存储",
+        "每个 RDS 实例的存储",
+        "存储量",
+        "RDS 扩展支持",
+        "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+        "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价）",
+        "在 Amazon RDS 扩展支持上运行的小时数",
+        "备份存储",
+        "额外备份存储",
+        "快照导出",
+        "已处理待导出的备份总大小（GB）"
+      ]
+    },
+    {
+      "fingerprint": "220c6054257aeeb1",
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io1）"
+        }
+      ],
+      "controls": [
+        {
+          "key": "formField1268-1786225061954-8717",
+          "name": "Description - optional",
+          "role": "input",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "输入估算的描述",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1269-1786225061955-3411",
+          "name": "选择位置类型信息",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "区域",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 0,
+          "choices": [
+            {
+              "label": "区域",
+              "selected": true
+            },
+            {
+              "label": "本地区域",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1282-1786225061955-7795",
+          "name": "选择一个区域 美国东部（俄亥俄州）",
+          "role": "button",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": true,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "input:3:",
+          "name": "",
+          "role": "combobox",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": true,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1504-1786225062712-232",
+          "name": "节点",
+          "role": "input",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "1",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "input1505-1786225062730-2631",
+          "name": "Select an instance",
+          "role": "combobox",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "db.m4.10xlarge",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "Select an instance",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "button:6:清除输入",
+          "name": "清除输入",
+          "role": "button",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1514-1786225062735-5527",
+          "name": "利用率（仅限按需） 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "100",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1515-1786225062736-7941",
+          "name": "利用率（仅限按需） 单位",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "%Utilized/Month",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 1,
+          "choices": [
+            {
+              "label": "%Utilized/Month",
+              "selected": true
+            },
+            {
+              "label": "Hours/Day",
+              "selected": false
+            },
+            {
+              "label": "Hours/Week",
+              "selected": false
+            },
+            {
+              "label": "Hours/Month",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1525-1786225062740-7811",
+          "name": "部署选项",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "Multi-AZ",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 2,
+          "choices": [
+            {
+              "label": "Multi-AZ",
+              "selected": true
+            },
+            {
+              "label": "Single-AZ",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1535-1786225062759-6332",
+          "name": "定价模型",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "OnDemand",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 3,
+          "choices": [
+            {
+              "label": "OnDemand",
+              "selected": true
+            }
+          ]
+        },
+        {
+          "key": "formField1363-1786225061986-7361",
+          "name": "您希望使用数据库创建 RDS 代理吗？",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "是",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 4,
+          "choices": [
+            {
+              "label": "是",
+              "selected": true
+            },
+            {
+              "label": "否",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1432-1786225062120-271",
+          "name": "每个 RDS 实例的存储",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "预调配 IOPS SSD（io1）",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 5,
+          "choices": [
+            {
+              "label": "通用型 SSD（gp2）",
+              "selected": false
+            },
+            {
+              "label": "通用型 SSD（gp3）",
+              "selected": false
+            },
+            {
+              "label": "预调配 IOPS SSD（io1）",
+              "selected": true
+            },
+            {
+              "label": "预调配 IOPS SSD（io2）",
+              "selected": false
+            },
+            {
+              "label": "磁介质（上一代）",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1594-1786225063786-7555",
+          "name": "预调配 IOPS 输入数量",
+          "role": "input",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "输入数量",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1311-1786225061965-8114",
+          "name": "存储量 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "100",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "输入数量",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1312-1786225061965-1339",
+          "name": "单位 存储量",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "GB",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 6,
+          "choices": [
+            {
+              "label": "MB",
+              "selected": false
+            },
+            {
+              "label": "GB",
+              "selected": true
+            },
+            {
+              "label": "TB",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1602-1786225063970-57",
+          "name": "专用日志卷",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "否",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 7,
+          "choices": [
+            {
+              "label": "是",
+              "selected": false
+            },
+            {
+              "label": "否",
+              "selected": true
+            }
+          ]
+        },
+        {
+          "key": "formField1442-1786225062121-1133",
+          "name": "您会为数据库启用 Database Insights 吗？",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "是",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 8,
+          "choices": [
+            {
+              "label": "是",
+              "selected": true
+            },
+            {
+              "label": "否",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1453-1786225062121-6821",
+          "name": "性能详情的保留期",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "7 天（免费套餐）",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 9,
+          "choices": [
+            {
+              "label": "7 天（免费套餐）",
+              "selected": true
+            },
+            {
+              "label": "1 个月",
+              "selected": false
+            },
+            {
+              "label": "2 个月",
+              "selected": false
+            },
+            {
+              "label": "3 个月",
+              "selected": false
+            },
+            {
+              "label": "4 个月",
+              "selected": false
+            },
+            {
+              "label": "5 个月",
+              "selected": false
+            },
+            {
+              "label": "6 个月",
+              "selected": false
+            },
+            {
+              "label": "7 个月",
+              "selected": false
+            },
+            {
+              "label": "8 个月",
+              "selected": false
+            },
+            {
+              "label": "9 个月",
+              "selected": false
+            },
+            {
+              "label": "10 个月",
+              "selected": false
+            },
+            {
+              "label": "11 个月",
+              "selected": false
+            },
+            {
+              "label": "12 个月",
+              "selected": false
+            },
+            {
+              "label": "13 个月",
+              "selected": false
+            },
+            {
+              "label": "14 个月",
+              "selected": false
+            },
+            {
+              "label": "15 个月",
+              "selected": false
+            },
+            {
+              "label": "16 个月",
+              "selected": false
+            },
+            {
+              "label": "17 个月",
+              "selected": false
+            },
+            {
+              "label": "18 个月",
+              "selected": false
+            },
+            {
+              "label": "19 个月",
+              "selected": false
+            },
+            {
+              "label": "20 个月",
+              "selected": false
+            },
+            {
+              "label": "21 个月",
+              "selected": false
+            },
+            {
+              "label": "22 个月",
+              "selected": false
+            },
+            {
+              "label": "23 个月",
+              "selected": false
+            },
+            {
+              "label": "24 个月",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1464-1786225062122-1284",
+          "name": "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "是",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 10,
+          "choices": [
+            {
+              "label": "是",
+              "selected": true
+            },
+            {
+              "label": "否",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1474-1786225062123-9785",
+          "name": "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价）",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "第 1 年和第 2 年的费用",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 11,
+          "choices": [
+            {
+              "label": "第 1 年和第 2 年的费用",
+              "selected": true
+            },
+            {
+              "label": "第 3 年的费用",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1421-1786225062110-3858",
+          "name": "在 Amazon RDS 扩展支持上运行的小时数 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1422-1786225062111-7967",
+          "name": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "每月",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 12,
+          "choices": [
+            {
+              "label": "每天",
+              "selected": false
+            },
+            {
+              "label": "每周",
+              "selected": false
+            },
+            {
+              "label": "每月",
+              "selected": true
+            }
+          ]
+        }
+      ],
+      "visible_text": [
+        "Create estimate: Configure Amazon RDS for MySQL",
+        "选择位置类型信息",
+        "选择一个区域",
+        "MySQL 实例规格",
+        "节点",
+        "利用率（仅限按需）",
+        "值",
+        "单位",
+        "部署选项",
+        "定价模型",
+        "显示计算结果",
+        "RDS 代理",
+        "您希望使用数据库创建 RDS 代理吗？",
+        "存储",
+        "每个 RDS 实例的存储",
+        "预调配 IOPS",
+        "存储量",
+        "专用日志卷",
+        "RDS 预置实例的 CloudWatch Database Insights 定价",
+        "您会为数据库启用 Database Insights 吗？",
+        "RDS 性能详情",
+        "性能详情的保留期",
+        "RDS 扩展支持",
+        "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+        "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价）",
+        "在 Amazon RDS 扩展支持上运行的小时数",
+        "备份存储",
+        "额外备份存储",
+        "快照导出",
+        "已处理待导出的备份总大小（GB）"
+      ]
+    },
+    {
+      "fingerprint": "d93527962525d384",
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "每个 RDS 实例的存储",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "预调配 IOPS SSD（io2）"
+        }
+      ],
+      "controls": [
+        {
+          "key": "formField1268-1786225061731-1830",
+          "name": "Description - optional",
+          "role": "input",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "输入估算的描述",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1269-1786225061732-5075",
+          "name": "选择位置类型信息",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "区域",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 0,
+          "choices": [
+            {
+              "label": "区域",
+              "selected": true
+            },
+            {
+              "label": "本地区域",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1282-1786225061732-1488",
+          "name": "选择一个区域 美国东部（俄亥俄州）",
+          "role": "button",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": true,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "input:3:",
+          "name": "",
+          "role": "combobox",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": true,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1504-1786225062166-7540",
+          "name": "节点",
+          "role": "input",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "1",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "input1505-1786225062296-2842",
+          "name": "Select an instance",
+          "role": "combobox",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "db.m4.10xlarge",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "Select an instance",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "button:6:清除输入",
+          "name": "清除输入",
+          "role": "button",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1514-1786225062308-3804",
+          "name": "利用率（仅限按需） 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "100",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1515-1786225062308-1296",
+          "name": "利用率（仅限按需） 单位",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "%Utilized/Month",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 1,
+          "choices": [
+            {
+              "label": "%Utilized/Month",
+              "selected": true
+            },
+            {
+              "label": "Hours/Day",
+              "selected": false
+            },
+            {
+              "label": "Hours/Week",
+              "selected": false
+            },
+            {
+              "label": "Hours/Month",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1525-1786225062315-6066",
+          "name": "部署选项",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "Multi-AZ",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 2,
+          "choices": [
+            {
+              "label": "Multi-AZ",
+              "selected": true
+            },
+            {
+              "label": "Single-AZ",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1535-1786225062324-944",
+          "name": "定价模型",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "OnDemand",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 3,
+          "choices": [
+            {
+              "label": "OnDemand",
+              "selected": true
+            }
+          ]
+        },
+        {
+          "key": "formField1363-1786225061759-8611",
+          "name": "您希望使用数据库创建 RDS 代理吗？",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "是",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 4,
+          "choices": [
+            {
+              "label": "是",
+              "selected": true
+            },
+            {
+              "label": "否",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1432-1786225061894-4191",
+          "name": "每个 RDS 实例的存储",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "预调配 IOPS SSD（io2）",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 5,
+          "choices": [
+            {
+              "label": "通用型 SSD（gp2）",
+              "selected": false
+            },
+            {
+              "label": "通用型 SSD（gp3）",
+              "selected": false
+            },
+            {
+              "label": "预调配 IOPS SSD（io1）",
+              "selected": false
+            },
+            {
+              "label": "预调配 IOPS SSD（io2）",
+              "selected": true
+            },
+            {
+              "label": "磁介质（上一代）",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1594-1786225063383-9437",
+          "name": "预调配 IOPS IO2 输入数量",
+          "role": "input",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "1000",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "输入数量",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1311-1786225061741-3449",
+          "name": "存储量 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "100",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "输入数量",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1312-1786225061741-452",
+          "name": "单位 存储量",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "GB",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 6,
+          "choices": [
+            {
+              "label": "MB",
+              "selected": false
+            },
+            {
+              "label": "GB",
+              "selected": true
+            },
+            {
+              "label": "TB",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1602-1786225063534-5501",
+          "name": "专用日志卷",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "否",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 7,
+          "choices": [
+            {
+              "label": "是",
+              "selected": false
+            },
+            {
+              "label": "否",
+              "selected": true
+            }
+          ]
+        },
+        {
+          "key": "formField1442-1786225061894-9131",
+          "name": "您会为数据库启用 Database Insights 吗？",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "是",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 8,
+          "choices": [
+            {
+              "label": "是",
+              "selected": true
+            },
+            {
+              "label": "否",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1453-1786225061895-7732",
+          "name": "性能详情的保留期",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "7 天（免费套餐）",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 9,
+          "choices": [
+            {
+              "label": "7 天（免费套餐）",
+              "selected": true
+            },
+            {
+              "label": "1 个月",
+              "selected": false
+            },
+            {
+              "label": "2 个月",
+              "selected": false
+            },
+            {
+              "label": "3 个月",
+              "selected": false
+            },
+            {
+              "label": "4 个月",
+              "selected": false
+            },
+            {
+              "label": "5 个月",
+              "selected": false
+            },
+            {
+              "label": "6 个月",
+              "selected": false
+            },
+            {
+              "label": "7 个月",
+              "selected": false
+            },
+            {
+              "label": "8 个月",
+              "selected": false
+            },
+            {
+              "label": "9 个月",
+              "selected": false
+            },
+            {
+              "label": "10 个月",
+              "selected": false
+            },
+            {
+              "label": "11 个月",
+              "selected": false
+            },
+            {
+              "label": "12 个月",
+              "selected": false
+            },
+            {
+              "label": "13 个月",
+              "selected": false
+            },
+            {
+              "label": "14 个月",
+              "selected": false
+            },
+            {
+              "label": "15 个月",
+              "selected": false
+            },
+            {
+              "label": "16 个月",
+              "selected": false
+            },
+            {
+              "label": "17 个月",
+              "selected": false
+            },
+            {
+              "label": "18 个月",
+              "selected": false
+            },
+            {
+              "label": "19 个月",
+              "selected": false
+            },
+            {
+              "label": "20 个月",
+              "selected": false
+            },
+            {
+              "label": "21 个月",
+              "selected": false
+            },
+            {
+              "label": "22 个月",
+              "selected": false
+            },
+            {
+              "label": "23 个月",
+              "selected": false
+            },
+            {
+              "label": "24 个月",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1464-1786225061896-2420",
+          "name": "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "是",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 10,
+          "choices": [
+            {
+              "label": "是",
+              "selected": true
+            },
+            {
+              "label": "否",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1474-1786225061897-3831",
+          "name": "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价）",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "第 1 年和第 2 年的费用",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 11,
+          "choices": [
+            {
+              "label": "第 1 年和第 2 年的费用",
+              "selected": true
+            },
+            {
+              "label": "第 3 年的费用",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField1421-1786225061884-6324",
+          "name": "在 Amazon RDS 扩展支持上运行的小时数 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField1422-1786225061884-8320",
+          "name": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "每月",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 12,
+          "choices": [
+            {
+              "label": "每天",
+              "selected": false
+            },
+            {
+              "label": "每周",
+              "selected": false
+            },
+            {
+              "label": "每月",
+              "selected": true
+            }
+          ]
+        }
+      ],
+      "visible_text": [
+        "Create estimate: Configure Amazon RDS for MySQL",
+        "选择位置类型信息",
+        "选择一个区域",
+        "MySQL 实例规格",
+        "节点",
+        "利用率（仅限按需）",
+        "值",
+        "单位",
+        "部署选项",
+        "定价模型",
+        "显示计算结果",
+        "RDS 代理",
+        "您希望使用数据库创建 RDS 代理吗？",
+        "存储",
+        "每个 RDS 实例的存储",
+        "预调配 IOPS IO2",
+        "存储量",
+        "专用日志卷",
+        "RDS 预置实例的 CloudWatch Database Insights 定价",
+        "您会为数据库启用 Database Insights 吗？",
+        "RDS 性能详情",
+        "性能详情的保留期",
+        "RDS 扩展支持",
+        "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+        "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价）",
+        "在 Amazon RDS 扩展支持上运行的小时数",
+        "备份存储",
+        "额外备份存储",
+        "快照导出",
+        "已处理待导出的备份总大小（GB）"
+      ]
+    },
+    {
+      "fingerprint": "4882d1933c6e8674",
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "occurrence": 0,
+          "position": 11,
+          "choice": "每天"
+        }
+      ],
+      "controls": [
+        {
+          "key": "formField274-1786225082964-8470",
+          "name": "Description - optional",
+          "role": "input",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "输入估算的描述",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField275-1786225082966-6083",
+          "name": "选择位置类型信息",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "本地区域",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 0,
+          "choices": [
+            {
+              "label": "区域",
+              "selected": false
+            },
+            {
+              "label": "本地区域",
+              "selected": true
+            }
+          ]
+        },
+        {
+          "key": "formField288-1786225082967-6945",
+          "name": "选择 Local Zone 美国西部（洛杉矶）",
+          "role": "button",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": true,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "input:3:",
+          "name": "",
+          "role": "combobox",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": true,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField310-1786225082972-3466",
+          "name": "存储量 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "100",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "输入数量",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField311-1786225082972-1219",
+          "name": "单位 存储量",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "GB",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 5,
+          "choices": [
+            {
+              "label": "MB",
+              "selected": false
+            },
+            {
+              "label": "GB",
+              "selected": true
+            },
+            {
+              "label": "TB",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField406-1786225083100-9336",
+          "name": "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "是",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 6,
+          "choices": [
+            {
+              "label": "是",
+              "selected": true
+            },
+            {
+              "label": "否",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField416-1786225083101-2283",
+          "name": "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价） 第 1 年和第 2 年的费用",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField395-1786225083092-1083",
+          "name": "在 Amazon RDS 扩展支持上运行的小时数 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField396-1786225083092-3477",
+          "name": "单位 在 Amazon RDS 扩展支持上运行的小时数 每天",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        }
+      ],
+      "visible_text": [
+        "Create estimate: Configure Amazon RDS for MySQL",
+        "选择位置类型信息",
+        "选择 Local Zone",
+        "MySQL 实例规格",
+        "节点",
+        "利用率（仅限按需）",
+        "值",
+        "单位",
+        "部署选项",
+        "定价模型",
+        "显示计算结果",
+        "存储",
+        "每个 RDS 实例的存储",
+        "存储量",
+        "RDS 扩展支持",
+        "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+        "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价）",
+        "在 Amazon RDS 扩展支持上运行的小时数",
+        "备份存储",
+        "额外备份存储",
+        "快照导出",
+        "已处理待导出的备份总大小（GB）"
+      ]
+    },
+    {
+      "fingerprint": "e06a08ef71c395bc",
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "occurrence": 0,
+          "position": 11,
+          "choice": "每周"
+        }
+      ],
+      "controls": [
+        {
+          "key": "formField274-1786225083295-2123",
+          "name": "Description - optional",
+          "role": "input",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "输入估算的描述",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField275-1786225083295-6646",
+          "name": "选择位置类型信息",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "本地区域",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 0,
+          "choices": [
+            {
+              "label": "区域",
+              "selected": false
+            },
+            {
+              "label": "本地区域",
+              "selected": true
+            }
+          ]
+        },
+        {
+          "key": "formField288-1786225083296-8240",
+          "name": "选择 Local Zone 美国西部（洛杉矶）",
+          "role": "button",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": true,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "input:3:",
+          "name": "",
+          "role": "combobox",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": true,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField310-1786225083305-6324",
+          "name": "存储量 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "100",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "输入数量",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField311-1786225083306-411",
+          "name": "单位 存储量",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "GB",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 5,
+          "choices": [
+            {
+              "label": "MB",
+              "selected": false
+            },
+            {
+              "label": "GB",
+              "selected": true
+            },
+            {
+              "label": "TB",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField406-1786225083424-236",
+          "name": "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "是",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 6,
+          "choices": [
+            {
+              "label": "是",
+              "selected": true
+            },
+            {
+              "label": "否",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField416-1786225083424-4212",
+          "name": "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价） 第 1 年和第 2 年的费用",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField395-1786225083415-3022",
+          "name": "在 Amazon RDS 扩展支持上运行的小时数 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField396-1786225083415-8218",
+          "name": "单位 在 Amazon RDS 扩展支持上运行的小时数 每周",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        }
+      ],
+      "visible_text": [
+        "Create estimate: Configure Amazon RDS for MySQL",
+        "选择位置类型信息",
+        "选择 Local Zone",
+        "MySQL 实例规格",
+        "节点",
+        "利用率（仅限按需）",
+        "值",
+        "单位",
+        "部署选项",
+        "定价模型",
+        "显示计算结果",
+        "存储",
+        "每个 RDS 实例的存储",
+        "存储量",
+        "RDS 扩展支持",
+        "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+        "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价）",
+        "在 Amazon RDS 扩展支持上运行的小时数",
+        "备份存储",
+        "额外备份存储",
+        "快照导出",
+        "已处理待导出的备份总大小（GB）"
+      ]
+    },
+    {
+      "fingerprint": "43ec10f3365176bf",
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "occurrence": 0,
+          "position": 11,
+          "choice": "每天"
+        },
+        {
+          "kind": "dropdown",
+          "control": "选择位置类型信息",
+          "occurrence": 0,
+          "position": 0,
+          "choice": "区域"
+        }
+      ],
+      "controls": [
+        {
+          "key": "formField274-1786225143198-8431",
+          "name": "Description - optional",
+          "role": "input",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "输入估算的描述",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField275-1786225143198-4785",
+          "name": "选择位置类型信息",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "区域",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 0,
+          "choices": [
+            {
+              "label": "区域",
+              "selected": true
+            },
+            {
+              "label": "本地区域",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField288-1786225143199-5470",
+          "name": "选择一个区域 美国东部（俄亥俄州）",
+          "role": "button",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": true,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "input:3:",
+          "name": "",
+          "role": "combobox",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": true,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField618-1786225146031-1277",
+          "name": "节点",
+          "role": "input",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "1",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "input619-1786225146032-1226",
+          "name": "Select an instance",
+          "role": "combobox",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "db.m4.10xlarge",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "Select an instance",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "button:6:清除输入",
+          "name": "清除输入",
+          "role": "button",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField628-1786225146033-56",
+          "name": "利用率（仅限按需） 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "100",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField629-1786225146033-9715",
+          "name": "利用率（仅限按需） 单位",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "%Utilized/Month",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 1,
+          "choices": [
+            {
+              "label": "%Utilized/Month",
+              "selected": true
+            },
+            {
+              "label": "Hours/Day",
+              "selected": false
+            },
+            {
+              "label": "Hours/Week",
+              "selected": false
+            },
+            {
+              "label": "Hours/Month",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField639-1786225146034-7751",
+          "name": "部署选项",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "Multi-AZ",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 2,
+          "choices": [
+            {
+              "label": "Multi-AZ",
+              "selected": true
+            },
+            {
+              "label": "Single-AZ",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField649-1786225146034-3897",
+          "name": "定价模型",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "OnDemand",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 3,
+          "choices": [
+            {
+              "label": "OnDemand",
+              "selected": true
+            }
+          ]
+        },
+        {
+          "key": "formField567-1786225145914-2061",
+          "name": "每个 RDS 实例的存储",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "通用型 SSD（gp2）",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 5,
+          "choices": [
+            {
+              "label": "通用型 SSD（gp2）",
+              "selected": true
+            },
+            {
+              "label": "通用型 SSD（gp3）",
+              "selected": false
+            },
+            {
+              "label": "预调配 IOPS SSD（io1）",
+              "selected": false
+            },
+            {
+              "label": "预调配 IOPS SSD（io2）",
+              "selected": false
+            },
+            {
+              "label": "磁介质（上一代）",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField449-1786225145677-776",
+          "name": "存储量 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "100",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "输入数量",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField450-1786225145677-1770",
+          "name": "单位 存储量",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "GB",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 6,
+          "choices": [
+            {
+              "label": "MB",
+              "selected": false
+            },
+            {
+              "label": "GB",
+              "selected": true
+            },
+            {
+              "label": "TB",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField577-1786225145915-1089",
+          "name": "您会为数据库启用 Database Insights 吗？",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "是",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 7,
+          "choices": [
+            {
+              "label": "是",
+              "selected": true
+            },
+            {
+              "label": "否",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField588-1786225145916-4393",
+          "name": "性能详情的保留期",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "7 天（免费套餐）",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 8,
+          "choices": [
+            {
+              "label": "7 天（免费套餐）",
+              "selected": true
+            },
+            {
+              "label": "1 个月",
+              "selected": false
+            },
+            {
+              "label": "2 个月",
+              "selected": false
+            },
+            {
+              "label": "3 个月",
+              "selected": false
+            },
+            {
+              "label": "4 个月",
+              "selected": false
+            },
+            {
+              "label": "5 个月",
+              "selected": false
+            },
+            {
+              "label": "6 个月",
+              "selected": false
+            },
+            {
+              "label": "7 个月",
+              "selected": false
+            },
+            {
+              "label": "8 个月",
+              "selected": false
+            },
+            {
+              "label": "9 个月",
+              "selected": false
+            },
+            {
+              "label": "10 个月",
+              "selected": false
+            },
+            {
+              "label": "11 个月",
+              "selected": false
+            },
+            {
+              "label": "12 个月",
+              "selected": false
+            },
+            {
+              "label": "13 个月",
+              "selected": false
+            },
+            {
+              "label": "14 个月",
+              "selected": false
+            },
+            {
+              "label": "15 个月",
+              "selected": false
+            },
+            {
+              "label": "16 个月",
+              "selected": false
+            },
+            {
+              "label": "17 个月",
+              "selected": false
+            },
+            {
+              "label": "18 个月",
+              "selected": false
+            },
+            {
+              "label": "19 个月",
+              "selected": false
+            },
+            {
+              "label": "20 个月",
+              "selected": false
+            },
+            {
+              "label": "21 个月",
+              "selected": false
+            },
+            {
+              "label": "22 个月",
+              "selected": false
+            },
+            {
+              "label": "23 个月",
+              "selected": false
+            },
+            {
+              "label": "24 个月",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField530-1786225145700-3922",
+          "name": "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "是",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 9,
+          "choices": [
+            {
+              "label": "是",
+              "selected": true
+            },
+            {
+              "label": "否",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField540-1786225145700-1024",
+          "name": "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价）",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "第 1 年和第 2 年的费用",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 10,
+          "choices": [
+            {
+              "label": "第 1 年和第 2 年的费用",
+              "selected": true
+            },
+            {
+              "label": "第 3 年的费用",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField469-1786225145678-2029",
+          "name": "在 Amazon RDS 扩展支持上运行的小时数 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField470-1786225145678-513",
+          "name": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "每月",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 11,
+          "choices": [
+            {
+              "label": "每天",
+              "selected": false
+            },
+            {
+              "label": "每周",
+              "selected": false
+            },
+            {
+              "label": "每月",
+              "selected": true
+            }
+          ]
+        }
+      ],
+      "visible_text": [
+        "Create estimate: Configure Amazon RDS for MySQL",
+        "选择位置类型信息",
+        "选择一个区域",
+        "MySQL 实例规格",
+        "节点",
+        "利用率（仅限按需）",
+        "值",
+        "单位",
+        "部署选项",
+        "定价模型",
+        "显示计算结果",
+        "RDS 代理",
+        "您希望使用数据库创建 RDS 代理吗？",
+        "存储",
+        "每个 RDS 实例的存储",
+        "存储量",
+        "RDS 预置实例的 CloudWatch Database Insights 定价",
+        "您会为数据库启用 Database Insights 吗？",
+        "RDS 性能详情",
+        "性能详情的保留期",
+        "RDS 扩展支持",
+        "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+        "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价）",
+        "在 Amazon RDS 扩展支持上运行的小时数",
+        "备份存储",
+        "额外备份存储",
+        "快照导出",
+        "已处理待导出的备份总大小（GB）"
+      ]
+    },
+    {
+      "fingerprint": "f51985322cb93db0",
+      "path": [
+        {
+          "kind": "dropdown",
+          "control": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "occurrence": 0,
+          "position": 11,
+          "choice": "每天"
+        },
+        {
+          "kind": "dropdown",
+          "control": "单位 存储量",
+          "occurrence": 0,
+          "position": 5,
+          "choice": "TB"
+        }
+      ],
+      "controls": [
+        {
+          "key": "formField274-1786225143628-3246",
+          "name": "Description - optional",
+          "role": "input",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "输入估算的描述",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField275-1786225143629-5336",
+          "name": "选择位置类型信息",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "本地区域",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 0,
+          "choices": [
+            {
+              "label": "区域",
+              "selected": false
+            },
+            {
+              "label": "本地区域",
+              "selected": true
+            }
+          ]
+        },
+        {
+          "key": "formField288-1786225143629-7877",
+          "name": "选择 Local Zone 美国西部（洛杉矶）",
+          "role": "button",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": true,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "input:3:",
+          "name": "",
+          "role": "combobox",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": true,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField434-1786225148279-6177",
+          "name": "节点",
+          "role": "input",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "1",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "input435-1786225148282-5073",
+          "name": "Select an instance",
+          "role": "combobox",
+          "tag": "input",
+          "input_type": "text",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "db.m5.12xlarge",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "Select an instance",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "button:6:清除输入",
+          "name": "清除输入",
+          "role": "button",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField444-1786225148286-4230",
+          "name": "利用率（仅限按需） 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "100",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField445-1786225148287-9802",
+          "name": "利用率（仅限按需） 单位",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "%Utilized/Month",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 1,
+          "choices": [
+            {
+              "label": "%Utilized/Month",
+              "selected": true
+            },
+            {
+              "label": "Hours/Day",
+              "selected": false
+            },
+            {
+              "label": "Hours/Week",
+              "selected": false
+            },
+            {
+              "label": "Hours/Month",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField455-1786225148289-4505",
+          "name": "部署选项",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "Single-AZ",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 2,
+          "choices": [
+            {
+              "label": "Single-AZ",
+              "selected": true
+            }
+          ]
+        },
+        {
+          "key": "formField465-1786225148290-1375",
+          "name": "定价模型",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "OnDemand",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 3,
+          "choices": [
+            {
+              "label": "OnDemand",
+              "selected": true
+            }
+          ]
+        },
+        {
+          "key": "formField475-1786225148330-7339",
+          "name": "每个 RDS 实例的存储",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "通用型 SSD（gp2）",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 4,
+          "choices": [
+            {
+              "label": "通用型 SSD（gp2）",
+              "selected": true
+            },
+            {
+              "label": "预调配 IOPS SSD（io1）",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField310-1786225143635-9635",
+          "name": "存储量 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "100",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "输入数量",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField311-1786225143635-2451",
+          "name": "单位 存储量",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "TB",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 5,
+          "choices": [
+            {
+              "label": "MB",
+              "selected": false
+            },
+            {
+              "label": "GB",
+              "selected": false
+            },
+            {
+              "label": "TB",
+              "selected": true
+            }
+          ]
+        },
+        {
+          "key": "formField406-1786225143754-2023",
+          "name": "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "是",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 6,
+          "choices": [
+            {
+              "label": "是",
+              "selected": true
+            },
+            {
+              "label": "否",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField416-1786225143755-6546",
+          "name": "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价）",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "第 1 年和第 2 年的费用",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 7,
+          "choices": [
+            {
+              "label": "第 1 年和第 2 年的费用",
+              "selected": true
+            },
+            {
+              "label": "第 3 年的费用",
+              "selected": false
+            }
+          ]
+        },
+        {
+          "key": "formField395-1786225143745-1176",
+          "name": "在 Amazon RDS 扩展支持上运行的小时数 值",
+          "role": "input",
+          "tag": "input",
+          "input_type": "number",
+          "required": false,
+          "disabled": false,
+          "expanded": null,
+          "value": "",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": "",
+          "dropdown_position": null,
+          "choices": []
+        },
+        {
+          "key": "formField396-1786225143745-9711",
+          "name": "单位 在 Amazon RDS 扩展支持上运行的小时数",
+          "role": "combobox",
+          "tag": "button",
+          "input_type": "button",
+          "required": false,
+          "disabled": false,
+          "expanded": false,
+          "value": "每天",
+          "minimum": null,
+          "maximum": null,
+          "step": null,
+          "pattern": null,
+          "placeholder": null,
+          "dropdown_position": 8,
+          "choices": [
+            {
+              "label": "每天",
+              "selected": true
+            },
+            {
+              "label": "每周",
+              "selected": false
+            },
+            {
+              "label": "每月",
+              "selected": false
+            }
+          ]
+        }
+      ],
+      "visible_text": [
+        "Create estimate: Configure Amazon RDS for MySQL",
+        "选择位置类型信息",
+        "选择 Local Zone",
+        "MySQL 实例规格",
+        "节点",
+        "利用率（仅限按需）",
+        "值",
+        "单位",
+        "部署选项",
+        "定价模型",
+        "显示计算结果",
+        "存储",
+        "每个 RDS 实例的存储",
+        "存储量",
+        "RDS 扩展支持",
+        "您是否计划运行扩展支持主要版本（例如 MySQL 5.7 或更高版本）？",
+        "请选择 RDS 扩展支持的定价年份（第 3 年的定价高于前 2 年的定价）",
+        "在 Amazon RDS 扩展支持上运行的小时数",
+        "备份存储",
+        "额外备份存储",
+        "快照导出",
+        "已处理待导出的备份总大小（GB）"
+      ]
+    }
+  ]
+}

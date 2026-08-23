@@ -1,0 +1,4 @@
+baojia.tontiancloud.com {
+    encode zstd gzip
+    reverse_proxy astraquote:3000
+}

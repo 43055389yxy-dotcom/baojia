@@ -1,0 +1,30 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+node_modules/
+.next/
+coverage/
+dist/
+backend/.cache/
+deploy/runtime/
+deploy/astraquote-codex-agent/
+
+# Local exports and test captures are not production source.
+/*.xlsx
+/*.png
+/*_config.json
+/aws_calculator_config_*.json
+/德国法兰克福基础设施_*_config.json
+/generate_final_summary.html
+/frontend/tsconfig.tsbuildinfo
+
+# The production AWS catalog seed is a compressed, non-secret snapshot.
+!deploy/cache/
+!deploy/cache/aws_catalog.sqlite3.gz

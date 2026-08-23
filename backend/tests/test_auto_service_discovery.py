@@ -1,0 +1,366 @@
+import json
+from pathlib import Path
+
+from app.domain.models import ServiceRequirement
+from app.integrations.deepseek import _official_profile_cache_model
+from app.integrations.auto_service_discovery import (
+    PROFILE_TTL_SECONDS,
+    PROFILE_SCHEMA_VERSION,
+    AutoServiceDiscovery,
+)
+from app.services.plugins.generic_official import GenericOfficialPlugin
+
+
+def appflow_product() -> dict:
+    return {
+        "serviceCode": "AmazonAppFlow",
+        "product": {
+            "sku": "appflow-data",
+            "attributes": {
+                "usagetype": "APS1-DataProcessed",
+                "operation": "RunFlow",
+                "regionCode": "ap-southeast-1",
+                "productFamily": "Data Processing",
+            },
+        },
+        "terms": {
+            "OnDemand": {
+                "term": {
+                    "priceDimensions": {
+                        "dimension": {
+                            "beginRange": "0",
+                            "unit": "GB",
+                            "description": "Data processed by an AppFlow flow",
+                            "pricePerUnit": {"USD": "0.02"},
+                        }
+                    }
+                }
+            }
+        },
+    }
+
+
+class AppFlowCatalog:
+    def __init__(self) -> None:
+        self.product_calls = 0
+
+    @staticmethod
+    def service_codes() -> list[str]:
+        return ["AWSLambda", "AmazonAppFlow", "AmazonDynamoDB"]
+
+    def products(self, service_code: str, filters: dict[str, str], *, max_pages: int = 20):
+        self.product_calls += 1
+        assert service_code == "AmazonAppFlow"
+        return [appflow_product()]
+
+
+def test_official_field_profiles_expire_after_ten_days() -> None:
+    assert PROFILE_TTL_SECONDS == 10 * 24 * 60 * 60
+
+
+def test_managed_service_name_resolves_by_unique_official_core_stem(tmp_path: Path) -> None:
+    class GrafanaCatalog:
+        @staticmethod
+        def service_codes() -> list[str]:
+            return ["AmazonGrafana", "AmazonManagedBlockchain"]
+
+    discovery = AutoServiceDiscovery(
+        GrafanaCatalog(),  # type: ignore[arg-type]
+        tmp_path / "auto-profiles.sqlite3",
+    )
+
+    assert (
+        discovery.resolve_service_code("amazon_managed_grafana", "Amazon Managed Grafana")
+        == "AmazonGrafana"
+    )
+
+
+def test_unknown_component_result_cache_is_bound_to_official_contract() -> None:
+    first = {
+        "status": "verified",
+        "profile_schema_version": 2,
+        "service_code": "AmazonExample",
+        "field_bindings": [
+            {
+                "field": "storage_gib_month",
+                "usage_type": "Storage",
+                "operation": "Store",
+                "unit": "GB-Mo",
+            }
+        ],
+        "attribute_fields": ["instanceType"],
+    }
+    changed = {
+        **first,
+        "field_bindings": [
+            {
+                "field": "data_processed_gib",
+                "usage_type": "DataProcessed",
+                "operation": "Process",
+                "unit": "GB",
+            }
+        ],
+    }
+
+    first_key = _official_profile_cache_model("model-a", first)
+    assert first_key is not None
+    assert first_key == _official_profile_cache_model("model-a", dict(first))
+    assert first_key != _official_profile_cache_model("model-a", changed)
+    assert _official_profile_cache_model("model-a", {"status": "failed"}) is None
+
+
+def test_unknown_service_builds_and_reuses_verified_official_profile(tmp_path: Path) -> None:
+    catalog = AppFlowCatalog()
+    discovery = AutoServiceDiscovery(
+        catalog,  # type: ignore[arg-type]
+        tmp_path / "auto-profiles.sqlite3",
+    )
+
+    first = discovery.ensure_profile(
+        service_key="appflow",
+        display_name="Amazon AppFlow",
+        region="ap-southeast-1",
+    )
+    second = discovery.ensure_profile(
+        service_key="appflow",
+        display_name="Amazon AppFlow",
+        region="ap-southeast-1",
+    )
+
+    assert first is not None
+    assert first["status"] == "verified"
+    assert first["service_code"] == "AmazonAppFlow"
+    assert "data_processed_gib" in first["fields"]
+    assert first["profile_schema_version"] == PROFILE_SCHEMA_VERSION
+    assert first["field_bindings"][0]["field"] == "data_processed_gib"
+    assert first["field_bindings"][0]["usage_type"] == "APS1-DataProcessed"
+    assert "官方目录自动生成" in first["prompt_text"]
+    assert "UsageType=APS1-DataProcessed" in first["prompt_text"]
+    assert second is not None
+    assert catalog.product_calls == 1
+    assert discovery.list_profiles()[0]["service_key"] == "appflow"
+
+
+def test_stale_profile_is_refreshed_from_official_catalog(tmp_path: Path) -> None:
+    database_path = tmp_path / "auto-profiles.sqlite3"
+    catalog = AppFlowCatalog()
+    discovery = AutoServiceDiscovery(
+        catalog,  # type: ignore[arg-type]
+        database_path,
+    )
+    discovery.ensure_profile(
+        service_key="appflow",
+        display_name="Amazon AppFlow",
+        region="ap-southeast-1",
+    )
+    with discovery._connect() as connection:
+        connection.execute(
+            "UPDATE auto_service_profiles SET updated_at = updated_at - ?",
+            (PROFILE_TTL_SECONDS + 1,),
+        )
+
+    result = discovery.refresh_stale_profiles()
+
+    assert result == {"checked": 1, "refreshed": 1, "failed": 0}
+    assert catalog.product_calls == 2
+
+
+def test_old_profile_schema_is_upgraded_without_waiting_ten_days(tmp_path: Path) -> None:
+    database_path = tmp_path / "auto-profiles.sqlite3"
+    catalog = AppFlowCatalog()
+    discovery = AutoServiceDiscovery(
+        catalog,  # type: ignore[arg-type]
+        database_path,
+    )
+    discovery.ensure_profile(
+        service_key="appflow",
+        display_name="Amazon AppFlow",
+        region="ap-southeast-1",
+    )
+    with discovery._connect() as connection:
+        row = connection.execute(
+            "SELECT profile_key, payload_json FROM auto_service_profiles"
+        ).fetchone()
+        payload = json.loads(row["payload_json"])
+        payload.pop("profile_schema_version", None)
+        payload.pop("field_bindings", None)
+        connection.execute(
+            "UPDATE auto_service_profiles SET payload_json = ? WHERE profile_key = ?",
+            (json.dumps(payload), row["profile_key"]),
+        )
+
+    upgraded = discovery.ensure_profile(
+        service_key="appflow",
+        display_name="Amazon AppFlow",
+        region="ap-southeast-1",
+    )
+
+    assert upgraded is not None
+    assert upgraded["profile_schema_version"] == PROFILE_SCHEMA_VERSION
+    assert upgraded["field_bindings"]
+    assert catalog.product_calls == 2
+
+
+def storage_product() -> dict:
+    product = appflow_product()
+    product["product"]["sku"] = "appflow-storage"
+    product["product"]["attributes"]["usagetype"] = "APS1-FlowStorage"
+    product["product"]["attributes"]["operation"] = "StoreFlowData"
+    dimension = product["terms"]["OnDemand"]["term"]["priceDimensions"]["dimension"]
+    dimension["unit"] = "GB-Mo"
+    dimension["description"] = "Storage used by AppFlow"
+    dimension["pricePerUnit"]["USD"] = "0.005"
+    return product
+
+
+class MultiDimensionAppFlowCatalog(AppFlowCatalog):
+    def products(self, service_code: str, filters: dict[str, str], *, max_pages: int = 20):
+        self.product_calls += 1
+        assert service_code == "AmazonAppFlow"
+        return [storage_product(), appflow_product()]
+
+
+def custom_unit_product() -> dict:
+    product = appflow_product()
+    product["product"]["sku"] = "appflow-execution"
+    product["product"]["attributes"]["usagetype"] = "APS1-FlowExecution"
+    product["product"]["attributes"]["operation"] = "ExecuteFlow"
+    dimension = product["terms"]["OnDemand"]["term"]["priceDimensions"]["dimension"]
+    dimension["unit"] = "Executions"
+    dimension["description"] = "Successful AppFlow executions"
+    dimension["pricePerUnit"]["USD"] = "0.10"
+    return product
+
+
+class CustomUnitAppFlowCatalog(AppFlowCatalog):
+    def products(self, service_code: str, filters: dict[str, str], *, max_pages: int = 20):
+        self.product_calls += 1
+        assert service_code == "AmazonAppFlow"
+        return [custom_unit_product()]
+
+
+def test_unknown_service_uses_exact_official_binding_not_cheapest_same_unit(
+    tmp_path: Path,
+) -> None:
+    catalog = MultiDimensionAppFlowCatalog()
+    discovery = AutoServiceDiscovery(
+        catalog,  # type: ignore[arg-type]
+        tmp_path / "auto-profiles.sqlite3",
+    )
+    plugin = GenericOfficialPlugin(
+        None,  # type: ignore[arg-type]
+        catalog,  # type: ignore[arg-type]
+        discovery,
+    )
+
+    selected = plugin.select(
+        ServiceRequirement(
+            service="appflow",
+            calculator_service_name="Amazon AppFlow",
+            region="ap-southeast-1",
+            requirements={"data_processed_gib": 500},
+        ),
+        "ap-southeast-1",
+    )
+
+    assert selected.usage_lines[0].usage_type == "APS1-DataProcessed"
+    assert selected.usage_lines[0].operation == "RunFlow"
+    assert selected.usage_lines[0].amount == 500
+
+
+def test_unknown_official_unit_gets_guarded_field_and_can_be_priced(
+    tmp_path: Path,
+) -> None:
+    catalog = CustomUnitAppFlowCatalog()
+    discovery = AutoServiceDiscovery(
+        catalog,  # type: ignore[arg-type]
+        tmp_path / "auto-profiles.sqlite3",
+    )
+    profile = discovery.ensure_profile(
+        service_key="appflow",
+        display_name="Amazon AppFlow",
+        region="ap-southeast-1",
+    )
+    assert profile is not None
+    field = next(
+        binding["field"]
+        for binding in profile["field_bindings"]
+        if binding["usage_type"] == "APS1-FlowExecution"
+    )
+    assert field.startswith("official_usage_")
+
+    plugin = GenericOfficialPlugin(
+        None,  # type: ignore[arg-type]
+        catalog,  # type: ignore[arg-type]
+        discovery,
+    )
+    selected = plugin.select(
+        ServiceRequirement(
+            service="appflow",
+            calculator_service_name="Amazon AppFlow",
+            region="ap-southeast-1",
+            requirements={field: 12},
+        ),
+        "ap-southeast-1",
+    )
+
+    assert selected.usage_lines[0].usage_type == "APS1-FlowExecution"
+    assert selected.usage_lines[0].amount == 12
+
+
+def test_unknown_service_can_quote_explicit_usage_without_custom_adapter(tmp_path: Path) -> None:
+    catalog = AppFlowCatalog()
+    discovery = AutoServiceDiscovery(
+        catalog,  # type: ignore[arg-type]
+        tmp_path / "auto-profiles.sqlite3",
+    )
+    discovery.ensure_profile(
+        service_key="appflow",
+        display_name="Amazon AppFlow",
+        region="ap-southeast-1",
+    )
+    plugin = GenericOfficialPlugin(
+        None,  # type: ignore[arg-type]
+        catalog,  # type: ignore[arg-type]
+        discovery,
+    )
+
+    selected = plugin.select(
+        ServiceRequirement(
+            service="appflow",
+            calculator_service_name="Amazon AppFlow",
+            region="ap-southeast-1",
+            requirements={"data_processed_gib": 500},
+        ),
+        "ap-southeast-1",
+    )
+
+    assert selected.usage_lines[0].amount == 500
+    assert selected.usage_lines[0].service_code == "AmazonAppFlow"
+    assert "自动建立" in selected.rationale
+
+
+def test_unknown_service_without_usage_uses_one_minimum_official_unit(tmp_path: Path) -> None:
+    catalog = AppFlowCatalog()
+    discovery = AutoServiceDiscovery(
+        catalog,  # type: ignore[arg-type]
+        tmp_path / "auto-profiles.sqlite3",
+    )
+    plugin = GenericOfficialPlugin(
+        None,  # type: ignore[arg-type]
+        catalog,  # type: ignore[arg-type]
+        discovery,
+    )
+
+    selected = plugin.select(
+        ServiceRequirement(
+            service="appflow",
+            calculator_service_name="Amazon AppFlow",
+            region="ap-southeast-1",
+        ),
+        "ap-southeast-1",
+    )
+
+    assert selected.reference_rates == []
+    assert selected.usage_lines[0].service_code == "AmazonAppFlow"
+    assert selected.usage_lines[0].amount == 1
