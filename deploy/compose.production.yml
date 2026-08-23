@@ -1,3 +1,5 @@
+name: astraquote
+
 services:
   astraquote:
     image: astraquote:production

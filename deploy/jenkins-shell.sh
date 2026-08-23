@@ -15,7 +15,7 @@ git -C "$APP_DIR" checkout main
 git -C "$APP_DIR" pull --ff-only origin main
 
 docker compose -f "$APP_DIR/deploy/compose.production.yml" build --pull
-docker compose -f "$APP_DIR/deploy/compose.production.yml" up -d --remove-orphans
+docker compose -p astraquote -f "$APP_DIR/deploy/compose.production.yml" up -d
 docker image prune -f --filter "until=168h"
 
 for attempt in {1..24}; do
