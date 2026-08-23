@@ -87,25 +87,21 @@ export function ConfigurationOptionPicker({ options, value, onChange, catalog = 
     <div className={`${className} configuration-picker`}>
       {hasProcessorFilter && <div className="configuration-picker-filters">
         <label>
-          <span>1. 选择处理器</span>
+          <span>处理器</span>
           <select aria-label="选择处理器" value={vcpu} onChange={(event) => handleVcpuChange(event.target.value)}>
             <option value="">请选择 vCPU</option>
               {vcpuValues.map((item) => <option value={item} key={item}>{item} vCPU</option>)}
           </select>
         </label>
         {vcpu && memoryValues.length > 0 && <label>
-          <span>2. 选择内存</span>
+          <span>内存</span>
           <select aria-label="选择内存" value={memory} onChange={(event) => handleMemoryChange(event.target.value)}>
             <option value="">请选择内存</option>
               {memoryValues.map((item) => <option value={item} key={item}>{item} GiB</option>)}
           </select>
         </label>}
       </div>}
-      {hasProcessorFilter && !vcpu ? (
-        <div className="configuration-picker-hint">请先选择处理器，系统会自动显示对应的内存和官方型号。</div>
-      ) : hasProcessorFilter && memoryValues.length > 0 && !memory ? (
-        <div className="configuration-picker-hint">请选择该处理器支持的内存规格。</div>
-      ) : filtered.length === 0 ? (
+      {hasProcessorFilter && !vcpu ? null : hasProcessorFilter && memoryValues.length > 0 && !memory ? null : filtered.length === 0 ? (
         <div className="configuration-picker-empty" role="status">当前区域没有同时满足所选处理器和内存的配置，请调整筛选条件。</div>
       ) : filtered.length === 1 ? (
         <button type="button" className={`configuration-picker-single ${value === filtered[0].option.value ? "selected" : ""}`} onClick={() => onChange(filtered[0].option.value)}>
@@ -113,7 +109,7 @@ export function ConfigurationOptionPicker({ options, value, onChange, catalog = 
         </button>
       ) : (
         <label className="configuration-picker-result">
-          {hasProcessorFilter && <span>3. 选择官方型号</span>}
+          {hasProcessorFilter && <span>官方型号</span>}
           <select className="configuration-picker-select" aria-label="选择可用配置" value={filtered.some(({ option }) => option.value === value) ? value : ""} onChange={(event) => onChange(event.target.value)}>
             <option value="">请选择当前区域支持的{hasProcessorFilter ? "型号" : "选项"}</option>
             {filtered.map(({ option }) => <option value={option.value} key={option.value}>{option.label}</option>)}

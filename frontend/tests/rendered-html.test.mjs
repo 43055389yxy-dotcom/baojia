@@ -59,9 +59,10 @@ test("configuration selection follows processor then memory without search", asy
     picker.indexOf("if (!catalog)"),
   );
 
-  assert.match(picker, /请先选择处理器/);
-  assert.match(picker, /请选择该处理器支持的内存规格/);
+  assert.match(picker, /处理器/);
+  assert.match(picker, /内存/);
   assert.doesNotMatch(picker, /搜索型号或配置|搜索可用项/);
+  assert.doesNotMatch(picker, /configuration-picker-hint/);
   assert.doesNotMatch(memoryHandler, /setVcpu/);
 });
 
@@ -74,4 +75,15 @@ test("final customer review keeps the instruction concise", async () => {
   assert.match(confirmationPage, /请核对配置信息/);
   assert.match(confirmationPage, /如有不符，请直接修改、添加或删除/);
   assert.doesNotMatch(confirmationPage, /最终配置确认|请核对完整配置清单|配置概览/);
+});
+
+test("customer questions use a short action-only heading", async () => {
+  const confirmationPage = await readFile(
+    new URL("../app/confirm/[token]/page.tsx", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(confirmationPage, /请选择配置/);
+  assert.match(confirmationPage, /请完成下面每个组件的选择/);
+  assert.doesNotMatch(confirmationPage, /仅填写需要您决定的项目|需求摘要/);
 });

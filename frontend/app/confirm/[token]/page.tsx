@@ -620,8 +620,7 @@ export default function CustomerConfirmationPage() {
           </>
         ) : session ? (
           <>
-            <div className="customer-confirm-title"><small>配置确认</small><h1>请确认以下配置</h1><p>仅填写需要您决定的项目；未提供用量的项目按最小单位单价计算。</p></div>
-            <div className="customer-summary"><strong>需求摘要</strong><p>{session.customer_summary}</p></div>
+            <div className="customer-confirm-title"><h1>请选择配置</h1><p>请完成下面每个组件的选择。</p></div>
             <div className="customer-questions">
               {session.confirmation_items.map((item, index) => (
                 <article key={item.question}>

@@ -693,6 +693,25 @@ class QuoteService:
                 for notice in notices
                 if self._confirmation_question_key(notice) not in prior_asked
             ]
+        # Region is the one quote-wide fallback: once every regional component
+        # has a resolved region, a late parser or preflight question must not
+        # ask the customer for it again. All other decisions remain enclosed
+        # within their own component.
+        notices = self._drop_resolved_region_questions(intent, notices)
+        notices = self._ensure_selection_confirmation_notices(
+            intent,
+            selections,
+            notices,
+            confirmation_components,
+            confirmation_options,
+        )
+        notices = self._simplify_model_selection_notices(
+            intent,
+            selections,
+            notices,
+            confirmation_components,
+            confirmation_options,
+        )
         # A cross-field/design conflict can be discovered before an individual
         # adapter previews successfully (for example Windows on an ARM EC2
         # model). Reflect that conflict on the corresponding component card.
@@ -1675,11 +1694,194 @@ class QuoteService:
     @staticmethod
     def _is_region_confirmation_notice(notice: str) -> bool:
         text = notice.casefold()
-        return (
-            "区域" in text
-            and any(marker in text for marker in ("请确认", "缺少", "未指定", "部署"))
-            and not any(marker in text for marker in ("不可用", "不支持"))
+        if "区域" not in text or any(marker in text for marker in ("不可用", "不支持")):
+            return False
+        # A configuration question often repeats source text such as
+        # ``区域：新加坡`` and later says ``请确认推荐配置``.  Treating those two
+        # unrelated fragments as a region question collapsed independent RDS,
+        # Redis and OpenSearch choices into one bogus global-region prompt.
+        return bool(
+            re.search(
+                r"(?:请确认|缺少|未指定)[^。；？?]{0,48}(?:部署[^。；？?]{0,16})?区域"
+                r"|部署在(?:哪|哪个|哪一个)[^。；？?]{0,20}区域"
+                r"|区域[^。；？?]{0,16}(?:缺少|未指定)",
+                text,
+            )
         )
+
+    @classmethod
+    def _drop_resolved_region_questions(
+        cls, intent: ParsedIntent, notices: list[str]
+    ) -> list[str]:
+        global_services = {
+            ServiceKind.CLOUDFRONT,
+            ServiceKind.ROUTE53,
+            ServiceKind.GLOBAL_ACCELERATOR,
+        }
+        regional = [
+            item
+            for item in intent.services
+            if cls._service_kind(item.service) not in global_services
+        ]
+        if not regional or not all(item.region for item in regional):
+            return notices
+        return [
+            notice
+            for notice in notices
+            if not cls._is_region_confirmation_notice(notice)
+        ]
+
+    @classmethod
+    def _ensure_selection_confirmation_notices(
+        cls,
+        intent: ParsedIntent,
+        selections: list[PreviewSelection],
+        notices: list[str],
+        confirmation_components: dict[str, tuple[str, str]],
+        confirmation_options: dict[str, list[ConfirmationOption]],
+    ) -> list[str]:
+        """Give every red component card one customer-answerable question."""
+
+        result = list(notices)
+        mapped_components = {
+            confirmation_components[notice][0]
+            for notice in result
+            if notice in confirmation_components
+        }
+        for selection in selections:
+            component_id = selection.component_id
+            if not selection.requires_confirmation or component_id in mapped_components:
+                continue
+            question = str(
+                selection.confirmation_reason
+                or selection.issue_message
+                or "请选择该组件当前区域支持的官方配置。"
+            ).strip()
+            if not question:
+                continue
+            existing_scope = confirmation_components.get(question)
+            if existing_scope and existing_scope[0] != component_id:
+                question = f"【{selection.display_name}】{question}"
+            confirmation_components[question] = (component_id, selection.service)
+            try:
+                requirement = intent.services[int(component_id)]
+            except (ValueError, IndexError):
+                requirement = object()
+            confirmation_options[question] = cls._compact_candidate_options(
+                selection.candidates, requirement
+            )
+            result.append(question)
+            mapped_components.add(component_id)
+        return cls._deduplicate_confirmation_notices(
+            result, confirmation_components
+        )
+
+    @staticmethod
+    def _customer_service_name(
+        selection: PreviewSelection, requirement: ServiceRequirement
+    ) -> str:
+        identity = " ".join(
+            filter(
+                None,
+                (
+                    selection.display_name,
+                    selection.service,
+                    requirement.product_identity,
+                    requirement.source_text,
+                ),
+            )
+        ).casefold()
+        if "eks worker" in identity or "worker nodes" in identity:
+            return "EKS 工作节点"
+        if "elasticache" in identity or "redis" in identity:
+            return "Redis"
+        if "postgres" in identity:
+            return "RDS PostgreSQL"
+        if "mysql" in identity:
+            return "RDS MySQL"
+        if "opensearch" in identity:
+            return "OpenSearch"
+        return selection.display_name.removeprefix("Amazon ").strip() or "该组件"
+
+    @staticmethod
+    def _plain_spec_value(value: object) -> str | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return f"{value:g}"
+        try:
+            return f"{float(str(value)):g}"
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _plain_model_selection_question(
+        cls, selection: PreviewSelection, requirement: ServiceRequirement
+    ) -> str:
+        service_name = cls._customer_service_name(selection, requirement)
+        vcpu = cls._plain_spec_value(requirement.requirements.get("vcpu"))
+        memory = cls._plain_spec_value(requirement.requirements.get("memory_gib"))
+        if service_name == "EKS 工作节点" and not vcpu and not memory:
+            return (
+                "您还没有指定 EKS 工作节点的 CPU 和内存，"
+                "请在下方选择您需要的型号。"
+            )
+        subject = (
+            f"{service_name} 每个节点的配置"
+            if service_name == "OpenSearch"
+            else f"{service_name} 的配置"
+        )
+        if vcpu and memory:
+            return (
+                f"您要求 {subject}为 {vcpu} 核 {memory} GB，但 AWS 没有完全相同的型号，"
+                "请在下方重新选择您需要的型号。"
+            )
+        if memory:
+            return (
+                f"您要求 {service_name} 的内存为 {memory} GB，但 AWS 没有完全相同的型号，"
+                "请在下方重新选择您需要的型号。"
+            )
+        if vcpu:
+            return (
+                f"您要求 {service_name} 的处理器为 {vcpu} 核，但 AWS 没有完全相同的型号，"
+                "请在下方重新选择您需要的型号。"
+            )
+        return f"{service_name} 还没有指定型号，请在下方选择您需要的型号。"
+
+    @classmethod
+    def _simplify_model_selection_notices(
+        cls,
+        intent: ParsedIntent,
+        selections: list[PreviewSelection],
+        notices: list[str],
+        confirmation_components: dict[str, tuple[str, str]],
+        confirmation_options: dict[str, list[ConfirmationOption]],
+    ) -> list[str]:
+        """Replace internal matching explanations with one clear customer action."""
+
+        selections_by_id = {item.component_id: item for item in selections}
+        result: list[str] = []
+        for notice in notices:
+            component = confirmation_components.get(notice)
+            options = confirmation_options.get(notice, [])
+            if not component or not any(option.model for option in options):
+                result.append(notice)
+                continue
+            selection = selections_by_id.get(component[0])
+            try:
+                requirement = intent.services[int(component[0])]
+            except (ValueError, IndexError):
+                requirement = None
+            if selection is None or requirement is None:
+                result.append(notice)
+                continue
+            plain = cls._plain_model_selection_question(selection, requirement)
+            confirmation_components.pop(notice, None)
+            confirmation_options.pop(notice, None)
+            confirmation_components[plain] = component
+            confirmation_options[plain] = options
+            result.append(plain)
+        return cls._deduplicate_confirmation_notices(result, confirmation_components)
 
     @staticmethod
     def _is_optional_opensearch_role_notice(notice: str) -> bool:

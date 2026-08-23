@@ -1674,6 +1674,122 @@ def test_resolved_region_and_optional_opensearch_roles_do_not_ask_customer() -> 
     assert QuoteService._confirmation_notices(intent) == []
 
 
+def test_late_global_region_question_is_removed_when_components_have_regions() -> None:
+    question = "请确认这些区域型服务部署在哪个 AWS 区域；如各服务区域不同，请分别说明。"
+    intent = ParsedIntent(
+        customer_summary="全部部署在新加坡",
+        services=[
+            ServiceRequirement(service="ec2", region="ap-southeast-1"),
+            ServiceRequirement(service="rds", region="ap-southeast-1"),
+            ServiceRequirement(service="cloudfront", region="global"),
+        ],
+    )
+
+    assert QuoteService._drop_resolved_region_questions(intent, [question]) == []
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        (
+            "您之前要求【Amazon RDS MySQL】：区域：新加坡，部署方式：Multi-AZ。"
+            "AWS 可订购的数据库规格与客户要求不是完全匹配，请确认推荐配置。"
+        ),
+        (
+            "您之前要求【Amazon OpenSearch Service】：区域：新加坡。"
+            "请选择节点型号；列表仅展示当前部署区域可用的官方型号。"
+        ),
+    ],
+)
+def test_component_configuration_question_is_not_misclassified_as_region(
+    question: str,
+) -> None:
+    assert QuoteService._is_region_confirmation_notice(question) is False
+
+
+def test_every_confirmation_card_gets_a_component_question() -> None:
+    intent = ParsedIntent(
+        customer_summary="RDS 和 Redis",
+        services=[
+            ServiceRequirement(service="rds", region="ap-southeast-1"),
+            ServiceRequirement(service="elasticache", region="ap-southeast-1"),
+        ],
+    )
+    redis_question = "Redis 需要选择官方规格。"
+    rds_question = "RDS 需要选择官方规格。"
+    selections = [
+        PreviewSelection(
+            component_id="0",
+            service="rds",
+            display_name="Amazon RDS",
+            region="ap-southeast-1",
+            requires_confirmation=True,
+            confirmation_reason=rds_question,
+        ),
+        PreviewSelection(
+            component_id="1",
+            service="elasticache",
+            display_name="Amazon ElastiCache",
+            region="ap-southeast-1",
+            requires_confirmation=True,
+            confirmation_reason=redis_question,
+        ),
+    ]
+    components = {redis_question: ("1", "elasticache")}
+    options = {}
+
+    notices = QuoteService._ensure_selection_confirmation_notices(
+        intent, selections, [redis_question], components, options
+    )
+
+    assert notices == [redis_question, rds_question]
+    assert components[rds_question] == ("0", "rds")
+
+
+@pytest.mark.parametrize(
+    ("selection", "requirement", "expected"),
+    [
+        (
+            PreviewSelection(
+                component_id="0",
+                service="rds",
+                display_name="Amazon RDS MySQL",
+                region="ap-southeast-1",
+            ),
+            ServiceRequirement(
+                service="rds",
+                region="ap-southeast-1",
+                requirements={"vcpu": 10, "memory_gib": 40},
+            ),
+            (
+                "您要求 RDS MySQL 的配置为 10 核 40 GB，但 AWS 没有完全相同的型号，"
+                "请在下方重新选择您需要的型号。"
+            ),
+        ),
+        (
+            PreviewSelection(
+                component_id="1",
+                service="ec2",
+                display_name="Amazon EC2 (EKS Worker Nodes)",
+                region="ap-southeast-1",
+            ),
+            ServiceRequirement(service="ec2", region="ap-southeast-1"),
+            "您还没有指定 EKS 工作节点的 CPU 和内存，请在下方选择您需要的型号。",
+        ),
+    ],
+)
+def test_model_questions_use_plain_customer_language(
+    selection: PreviewSelection,
+    requirement: ServiceRequirement,
+    expected: str,
+) -> None:
+    question = QuoteService._plain_model_selection_question(selection, requirement)
+
+    assert question == expected
+    assert "您之前要求" not in question
+    assert "推荐规格与客户原始要求不是完全匹配" not in question
+
+
 def test_component_region_variants_and_optional_product_choices_do_not_repeat() -> None:
     intent = ParsedIntent(
         customer_summary="workload defaults",

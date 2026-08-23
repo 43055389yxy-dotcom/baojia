@@ -183,14 +183,17 @@ select { width: 100%; height: 48px; padding: 0 35px 0 13px; border: 1px solid #c
 .customer-questions { display: grid; gap: 18px; margin-top: 20px; }
 .customer-questions article { padding: 20px 22px; border: 1px solid var(--line); border-radius: 14px; background: white; }
 .customer-questions label { display: flex; gap: 10px; align-items: flex-start; line-height: 1.6; }
+.customer-questions label > span { font-size: 15px; font-weight: 720; }
 .customer-questions label b { display: grid; flex: 0 0 26px; height: 26px; place-items: center; border-radius: 50%; background: #e4f4ef; color: var(--teal); }
 .customer-questions input { width: 100%; height: 44px; margin-top: 12px; padding: 0 13px; border: 1px solid var(--line); border-radius: 9px; outline: none; }
 .customer-questions input:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(13,124,114,.08); }
 .customer-options { display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0 0 36px; }
+.customer-options.configuration-picker { width: calc(100% - 36px); }
 .customer-options button { padding: 8px 11px; border: 1px solid var(--line); border-radius: 8px; background: #f8fbf9; cursor: pointer; }
 .customer-options button.selected { border-color: var(--teal); background: #e4f4ef; color: var(--teal); font-weight: 800; }
 .configuration-picker { width: 100%; display: grid !important; gap: 14px; }
 .configuration-picker-filters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.configuration-picker-filters label:only-child { grid-column: 1 / -1; }
 .configuration-picker label { display: grid; gap: 7px; }
 .configuration-picker label > span { color: #52716a; font-size: 11px; font-weight: 850; }
 .configuration-picker input, .configuration-picker select {
@@ -200,7 +203,6 @@ select { width: 100%; height: 48px; padding: 0 35px 0 13px; border: 1px solid #c
 .configuration-picker input:focus, .configuration-picker select:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(13,124,114,.08); }
 .configuration-picker-select { border-color: rgba(13,124,114,.45) !important; background: #f1faf6 !important; font-weight: 750 !important; }
 .configuration-picker-result { width: 100%; }
-.configuration-picker-hint { padding: 14px 16px; border-radius: 10px; background: #f4f8f6; color: #6b7f7a; font-size: 12px; }
 .configuration-picker-empty { padding: 11px 13px; border: 1px solid #edb29f; border-radius: 9px; background: #fff3ee; color: #a8462f; font-size: 12px; }
 .configuration-picker-single { display: grid; gap: 2px; width: 100%; padding: 10px 13px; border: 1px solid rgba(13,124,114,.45); border-radius: 9px; background: #f1faf6; color: var(--ink); text-align: left; cursor: pointer; }
 .configuration-picker-single small { color: var(--teal); font-size: 9px; font-weight: 850; letter-spacing: .08em; }
