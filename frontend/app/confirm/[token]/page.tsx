@@ -261,11 +261,6 @@ export default function CustomerConfirmationPage() {
       .map((item) => String(item.region)),
   )), [session?.configuration_items]);
   const sharedRegion = regionalRegions.length === 1 ? regionalRegions[0] : null;
-  const regionSummary = sharedRegion
-    ? REGION_LABELS[sharedRegion] ?? sharedRegion
-    : regionalRegions.length > 1
-      ? "多个地区（以各项配置为准）"
-      : "待确认";
   const hasPendingComponentFeedback = Object.values(componentFeedback).some(
     (value) => value.trim().length > 0,
   );
@@ -472,10 +467,9 @@ export default function CustomerConfirmationPage() {
           </div>
         ) : showConfigurationReview && session ? (
           <>
-            <div className="customer-confirm-title"><small>最终配置确认</small><h1>请核对完整配置清单</h1><p>确认服务、区域、型号、规格和数量无误后，系统才会开始报价。</p></div>
-            <div className="customer-summary customer-configuration-summary">
-              <strong>配置概览</strong>
-              <p>报价区域：{regionSummary} · 共 {session.configuration_items.length} 项服务</p>
+            <div className="customer-confirm-title customer-review-heading">
+              <h1>请核对配置信息</h1>
+              <p>如有不符，请直接修改、添加或删除。</p>
             </div>
             {isConfigurationRefreshActive && (
               <div className="configuration-refresh-status" role="status">

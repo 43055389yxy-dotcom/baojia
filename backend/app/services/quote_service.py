@@ -676,7 +676,9 @@ class QuoteService:
 
         total_elapsed = time.perf_counter() - started_at
         logger.info("Quote preview completed in %.2fs", total_elapsed)
-        notices = self._deduplicate_confirmation_notices(notices)
+        notices = self._deduplicate_confirmation_notices(
+            notices, confirmation_components
+        )
         prior_asked = (
             self._asked_confirmation_questions.get(request.draft_id, set())
             if request.draft_id
@@ -1692,7 +1694,10 @@ class QuoteService:
         )
 
     @staticmethod
-    def _deduplicate_confirmation_notices(notices: list[str]) -> list[str]:
+    def _deduplicate_confirmation_notices(
+        notices: list[str],
+        component_scopes: dict[str, tuple[str, str]] | None = None,
+    ) -> list[str]:
         """Merge customer questions by business meaning, not exact wording.
 
         The intake model may report the same missing region once per regional
@@ -1722,11 +1727,22 @@ class QuoteService:
                 )
             else:
                 normalized = re.sub(r"[\s，,。；;：:？?!！…]+", "", folded)
+                current_scope = (
+                    component_scopes.get(raw)
+                    if component_scopes is not None
+                    else None
+                )
                 prefix_duplicate = next(
                     (
                         index
                         for index, existing in enumerate(result)
-                        if min(
+                        if not (
+                            current_scope
+                            and component_scopes is not None
+                            and component_scopes.get(existing)
+                            and component_scopes.get(existing) != current_scope
+                        )
+                        and min(
                             len(normalized),
                             len(re.sub(r"[\s，,。；;：:？?!！…]+", "", existing.casefold())),
                         ) >= 24
@@ -1746,7 +1762,8 @@ class QuoteService:
                     if len(notice) > len(existing):
                         result[prefix_duplicate] = notice
                     continue
-                key = f"semantic:{normalized[:48]}"
+                scope_key = current_scope[0] if current_scope else "global"
+                key = f"semantic:{scope_key}:{normalized[:48]}"
             if key in seen:
                 continue
             seen.add(key)

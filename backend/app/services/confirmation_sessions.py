@@ -407,7 +407,7 @@ class ConfirmationSessionStore:
     def _deduplicate_confirmation_items(
         items: list[ConfirmationItem],
     ) -> list[ConfirmationItem]:
-        """Prefer the complete AI question over a truncated duplicate."""
+        """Prefer the complete question over a truncated duplicate in one component."""
 
         result: list[ConfirmationItem] = []
 
@@ -416,13 +416,29 @@ class ConfirmationSessionStore:
                 r"[\s，,。；;、：:？?!！…]+", "", question.casefold()
             )
 
+        def same_scope(left: ConfirmationItem, right: ConfirmationItem) -> bool:
+            if left.component_id or right.component_id:
+                return bool(
+                    left.component_id
+                    and right.component_id
+                    and left.component_id == right.component_id
+                )
+            if left.service or right.service:
+                return bool(
+                    left.service
+                    and right.service
+                    and left.service == right.service
+                )
+            return True
+
         for item in items:
             current = normalized(item.question)
             duplicate_index = next(
                 (
                     index
                     for index, existing in enumerate(result)
-                    if min(len(current), len(normalized(existing.question))) >= 24
+                    if same_scope(item, existing)
+                    and min(len(current), len(normalized(existing.question))) >= 20
                     and (
                         current.startswith(normalized(existing.question))
                         or normalized(existing.question).startswith(current)

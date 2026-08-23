@@ -1447,6 +1447,19 @@ def test_component_region_question_is_not_rewritten_as_shared_region_question() 
     assert QuoteService._deduplicate_confirmation_notices([question]) == [question]
 
 
+def test_prefix_questions_from_different_components_are_not_deduplicated() -> None:
+    first = "请选择当前区域支持的处理器和内存配置。"
+    second = "请选择当前区域支持的处理器和内存配置，并选择最终型号。"
+
+    assert QuoteService._deduplicate_confirmation_notices(
+        [first, second],
+        {
+            first: ("component-a", "Amazon EC2"),
+            second: ("component-b", "Amazon RDS"),
+        },
+    ) == [first, second]
+
+
 def test_aws_discovery_failures_are_internal_not_customer_questions() -> None:
     error = ManualConfirmationRequired(
         "EC2 官方 API 无法确认区域",

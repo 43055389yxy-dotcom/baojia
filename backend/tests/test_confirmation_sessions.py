@@ -286,3 +286,41 @@ def test_customer_answers_are_partitioned_by_component(tmp_path: Path) -> None:
 
     assert component == {0: {rds_question: "主备"}}
     assert global_answers == {region_question: "法兰克福"}
+
+
+def test_confirmation_question_deduplication_keeps_complete_question() -> None:
+    short = ConfirmationItem(
+        question="请确认当前组件在所选区域支持的处理器和内存配置？",
+        component_id="component-a",
+        service="Amazon EC2",
+    )
+    complete = ConfirmationItem(
+        question="请确认当前组件在所选区域支持的处理器和内存配置，并选择最终型号。",
+        component_id="component-a",
+        service="Amazon EC2",
+    )
+
+    result = ConfirmationSessionStore._deduplicate_confirmation_items(
+        [short, complete]
+    )
+
+    assert result == [complete]
+
+
+def test_confirmation_question_deduplication_does_not_cross_components() -> None:
+    first = ConfirmationItem(
+        question="请确认当前组件在所选区域支持的处理器和内存配置？",
+        component_id="component-a",
+        service="Amazon EC2",
+    )
+    second = ConfirmationItem(
+        question="请确认当前组件在所选区域支持的处理器和内存配置，并选择最终型号。",
+        component_id="component-b",
+        service="Amazon RDS",
+    )
+
+    result = ConfirmationSessionStore._deduplicate_confirmation_items(
+        [first, second]
+    )
+
+    assert result == [first, second]

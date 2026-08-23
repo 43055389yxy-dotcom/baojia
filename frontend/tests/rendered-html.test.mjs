@@ -34,7 +34,8 @@ test("client uses the live quote job API and keeps official-source copy", async 
   assert.match(page, /本次没有生成价格/);
   assert.match(page, /月均成本/);
   assert.doesNotMatch(page, /复制链接/);
-  assert.match(page, /Enter 开始系统解析/);
+  assert.match(page, /event\.key === "Enter" && !event\.shiftKey/);
+  assert.match(page, /void submitRequirement\(\)/);
   assert.doesNotMatch(page, /交给 AI 拆分/);
   assert.match(page, /组件配置清单/);
   assert.match(page, /配置确认/);
@@ -46,4 +47,31 @@ test("client uses the live quote job API and keeps official-source copy", async 
   assert.doesNotMatch(page, /报价记录|插件中心|查看 AWS 技术计费字段/);
   assert.match(layout, /AWS 智能报价/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
+});
+
+test("configuration selection follows processor then memory without search", async () => {
+  const picker = await readFile(
+    new URL("../app/components/configuration-option-picker.tsx", import.meta.url),
+    "utf8",
+  );
+  const memoryHandler = picker.slice(
+    picker.indexOf("const handleMemoryChange"),
+    picker.indexOf("if (!catalog)"),
+  );
+
+  assert.match(picker, /请先选择处理器/);
+  assert.match(picker, /请选择该处理器支持的内存规格/);
+  assert.doesNotMatch(picker, /搜索型号或配置|搜索可用项/);
+  assert.doesNotMatch(memoryHandler, /setVcpu/);
+});
+
+test("final customer review keeps the instruction concise", async () => {
+  const confirmationPage = await readFile(
+    new URL("../app/confirm/[token]/page.tsx", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(confirmationPage, /请核对配置信息/);
+  assert.match(confirmationPage, /如有不符，请直接修改、添加或删除/);
+  assert.doesNotMatch(confirmationPage, /最终配置确认|请核对完整配置清单|配置概览/);
 });
