@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ConfigurationOptionPicker, type ConfigurationChoice } from "./components/configuration-option-picker";
 
 type Health = { status: string; awsAccount?: string; calculatorReady?: boolean; aiProvider?: string; pricingMode?: string };
 type JobEvent = { stage: string; message: string; time: string };
@@ -53,9 +54,10 @@ type PreviewSelection = {
 };
 type ConfirmationItem = {
   question: string;
-  options: { label: string; value: string }[];
+  options: ConfigurationChoice[];
   component_id?: string | null;
   service?: string | null;
+  selection_mode?: "buttons" | "catalog";
 };
 type Selection = {
   service: string;
@@ -426,7 +428,7 @@ export default function Home() {
   const [logExpanded, setLogExpanded] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const [pricingMode, setPricingMode] = useState<PricingMode>("standard_reserved");
+  const [pricingMode, setPricingMode] = useState<PricingMode | null>("standard_reserved");
   const [includeOnDemandScenario, setIncludeOnDemandScenario] = useState(true);
   const [reservedTermYears, setReservedTermYears] = useState<(1 | 3)[]>([1, 3]);
   const [paymentOption, setPaymentOption] = useState<PaymentOption>("all_upfront");
@@ -691,11 +693,11 @@ export default function Home() {
           cloud_provider: cloudProvider,
           customer_request: requestText,
           draft_id: draftId,
-          pricing_mode: pricingMode,
-          reserved_term_years: pricingMode === "on_demand" ? null : reservedTermYears[0],
-          reserved_term_options: pricingMode === "on_demand" ? null : reservedTermYears,
-          payment_option: pricingMode === "on_demand" ? null : paymentOption,
-          include_on_demand_scenario: includeOnDemandScenario,
+          pricing_mode: pricingMode ?? "on_demand",
+          reserved_term_years: pricingMode ? reservedTermYears[0] : null,
+          reserved_term_options: pricingMode ? reservedTermYears : null,
+          payment_option: pricingMode ? paymentOption : null,
+          include_on_demand_scenario: pricingMode ? includeOnDemandScenario : true,
           utilization_percent: utilizationPercent,
         }),
       });
@@ -956,11 +958,11 @@ export default function Home() {
         customer_request: requestText,
         draft_id: draftId,
         confirmation_responses: confirmationResponses,
-        pricing_mode: pricingMode,
-        reserved_term_years: pricingMode === "on_demand" ? null : reservedTermYears[0],
-        reserved_term_options: pricingMode === "on_demand" ? null : reservedTermYears,
-        payment_option: pricingMode === "on_demand" ? null : paymentOption,
-        include_on_demand_scenario: includeOnDemandScenario,
+        pricing_mode: pricingMode ?? "on_demand",
+        reserved_term_years: pricingMode ? reservedTermYears[0] : null,
+        reserved_term_options: pricingMode ? reservedTermYears : null,
+        payment_option: pricingMode ? paymentOption : null,
+        include_on_demand_scenario: pricingMode ? includeOnDemandScenario : true,
         utilization_percent: utilizationPercent,
       };
       if (cloudProvider === "aws") {
@@ -1209,12 +1211,7 @@ export default function Home() {
           <span>A</span>
           <strong>AstraQuote</strong>
         </a>
-        <div className="product-title">
-          <strong>智能报价</strong>
-          <span>{cloudProvider === "aws" ? "AWS 官方成本估算" : "Microsoft Azure 零售成本估算"}</span>
-        </div>
         <div className="header-actions">
-          <a className="prompt-nav-link" href={`/prompts?provider=${cloudProvider}`}>提示词管理</a>
           <div className={`health ${health?.status === "ok" ? "online" : ""}`}>
             <i />
             {health?.status === "ok"
@@ -1230,7 +1227,7 @@ export default function Home() {
         <button type="button" className={cloudProvider === "aws" ? "selected" : ""} onClick={() => {
           workflowPhase.current = "idle";
           setCloudProvider("aws");
-          if (pricingMode === "on_demand") setPricingMode("standard_reserved");
+          setPricingMode("standard_reserved");
           setIncludeOnDemandScenario(true);
           setReservedTermYears([1, 3]);
           setPaymentOption("all_upfront");
@@ -1238,7 +1235,7 @@ export default function Home() {
           setJob(null);
           setSalesReview(null);
         }}>AWS 报价</button>
-        <button type="button" className={cloudProvider === "azure" ? "selected" : ""} onClick={() => { workflowPhase.current = "idle"; window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY); setCloudProvider("azure"); setPricingMode("on_demand"); setJob(null); setSalesReview(null); }}>Microsoft Azure 报价</button>
+        <button type="button" className={cloudProvider === "azure" ? "selected" : ""} onClick={() => { workflowPhase.current = "idle"; window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY); setCloudProvider("azure"); setPricingMode(null); setJob(null); setSalesReview(null); }}>Microsoft Azure 报价</button>
       </nav>}
 
       <nav className="quote-steps" aria-label="报价步骤">
@@ -1256,10 +1253,7 @@ export default function Home() {
       {!job && !confirmationText && !salesReview && (
       <section className="hero" id="top">
         <form className="quote-form" onSubmit={submit}>
-          <div className="form-title">
-            <div><h1>{cloudProvider === "aws" ? "新建 AWS 报价" : "新建 Microsoft Azure 报价"}</h1><p>原样粘贴客户发来的全部内容，无需分类或整理。</p></div>
-          </div>
-          <label htmlFor="requirement">客户原始消息 <small>系统将自动拆分服务、规格、数量和区域</small></label>
+          <label className="sr-only" htmlFor="requirement">客户需求</label>
           <textarea
             ref={requirementInput}
             id="requirement"
@@ -1274,24 +1268,33 @@ export default function Home() {
               }
             }}
             maxLength={12000}
-            placeholder={`直接粘贴客户发来的完整消息，不用改格式、不用按 ${cloudProvider === "aws" ? "AWS" : "Azure"} 服务分类。`}
+            placeholder={`请按 1、2、3、4 分条粘贴客户需求；序号后可用顿号、逗号、句号或空格。\n\n示例：\n1、云服务器：数量、区域、规格……\n2、数据库：引擎、容量、部署方式……`}
           />
           <div className="counter">{requirement.length.toLocaleString()} / 12,000</div>
           {cloudProvider === "aws" ? <fieldset className="pricing-choice">
             <legend>报价方案 <small>客户明确要求优先；未指定时按已选方案生成对比报价</small></legend>
             <div className="pricing-mode-grid">
               {([
-                ["on_demand", "按需实例", "按实际使用付费"],
-                ["standard_reserved", "标准预留实例", "价格更低，不支持更换实例系列"],
-                ["convertible_reserved", "可转换预留实例", "可调整实例系列，折扣较低"],
+                ["on_demand", "按需", "按实际使用付费"],
+                ["standard_reserved", "标准预留", "可选择 1 年或 3 年"],
+                ["convertible_reserved", "可转换预留", "支持调整实例系列"],
               ] as const).map(([value, label, description]) => (
                 <button
                   type="button"
                   className={value === "on_demand" ? (includeOnDemandScenario ? "selected" : "") : (pricingMode === value ? "selected" : "")}
                   key={value}
                   onClick={() => {
-                    if (value === "on_demand") setIncludeOnDemandScenario((current) => !current);
-                    else setPricingMode(value);
+                    if (value === "on_demand") {
+                      setIncludeOnDemandScenario((current) => pricingMode ? !current : true);
+                    } else {
+                      setPricingMode((current) => {
+                        if (current === value) {
+                          setIncludeOnDemandScenario(true);
+                          return null;
+                        }
+                        return value;
+                      });
+                    }
                   }}
                 >
                   <i aria-hidden="true" />
@@ -1299,7 +1302,7 @@ export default function Home() {
                 </button>
               ))}
             </div>
-            {pricingMode === "on_demand" ? (
+            {!pricingMode ? (
               <div className="pricing-details compact">
                 <label>预计使用率
                   <span className="number-field">
@@ -1353,7 +1356,6 @@ export default function Home() {
               </div>
             )}
           </fieldset> : <div className="azure-pricing-note"><strong>公开零售价</strong><span>无需 Azure 登录或密钥，通过 Azure Retail Prices API 查询 Pay-as-you-go 价格</span></div>}
-          <div className="input-hint">Enter 开始系统解析 · Shift + Enter 换行</div>
         </form>
       </section>
       )}
@@ -1540,7 +1542,7 @@ export default function Home() {
         </section>
       )}
 
-      {!running && (job?.events.length ?? 0) > 0 && (
+      {false && !running && (job?.events.length ?? 0) > 0 && (
         <section className="workbench audit-log" aria-label="系统执行日志">
           <div className="workbench-head">
             <div><p className="kicker">SYSTEM PROCESS LOG</p><h2>系统处理记录</h2></div>
@@ -1585,18 +1587,13 @@ export default function Home() {
                     <b>{index + 1}</b><span>{item.question}</span>
                   </label>
                   {item.options.length > 0 && (
-                    <div className="confirmation-options">
-                      {item.options.map((option) => (
-                        <button
-                          type="button"
-                          className={confirmationAnswers[index] === option.value ? "selected" : ""}
-                          key={option.value}
-                          onClick={() => setConfirmationAnswers((current) => current.map((answer, answerIndex) => answerIndex === index ? option.value : answer))}
-                        >
-                          {option.label}
-                        </button>
-                      ))}
-                    </div>
+                    <ConfigurationOptionPicker
+                      className="confirmation-options"
+                      options={item.options}
+                      value={confirmationAnswers[index]}
+                      catalog={item.selection_mode === "catalog" || item.options.some((option) => Boolean(option.model))}
+                      onChange={(selected) => setConfirmationAnswers((current) => current.map((answer, answerIndex) => answerIndex === index ? selected : answer))}
+                    />
                   )}
                   {item.options.length === 0 && <input
                     id={`confirmation-reply-${index}`}

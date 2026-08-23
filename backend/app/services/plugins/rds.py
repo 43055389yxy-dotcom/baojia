@@ -160,20 +160,24 @@ class RdsPlugin(ServicePlugin):
             options[0],
         )
         default.is_default = True
-        options = [default, *(option for option in options if option.model != default.model)][:12]
+        options = [default, *(option for option in options if option.model != default.model)]
         # CPU/memory without a model means "choose for me". The adapter already
         # ranks non-underprovisioned official products by monthly price, so a
         # non-exact shape must not be sent back to the customer.
         requires_confirmation = bool(
-            requested_model and default.model != requested_model
+            (not requested_model and len(options) > 1)
+            or (requested_model and default.model != requested_model)
         )
+        if requires_confirmation:
+            for option in options:
+                option.is_default = False
         return PreviewSelection(
             component_id="component",
             service=self.kind,
             display_name=_display_name(engine),
             region=region,
             requested_model=requested_model,
-            selected_model=default.model,
+            selected_model=None if requires_confirmation else default.model,
             selection_reason=(
                 "客户指定型号已确认可用，直接采用。"
                 if requested_model and options[0].model == requested_model

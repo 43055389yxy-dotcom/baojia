@@ -193,6 +193,9 @@ class PreviewSelection(BaseModel):
 class ConfirmationOption(BaseModel):
     label: str
     value: str
+    model: str | None = None
+    specifications: dict[str, Any] = Field(default_factory=dict)
+    monthly_catalog_cost: float | None = None
 
 
 class ConfirmationItem(BaseModel):
@@ -200,6 +203,7 @@ class ConfirmationItem(BaseModel):
     options: list[ConfirmationOption] = Field(default_factory=list)
     component_id: str | None = None
     service: str | None = None
+    selection_mode: Literal["buttons", "catalog"] = "buttons"
 
 
 class ExpertReview(BaseModel):

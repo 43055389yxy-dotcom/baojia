@@ -452,9 +452,9 @@ def test_opensearch_quotes_nodes_and_storage_per_node() -> None:
         ),
         "ap-southeast-1",
     )
-    assert preview.selected_model == "m7g.xlarge.search"
-    assert preview.requires_confirmation is False
-    assert preview.confirmation_reason is None
+    assert preview.selected_model is None
+    assert preview.requires_confirmation is True
+    assert preview.confirmation_reason is not None
 
 
 def test_opensearch_accepts_ai_data_node_field_aliases() -> None:
@@ -532,11 +532,11 @@ def test_opensearch_nonstandard_shape_auto_selects_non_underprovisioned_option()
         "ap-southeast-1",
     )
 
-    assert preview.requires_confirmation is False
-    assert preview.selected_model == "m7g.xlarge.search"
+    assert preview.requires_confirmation is True
+    assert preview.selected_model is None
     assert [option.model for option in preview.candidates] == [
-        "m7g.large.search",
         "m7g.xlarge.search",
+        "m7g.large.search",
     ]
 
 

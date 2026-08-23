@@ -453,8 +453,8 @@ async def test_reserved_one_and_three_year_terms_produce_two_scenarios_without_r
     assert parser.calls == 1
     assert [item.reserved_term_years for item in quote.pricing_scenarios] == [1, 3]
     assert [item.label for item in quote.pricing_scenarios] == [
-        "标准预留实例 · 1 年 · 无预付",
-        "标准预留实例 · 3 年 · 无预付",
+        "1年无预付",
+        "3年无预付",
     ]
 
 
@@ -478,9 +478,9 @@ async def test_on_demand_and_reserved_terms_produce_three_comparison_scenarios()
     )
 
     assert [item.label for item in quote.pricing_scenarios] == [
-        "按需实例",
-        "标准预留实例 · 1 年 · 全预付",
-        "标准预留实例 · 3 年 · 全预付",
+        "按需",
+        "1年全预付",
+        "3年全预付",
     ]
 
 
@@ -510,7 +510,7 @@ async def test_unavailable_reserved_offer_does_not_become_customer_question() ->
         )
     )
 
-    assert [item.label for item in quote.pricing_scenarios] == ["按需实例"]
+    assert [item.label for item in quote.pricing_scenarios] == ["按需"]
     assert len(quote.notices) == 2
     assert all("本方案暂不展示" in notice for notice in quote.notices)
 
@@ -619,9 +619,9 @@ async def test_preview_validates_plugins_without_calling_estimator() -> None:
 
     assert len(preview.selections) == 3
     assert preview.selections[2].display_name == "Amazon ElastiCache for Redis"
-    # A component without local or quote-wide region evidence must not inherit
-    # another component's region. It uses the request fallback independently.
-    assert preview.selections[2].region == "ap-southeast-1"
+    # When the whole request contains one explicit region, components without
+    # their own region inherit that quote-wide region.
+    assert preview.selections[2].region == "ap-northeast-1"
 
 
 @pytest.mark.asyncio
@@ -1222,7 +1222,7 @@ async def test_shape_only_requirement_does_not_trigger_legacy_nearest_shape_ques
     assert preview.confirmation_items == []
 
 
-def test_compact_candidate_options_selects_one_lower_and_one_upper_tier() -> None:
+def test_compact_candidate_options_exposes_the_full_supported_catalog() -> None:
     requirement = ServiceRequirement(
         service="rds",
         requirements={"vcpu": 3, "memory_gib": 12},
@@ -1256,12 +1256,16 @@ def test_compact_candidate_options_selects_one_lower_and_one_upper_tier() -> Non
 
     options = QuoteService._compact_candidate_options(candidates, requirement)
 
-    assert [option.value for option in options] == [
+    assert len(options) == 4
+    assert options[0].value == "选择 db.large-b"
+    assert {option.value for option in options} == {
+        "选择 db.large-a",
         "选择 db.large-b",
         "选择 db.xlarge-a",
-    ]
-    assert options[0].label.startswith("低一档：")
-    assert options[1].label.startswith("高一档：")
+        "选择 db.2xlarge",
+    }
+    assert all(option.model for option in options)
+    assert options[0].specifications == {"vCPU": 2, "memoryGiB": 10}
 
 
 def test_official_error_candidates_are_available_to_global_confirmation_flow() -> None:

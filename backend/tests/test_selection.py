@@ -431,8 +431,8 @@ def test_invalid_explicit_redis_model_question_names_original_model(
 
     assert preview.requires_confirmation is True
     assert "cache.r7g.medium" in (preview.confirmation_reason or "")
-    assert "低一档 cache.t4g.medium" in (preview.confirmation_reason or "")
-    assert "高一档 cache.r7g.large" in (preview.confirmation_reason or "")
+    assert "当前区域支持的配置" in (preview.confirmation_reason or "")
+    assert len(preview.candidates) == 2
 
 
 def test_redis_unspecified_model_uses_cheapest_eligible_official_rate() -> None:
@@ -462,7 +462,7 @@ def test_redis_unspecified_model_uses_cheapest_eligible_official_rate() -> None:
     assert substituted is False
 
 
-def test_redis_preview_without_model_or_capacity_uses_lowest_candidate(
+def test_redis_preview_without_model_or_capacity_requires_catalog_choice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plugin = RedisPlugin(None, None)  # type: ignore[arg-type]
@@ -480,8 +480,12 @@ def test_redis_preview_without_model_or_capacity_uses_lowest_candidate(
 
     preview = plugin.preview(requirement, "ap-southeast-3")
 
-    assert preview.selected_model == "cache.t4g.micro"
-    assert preview.requires_confirmation is False
+    assert preview.selected_model is None
+    assert preview.requires_confirmation is True
+    assert [option.model for option in preview.candidates] == [
+        "cache.t4g.micro",
+        "cache.t4g.small",
+    ]
 
 
 def test_redis_shape_without_exact_official_size_requires_customer_choice(
@@ -508,8 +512,7 @@ def test_redis_shape_without_exact_official_size_requires_customer_choice(
     assert preview.requires_confirmation is True
     assert all(option.is_default is False for option in preview.candidates)
     assert "客户需要 Redis 每节点约 8G" in (preview.confirmation_reason or "")
-    assert "cache.m4.large" in (preview.confirmation_reason or "")
-    assert "cache.r6g.large" in (preview.confirmation_reason or "")
+    assert "当前区域支持的配置" in (preview.confirmation_reason or "")
 
 
 def test_redis_reserved_selection_excludes_old_family_without_requested_offer() -> None:

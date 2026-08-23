@@ -1,9 +1,9 @@
 "use client";
 
 import { Fragment, useEffect, useMemo, useState } from "react";
+import { ConfigurationOptionPicker, type ConfigurationChoice } from "../../components/configuration-option-picker";
 
-type Option = { label: string; value: string };
-type Item = { question: string; options: Option[] };
+type Item = { question: string; options: ConfigurationChoice[]; selection_mode?: "buttons" | "catalog" };
 type ConfigurationItem = {
   component_id: string;
   service: string;
@@ -622,9 +622,13 @@ export default function CustomerConfirmationPage() {
               {session.confirmation_items.map((item, index) => (
                 <article key={item.question}>
                   <label><b>{index + 1}</b><span>{item.question}</span></label>
-                  {item.options.length > 0 && <div className="customer-options">
-                    {item.options.map((option) => <button type="button" className={answers[item.question] === option.value ? "selected" : ""} key={option.value} onClick={() => setAnswers((current) => ({ ...current, [item.question]: option.value }))}>{option.label}</button>)}
-                  </div>}
+                  {item.options.length > 0 && <ConfigurationOptionPicker
+                    className="customer-options"
+                    options={item.options}
+                    value={answers[item.question]}
+                    catalog={item.selection_mode === "catalog" || item.options.some((option) => Boolean(option.model))}
+                    onChange={(selected) => setAnswers((current) => ({ ...current, [item.question]: selected }))}
+                  />}
                   {item.options.length === 0 && <input value={answers[item.question] ?? ""} onChange={(event) => setAnswers((current) => ({ ...current, [item.question]: event.target.value }))} placeholder="填写您的选择" />}
                 </article>
               ))}

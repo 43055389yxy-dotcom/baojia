@@ -87,7 +87,6 @@ textarea:focus { border-color: var(--teal); box-shadow: 0 0 0 4px rgba(13,124,11
 .quick-examples { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 22px; }
 .quick-examples button { padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: #637775; font-size: 9px; cursor: pointer; }
 .quick-examples button:hover { border-color: #8cb5ad; color: var(--teal); }
-.input-hint { margin-top: 13px; color: #879591; font-size: 9px; text-align: right; }
 .form-actions { display: flex; justify-content: flex-end; margin-top: 22px; }
 select { width: 100%; height: 48px; padding: 0 35px 0 13px; border: 1px solid #cbd6ce; border-radius: 11px; outline: 0; background: #fbfcf8; color: var(--ink); }
 .primary { min-width: 215px; height: 48px; border: 0; border-radius: 11px; background: var(--orange); color: white; font-size: 12px; font-weight: 900; cursor: pointer; box-shadow: 0 12px 25px rgba(255,106,60,.2); }
@@ -187,6 +186,15 @@ select { width: 100%; height: 48px; padding: 0 35px 0 13px; border: 1px solid #c
 .customer-options { display: flex; flex-wrap: wrap; gap: 7px; margin: 9px 0 0 36px; }
 .customer-options button { padding: 8px 11px; border: 1px solid var(--line); border-radius: 8px; background: #f8fbf9; cursor: pointer; }
 .customer-options button.selected { border-color: var(--teal); background: #e4f4ef; color: var(--teal); font-weight: 800; }
+.configuration-picker { width: 100%; display: grid !important; gap: 8px; }
+.configuration-picker-filters { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(125px, .36fr) minmax(125px, .36fr); gap: 8px; }
+.configuration-picker input, .configuration-picker select {
+  width: 100%; height: 40px; margin: 0; padding: 0 11px; border: 1px solid var(--line); border-radius: 9px;
+  background: #fbfdfc; color: var(--ink); font: inherit; outline: none;
+}
+.configuration-picker input:focus, .configuration-picker select:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(13,124,114,.08); }
+.configuration-picker-select { border-color: rgba(13,124,114,.45) !important; background: #f1faf6 !important; font-weight: 750 !important; }
+.configuration-picker-count { color: var(--muted); font-size: 9px; }
 .customer-submit { display: block; min-width: 170px; height: 46px; margin: 22px 0 0 auto; border: 0; border-radius: 10px; background: var(--orange); color: white; font-weight: 900; cursor: pointer; }
 .customer-submit:disabled { opacity: .45; cursor: not-allowed; }
 .customer-confirm-state, .customer-confirm-success { padding: 70px 20px; text-align: center; color: var(--muted); }
@@ -392,9 +400,11 @@ select { width: 100%; height: 48px; padding: 0 35px 0 13px; border: 1px solid #c
 .result-notices ul { margin: 0; padding-left: 18px; }
 .quote-table-wrap { margin-top: 18px; overflow-x: auto; border: 1px solid var(--line); border-radius: 13px; background: #fff; }
 .quote-table { width: 100%; min-width: 900px; border-collapse: collapse; font-size: 11px; }
-.quote-table th { padding: 11px 12px; text-align: left; background: var(--teal-dark); color: #dcece8; font-size: 9px; letter-spacing: .05em; }
+.quote-table { border-collapse: collapse; }
+.quote-table th { padding: 11px 12px; text-align: left; background: var(--teal-dark); color: #dcece8; font-size: 9px; letter-spacing: .05em; border: 1px solid #d5e0dc; }
 .quote-table th small, .quote-table tfoot small { display: block; margin-top: 3px; font-size: 8px; font-weight: 500; opacity: .75; }
-.quote-table td { padding: 12px; border-bottom: 1px solid #e4e9e4; vertical-align: top; color: #526966; }
+.quote-table td { padding: 12px; border: 1px solid #d5e0dc; vertical-align: top; color: #526966; }
+.sr-only { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
 .quote-table tbody tr:nth-child(even) { background: #f7f9f5; }
 .quote-table td:first-child { width: 42px; color: #9aa8a3; font-weight: 900; }
 .quote-table td strong { display: block; color: var(--ink); font-size: 11px; }
@@ -949,6 +959,8 @@ textarea:focus, select:focus, input:focus {
   .result-summary-actions { display: grid; gap: 10px; }
   .scenario-totals { justify-content: flex-start; }
   .result-action-buttons { justify-content: flex-start; }
+  .configuration-picker-filters { grid-template-columns: 1fr 1fr; }
+  .configuration-picker-filters input { grid-column: 1 / -1; }
 }
 
 @media (prefers-reduced-motion: reduce) {

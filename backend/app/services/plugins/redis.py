@@ -27,7 +27,7 @@ class RedisPlugin(ServicePlugin):
         requested_model = _text(requested.get("requested_model"))
         min_memory = required_float(requested, "memory_gib")
         min_vcpu = required_float(requested, "vcpu")
-        candidates = self.nearby_candidates(requirement, default_region, limit=5)
+        candidates = self.nearby_candidates(requirement, default_region, limit=None)
         if requested_model:
             exact = next(
                 (
@@ -77,14 +77,9 @@ class RedisPlugin(ServicePlugin):
         # adjacent official sizes during configuration review instead.  Once
         # the customer selects an official model, that model is authoritative
         # and this question is resolved.
-        exact_memory = min_memory is None or any(
-            isinstance(item.get("memory_gib"), (int, float))
-            and abs(float(item["memory_gib"]) - min_memory) < 0.01
-            for item in candidates
-        )
         requires_confirmation = bool(
             (requested_model and selected.model != requested_model)
-            or (not requested_model and min_memory is not None and not exact_memory)
+            or (not requested_model and len(options) > 1)
         )
         # A lower/upper sizing question is a real customer decision.  Do not
         # preselect either answer or persist a provisional model as if the
@@ -121,38 +116,18 @@ class RedisPlugin(ServicePlugin):
         requested_model: str | None = None,
     ) -> str:
         if requested_model:
-            choices = []
-            for index, option in enumerate(options[:2]):
-                memory = option.specifications.get("memoryGiB")
-                direction = "低一档" if index == 0 else "高一档"
-                choices.append(
-                    f"{direction} {option.model}（{memory:g}G）"
-                    if isinstance(memory, (int, float))
-                    else f"{direction} {option.model}"
-                )
             return (
                 f"您指定的 Redis 型号 {requested_model} 不在目标区域的 AWS 官方目录中；"
-                f"请选择{'、'.join(choices)}。"
+                "请从当前区域支持的配置中选择。"
             )
         requested = f"{requested_memory:g}G" if requested_memory is not None else "所需"
-        choices = []
-        for option in options:
-            memory = option.specifications.get("memoryGiB")
-            direction = (
-                "偏低"
-                if requested_memory is not None
-                and isinstance(memory, (int, float))
-                and memory < requested_memory
-                else "不低配"
-            )
-            choices.append(f"{option.model}（{memory:g}G，{direction}）")
-        return f"客户需要 Redis 每节点约 {requested}；AWS 相邻规格为{'、'.join(choices)}，请选择。"
+        return f"客户需要 Redis 每节点约 {requested}；没有完全一致的官方规格，请从当前区域支持的配置中选择。"
 
     def nearby_candidates(
         self,
         requirement: ServiceRequirement,
         default_region: str = "us-east-1",
-        limit: int = 5,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """Return official nearby node sizes without resolving billing dimensions."""
 
@@ -225,7 +200,7 @@ class RedisPlugin(ServicePlugin):
             chosen = (
                 [exact_model]
                 if exact_model
-                else _invalid_model_neighbors(unique, requested_model)[:limit]
+                else _invalid_model_neighbors(unique, requested_model)
             )
         elif min_memory is not None:
             exact_memory = next(
@@ -234,11 +209,12 @@ class RedisPlugin(ServicePlugin):
             if exact_memory:
                 chosen = [exact_memory]
             else:
-                lower = [item for item in unique if item["memory_gib"] < min_memory]
-                upper = [item for item in unique if item["memory_gib"] > min_memory]
-                chosen = [*(lower[-1:] if lower else []), *(upper[:1] if upper else [])]
+                chosen = unique
         else:
-            chosen = unique[:limit]
+            chosen = unique
+
+        if limit is not None:
+            chosen = chosen[:limit]
 
         result: list[dict[str, Any]] = []
         for item in chosen:

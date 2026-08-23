@@ -65,16 +65,15 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
     def preview(
         self, requirement: ServiceRequirement, default_region: str
     ) -> PreviewSelection:
-        """Expose two adjacent official shapes when no exact shape exists."""
+        """Require a regional catalog choice when the customer omitted a model."""
 
-        selected = self.select(requirement, default_region)
         requested = canonicalize_requirement_fields(
             requirement.requirements, service="opensearch"
         )
         requested_model = str(requested.get("requested_model") or "").strip().lower()
         min_vcpu = required_float(requested, "vcpu")
         min_memory = required_float(requested, "memory_gib")
-        if requested_model or (min_vcpu is None and min_memory is None):
+        if requested_model:
             return super().preview(requirement, default_region)
 
         region = requirement.region or default_region
@@ -101,15 +100,7 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
             if rate is not None:
                 shapes.append((rate, model, vcpu, memory, product))
 
-        exact = any(
-            (min_vcpu is None or vcpu == min_vcpu)
-            and (min_memory is None or memory == min_memory)
-            for _, _, vcpu, memory, _ in shapes
-        )
-        if exact:
-            # Exact CPU/memory match plus the lowest official hourly rate is
-            # an automatic selection, not a customer decision.  The selected
-            # model is disclosed later in the quote remarks.
+        if not shapes:
             return super().preview(requirement, default_region)
 
         def distance(item: tuple[float, str, float, float, dict[str, Any]]) -> float:
@@ -122,30 +113,24 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
                 else 0
             )
 
-        lower = [
-            item
-            for item in shapes
-            if (min_vcpu is None or item[2] <= min_vcpu)
-            and (min_memory is None or item[3] <= min_memory)
-        ]
-        upper = [
-            item
-            for item in shapes
-            if (min_vcpu is None or item[2] >= min_vcpu)
-            and (min_memory is None or item[3] >= min_memory)
-        ]
-        adjacent = [
-            min(
-                lower,
-                key=lambda item: (distance(item), -item[2], -item[3], item[1]),
-                default=None,
+        available = sorted(
+            shapes,
+            key=(
+                (
+                    lambda item: (
+                        not (
+                            (min_vcpu is None or item[2] >= min_vcpu)
+                            and (min_memory is None or item[3] >= min_memory)
+                        ),
+                        distance(item),
+                        item[0],
+                        item[1],
+                    )
+                )
+                if min_vcpu is not None or min_memory is not None
+                else (lambda item: (item[0], item[1]))
             ),
-            min(
-                upper,
-                key=lambda item: (distance(item), item[0], item[1]),
-                default=None,
-            ),
-        ]
+        )
         options: list[CandidateOption] = []
         seen_models: set[str] = set()
         data_nodes = int(
@@ -153,8 +138,8 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
             or required_float(requested, "nodes")
             or requirement.quantity
         )
-        for item in adjacent:
-            if item is None or item[1] in seen_models:
+        for item in available:
+            if item[1] in seen_models:
                 continue
             rate, model, vcpu, memory, product = item
             seen_models.add(model)
@@ -166,13 +151,13 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
                     monthly_catalog_cost=(
                         rate * requirement.hours_per_month * data_nodes
                     ),
-                    rationale="AWS 官方目录中的相邻 OpenSearch 节点规格。",
+                    rationale="AWS 官方目录中的可用 OpenSearch 节点规格。",
                     official_product={
                         "source": "AWS Price List",
                         "sku": product.get("product", {}).get("sku"),
                         "regionCode": region,
                     },
-                    is_default=model == selected.model,
+                    is_default=False,
                 )
             )
         return PreviewSelection(
@@ -181,11 +166,13 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
             display_name=self.display_name,
             region=region,
             requested_model=None,
-            selected_model=selected.model,
-            selection_reason="按客户规格从 AWS 官方目录匹配相邻档位。",
+            selected_model=None,
+            selection_reason="客户未指定节点型号，等待从部署区域的官方可用型号中选择。",
             candidates=options,
-            requires_confirmation=False,
-            confirmation_reason=None,
+            requires_confirmation=True,
+            confirmation_reason=(
+                "请选择 OpenSearch 节点型号；列表仅展示当前部署区域可用的官方型号。"
+            ),
         )
 
     def select(self, requirement: ServiceRequirement, default_region: str) -> SelectedResource:

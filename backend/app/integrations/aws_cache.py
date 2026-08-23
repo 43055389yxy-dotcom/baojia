@@ -30,7 +30,7 @@ class PersistentAwsCache:
         digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
         return f"{namespace}:{digest}"
 
-    def get(self, key: str) -> Any | None:
+    def get(self, key: str, *, allow_stale: bool = False) -> Any | None:
         with self._lock:
             connection = self._connect()
             try:
@@ -39,9 +39,7 @@ class PersistentAwsCache:
                 ).fetchone()
                 if row is None:
                     return None
-                if float(row[1]) <= time.time():
-                    connection.execute("DELETE FROM aws_cache WHERE cache_key = ?", (key,))
-                    connection.commit()
+                if float(row[1]) <= time.time() and not allow_stale:
                     return None
                 return json.loads(row[0])
             finally:

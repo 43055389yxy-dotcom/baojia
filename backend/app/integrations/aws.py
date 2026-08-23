@@ -123,6 +123,7 @@ class PricingCatalog:
         if not refresh and cache_key in self._product_cache:
             return self._product_cache[cache_key]
         persistent_key = self._persistent_cache.key("pricing-products", cache_key)
+        stale = self._persistent_cache.get(persistent_key, allow_stale=True)
         if not refresh:
             persistent = self._persistent_cache.get(persistent_key)
             # Never keep an empty official response alive for the full cache
@@ -147,6 +148,9 @@ class PricingCatalog:
             for page in pages:
                 products.extend(json.loads(raw) for raw in page.get("PriceList", []))
         except (ClientError, BotoCoreError, ValueError) as exc:
+            if isinstance(stale, list) and stale:
+                self._product_cache[cache_key] = stale
+                return stale
             raise ManualConfirmationRequired(
                 "AWS Price List API 查询失败，禁止继续报价",
                 code="pricing_catalog_unavailable",
@@ -162,6 +166,8 @@ class PricingCatalog:
                 max_pages=max_pages,
                 refresh=True,
             )
+        if not products and isinstance(stale, list) and stale:
+            products = stale
         if products:
             self._product_cache[cache_key] = products
             self._persistent_cache.set(persistent_key, products)

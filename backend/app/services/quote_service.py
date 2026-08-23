@@ -357,21 +357,15 @@ class QuoteService:
                                 continue
                             vcpu = float(option["vcpu"])
                             memory = float(option["memory_gib"])
-                            direction = (
-                                "低一档"
-                                if any(
-                                    marker in str(option.get("label", ""))
-                                    for marker in ("较低", "低一档", "偏低")
-                                )
-                                else "高一档"
-                            )
                             options.append(
                                 ConfirmationOption(
                                     label=(
                                         f"{model} · {vcpu:g} vCPU · "
-                                        f"{memory:g} GiB（{direction}）"
+                                        f"{memory:g} GiB"
                                     ),
                                     value=f"选择 {model}",
+                                    model=model,
+                                    specifications={"vCPU": vcpu, "memoryGiB": memory},
                                 )
                             )
                         confirmation_options[question] = options
@@ -786,7 +780,11 @@ class QuoteService:
             )
         for notice in notices:
             if not confirmation_options.get(notice):
-                generated = self._default_confirmation_options(notice)
+                generated = (
+                    self._region_confirmation_options()
+                    if self._is_region_confirmation_notice(notice)
+                    else self._default_confirmation_options(notice)
+                )
                 if generated:
                     confirmation_options[notice] = generated
         confirmation_items = [
@@ -795,6 +793,14 @@ class QuoteService:
                 options=confirmation_options.get(notice, []),
                 component_id=confirmation_components.get(notice, (None, None))[0],
                 service=confirmation_components.get(notice, (None, None))[1],
+                selection_mode=(
+                    "catalog"
+                    if (
+                        any(option.model for option in confirmation_options.get(notice, []))
+                        or len(confirmation_options.get(notice, [])) > 6
+                    )
+                    else "buttons"
+                ),
             )
             for notice in notices
         ]
@@ -967,11 +973,6 @@ class QuoteService:
         requested_memory = (
             requirements.get("memory_gib") if isinstance(requirements, dict) else None
         )
-        requested_model = (
-            str(requirements.get("requested_model") or "").strip()
-            if isinstance(requirements, dict)
-            else ""
-        )
         if not isinstance(requested_vcpu, (int, float)):
             requested_vcpu = None
         if not isinstance(requested_memory, (int, float)):
@@ -990,52 +991,21 @@ class QuoteService:
                 else 0
             )
 
-        ordered = sorted(candidates, key=lambda candidate: (distance(candidate), candidate.model))
-
-        def relation(candidate: CandidateOption) -> str | None:
-            dimensions: list[tuple[float, float]] = []
-            vcpu = candidate.specifications.get("vCPU")
-            memory = candidate.specifications.get("memoryGiB")
-            if requested_vcpu is not None and isinstance(vcpu, (int, float)):
-                dimensions.append((float(vcpu), float(requested_vcpu)))
-            if requested_memory is not None and isinstance(memory, (int, float)):
-                dimensions.append((float(memory), float(requested_memory)))
-            if not dimensions:
-                return None
-            if all(actual <= requested for actual, requested in dimensions) and any(
-                actual < requested for actual, requested in dimensions
-            ):
-                return "低一档"
-            if all(actual >= requested for actual, requested in dimensions) and any(
-                actual > requested for actual, requested in dimensions
-            ):
-                return "高一档"
-            return None
-
-        lower = next((candidate for candidate in ordered if relation(candidate) == "低一档"), None)
-        upper = next((candidate for candidate in ordered if relation(candidate) == "高一档"), None)
-        chosen: list[tuple[CandidateOption, str]] = []
-        if lower is not None:
-            chosen.append((lower, "低一档"))
-        if upper is not None and upper.model != getattr(lower, "model", None):
-            chosen.append((upper, "高一档"))
-        for candidate in ordered:
-            if len(chosen) >= 2:
-                break
-            if any(existing.model == candidate.model for existing, _ in chosen):
-                continue
-            chosen.append((candidate, relation(candidate) or "最邻近档位"))
-        if requested_model and requested_vcpu is None and requested_memory is None:
-            # Service adapters return invalid-explicit-model candidates in
-            # deliberate lower/upper order. There is no numeric requested
-            # shape to infer direction from, so preserve that semantic order.
-            chosen = [
-                (candidate, "低一档" if index == 0 else "高一档")
-                for index, candidate in enumerate(candidates[:2])
-            ]
+        unique: dict[str, CandidateOption] = {}
+        for candidate in candidates:
+            unique.setdefault(candidate.model.casefold(), candidate)
+        ordered = sorted(
+            unique.values(),
+            key=lambda candidate: (
+                distance(candidate),
+                candidate.monthly_catalog_cost is None,
+                candidate.monthly_catalog_cost or float("inf"),
+                candidate.model,
+            ),
+        )
         return [
             ConfirmationOption(
-                label=f"{direction}：" + " · ".join(
+                label=" · ".join(
                     part
                     for part in (
                         candidate.model,
@@ -1053,8 +1023,11 @@ class QuoteService:
                     if part
                 ),
                 value=f"选择 {candidate.model}",
+                model=candidate.model,
+                specifications=candidate.specifications,
+                monthly_catalog_cost=candidate.monthly_catalog_cost,
             )
-            for candidate, direction in chosen[:2]
+            for candidate in ordered
         ]
 
     @staticmethod
@@ -1135,6 +1108,29 @@ class QuoteService:
                 ConfirmationOption(label="每节点 8 GiB", value="8G"),
             ]
         return []
+
+    @staticmethod
+    def _region_confirmation_options() -> list[ConfirmationOption]:
+        """Offer common AWS regions as a searchable, official-code list."""
+
+        regions = (
+            ("美国东部（弗吉尼亚北部）", "us-east-1"),
+            ("美国东部（俄亥俄）", "us-east-2"),
+            ("美国西部（加利福尼亚北部）", "us-west-1"),
+            ("美国西部（俄勒冈）", "us-west-2"),
+            ("香港", "ap-east-1"),
+            ("新加坡", "ap-southeast-1"),
+            ("悉尼", "ap-southeast-2"),
+            ("东京", "ap-northeast-1"),
+            ("首尔", "ap-northeast-2"),
+            ("法兰克福", "eu-central-1"),
+            ("爱尔兰", "eu-west-1"),
+            ("伦敦", "eu-west-2"),
+        )
+        return [
+            ConfirmationOption(label=f"{name}（{code}）", value=code)
+            for name, code in regions
+        ]
 
     async def _apply_confirmation_responses(
         self, intent: ParsedIntent, responses: dict[str, str]
@@ -2296,6 +2292,11 @@ class QuoteService:
             options=options,
             component_id=str(component_index) if component_index >= 0 else None,
             service=service.service if service is not None else None,
+            selection_mode=(
+                "catalog"
+                if any(option.model for option in options) or len(options) > 6
+                else "buttons"
+            ),
         )
         self._drafts[draft_id] = (request.customer_request, intent.model_copy(deep=True))
         token = self._confirmation_sessions.create_or_replace(
@@ -2322,18 +2323,16 @@ class QuoteService:
     @staticmethod
     def _pricing_scenario_label(request: QuoteRequest) -> str:
         if request.pricing_mode == "on_demand":
-            return "按需实例"
-        mode = (
-            "标准预留实例"
-            if request.pricing_mode == "standard_reserved"
-            else "可转换预留实例"
-        )
+            return "按需"
         payment = {
             "no_upfront": "无预付",
             "partial_upfront": "部分预付",
             "all_upfront": "全预付",
         }.get(request.payment_option or "no_upfront", "")
-        return f"{mode} · {request.reserved_term_years} 年 · {payment}"
+        label = f"{request.reserved_term_years}年{payment}"
+        if request.pricing_mode == "convertible_reserved":
+            return f"{label}（可转换）"
+        return label
 
     @staticmethod
     def _is_unavailable_pricing_scenario(error: ManualConfirmationRequired) -> bool:
@@ -3516,7 +3515,20 @@ class QuoteService:
         present = {str(item.service).casefold() for item in all_services}
         source = service.source_text or ""
         notes: list[str] = []
-        if key == "eks":
+        calculator_name = str(service.calculator_service_name or "").casefold()
+        is_eks_worker = key == "ec2" and (
+            "eks worker" in calculator_name
+            or "eks 工作节点" in calculator_name
+            or (
+                bool(re.search(r"\beks\b|kubernetes|k8s|k8s", source, re.I))
+                and bool(re.search(r"worker|工作节点", source, re.I))
+            )
+        )
+        if is_eks_worker:
+            notes.append(
+                "本项为 EKS 集群的工作节点计算资源，由 EC2 提供并与对应 EKS 集群配套使用。"
+            )
+        elif key == "eks":
             has_explicit_workers = bool(
                 re.search(r"(?:工作|worker)?节点(?:数量|规格)|node\s*group", source, re.I)
             )

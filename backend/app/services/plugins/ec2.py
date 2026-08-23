@@ -133,61 +133,24 @@ class Ec2Plugin(ServicePlugin):
         ):
             return []
 
-        lower = [
-            item
-            for item in pool
-            if item["vcpu"] <= requested_vcpu
-            and item["memory_gib"] <= requested_memory
-            and (item["vcpu"], item["memory_gib"])
-            != (requested_vcpu, requested_memory)
-        ]
-        upper = [
-            item
-            for item in pool
-            if item["vcpu"] >= requested_vcpu
-            and item["memory_gib"] >= requested_memory
-            and (item["vcpu"], item["memory_gib"])
-            != (requested_vcpu, requested_memory)
-        ]
-
-        def lower_key(item: dict[str, Any]) -> tuple[float, float, str]:
+        def distance(item: dict[str, Any]) -> float:
             return (
-                (requested_vcpu - item["vcpu"]) / max(requested_vcpu, 1)
-                + (requested_memory - item["memory_gib"]) / max(requested_memory, 1),
-                -item["memory_gib"],
-                item["model"],
+                abs(item["vcpu"] - requested_vcpu) / max(requested_vcpu, 1)
+                + abs(item["memory_gib"] - requested_memory) / max(requested_memory, 1)
             )
 
-        def upper_key(item: dict[str, Any]) -> tuple[float, float, str]:
-            return (
-                (item["vcpu"] - requested_vcpu) / max(requested_vcpu, 1)
-                + (item["memory_gib"] - requested_memory) / max(requested_memory, 1),
-                item["memory_gib"],
-                item["model"],
-            )
-
-        options: list[dict[str, object]] = []
-        if lower:
-            item = min(lower, key=lower_key)
-            options.append(
-                {
-                    "label": "较低配置（可能低于业务需求）",
-                    "vcpu": item["vcpu"],
-                    "memory_gib": item["memory_gib"],
-                    "example_model": item["model"],
-                }
-            )
-        if upper:
-            item = min(upper, key=upper_key)
-            options.append(
-                {
-                    "label": "较高配置（不低于客户需求）",
-                    "vcpu": item["vcpu"],
-                    "memory_gib": item["memory_gib"],
-                    "example_model": item["model"],
-                }
-            )
-        return options
+        unique: dict[str, dict[str, Any]] = {}
+        for item in sorted(pool, key=lambda candidate: (distance(candidate), candidate["model"])):
+            unique.setdefault(str(item["model"]).casefold(), item)
+        return [
+            {
+                "label": "当前区域可用配置",
+                "vcpu": item["vcpu"],
+                "memory_gib": item["memory_gib"],
+                "example_model": item["model"],
+            }
+            for item in unique.values()
+        ]
 
     def preview(self, requirement: ServiceRequirement, default_region: str) -> PreviewSelection:
         region = requirement.region or default_region
@@ -210,7 +173,7 @@ class Ec2Plugin(ServicePlugin):
             architecture=_optional_string(requested.get("architecture")),
             min_vcpu=min_vcpu,
             min_memory=min_memory,
-        )[:40]
+        )
         operating_system = _pricing_operating_system(
             _optional_string(requested.get("operating_system"))
         )
@@ -259,8 +222,6 @@ class Ec2Plugin(ServicePlugin):
                     },
                 )
             )
-            if len(options) >= 12:
-                break
         exact = next((option for option in options if option.model == requested_model), None)
         if requested_model and exact is None:
             options[
@@ -280,10 +241,9 @@ class Ec2Plugin(ServicePlugin):
             )
         default = options[0]
         default.is_default = True
-        # A shape-only request is a lower bound, not a customer decision. Pick
-        # the cheapest official model that satisfies it. Only an explicitly
-        # named but unavailable model requires customer confirmation.
-        requires_confirmation = bool(requested_model and exact is None)
+        # When no exact model was supplied, let the customer choose from the
+        # complete regional catalog instead of silently fixing a model.
+        requires_confirmation = bool(exact is None and len(options) > 1)
         confirmation_reason = None
         if requires_confirmation:
             confirmation_reason = (
@@ -299,7 +259,7 @@ class Ec2Plugin(ServicePlugin):
             display_name=self.display_name,
             region=region,
             requested_model=requested_model,
-            selected_model=default.model,
+            selected_model=None if requires_confirmation else default.model,
             selection_reason=(
                 "客户指定型号已确认可用，直接采用。"
                 if requested_model and exact
