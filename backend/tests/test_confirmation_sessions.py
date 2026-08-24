@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+import json
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ from app.domain.models import ConfirmationItem, ConfirmationOption, ParsedIntent
 from app.services.confirmation_sessions import (
     CONFIGURATION_COMPONENT_DELETE,
     CONFIGURATION_COMPONENT_FEEDBACK_PREFIX,
+    CONFIGURATION_COMPONENT_UPDATE_PREFIX,
     CONFIGURATION_FEEDBACK_QUESTION,
     ConfirmationSessionStore,
 )
@@ -231,6 +233,42 @@ def test_stale_configuration_update_returns_to_editable_table(tmp_path: Path) ->
     assert "原配置已保留" in recovered.confirmation_text
 
 
+def test_legacy_product_identity_is_normalized_when_session_is_loaded(
+    tmp_path: Path,
+) -> None:
+    store = ConfirmationSessionStore(tmp_path / "sessions.sqlite3")
+    intent = ParsedIntent(
+        customer_summary="Prometheus",
+        services=[
+            ServiceRequirement(
+                service="amp",
+                product_identity="prometheus",
+                source_text="Prometheus 指标监控",
+            )
+        ],
+    )
+    token = store.create_or_replace(
+        draft_id="draft-legacy-identity",
+        customer_request="Prometheus 指标监控",
+        customer_summary="Prometheus",
+        intent=intent,
+        confirmation_text="请确认",
+        items=[],
+    )
+    legacy = json.loads(intent.model_dump_json())
+    legacy["services"][0]["product_identity"] = "Prometheus"
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE confirmation_sessions SET intent_json = ? WHERE token = ?",
+            (json.dumps(legacy, ensure_ascii=False), token),
+        )
+
+    restored = store.get(token)
+
+    assert restored is not None
+    assert restored.configuration_items[0].service == "amp"
+
+
 def test_configuration_feedback_targets_only_selected_components(tmp_path: Path) -> None:
     store = ConfirmationSessionStore(tmp_path / "sessions.sqlite3")
     intent = ParsedIntent(
@@ -390,3 +428,35 @@ def test_confirmation_question_deduplication_does_not_cross_components() -> None
     )
 
     assert result == [first, second]
+
+
+def test_structured_component_update_is_stored_without_free_form_ai_text(
+    tmp_path: Path,
+) -> None:
+    store = ConfirmationSessionStore(tmp_path / "sessions.sqlite3")
+    intent = ParsedIntent(
+        customer_summary="test",
+        services=[ServiceRequirement(service="s3", requirements={"storage_class": "standard"})],
+    )
+    token = store.create_or_replace(
+        draft_id="draft-structured-edit",
+        customer_request="S3",
+        customer_summary="test",
+        intent=intent,
+        confirmation_text="确认",
+        items=[],
+    )
+    store.prepare_configuration_review(
+        draft_id="draft-structured-edit", intent=intent
+    )
+
+    submitted = store.submit_configuration_feedback(
+        token,
+        component_updates={"0": {"requirements": {"storage_gib": 20480}}},
+    )
+
+    assert submitted is not None
+    assert submitted.status == "reviewing"
+    assert submitted.answers == {
+        f"{CONFIGURATION_COMPONENT_UPDATE_PREFIX}0": '{"requirements":{"storage_gib":20480}}'
+    }

@@ -425,6 +425,7 @@ async def submit_configuration_feedback(
             token,
             feedback=submission.feedback,
             component_feedback=submission.component_feedback,
+            component_updates=submission.component_updates,
         )
     except ValueError as exc:
         return JSONResponse(status_code=409, content={"message": str(exc)})

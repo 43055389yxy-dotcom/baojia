@@ -262,6 +262,7 @@ class ConfirmationSubmission(BaseModel):
 class ConfigurationFeedbackSubmission(BaseModel):
     feedback: str | None = Field(default=None, max_length=4000)
     component_feedback: dict[str, str] = Field(default_factory=dict)
+    component_updates: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
     @field_validator("feedback")
     @classmethod
@@ -277,9 +278,53 @@ class ConfigurationFeedbackSubmission(BaseModel):
             if feedback.strip()
         }
 
+    @field_validator("component_updates")
+    @classmethod
+    def clean_component_updates(
+        cls, value: dict[str, dict[str, Any]]
+    ) -> dict[str, dict[str, Any]]:
+        allowed_top_level = {"region", "quantity", "requirements"}
+        cleaned: dict[str, dict[str, Any]] = {}
+        for component_id, update in value.items():
+            if not isinstance(update, dict):
+                continue
+            unknown = set(update) - allowed_top_level
+            if unknown:
+                raise ValueError("结构化配置包含不支持的字段")
+            requirements = update.get("requirements", {})
+            if not isinstance(requirements, dict):
+                raise ValueError("组件参数格式不正确")
+            safe_requirements: dict[str, Any] = {}
+            for key, field_value in requirements.items():
+                if not isinstance(key, str) or not key or key.startswith("_"):
+                    raise ValueError("组件参数名称不正确")
+                if field_value is not None and not isinstance(
+                    field_value, (str, int, float, bool)
+                ):
+                    raise ValueError("组件参数只支持文字、数字或开关")
+                safe_requirements[key] = field_value
+            candidate: dict[str, Any] = {}
+            if "region" in update:
+                if not isinstance(update["region"], str) or not update["region"].strip():
+                    raise ValueError("区域格式不正确")
+                candidate["region"] = update["region"]
+            if "quantity" in update:
+                if isinstance(update["quantity"], bool) or not isinstance(
+                    update["quantity"], int
+                ):
+                    raise ValueError("数量必须是整数")
+                if not 1 <= update["quantity"] <= 10000:
+                    raise ValueError("数量必须在 1 到 10000 之间")
+                candidate["quantity"] = update["quantity"]
+            if safe_requirements:
+                candidate["requirements"] = safe_requirements
+            if candidate:
+                cleaned[str(component_id)] = candidate
+        return cleaned
+
     @model_validator(mode="after")
     def has_feedback(self) -> "ConfigurationFeedbackSubmission":
-        if not self.feedback and not self.component_feedback:
+        if not self.feedback and not self.component_feedback and not self.component_updates:
             raise ValueError("请至少填写一项需要修改的内容")
         return self
 

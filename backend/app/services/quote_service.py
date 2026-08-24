@@ -7,6 +7,7 @@ import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from app.core.errors import ManualConfirmationRequired
 from app.domain.customer_configuration import (
@@ -36,6 +37,10 @@ from app.domain.requirement_fields import (
     canonicalize_requirement_fields,
     sanitize_requirement_values,
 )
+from app.domain.structured_component_updates import (
+    apply_component_update,
+    decode_component_update,
+)
 from app.integrations.calculator_web import (
     AwsCalculatorWebAutomator,
     GenericCalculatorInput,
@@ -45,6 +50,7 @@ from app.services.bcm_estimator import BcmQuoteResult, BcmWorkloadEstimator
 from app.services.confirmation_sessions import (
     CONFIGURATION_COMPONENT_DELETE,
     CONFIGURATION_COMPONENT_FEEDBACK_PREFIX,
+    CONFIGURATION_COMPONENT_UPDATE_PREFIX,
     CONFIGURATION_FEEDBACK_QUESTION,
     ConfirmationSessionStore,
 )
@@ -150,6 +156,7 @@ class QuoteService:
             structured_response_components: dict[str, int] = {}
             configuration_revision_requested = any(
                 question.startswith(CONFIGURATION_COMPONENT_FEEDBACK_PREFIX)
+                or question.startswith(CONFIGURATION_COMPONENT_UPDATE_PREFIX)
                 or question == CONFIGURATION_FEEDBACK_QUESTION
                 for question in confirmation_responses
             )
@@ -160,8 +167,20 @@ class QuoteService:
                 # confirmed configuration.
                 configuration_revision_original_intent = intent.model_copy(deep=True)
             component_feedback: dict[int, str] = {}
+            component_updates: dict[int, dict[str, Any]] = {}
             answered_component_questions: dict[int, set[str]] = {}
             for question in list(confirmation_responses):
+                if question.startswith(CONFIGURATION_COMPONENT_UPDATE_PREFIX):
+                    component_id = question.removeprefix(
+                        CONFIGURATION_COMPONENT_UPDATE_PREFIX
+                    )
+                    update = decode_component_update(
+                        confirmation_responses.pop(question, "")
+                    )
+                    if component_id.isdigit() and update:
+                        component_updates[int(component_id)] = update
+                        configuration_revision_component_ids.add(int(component_id))
+                    continue
                 if not question.startswith(CONFIGURATION_COMPONENT_FEEDBACK_PREFIX):
                     continue
                 component_id = question.removeprefix(
@@ -171,6 +190,12 @@ class QuoteService:
                 if component_id.isdigit() and feedback:
                     component_feedback[int(component_id)] = feedback
                     configuration_revision_component_ids.add(int(component_id))
+
+            for index, update in component_updates.items():
+                if 0 <= index < len(intent.services):
+                    intent.services[index] = apply_component_update(
+                        intent.services[index], update
+                    )
 
             deleted_component_indices = {
                 index
@@ -371,7 +396,9 @@ class QuoteService:
         logger.info("Quote preview AI parse completed in %.2fs", parse_elapsed)
         self._merge_transfer_only_ec2_services(intent)
         self._strip_non_numeric_placeholders(intent)
+        confirmed_before_defaults = self._customer_confirmed_snapshot(intent)
         self._apply_calculator_minimum_defaults(intent)
+        self._restore_customer_confirmed_snapshot(intent, confirmed_before_defaults)
         preflight_notices: list[str] = []
         preflight_sizing_service_indexes: set[int] = set()
         confirmation_options: dict[str, list[ConfirmationOption]] = {}
@@ -2495,6 +2522,41 @@ class QuoteService:
         return "\n".join(lines)
 
     @staticmethod
+    def _customer_confirmed_snapshot(
+        intent: ParsedIntent,
+    ) -> list[dict[str, object]]:
+        """Capture the exact fields a customer changed on each component."""
+
+        snapshots: list[dict[str, object]] = []
+        for service in intent.services:
+            snapshot: dict[str, object] = {}
+            for field in ("region", "quantity", "hours_per_month"):
+                if service.field_sources.get(field) == "customer_confirmation":
+                    snapshot[field] = getattr(service, field)
+            for field, value in service.requirements.items():
+                if service.field_sources.get(f"requirements.{field}") == "customer_confirmation":
+                    snapshot[f"requirements.{field}"] = value
+            snapshots.append(snapshot)
+        return snapshots
+
+    @staticmethod
+    def _restore_customer_confirmed_snapshot(
+        intent: ParsedIntent,
+        snapshots: list[dict[str, object]],
+    ) -> None:
+        """Prevent any later defaulting rule from erasing a customer edit."""
+
+        for service, snapshot in zip(intent.services, snapshots, strict=False):
+            for path, value in snapshot.items():
+                if path.startswith("requirements."):
+                    field = path.split(".", 1)[1]
+                    service.requirements[field] = value
+                else:
+                    setattr(service, path, value)
+                service.field_sources[path] = "customer_confirmation"
+                service.locked_fields = sorted(set(service.locked_fields) | {path})
+
+    @staticmethod
     def _apply_calculator_minimum_defaults(intent: ParsedIntent) -> list[str]:
         notices: list[str] = []
         lcu_fields = {
@@ -2604,17 +2666,25 @@ class QuoteService:
             if service.service.lower() in {"s3", "amazon_s3"}:
                 customer_supplied_storage = bool(
                     re.search(
-                        r"\d+(?:\.\d+)?\s*(?:gib|gb|g|tib|tb|t)",
+                        r"\d+(?:\.\d+)?\s*(?:个|块|条|份)?\s*(?:gib|gb|g|tib|tb|t)",
                         service.source_text or "",
                         re.IGNORECASE,
                     )
                 )
-                if not customer_supplied_storage:
+                structured_storage = (
+                    (QuoteService._numeric_requirement(service, "storage_gib") or 0) > 0
+                )
+                if not customer_supplied_storage and not structured_storage:
                     requirements.pop("storage_gib", None)
                     requirements["reference_unit_only"] = True
                     requirements["system_default_assumption"] = (
                         "客户未提供 S3 容量；仅展示 1 GiB 对应的官方单位价，不计入月费合计"
                     )
+                else:
+                    requirements.pop("reference_unit_only", None)
+                    default_note = requirements.get("system_default_assumption")
+                    if isinstance(default_note, str) and "S3 容量" in default_note:
+                        requirements.pop("system_default_assumption", None)
                 if requirements.get("system_default_assumption"):
                     notices.append(str(requirements["system_default_assumption"]))
                 continue

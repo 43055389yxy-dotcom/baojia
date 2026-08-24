@@ -617,7 +617,9 @@ class DeepSeekIntentParser:
         )
         content = (
             f"客户最新修改（最高优先级）：\n{feedback.strip()}\n\n"
-            f"该组件已经确认的历史（只用于补全未修改字段）：\n"
+            f"该组件当前完整旧配置（只用于补全客户没有修改的字段）：\n"
+            f"{component.model_dump_json()}\n\n"
+            f"该组件客户历史原话（只用于核对来源）：\n"
             f"{component.source_text}\n\n"
             "按编号逐项从原话和最新修改重新提取：\n"
             + "\n".join(
@@ -757,6 +759,16 @@ class DeepSeekIntentParser:
             target=revised,
             feedback=feedback,
         )
+        # Defaults and review artefacts belong to the old result, never to the
+        # customer's new instruction.  The normal preview pipeline will
+        # recreate any still-needed defaults from the rebuilt component.
+        for derived_field in (
+            "reference_unit_only",
+            "reference_lcu_unit_only",
+            "system_default_assumption",
+            "_quote_skip_reason",
+        ):
+            revised.requirements.pop(derived_field, None)
         changes_model = bool(
             selected_model
             or re.search(r"型号|机型|实例类型|sku", feedback, re.IGNORECASE)
@@ -3964,7 +3976,7 @@ class DeepSeekIntentParser:
             item.calculator_service_name = (
                 "Amazon Managed Service for Prometheus (AMP)"
             )
-            item.product_identity = "Prometheus"
+            item.product_identity = "prometheus"
 
     @classmethod
     def _append_explicit_minimum_services(cls, text: str, parsed: ParsedIntent) -> None:

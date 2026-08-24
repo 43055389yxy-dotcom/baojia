@@ -2556,6 +2556,37 @@ def test_cloudfront_structured_traffic_is_not_erased_by_short_source_excerpt() -
     assert "system_default_assumption" not in requirements
 
 
+def test_s3_customer_revision_capacity_is_not_erased_by_defaulting() -> None:
+    intent = ParsedIntent(
+        customer_summary="S3 20TB",
+        services=[
+            ServiceRequirement(
+                service="s3",
+                calculator_service_name="Amazon S3",
+                source_text="客户最新修改：存储改为20个T",
+                requirements={
+                    "storage_gib": 20480,
+                    "storage_class": "standard",
+                    "reference_unit_only": True,
+                    "system_default_assumption": "客户未提供 S3 容量",
+                },
+                field_sources={
+                    "requirements.storage_gib": "customer_confirmation",
+                },
+            )
+        ],
+    )
+
+    snapshot = QuoteService._customer_confirmed_snapshot(intent)
+    QuoteService._apply_calculator_minimum_defaults(intent)
+    QuoteService._restore_customer_confirmed_snapshot(intent, snapshot)
+
+    requirements = intent.services[0].requirements
+    assert requirements["storage_gib"] == 20480
+    assert "reference_unit_only" not in requirements
+    assert "system_default_assumption" not in requirements
+
+
 def test_actual_usage_placeholders_are_removed_before_official_checks() -> None:
     intent = ParsedIntent(
         customer_summary="Redis 与公网流量按实际使用",

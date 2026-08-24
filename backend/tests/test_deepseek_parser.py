@@ -210,7 +210,8 @@ async def test_component_feedback_sends_only_the_changed_component_to_ai() -> No
     assert "RDS MySQL" not in gateway.user_contents[0]
     assert "EC2 4 台" not in gateway.user_contents[0]
     assert "客户最新修改（最高优先级）" in gateway.user_contents[0]
-    assert "该组件已经确认的历史（只用于补全未修改字段）" in gateway.user_contents[0]
+    assert "该组件当前完整旧配置（只用于补全客户没有修改的字段）" in gateway.user_contents[0]
+    assert "该组件客户历史原话（只用于核对来源）" in gateway.user_contents[0]
     assert "当前旧配置" not in gateway.user_contents[0]
 
 
@@ -285,6 +286,50 @@ def test_component_template_derives_missing_ec2_total_disk() -> None:
         "requirements.system_disk_gib": "硬盘10个T",
         "requirements.total_system_disk_gib": "system_derived",
     }
+
+
+@pytest.mark.asyncio
+async def test_s3_revision_rebuilds_capacity_and_drops_old_reference_default() -> None:
+    class S3RevisionGateway:
+        async def complete_json(self, **_: object) -> dict[str, object]:
+            return {
+                "component": {
+                    "service": "s3",
+                    "calculator_service_name": "Amazon S3",
+                    "region": "ap-northeast-1",
+                    "quantity": 1,
+                    "hours_per_month": 730,
+                    "requirements": {"storage_class": "standard"},
+                    "field_evidence": {"requirements.storage_class": "Standard"},
+                    "source_text": "S3 Standard",
+                    "query_action": None,
+                }
+            }
+
+    component = ServiceRequirement(
+        service="s3",
+        calculator_service_name="Amazon S3",
+        region="ap-northeast-1",
+        requirements={
+            "storage_class": "standard",
+            "reference_unit_only": True,
+            "system_default_assumption": "客户未提供 S3 容量",
+        },
+        source_text="Amazon S3，存储类型 Standard",
+    )
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid")
+    )
+    parser._gateway = S3RevisionGateway()  # type: ignore[assignment]
+
+    revised = await parser.revise_component_from_feedback(
+        component.source_text, component, "存储改为20个T"
+    )
+
+    assert revised.requirements["storage_gib"] == 20 * 1024
+    assert "reference_unit_only" not in revised.requirements
+    assert "system_default_assumption" not in revised.requirements
+    assert revised.field_sources["requirements.storage_gib"] == "customer_confirmation"
 
 
 @pytest.mark.asyncio
@@ -3436,7 +3481,7 @@ def test_prometheus_identity_overrides_cloudwatch_mapping() -> None:
     assert component.calculator_service_name == (
         "Amazon Managed Service for Prometheus (AMP)"
     )
-    assert component.product_identity == "Prometheus"
+    assert component.product_identity == "prometheus"
 
 
 def test_numbered_shorthand_blocks_restore_opensearch_storage_and_unsized_eks_workers() -> None:

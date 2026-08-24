@@ -20,6 +20,7 @@ from app.domain.models import (
 
 CONFIGURATION_FEEDBACK_QUESTION = "【客户对最终配置表的修改意见】"
 CONFIGURATION_COMPONENT_FEEDBACK_PREFIX = "【组件修改】"
+CONFIGURATION_COMPONENT_UPDATE_PREFIX = "【组件字段修改】"
 CONFIGURATION_COMPONENT_DELETE = "__DELETE_COMPONENT__"
 
 
@@ -41,6 +42,30 @@ class ConfirmationSessionStore:
         connection = sqlite3.connect(self._database_path)
         connection.row_factory = sqlite3.Row
         return connection
+
+    @staticmethod
+    def _parse_persisted_intent(value: str) -> ParsedIntent:
+        """Load old drafts after normalizing internal identity slugs.
+
+        Customer-visible product names may contain capitals and spaces, but
+        ``product_identity`` is an internal stable key.  Normalizing at the
+        persistence boundary keeps links created by an older release usable.
+        """
+
+        payload = json.loads(value)
+        services = payload.get("services") if isinstance(payload, dict) else None
+        if isinstance(services, list):
+            for service in services:
+                if not isinstance(service, dict):
+                    continue
+                identity = service.get("product_identity")
+                if not isinstance(identity, str) or not identity.strip():
+                    continue
+                normalized = re.sub(
+                    r"[^a-z0-9_-]+", "_", identity.strip().casefold()
+                ).strip("_-")
+                service["product_identity"] = normalized or None
+        return ParsedIntent.model_validate(payload)
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -133,7 +158,7 @@ class ConfirmationSessionStore:
                 row = self._row(token)
                 if row is None:
                     return None
-        intent = ParsedIntent.model_validate_json(str(row["intent_json"]))
+        intent = self._parse_persisted_intent(str(row["intent_json"]))
         if self.cloud_provider == "aws":
             preserve_customer_configuration(intent)
             self._normalize_review_group_quantities(intent)
@@ -296,6 +321,7 @@ class ConfirmationSessionStore:
         token: str,
         feedback: str | None = None,
         component_feedback: dict[str, str] | None = None,
+        component_updates: dict[str, dict[str, object]] | None = None,
     ) -> ConfirmationSessionResponse | None:
         """Queue only the configuration components the customer corrected."""
 
@@ -304,14 +330,19 @@ class ConfirmationSessionStore:
             return None
         if str(row["status"]) != "configuration_review":
             raise ValueError("当前确认单还没有进入最终配置确认阶段")
-        intent = ParsedIntent.model_validate_json(str(row["intent_json"]))
+        intent = self._parse_persisted_intent(str(row["intent_json"]))
         valid_component_ids = {str(index) for index in range(len(intent.services))}
         cleaned_components = {
             str(component_id): value.strip()
             for component_id, value in (component_feedback or {}).items()
             if value.strip()
         }
-        invalid_ids = set(cleaned_components) - valid_component_ids
+        cleaned_updates = {
+            str(component_id): update
+            for component_id, update in (component_updates or {}).items()
+            if update
+        }
+        invalid_ids = (set(cleaned_components) | set(cleaned_updates)) - valid_component_ids
         if invalid_ids:
             raise ValueError("配置项已变更，请刷新页面后重新填写")
         cleaned_feedback = (feedback or "").strip()
@@ -322,7 +353,7 @@ class ConfirmationSessionStore:
         }
         if delete_ids and len(delete_ids) >= len(intent.services) and not cleaned_feedback:
             raise ValueError("报价至少需要保留一项配置")
-        if not cleaned_feedback and not cleaned_components:
+        if not cleaned_feedback and not cleaned_components and not cleaned_updates:
             raise ValueError("请填写需要修改的内容")
         submitted_at = datetime.now(UTC).isoformat()
         answers: dict[str, str] = {}
@@ -334,6 +365,14 @@ class ConfirmationSessionStore:
             {
                 f"{CONFIGURATION_COMPONENT_FEEDBACK_PREFIX}{component_id}": value
                 for component_id, value in cleaned_components.items()
+            }
+        )
+        answers.update(
+            {
+                f"{CONFIGURATION_COMPONENT_UPDATE_PREFIX}{component_id}": json.dumps(
+                    update, ensure_ascii=False, separators=(",", ":")
+                )
+                for component_id, update in cleaned_updates.items()
             }
         )
         with self._lock, self._connect() as connection:
@@ -363,7 +402,7 @@ class ConfirmationSessionStore:
             ).fetchone()
         if row is None:
             return None
-        intent = ParsedIntent.model_validate_json(str(row["intent_json"]))
+        intent = self._parse_persisted_intent(str(row["intent_json"]))
         if self.cloud_provider == "aws":
             preserve_customer_configuration(intent)
         return str(row["customer_request"]), intent
