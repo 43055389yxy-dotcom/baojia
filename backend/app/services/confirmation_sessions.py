@@ -82,10 +82,28 @@ class ConfirmationSessionStore:
                     answers_json TEXT NOT NULL DEFAULT '{}',
                     status TEXT NOT NULL DEFAULT 'pending',
                     created_at TEXT NOT NULL,
-                    submitted_at TEXT
+                    submitted_at TEXT,
+                    confirmation_round INTEGER NOT NULL DEFAULT 0,
+                    asked_questions_json TEXT NOT NULL DEFAULT '[]'
                 )
                 """
             )
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(confirmation_sessions)"
+                ).fetchall()
+            }
+            if "confirmation_round" not in columns:
+                connection.execute(
+                    "ALTER TABLE confirmation_sessions "
+                    "ADD COLUMN confirmation_round INTEGER NOT NULL DEFAULT 0"
+                )
+            if "asked_questions_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE confirmation_sessions "
+                    "ADD COLUMN asked_questions_json TEXT NOT NULL DEFAULT '[]'"
+                )
 
     def create_or_replace(
         self,
@@ -100,7 +118,8 @@ class ConfirmationSessionStore:
         now = datetime.now(UTC).isoformat()
         with self._lock, self._connect() as connection:
             existing = connection.execute(
-                "SELECT token FROM confirmation_sessions WHERE draft_id = ?",
+                "SELECT token, asked_questions_json FROM confirmation_sessions "
+                "WHERE draft_id = ?",
                 (draft_id,),
             ).fetchone()
             token = (
@@ -108,19 +127,34 @@ class ConfirmationSessionStore:
                 if existing
                 else f"{self.cloud_provider}_{secrets.token_urlsafe(18)}"
             )
+            asked_questions = (
+                json.loads(str(existing["asked_questions_json"]))
+                if existing and existing["asked_questions_json"]
+                else []
+            )
+            asked_questions = list(
+                dict.fromkeys(
+                    [
+                        *(str(question) for question in asked_questions),
+                        *(item.question for item in items),
+                    ]
+                )
+            )
             connection.execute(
                 """
                 INSERT INTO confirmation_sessions (
                     token, draft_id, customer_request, customer_summary, intent_json,
-                    confirmation_text, items_json, answers_json, status, created_at, submitted_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 'pending', ?, NULL)
+                    confirmation_text, items_json, answers_json, status, created_at,
+                    submitted_at, asked_questions_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 'pending', ?, NULL, ?)
                 ON CONFLICT(draft_id) DO UPDATE SET
                     customer_request=excluded.customer_request,
                     customer_summary=excluded.customer_summary,
                     intent_json=excluded.intent_json,
                     confirmation_text=excluded.confirmation_text,
                     items_json=excluded.items_json,
-                    answers_json='{}', status='pending', submitted_at=NULL
+                    answers_json='{}', status='pending', submitted_at=NULL,
+                    asked_questions_json=excluded.asked_questions_json
                 """,
                 (
                     token,
@@ -131,6 +165,7 @@ class ConfirmationSessionStore:
                     confirmation_text,
                     json.dumps([item.model_dump(mode="json") for item in items], ensure_ascii=False),
                     now,
+                    json.dumps(asked_questions, ensure_ascii=False),
                 ),
             )
         return token
@@ -248,12 +283,32 @@ class ConfirmationSessionStore:
             connection.execute(
                 """
                 UPDATE confirmation_sessions
-                SET answers_json = ?, status = 'reviewing', submitted_at = ?
+                SET answers_json = ?, status = 'reviewing', submitted_at = ?,
+                    confirmation_round = confirmation_round + 1
                 WHERE token = ?
                 """,
                 (json.dumps(cleaned, ensure_ascii=False), submitted_at, token),
             )
         return self.get(token)
+
+    def confirmation_round_by_draft(self, draft_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT confirmation_round FROM confirmation_sessions WHERE draft_id = ?",
+                (draft_id,),
+            ).fetchone()
+        return int(row["confirmation_round"] or 0) if row is not None else 0
+
+    def asked_questions_by_draft(self, draft_id: str) -> list[str]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT asked_questions_json FROM confirmation_sessions WHERE draft_id = ?",
+                (draft_id,),
+            ).fetchone()
+        if row is None or not row["asked_questions_json"]:
+            return []
+        parsed = json.loads(str(row["asked_questions_json"]))
+        return [str(question) for question in parsed if str(question).strip()]
 
     def complete_by_draft(self, draft_id: str) -> None:
         """Mark the stable customer link complete after the recheck passes."""

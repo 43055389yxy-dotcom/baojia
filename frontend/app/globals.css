@@ -288,21 +288,21 @@ select { width: 100%; height: 48px; padding: 0 35px 0 13px; border: 1px solid #c
 .customer-component-feedback-input button { min-width: 92px; height: 38px; margin-bottom: 1px; border: 0; border-radius: 8px; background: var(--teal); color: white; font-size: 10px; font-weight: 900; cursor: pointer; }
 .customer-component-feedback-input button:disabled { opacity: .42; cursor: not-allowed; }
 .customer-component-feedback-input button.is-refreshing:disabled { opacity: 1; background: #c8cfcd; color: #f7f9f8; }
-.customer-structured-editor-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
-.customer-structured-editor-heading strong { color: var(--ink); font-size: 13px; }
-.customer-structured-editor-heading span { color: var(--muted); font-size: 11px; }
-.customer-structured-editor-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 12px; }
-.customer-structured-editor-grid label { display: grid; gap: 5px; color: var(--muted); font-size: 11px; }
+.customer-structured-editor-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+.customer-structured-editor-heading strong { color: var(--ink); font-size: 12px; }
+.customer-structured-editor-heading span { color: var(--muted); font-size: 10px; }
+.customer-structured-editor-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px 9px; }
+.customer-structured-editor-grid label { display: grid; gap: 3px; color: var(--muted); font-size: 10px; }
 .customer-structured-editor-grid input,
-.customer-structured-editor-grid select { width: 100%; height: 40px; padding: 0 11px; border: 1px solid var(--line); border-radius: 8px; background: white; color: var(--ink); font: inherit; font-size: 12px; outline: none; }
+.customer-structured-editor-grid select { width: 100%; height: 32px; padding: 0 8px; border: 1px solid var(--line); border-radius: 7px; background: white; color: var(--ink); font: inherit; font-size: 11px; outline: none; }
 .customer-structured-editor-grid input:focus,
 .customer-structured-editor-grid select:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(13,124,114,.08); }
-.customer-value-with-unit { display: grid; grid-template-columns: minmax(0, 1fr) 78px; gap: 6px; }
-.customer-add-usage-field { display: flex; justify-content: flex-start; gap: 8px; margin-top: 12px; }
-.customer-add-usage-field select { min-width: 180px; height: 36px; padding: 0 10px; border: 1px solid var(--line); border-radius: 8px; background: white; color: var(--ink); font-size: 11px; }
-.customer-add-usage-field button { height: 36px; padding: 0 13px; border: 1px solid var(--teal); border-radius: 8px; background: white; color: var(--teal); font-size: 11px; font-weight: 800; cursor: pointer; }
-.customer-structured-editor-actions { display: flex; justify-content: flex-end; margin-top: 12px; }
-.customer-structured-editor-actions button { min-width: 110px; height: 38px; border: 0; border-radius: 8px; background: var(--teal); color: white; font-size: 11px; font-weight: 900; cursor: pointer; }
+.customer-value-with-unit { display: grid; grid-template-columns: minmax(0, 1fr) 64px; gap: 4px; }
+.customer-add-usage-field { display: flex; justify-content: flex-start; gap: 6px; margin-top: 8px; }
+.customer-add-usage-field select { min-width: 160px; height: 31px; padding: 0 8px; border: 1px solid var(--line); border-radius: 7px; background: white; color: var(--ink); font-size: 10px; }
+.customer-add-usage-field button { height: 31px; padding: 0 10px; border: 1px solid var(--teal); border-radius: 7px; background: white; color: var(--teal); font-size: 10px; font-weight: 800; cursor: pointer; }
+.customer-structured-editor-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
+.customer-structured-editor-actions button { min-width: 96px; height: 32px; border: 0; border-radius: 7px; background: var(--teal); color: white; font-size: 10px; font-weight: 900; cursor: pointer; }
 .customer-structured-editor-actions button:disabled { opacity: .42; cursor: not-allowed; }
 .customer-configuration-actions { display: flex; justify-content: flex-end; margin-top: 18px; }
 .customer-configuration-actions .customer-feedback-submit { margin: 0; }

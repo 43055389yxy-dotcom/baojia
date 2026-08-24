@@ -392,6 +392,39 @@ def test_customer_answers_are_partitioned_by_component(tmp_path: Path) -> None:
     assert global_answers == {region_question: "法兰克福"}
 
 
+def test_confirmation_round_survives_replacing_the_same_draft(tmp_path: Path) -> None:
+    store = ConfirmationSessionStore(tmp_path / "sessions.sqlite3")
+    intent = ParsedIntent(
+        customer_summary="test",
+        services=[ServiceRequirement(service="ec2")],
+    )
+    question = "请选择处理器"
+    token = store.create_or_replace(
+        draft_id="draft-one-page",
+        customer_request="EC2",
+        customer_summary="test",
+        intent=intent,
+        confirmation_text="确认",
+        items=[ConfirmationItem(question=question)],
+    )
+    store.submit(token, {question: "4 vCPU"})
+
+    store.create_or_replace(
+        draft_id="draft-one-page",
+        customer_request="EC2",
+        customer_summary="test",
+        intent=intent,
+        confirmation_text="不应再显示第二页",
+        items=[ConfirmationItem(question="请选择型号")],
+    )
+
+    assert store.confirmation_round_by_draft("draft-one-page") == 1
+    assert store.asked_questions_by_draft("draft-one-page") == [
+        "请选择处理器",
+        "请选择型号",
+    ]
+
+
 def test_confirmation_question_deduplication_keeps_complete_question() -> None:
     short = ConfirmationItem(
         question="请确认当前组件在所选区域支持的处理器和内存配置？",

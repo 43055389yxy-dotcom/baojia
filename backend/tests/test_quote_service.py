@@ -1035,6 +1035,78 @@ async def test_redis_capacity_confirmation_updates_saved_draft_without_looping()
     assert parser.calls == 1
 
 
+@pytest.mark.asyncio
+async def test_second_question_page_is_replaced_by_cheapest_matching_model() -> None:
+    class CachedOnlyParser:
+        async def parse(self, _: str) -> ParsedIntent:
+            raise AssertionError("saved draft must be reused")
+
+    class FollowUpCatalogPlugin(ApiPlugin):
+        def preview(
+            self, requirement: ServiceRequirement, default_region: str
+        ) -> PreviewSelection:
+            return PreviewSelection(
+                component_id="component",
+                service=ServiceKind.EC2,
+                display_name="EKS Worker",
+                region=requirement.region or default_region,
+                candidates=[
+                    CandidateOption(
+                        model="expensive.xlarge",
+                        family="test",
+                        specifications={"vCPU": 4, "memoryGiB": 16},
+                        monthly_catalog_cost=80,
+                        rationale="official",
+                    ),
+                    CandidateOption(
+                        model="cheap.xlarge",
+                        family="test",
+                        specifications={"vCPU": 4, "memoryGiB": 16},
+                        monthly_catalog_cost=20,
+                        rationale="official",
+                    ),
+                ],
+                requires_confirmation=True,
+                confirmation_reason="还没有指定型号",
+            )
+
+    draft_id = "onepage00001"
+    intent = ParsedIntent(
+        customer_summary="EKS Worker",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                region="ap-northeast-1",
+                requirements={"vcpu": 4, "memory_gib": 16},
+            )
+        ],
+    )
+    service = QuoteService(
+        CachedOnlyParser(),  # type: ignore[arg-type]
+        PluginRegistry([FollowUpCatalogPlugin(ServiceKind.EC2, "fallback")]),
+        FailingEstimator(),  # type: ignore[arg-type]
+    )
+    service._drafts[draft_id] = ("EKS Worker", intent)
+    service._confirmation_rounds[draft_id] = 1
+
+    preview = await service.preview(
+        QuoteRequest(customer_request="EKS Worker", draft_id=draft_id)
+    )
+
+    assert preview.confirmation_items == []
+    assert preview.confirmation_text is None
+    assert preview.selections[0].selected_model == "cheap.xlarge"
+    assert preview.selections[0].selection_reason == "已自动选择满足配置的最低价官方型号"
+
+
+def test_rephrased_shape_question_uses_the_same_confirmation_key() -> None:
+    assert QuoteService._confirmation_question_key(
+        "OpenSearch 还没有指定型号，请选择官方型号。"
+    ) == QuoteService._confirmation_question_key(
+        "请选择 OpenSearch 的处理器、内存和规格。"
+    )
+
+
 def test_missing_redis_capacity_generates_clickable_options() -> None:
     question = (
         "您已选 Redis 1 主 1 从，但还缺少单节点容量。"

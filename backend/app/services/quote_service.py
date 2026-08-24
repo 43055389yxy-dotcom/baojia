@@ -785,6 +785,24 @@ class QuoteService:
             if request.draft_id
             else set()
         )
+        if request.draft_id and self._confirmation_sessions is not None:
+            prior_asked = set(prior_asked)
+            prior_asked.update(
+                self._confirmation_question_key(question)
+                for question in self._confirmation_sessions.asked_questions_by_draft(
+                    request.draft_id
+                )
+            )
+        completed_confirmation_rounds = self._confirmation_rounds.get(
+            request.draft_id or "", 0
+        )
+        if request.draft_id and self._confirmation_sessions is not None:
+            completed_confirmation_rounds = max(
+                completed_confirmation_rounds,
+                self._confirmation_sessions.confirmation_round_by_draft(
+                    request.draft_id
+                ),
+            )
         # If the customer has just answered a round, never ask an identical
         # normalized question again even when the AI phrases the unresolved
         # component in the same way during cleanup.
@@ -852,6 +870,99 @@ class QuoteService:
                     )
                 )
             ]
+        # The customer must see one consolidated question page only.  After
+        # they submit that page, any newly exposed catalog-only model choice
+        # is deterministic: use the cheapest official model matching the
+        # already confirmed CPU and memory, then continue to the final editable
+        # configuration table.  Business decisions (for example managed vs
+        # self-hosted) are never auto-selected here.
+        if request.draft_id and completed_confirmation_rounds > 0:
+            selection_positions = {
+                selection.component_id: position
+                for position, selection in enumerate(selections)
+            }
+            auto_resolved_notices: set[str] = set()
+            for notice in notices:
+                component = confirmation_components.get(notice)
+                if component is None or component[0] in pending_architecture:
+                    continue
+                options = confirmation_options.get(notice, [])
+                if not options or not any(option.model for option in options):
+                    continue
+                position = selection_positions.get(component[0])
+                if position is None:
+                    continue
+                selection = selections[position]
+                candidates = [candidate for candidate in selection.candidates if candidate.model]
+                if not candidates:
+                    continue
+                requested_vcpu = intent.services[int(component[0])].requirements.get(
+                    "vcpu"
+                )
+                requested_memory = intent.services[int(component[0])].requirements.get(
+                    "memory_gib"
+                )
+                exact_shape = [
+                    candidate
+                    for candidate in candidates
+                    if (
+                        requested_vcpu is None
+                        or candidate.specifications.get("vCPU") == requested_vcpu
+                    )
+                    and (
+                        requested_memory is None
+                        or candidate.specifications.get("memoryGiB")
+                        == requested_memory
+                    )
+                ]
+                if exact_shape:
+                    candidates = exact_shape
+                cheapest = min(
+                    candidates,
+                    key=lambda candidate: (
+                        candidate.monthly_catalog_cost is None,
+                        candidate.monthly_catalog_cost
+                        if candidate.monthly_catalog_cost is not None
+                        else float("inf"),
+                        candidate.model,
+                    ),
+                )
+                component_index = int(component[0])
+                requirement = intent.services[component_index]
+                requirement.requirements["requested_model"] = cheapest.model
+                requirement.field_sources[
+                    "requirements.requested_model"
+                ] = "system_cheapest_official_match"
+                vcpu = cheapest.specifications.get("vCPU")
+                memory = cheapest.specifications.get("memoryGiB")
+                if "vcpu" not in requirement.requirements and isinstance(
+                    vcpu, (int, float)
+                ):
+                    requirement.requirements["vcpu"] = vcpu
+                if "memory_gib" not in requirement.requirements and isinstance(
+                    memory, (int, float)
+                ):
+                    requirement.requirements["memory_gib"] = memory
+                selections[position] = selection.model_copy(
+                    update={
+                        "requested_model": cheapest.model,
+                        "selected_model": cheapest.model,
+                        "selection_reason": "已自动选择满足配置的最低价官方型号",
+                        "requirements": dict(requirement.requirements),
+                        "requires_confirmation": False,
+                        "confirmation_reason": None,
+                        "status": "ready",
+                        "issue_message": None,
+                    }
+                )
+                auto_resolved_notices.add(notice)
+            if auto_resolved_notices:
+                notices = [
+                    notice for notice in notices if notice not in auto_resolved_notices
+                ]
+                for notice in auto_resolved_notices:
+                    confirmation_components.pop(notice, None)
+                    confirmation_options.pop(notice, None)
         # A cross-field/design conflict can be discovered before an individual
         # adapter previews successfully (for example Windows on an ARM EC2
         # model). Reflect that conflict on the corresponding component card.
@@ -2959,7 +3070,46 @@ class QuoteService:
 
     @staticmethod
     def _confirmation_question_key(question: str) -> str:
-        return re.sub(r"[\s，。；;、：:？！?]+", "", question).casefold()
+        compact = re.sub(r"[\s，。；;、：:？！?]+", "", question).casefold()
+        product_aliases = (
+            ("opensearch", ("opensearch", "开放搜索")),
+            ("eks_worker", ("eks工作节点", "eksworker", "worker节点")),
+            ("eks", ("eks", "kubernetes")),
+            ("elasticache", ("elasticache", "redis")),
+            ("rds", ("rds", "aurora", "数据库")),
+            ("msk", ("msk", "kafka")),
+            ("nacos", ("nacos",)),
+            ("ec2", ("ec2", "云服务器")),
+            ("s3", ("s3", "对象存储")),
+            ("cloudfront", ("cloudfront", "cdn")),
+            ("waf", ("waf",)),
+        )
+        product = next(
+            (
+                name
+                for name, aliases in product_aliases
+                if any(alias in compact for alias in aliases)
+            ),
+            "",
+        )
+        categories = (
+            ("hosting", ("自建", "托管", "managed")),
+            ("region", ("区域", "region")),
+            ("shape_model", ("型号", "机型", "vcpu", "cpu", "处理器", "内存", "规格")),
+            ("storage", ("存储", "硬盘", "磁盘", "容量")),
+            ("deployment", ("主备", "高可用", "可用区", "部署方式")),
+            ("quantity", ("数量", "节点数", "几台", "台数")),
+            ("traffic", ("流量", "请求量", "请求数")),
+        )
+        category = next(
+            (
+                name
+                for name, aliases in categories
+                if any(alias in compact for alias in aliases)
+            ),
+            "",
+        )
+        return f"{product}|{category}" if product and category else compact
 
     def _late_customer_confirmation(
         self,
