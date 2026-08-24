@@ -4,6 +4,7 @@ from typing import Any
 
 from app.core.errors import ManualConfirmationRequired
 from app.domain.models import (
+    CandidateOption,
     PreviewSelection,
     ReferenceRate,
     SelectedResource,
@@ -60,6 +61,91 @@ class _NoConfirmationPlugin(ServicePlugin):
 class MskPlugin(_NoConfirmationPlugin):
     kind = ServiceKind.MSK
     display_name = "Amazon MSK"
+
+    def configuration_candidates(
+        self, requirement: ServiceRequirement, default_region: str
+    ) -> list[CandidateOption]:
+        """Return every regional provisioned Broker shape for edit controls."""
+
+        region = requirement.region or default_region
+        products = self.catalog.products(
+            "AmazonMSK",
+            {"regionCode": region, "group": "Broker", "operation": "RunBroker"},
+            max_pages=10,
+        )
+        products_by_model: dict[str, tuple[float, dict[str, Any]]] = {}
+        for product in products:
+            model = _msk_model(product)
+            if not model or model.startswith("express."):
+                continue
+            rate = PricingCatalog.on_demand_rate(product)
+            if rate is None:
+                continue
+            current = products_by_model.get(model)
+            if current is None or rate < current[0]:
+                products_by_model[model] = (rate, product)
+        if not products_by_model:
+            return []
+
+        official_specs: dict[str, tuple[float, float]] = {}
+        try:
+            payload = ReadOnlyAwsQueryExecutor(self.clients).execute(
+                service="ec2",
+                operation="describe_instance_types",
+                region=region,
+                parameters={"InstanceTypes": sorted(products_by_model)},
+                paginate=False,
+            )
+            for page in payload.get("pages", [payload]):
+                for item in page.get("InstanceTypes", []):
+                    official_specs[str(item["InstanceType"]).lower()] = (
+                        float(item["VCpuInfo"]["DefaultVCpus"]),
+                        float(item["MemoryInfo"]["SizeInMiB"]) / 1024,
+                    )
+        except (
+            ManualConfirmationRequired,
+            AttributeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ):
+            # Catalog attributes are still usable when the read-only EC2
+            # specification endpoint is temporarily unavailable.
+            pass
+
+        candidates: list[CandidateOption] = []
+        for model, (rate, product) in products_by_model.items():
+            attrs = PricingCatalog.attributes(product)
+            try:
+                catalog_vcpu = float(attrs.get("vcpu") or 0)
+                catalog_memory = float(attrs.get("memoryGib") or 0)
+            except (TypeError, ValueError):
+                catalog_vcpu, catalog_memory = 0, 0
+            vcpu, memory = official_specs.get(
+                model, (catalog_vcpu, catalog_memory)
+            )
+            specifications = {
+                **({"vCPU": vcpu} if vcpu > 0 else {}),
+                **({"memoryGiB": memory} if memory > 0 else {}),
+            }
+            candidates.append(
+                CandidateOption(
+                    model=model,
+                    family="Amazon MSK Broker",
+                    specifications=specifications,
+                    monthly_catalog_cost=rate * 730,
+                    rationale="AWS 当前区域可用的 MSK Broker 官方规格",
+                    official_product=product,
+                )
+            )
+        return sorted(
+            candidates,
+            key=lambda item: (
+                item.monthly_catalog_cost is None,
+                item.monthly_catalog_cost or 0,
+                item.model,
+            ),
+        )
 
     def select(self, requirement: ServiceRequirement, default_region: str) -> SelectedResource:
         region = requirement.region or default_region

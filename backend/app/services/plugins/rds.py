@@ -25,7 +25,12 @@ class RdsPlugin(ServicePlugin):
     def preview(self, requirement: ServiceRequirement, default_region: str) -> PreviewSelection:
         region = requirement.region or default_region
         requested = canonicalize_requirement_fields(requirement.requirements, service="rds")
-        engine = _text(requested.get("engine")) or "mysql"
+        engine = _text(requested.get("engine"))
+        if not engine:
+            raise ManualConfirmationRequired(
+                "请先选择 RDS 数据库类型（MySQL、PostgreSQL、MariaDB、SQL Server、Oracle 或 Db2）",
+                code="missing_rds_engine",
+            )
         requested_model = _text(requested.get("requested_model"))
         min_vcpu = required_float(requested, "vcpu")
         min_memory = required_float(requested, "memory_gib")
@@ -207,7 +212,12 @@ class RdsPlugin(ServicePlugin):
     def select(self, requirement: ServiceRequirement, default_region: str) -> SelectedResource:
         region = requirement.region or default_region
         requested = canonicalize_requirement_fields(requirement.requirements, service="rds")
-        engine = _text(requested.get("engine")) or "mysql"
+        engine = _text(requested.get("engine"))
+        if not engine:
+            raise ManualConfirmationRequired(
+                "请先选择 RDS 数据库类型（MySQL、PostgreSQL、MariaDB、SQL Server、Oracle 或 Db2）",
+                code="missing_rds_engine",
+            )
 
         requested_model = _text(requested.get("requested_model"))
         purchase_option = _text(requested.get("purchase_option")) or "on_demand"

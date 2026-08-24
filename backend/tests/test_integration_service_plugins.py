@@ -238,6 +238,38 @@ def test_msk_quotes_broker_hours_and_per_broker_storage() -> None:
     ]
 
 
+def test_msk_configuration_candidates_include_all_regional_broker_shapes() -> None:
+    small = product(
+        "AmazonMSK", "APS1-Kafka.t3.small", "RunBroker", 0.1, "hours",
+        group="Broker", computeFamily="t3.small", vcpu="2", memoryGib="2",
+    )
+    large = product(
+        "AmazonMSK", "APS1-Kafka.m7g.large", "RunBroker", 0.3, "hours",
+        group="Broker", computeFamily="m7g.large", vcpu="2", memoryGib="8",
+    )
+    xlarge = product(
+        "AmazonMSK", "APS1-Kafka.m7g.xlarge", "RunBroker", 0.6, "hours",
+        group="Broker", computeFamily="m7g.xlarge", vcpu="4", memoryGib="16",
+    )
+    plugin = MskPlugin(
+        None, FakeCatalog({"AmazonMSK": [small, large, xlarge]})
+    )  # type: ignore[arg-type]
+
+    candidates = plugin.configuration_candidates(
+        ServiceRequirement(service="msk", region="ap-southeast-1"),
+        "ap-southeast-1",
+    )
+
+    assert [item.model for item in candidates] == [
+        "t3.small", "m7g.large", "m7g.xlarge"
+    ]
+    assert [item.specifications for item in candidates] == [
+        {"vCPU": 2.0, "memoryGiB": 2.0},
+        {"vCPU": 2.0, "memoryGiB": 8.0},
+        {"vCPU": 4.0, "memoryGiB": 16.0},
+    ]
+
+
 def test_msk_enriches_missing_price_list_shape_from_ec2(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

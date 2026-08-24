@@ -4,7 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from app.domain.models import ConfirmationItem, ConfirmationOption, ParsedIntent, ServiceRequirement
+from app.domain.models import (
+    ConfirmationItem,
+    ConfirmationOption,
+    ParsedIntent,
+    QuoteRequest,
+    ServiceRequirement,
+)
 from app.services.confirmation_sessions import (
     CONFIGURATION_COMPONENT_DELETE,
     CONFIGURATION_COMPONENT_FEEDBACK_PREFIX,
@@ -134,6 +140,14 @@ def test_same_draft_reuses_link_and_moves_to_configuration_review(tmp_path: Path
                         "vCPU": 8,
                         "memoryGiB": 16,
                     },
+                    "_review_available_shapes": [
+                        {"vcpu": 2, "memory_gib": 4},
+                        {"vcpu": 2, "memory_gib": 8},
+                        {"vcpu": 8, "memory_gib": 16},
+                    ],
+                    "_review_field_options": {
+                        "operating_system": ["linux", "windows"],
+                    },
                 },
                 source_text="EC2 8核16G 2台",
             )
@@ -169,6 +183,14 @@ def test_same_draft_reuses_link_and_moves_to_configuration_review(tmp_path: Path
     assert review.configuration_items[0].official_specifications == {
         "vCPU": 8,
         "memoryGiB": 16,
+    }
+    assert review.configuration_items[0].available_shapes == [
+        {"vcpu": 2.0, "memory_gib": 4.0},
+        {"vcpu": 2.0, "memory_gib": 8.0},
+        {"vcpu": 8.0, "memory_gib": 16.0},
+    ]
+    assert review.configuration_items[0].available_options == {
+        "operating_system": ["linux", "windows"],
     }
 
     approved = store.approve_configuration(first)
@@ -493,3 +515,86 @@ def test_structured_component_update_is_stored_without_free_form_ai_text(
     assert submitted.answers == {
         f"{CONFIGURATION_COMPONENT_UPDATE_PREFIX}0": '{"requirements":{"storage_gib":20480}}'
     }
+
+
+def test_submitted_aws_edit_can_be_claimed_without_sales_browser(tmp_path: Path) -> None:
+    store = ConfirmationSessionStore(tmp_path / "self-processing.sqlite3")
+    intent = ParsedIntent(
+        customer_summary="test",
+        services=[ServiceRequirement(service="ec2", region="ap-southeast-1")],
+    )
+    original_request = QuoteRequest(
+        customer_request="EC2 新加坡",
+        draft_id="selfprocess1",
+        pricing_mode="standard_reserved",
+        reserved_term_years=3,
+        payment_option="all_upfront",
+    )
+    token = store.create_or_replace(
+        draft_id="selfprocess1",
+        customer_request=original_request.customer_request,
+        customer_summary="test",
+        intent=intent,
+        confirmation_text="确认",
+        items=[],
+        quote_request=original_request,
+    )
+    store.prepare_configuration_review(draft_id="selfprocess1", intent=intent)
+    store.submit_configuration_feedback(
+        token,
+        component_updates={"0": {"quantity": 3}},
+    )
+
+    claimed = store.begin_configuration_reprocessing(token)
+
+    assert claimed is not None
+    assert claimed.draft_id == "selfprocess1"
+    assert claimed.pricing_mode == "standard_reserved"
+    assert claimed.reserved_term_options == [3]
+    assert claimed.confirmation_responses == {
+        f"{CONFIGURATION_COMPONENT_UPDATE_PREFIX}0": '{"quantity":3}'
+    }
+    processing = store.get(token)
+    assert processing is not None
+    assert processing.status == "processing"
+    assert store.begin_configuration_reprocessing(token) is None
+
+
+def test_configuration_items_expose_service_specific_billing_fields(tmp_path: Path) -> None:
+    store = ConfirmationSessionStore(tmp_path / "billing-fields.sqlite3")
+    intent = ParsedIntent(
+        customer_summary="Cloud Map 和 RDS",
+        services=[
+            ServiceRequirement(service="cloud_map", region="ap-southeast-1"),
+            ServiceRequirement(service="rds", region="ap-southeast-1"),
+            ServiceRequirement(service="appconfig", region="ap-southeast-1"),
+        ],
+    )
+    token = store.create_or_replace(
+        draft_id="billingfield1",
+        customer_request="Cloud Map 和 RDS",
+        customer_summary=intent.customer_summary,
+        intent=intent,
+        confirmation_text="确认",
+        items=[],
+    )
+    store.prepare_configuration_review(draft_id="billingfield1", intent=intent)
+
+    session = store.get(token)
+
+    assert session is not None
+    assert session.configuration_items[0].available_billing_fields == [
+        "namespaces",
+        "service_instances",
+        "api_calls",
+        "dns_queries",
+    ]
+    assert "log_ingestion_gib" not in session.configuration_items[0].available_billing_fields
+    assert "data_scanned_gib" not in session.configuration_items[0].available_billing_fields
+    assert "storage_gib" in session.configuration_items[1].available_billing_fields
+    assert "dns_queries" not in session.configuration_items[1].available_billing_fields
+    assert session.configuration_items[2].available_billing_fields == [
+        "configuration_requests",
+        "configuration_retrievals",
+        "experiment_hours",
+    ]

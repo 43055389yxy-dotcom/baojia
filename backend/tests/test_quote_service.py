@@ -21,6 +21,7 @@ from app.integrations.calculator_web import (
 from app.services.bcm_estimator import BcmQuoteResult
 from app.services.confirmation_sessions import (
     CONFIGURATION_COMPONENT_FEEDBACK_PREFIX,
+    CONFIGURATION_COMPONENT_UPDATE_PREFIX,
     ConfirmationSessionStore,
 )
 from app.services.plugins.base import PluginRegistry
@@ -31,6 +32,40 @@ from app.services.plugins.common import (
 )
 from app.services.plugins.minimum_services import WafPlugin
 from app.services.quote_service import QuoteService
+
+
+def test_final_specifications_hide_internal_derived_and_false_fields() -> None:
+    requirement = ServiceRequirement(
+        service="ec2",
+        quantity=2,
+        requirements={
+            "vcpu": 4,
+            "memory_gib": 16,
+            "system_disk_gib": 200,
+            "total_system_disk_gib": 400,
+            "volume_type": "gp3",
+            "purchase_option": "on_demand",
+            "utilization_percent": 100,
+            "detailed_monitoring": False,
+            "requested_model": "m6i.xlarge",
+        },
+    )
+
+    specifications = QuoteService._complete_selection_specifications(
+        requirement,
+        {
+            **requirement.requirements,
+            "requested_model": "m6i.xlarge",
+            "_internal_trace": "hidden",
+        },
+    )
+
+    assert specifications == {
+        "vCPU": 4,
+        "memoryGiB": 16,
+        "systemDiskGiB": 200,
+        "volumeType": "gp3",
+    }
 
 
 class MixedParser:
@@ -385,6 +420,127 @@ async def test_mixed_services_use_one_bcm_estimate() -> None:
     assert quote.selections[1].specifications["storageGiB"] == 500
     assert quote.selections[2].specifications["engine"] == "redis"
     assert quote.selections[2].specifications["memoryGiB"] == 4
+
+
+@pytest.mark.asyncio
+async def test_unpriceable_review_model_is_reselected_without_cancelling_quote() -> None:
+    class StaleModelPlugin(ApiPlugin):
+        def __init__(self) -> None:
+            super().__init__(ServiceKind.EC2, "m7i.xlarge")
+            self.requests: list[tuple[str | None, object, object]] = []
+
+        def select(
+            self, requirement: ServiceRequirement, default_region: str
+        ) -> SelectedResource:
+            requested = requirement.requirements.get("requested_model")
+            self.requests.append(
+                (
+                    str(requested) if requested else None,
+                    requirement.requirements.get("vcpu"),
+                    requirement.requirements.get("memory_gib"),
+                )
+            )
+            if requested:
+                raise ManualConfirmationRequired(
+                    "old model has no billing product",
+                    code="ec2_billing_product_not_found",
+                )
+            return super().select(requirement, default_region)
+
+    plugin = StaleModelPlugin()
+    service = QuoteService(
+        MixedParser(),  # type: ignore[arg-type]
+        PluginRegistry([plugin, ApiPlugin(ServiceKind.RDS, "db.m7g.large")]),
+        ApiEstimator(),  # type: ignore[arg-type]
+        None,
+    )
+    intent = ParsedIntent(
+        customer_summary="EC2 and RDS",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                region="ap-southeast-1",
+                requirements={
+                    "_review_selected_model": "mac1.metal",
+                    "_review_selected_specifications": {
+                        "vCPU": 12,
+                        "memoryGiB": 32,
+                    },
+                    "operating_system": "windows",
+                },
+            ),
+            ServiceRequirement(
+                service="rds",
+                region="ap-southeast-1",
+                requirements={},
+            ),
+        ],
+    )
+
+    quote = await service._create_api_quote(
+        intent,
+        QuoteRequest(customer_request="EC2 and RDS"),
+        None,
+    )
+
+    assert [item.model for item in quote.selections] == [
+        "m7i.xlarge",
+        "db.m7g.large",
+    ]
+    assert plugin.requests == [
+        ("mac1.metal", None, None),
+        (None, 12, 32),
+    ]
+    assert any("mac1.metal" in notice and "m7i.xlarge" in notice for notice in quote.notices)
+
+
+@pytest.mark.asyncio
+async def test_one_catalog_failure_does_not_cancel_independent_components() -> None:
+    class AlwaysUnavailablePlugin(ApiPlugin):
+        def select(
+            self, requirement: ServiceRequirement, default_region: str
+        ) -> SelectedResource:
+            raise ManualConfirmationRequired(
+                "catalog did not return a billable product",
+                code="ec2_billing_product_not_found",
+            )
+
+    service = QuoteService(
+        MixedParser(),  # type: ignore[arg-type]
+        PluginRegistry(
+            [
+                AlwaysUnavailablePlugin(ServiceKind.EC2, "bad"),
+                ApiPlugin(ServiceKind.RDS, "db.m7g.large"),
+            ]
+        ),
+        ApiEstimator(),  # type: ignore[arg-type]
+        None,
+    )
+    intent = ParsedIntent(
+        customer_summary="independent components",
+        services=[
+            ServiceRequirement(service="ec2", region="ap-southeast-1"),
+            ServiceRequirement(service="rds", region="ap-southeast-1"),
+        ],
+    )
+
+    quote = await service._create_api_quote(
+        intent,
+        QuoteRequest(customer_request="independent components"),
+        None,
+    )
+
+    assert [item.service for item in quote.selections] == [ServiceKind.RDS]
+    assert any("Amazon EC2" in notice or "ec2" in notice for notice in quote.notices)
+
+
+def test_new_service_auto_discovery_miss_is_component_isolatable() -> None:
+    error = ManualConfirmationRequired(
+        "official dimensions unavailable",
+        code="generic_semantic_rate_not_found",
+    )
+
+    assert QuoteService._is_component_isolatable_pricing_error(error) is True
 
 
 @pytest.mark.asyncio
@@ -779,6 +935,124 @@ async def test_later_invalid_component_edit_stays_on_configuration_table(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_structured_component_edit_revalidates_only_the_changed_component(
+    tmp_path,
+) -> None:
+    class SavedDraftParser:
+        async def parse(self, _: str) -> ParsedIntent:
+            raise AssertionError("a final-table edit must reuse the saved draft")
+
+    class CountingPlugin(ApiPlugin):
+        def __init__(self, kind: ServiceKind, model: str) -> None:
+            super().__init__(kind, model)
+            self.preview_calls = 0
+
+        def preview(
+            self, requirement: ServiceRequirement, default_region: str
+        ) -> PreviewSelection:
+            self.preview_calls += 1
+            return super().preview(requirement, default_region)
+
+    ec2_plugin = CountingPlugin(ServiceKind.EC2, "m7i.xlarge")
+    rds_plugin = CountingPlugin(ServiceKind.RDS, "db.m7g.large")
+    store = ConfirmationSessionStore(tmp_path / "scoped-edit.sqlite3")
+    service = QuoteService(
+        SavedDraftParser(),  # type: ignore[arg-type]
+        PluginRegistry([ec2_plugin, rds_plugin]),
+        FailingEstimator(),  # type: ignore[arg-type]
+        confirmation_sessions=store,
+    )
+    intent = ParsedIntent(
+        customer_summary="EC2 和 RDS",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                region="ap-southeast-1",
+                requirements={
+                    "requested_model": "m7i.xlarge",
+                    "storage_gib": 100,
+                    "_review_selected_model": "m7i.xlarge",
+                    "_review_selected_specifications": {
+                        "vCPU": 4,
+                        "memoryGiB": 16,
+                    },
+                    "_review_available_shapes": [
+                        {"vcpu": 4, "memory_gib": 16}
+                    ],
+                },
+            ),
+            ServiceRequirement(
+                service="rds",
+                region="ap-southeast-1",
+                requirements={
+                    "requested_model": "db.m7g.large",
+                    "_review_selected_model": "db.m7g.large",
+                    "_review_selected_specifications": {
+                        "vCPU": 2,
+                        "memoryGiB": 8,
+                    },
+                    "_review_available_shapes": [
+                        {"vcpu": 2, "memory_gib": 8}
+                    ],
+                },
+            ),
+        ],
+    )
+    draft_id = "scope-edit01"
+    service._drafts[draft_id] = ("EC2 和 RDS", intent.model_copy(deep=True))
+    store.create_or_replace(
+        draft_id=draft_id,
+        customer_request="EC2 和 RDS",
+        customer_summary=intent.customer_summary,
+        intent=intent,
+        confirmation_text="请确认",
+        items=[],
+    )
+    store.prepare_configuration_review(draft_id=draft_id, intent=intent)
+
+    result = await service.preview(
+        QuoteRequest(
+            customer_request="EC2 和 RDS",
+            draft_id=draft_id,
+            confirmation_responses={
+                f"{CONFIGURATION_COMPONENT_UPDATE_PREFIX}0": (
+                    '{"region":"eu-central-1",'
+                    '"requirements":{"storage_gib":20480}}'
+                )
+            },
+        )
+    )
+
+    assert result.configuration_review_required is True
+    assert ec2_plugin.preview_calls >= 1
+    assert rds_plugin.preview_calls == 0
+    session = store.get(result.confirmation_token or "")
+    assert session is not None
+    assert session.configuration_items[0].requirements["storage_gib"] == 20480
+    assert session.configuration_items[1].selected_model == "db.m7g.large"
+    assert session.configuration_items[1].available_shapes == [
+        {"vcpu": 2.0, "memory_gib": 8.0}
+    ]
+
+    ec2_plugin.preview_calls = 0
+    rds_plugin.preview_calls = 0
+    quantity_result = await service.preview(
+        QuoteRequest(
+            customer_request="EC2 和 RDS",
+            draft_id=draft_id,
+            confirmation_responses={
+                f"{CONFIGURATION_COMPONENT_UPDATE_PREFIX}0": '{"quantity":9}'
+            },
+        )
+    )
+    assert ec2_plugin.preview_calls == 0
+    assert rds_plugin.preview_calls == 0
+    quantity_session = store.get(quantity_result.confirmation_token or "")
+    assert quantity_session is not None
+    assert quantity_session.configuration_items[0].quantity == 9
+
+
+@pytest.mark.asyncio
 async def test_reviewed_models_are_locked_across_restart_for_all_service_plugins(tmp_path) -> None:
     class ReviewedParser:
         async def parse(self, _: str) -> ParsedIntent:
@@ -1105,6 +1379,41 @@ def test_rephrased_shape_question_uses_the_same_confirmation_key() -> None:
     ) == QuoteService._confirmation_question_key(
         "请选择 OpenSearch 的处理器、内存和规格。"
     )
+
+
+def test_rephrased_rds_engine_question_uses_the_same_confirmation_key() -> None:
+    first = (
+        "Amazon RDS 数据库没有说明数据库类型，请选择 MySQL、PostgreSQL、"
+        "MariaDB、SQL Server、Oracle 或 Db2。"
+    )
+    second = (
+        "请先选择 RDS 数据库类型（MySQL、PostgreSQL、MariaDB、SQL Server、"
+        "Oracle 或 Db2）。请从下方可用配置中选择，或补充业务规格。"
+    )
+
+    assert QuoteService._confirmation_question_key(first) == "rds|engine"
+    assert QuoteService._confirmation_question_key(second) == "rds|engine"
+
+
+def test_duplicate_rds_engine_questions_are_merged_within_one_component() -> None:
+    first = "Amazon RDS 数据库没有说明数据库类型，请选择数据库引擎。"
+    second = "请先选择 RDS 数据库类型，并从下方可用配置中选择。"
+    scope = ("1", "rds")
+
+    assert QuoteService._deduplicate_confirmation_notices(
+        [first, second],
+        {first: scope, second: scope},
+    ) == [first]
+
+
+def test_rds_engine_questions_for_independent_components_are_not_merged() -> None:
+    first = "第一套 RDS 数据库没有说明数据库类型，请选择数据库引擎。"
+    second = "第二套 RDS 数据库没有说明数据库类型，请选择数据库引擎。"
+
+    assert QuoteService._deduplicate_confirmation_notices(
+        [first, second],
+        {first: ("0", "rds"), second: ("1", "rds")},
+    ) == [first, second]
 
 
 def test_missing_redis_capacity_generates_clickable_options() -> None:
@@ -2926,6 +3235,55 @@ def test_missing_rds_deployment_question_has_customer_choices() -> None:
     ]
 
 
+def test_missing_rds_engine_question_has_customer_choices() -> None:
+    options = QuoteService._default_confirmation_options(
+        "Amazon RDS 数据库没有说明数据库类型，请选择 MySQL、PostgreSQL、MariaDB、"
+        "SQL Server、Oracle 或 Db2。"
+    )
+
+    assert [item.value for item in options] == [
+        "mysql",
+        "postgresql",
+        "mariadb",
+        "sql_server_standard",
+        "oracle",
+        "db2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rds_engine_confirmation_updates_only_the_database_component() -> None:
+    question = (
+        "Amazon RDS 数据库没有说明数据库类型，请选择 MySQL、PostgreSQL、MariaDB、"
+        "SQL Server、Oracle 或 Db2。"
+    )
+    intent = ParsedIntent(
+        customer_summary="数据库和服务器",
+        services=[
+            ServiceRequirement(service="ec2", requirements={"vcpu": 4}),
+            ServiceRequirement(
+                service="rds",
+                requirements={"vcpu": 8, "memory_gib": 32},
+            ),
+        ],
+        ambiguities=[question],
+    )
+    service = QuoteService(
+        MixedParser(),  # type: ignore[arg-type]
+        PluginRegistry([]),
+        FailingEstimator(),  # type: ignore[arg-type]
+        None,
+    )
+
+    await service._apply_confirmation_responses(
+        intent, {question: "postgresql"}
+    )
+
+    assert intent.services[0].requirements == {"vcpu": 4}
+    assert intent.services[1].requirements["engine"] == "postgresql"
+    assert intent.ambiguities == []
+
+
 def test_nacos_partial_managed_replacement_has_two_clear_choices() -> None:
     options = QuoteService._default_confirmation_options(
         "您需要 Nacos 的服务发现和配置中心。是继续自建 Nacos（3 个节点），"
@@ -3059,6 +3417,9 @@ async def test_self_hosted_machine_selection_applies_model_and_machine_count() -
     component = intent.services[0]
     assert component.quantity == 5
     assert component.requirements["requested_model"] == "m7g.large"
+    assert "_pending_architecture_decision" not in component.field_sources
+    assert "_customer_select_configuration" not in component.field_sources
+    assert component.requirements["requested_model"] == "m7g.large"
     assert "_customer_select_configuration" not in component.field_sources
 
 
@@ -3093,9 +3454,38 @@ async def test_self_hosted_choice_and_machine_configuration_apply_in_one_answer(
 
     component = intent.services[0]
     assert component.quantity == 5
-    assert component.requirements["requested_model"] == "m7g.large"
-    assert "_pending_architecture_decision" not in component.field_sources
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_choice_reuses_customer_cpu_and_memory_without_second_picker() -> None:
+    question = "请选择 AWS 托管方案还是保留原产品自建。"
+    intent = ParsedIntent(
+        customer_summary="ClickHouse",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                calculator_service_name="Amazon EC2（自建 ClickHouse）",
+                quantity=3,
+                requirements={"vcpu": 8, "memory_gib": 32, "system_disk_gib": 1024},
+                field_sources={"_pending_architecture_decision": "system_policy"},
+            )
+        ],
+    )
+
+    service = QuoteService.__new__(QuoteService)
+    await service._apply_confirmation_responses(
+        intent,
+        {question: "self_hosted"},
+        response_components={question: 0},
+    )
+
+    component = intent.services[0]
+    assert component.quantity == 3
+    assert component.requirements["vcpu"] == 8
+    assert component.requirements["memory_gib"] == 32
+    assert component.requirements["system_disk_gib"] == 1024
     assert "_customer_select_configuration" not in component.field_sources
+    assert "_pending_architecture_decision" not in component.field_sources
 
 
 @pytest.mark.asyncio
@@ -3211,3 +3601,132 @@ def test_confirmation_model_choice_is_bound_to_the_correct_service(
     question: str, model: str, expected: ServiceKind
 ) -> None:
     assert QuoteService._confirmation_service_kind(question, model) == expected
+
+
+@pytest.mark.asyncio
+async def test_unknown_third_party_product_becomes_architecture_question() -> None:
+    customer_request = (
+        "1、Amazon EC2：区域：新加坡，数量：3台\n"
+        "5、ClickHouse：用途：实时数据分析和报表查询，部署数量：3个节点，"
+        "每节点配置：8核32GB，存储容量：1TB/节点"
+    )
+
+    class ClickHouseParser:
+        async def parse(self, _: str) -> ParsedIntent:
+            return ParsedIntent(
+                customer_summary="ClickHouse",
+                services=[
+                    ServiceRequirement(
+                        service="clickhouse",
+                        calculator_service_name="ClickHouse",
+                        region="ap-southeast-1",
+                        source_text="ClickHouse：",
+                    )
+                ],
+            )
+
+    class MissingGenericCatalog:
+        def preview(self, *_: object) -> None:
+            raise ManualConfirmationRequired(
+                "没有找到官方服务代码",
+                code="generic_service_code_not_found",
+            )
+
+    service = QuoteService(
+        ClickHouseParser(),  # type: ignore[arg-type]
+        PluginRegistry([ApiPlugin(ServiceKind.EC2, "m6i.2xlarge")]),
+        FailingEstimator(),  # type: ignore[arg-type]
+        None,
+        generic_plugin=MissingGenericCatalog(),  # type: ignore[arg-type]
+    )
+
+    preview = await service.preview(QuoteRequest(customer_request=customer_request))
+
+    clickhouse_items = [
+        item for item in preview.confirmation_items if "ClickHouse" in item.question
+    ]
+    assert len(clickhouse_items) == 1, (preview.confirmation_items, preview.selections)
+    assert [option.value for option in clickhouse_items[0].options] == [
+        "aws_managed",
+        "self_hosted",
+    ]
+    assert [option.model for option in clickhouse_items[0].dependent_options] == [
+        "m6i.2xlarge"
+    ]
+    recovered = service._drafts[preview.draft_id][1].services[0]
+    assert recovered.quantity == 3
+    assert recovered.requirements["vcpu"] == 8
+    assert recovered.requirements["memory_gib"] == 32
+    assert recovered.requirements["system_disk_gib"] == 1024
+    assert recovered.field_sources["_pending_architecture_decision"] == "system_policy"
+
+
+def test_multiple_architecture_questions_bind_to_their_own_components() -> None:
+    intent = ParsedIntent(
+        customer_summary="two self-hosted products",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                calculator_service_name="Amazon EC2（自建 Apache Kafka）",
+                field_sources={
+                    "_pending_architecture_decision": "system_policy",
+                    "_third_party_product": "Apache Kafka",
+                },
+            ),
+            ServiceRequirement(
+                service="clickhouse",
+                calculator_service_name="Amazon EC2（自建 ClickHouse）",
+                field_sources={
+                    "_pending_architecture_decision": "system_policy",
+                    "_third_party_product": "ClickHouse",
+                },
+            ),
+        ],
+    )
+    pending = {"0", "1"}
+
+    assert QuoteService._architecture_notice_component_id(
+        intent,
+        "AWS 没有与 Apache Kafka 完全等价的托管服务，采用托管还是自建？",
+        pending,
+    ) == "0"
+    assert QuoteService._architecture_notice_component_id(
+        intent,
+        "AWS 没有与 ClickHouse 完全等价的托管服务，采用托管还是自建？",
+        pending,
+    ) == "1"
+
+
+def test_model_availability_question_waits_until_region_is_selected() -> None:
+    region_question = (
+        "请确认这些区域型服务部署在哪个 AWS 区域；"
+        "如各服务区域不同，请分别说明。"
+    )
+    model_question = (
+        "EC2（自建 ClickHouse）：AWS 当前区域没有这个型号，"
+        "请从当前区域支持的规格中选择。"
+    )
+    intent = ParsedIntent(
+        customer_summary="ClickHouse",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                calculator_service_name="Amazon EC2（自建 ClickHouse）",
+                region=None,
+                requirements={"requested_model": "m6i.xlarge"},
+            )
+        ],
+    )
+
+    assert QuoteService._drop_pre_region_catalog_questions(
+        intent,
+        [region_question, model_question],
+        {model_question: ("0", "ec2")},
+    ) == [region_question]
+
+    intent.services[0].region = "ap-southeast-1"
+    assert QuoteService._drop_pre_region_catalog_questions(
+        intent,
+        [region_question, model_question],
+        {model_question: ("0", "ec2")},
+    ) == [region_question, model_question]

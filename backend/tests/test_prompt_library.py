@@ -5,6 +5,7 @@ from app.integrations.prompt_library import (
     PROMPT_META,
     SERVICE_KEYWORDS,
     SERVICE_PROMPTS,
+    build_component_extraction_prompt,
     build_intake_prompt,
     build_service_prompt,
     build_system_prompt,
@@ -26,6 +27,31 @@ def test_intake_and_component_prompts_are_physically_separated() -> None:
     assert "AWS 相邻档位确认" not in intake
     assert "客户问题识别" not in ec2
     assert len(ec2) < len(intake)
+
+
+def test_component_extraction_loads_exactly_its_own_full_service_prompt() -> None:
+    ec2 = build_component_extraction_prompt(
+        "ec2", "EC2 m6i.xlarge (4C16G) + gp3 500GB，数量1"
+    )
+    rds = build_component_extraction_prompt(
+        "rds", "RDS MySQL db.t3.large Multi-AZ + 100GB，数量1"
+    )
+
+    assert "additional_ebs_volumes" in ec2
+    assert "16G 是内存，500GB 才是磁盘" in ec2
+    assert "deployment 只能" not in ec2
+    assert "db.t3.large 只能是" in rds
+    assert "additional_ebs_volumes" not in rds
+
+
+def test_quicksight_component_uses_native_independent_template_prompt() -> None:
+    prompt = build_component_extraction_prompt(
+        "quicksight", "QuickSight Enterprise (10用户)，数量1"
+    )
+
+    assert "字段：edition, users" in prompt
+    assert "不得改写成“BI 可视化自建软件”" in prompt
+    assert "additional_ebs_volumes" not in prompt
 
 
 def test_lowest_cost_guard_is_loaded_in_every_ai_stage() -> None:

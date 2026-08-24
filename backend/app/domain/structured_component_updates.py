@@ -17,6 +17,24 @@ SHAPE_FIELDS = {
     "task_memory_gib",
 }
 
+# Any of these fields can change which official SKU/model is valid.  A model
+# selected before the edit is only a cache of the old configuration; keeping
+# it after (for example) switching Linux to Windows or changing a database
+# engine makes the final pricing pass query an impossible combination.
+CATALOG_COMPATIBILITY_FIELDS = {
+    *SHAPE_FIELDS,
+    "requested_model",
+    "operating_system",
+    "architecture",
+    "tenancy",
+    "engine",
+    "deployment",
+    "storage_class",
+    "storage_type",
+    "cluster_type",
+    "volume_type",
+}
+
 
 def decode_component_update(value: str) -> dict[str, Any] | None:
     try:
@@ -50,7 +68,10 @@ def apply_component_update(
     if not isinstance(requirements, dict):
         raise ValueError("组件参数格式不正确")
     explicitly_selected_model = "requested_model" in requirements
-    shape_changed = any(field in requirements for field in SHAPE_FIELDS)
+    catalog_compatibility_changed = (
+        "region" in update
+        or any(field in requirements for field in CATALOG_COMPATIBILITY_FIELDS)
+    )
     for field, value in requirements.items():
         if not isinstance(field, str) or not field or field.startswith("_"):
             raise ValueError("组件参数名称不正确")
@@ -64,14 +85,17 @@ def apply_component_update(
         revised.requirements[field] = value
         changed_paths.append(path)
 
-    # A changed CPU/memory shape must be matched again. Keeping the old model
-    # would make the official catalog silently restore its old CPU and memory.
-    if shape_changed and not explicitly_selected_model:
+    # Any catalog-compatibility edit must be matched again. Keeping the old
+    # model would make the official catalog restore stale CPU/memory/OS/engine
+    # information or reach the final quote with no billable product.
+    if catalog_compatibility_changed and not explicitly_selected_model:
         revised.requirements.pop("requested_model", None)
         revised.requirements.pop("_review_selected_model", None)
+        revised.requirements.pop("_review_selected_specifications", None)
         for path in (
             "requirements.requested_model",
             "requirements._review_selected_model",
+            "requirements._review_selected_specifications",
         ):
             revised.field_sources.pop(path, None)
             revised.field_evidence.pop(path, None)

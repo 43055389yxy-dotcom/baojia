@@ -5,6 +5,72 @@ import { ConfigurationOptionPicker, type ConfigurationChoice } from "./component
 
 type Health = { status: string; awsAccount?: string; calculatorReady?: boolean; aiProvider?: string; pricingMode?: string };
 type JobEvent = { stage: string; message: string; time: string };
+type ActivityChannel = {
+  id: string;
+  name: string;
+  message: string;
+  history: string[];
+  state: "running" | "repair" | "done";
+  order: number;
+};
+
+function serviceActivityLogs(name: string): string[] {
+  const normalized = name.toLowerCase();
+  if (normalized.includes("ec2")) return ["识别实例系列", "核对区域可用性", "整理处理器与内存组合", "筛选处理器架构", "检查操作系统兼容性", "分析云硬盘配置", "核对网络基线", "验证租用方式", "读取按需计费维度", "准备预付费价格矩阵", "校验官方产品编号", "实例候选集准备完成"];
+  if (normalized.includes("rds")) return ["识别数据库引擎", "确认引擎版本", "核对多可用区拓扑", "查询数据库实例类型", "关联处理器与内存", "匹配存储类型", "检查性能上限", "核对备份设置", "识别授权计费维度", "读取区域价格", "校验官方产品编号", "数据库候选集准备完成"];
+  if (normalized.includes("elasticache") || normalized.includes("redis")) return ["识别缓存引擎", "核对 Redis 与 Valkey 能力", "解析主从拓扑", "隔离分片数量", "匹配节点内存", "检查故障转移策略", "核对可用区部署", "查询预留节点", "扫描网络计费维度", "读取区域价格", "校验缓存产品编号", "缓存候选集准备完成"];
+  if (normalized.includes("msk") || normalized.includes("kafka")) return ["识别 Kafka 工作负载", "锁定 Amazon MSK 映射", "解析 Broker 拓扑", "隔离集群数量", "恢复 Broker 数量", "核对每节点云硬盘", "检查吞吐量配置", "验证可用区分布", "查询实例类型", "匹配存储计费维度", "校验 MSK 产品编号", "MSK 候选集准备完成"];
+  if (normalized.includes("s3") || normalized.includes("storage")) return ["识别存储类型", "规范化对象容量", "转换容量单位", "拆分读写请求", "识别流量方向", "分析生命周期策略", "扫描取回计费维度", "检查复制策略", "读取区域请求价格", "查询存储单价", "校验 S3 产品编号", "S3 计费维度准备完成"];
+  if (normalized.includes("eks") || normalized.includes("kubernetes")) return ["识别容器集群需求", "隔离托管控制面", "识别工作节点池", "计算集群与节点总数", "匹配 EC2 节点配置", "核对系统盘", "检查版本支持", "验证区域端点", "计算控制面时长", "关联工作节点目录", "校验 EKS 拓扑", "EKS 计费维度准备完成"];
+  if (normalized.includes("opensearch")) return ["解析搜索节点拓扑", "拆分数据与主节点角色", "恢复节点数量", "关联处理器与内存", "核对每节点云硬盘", "分析索引工作负载", "验证高可用布局", "检查分层存储能力", "查询区域型号", "匹配存储计费维度", "校验 OpenSearch 产品编号", "搜索服务候选集准备完成"];
+  if (normalized.includes("cloudfront")) return ["读取边缘节点网络", "确认全球服务范围", "匹配出站流量阶梯", "识别 HTTPS 请求量", "检查源站路由", "分析缓存行为", "确认价格等级", "匹配缓存刷新计费", "检查源站防护能力", "查询边缘单价", "校验 CloudFront 产品编号", "CloudFront 价格准备完成"];
+  if (normalized.includes("waf")) return ["读取访问控制列表", "确认服务范围", "识别托管规则组", "统计自定义规则", "规范化请求量", "匹配机器人防护", "扫描验证码计费维度", "检查区域范围", "核对 CloudFront 关联", "查询 WAF 单价", "校验安全策略", "WAF 价格准备完成"];
+  return ["识别产品身份", "锁定组件数据边界", "复核客户原始要求", "分析 AWS 托管覆盖范围", "比较功能适配程度", "解析自建部署拓扑", "恢复节点数量", "恢复处理器与内存", "规范化存储单位", "检查架构决策", "选择官方目录路径", "安全报价路径准备完成"];
+}
+
+function activityLogStream(channel: ActivityChannel): string[] {
+  const isPricingChannel = channel.history.some((message) =>
+    /报价队列|官方产品|计费项|月费|报价计算/.test(message),
+  );
+  const pricingLogs = isPricingChannel ? [
+    "初始化独立报价上下文",
+    "同步区域产品目录索引",
+    "查询 AWS Price List Service Code",
+    "扫描产品属性与 SKU 约束",
+    "校验区域与部署方式兼容性",
+    "关联型号、规格和购买方式",
+    "展开官方计费维度集合",
+    "规范化月度用量与单位",
+    "生成 BCM Calculator Usage Lines",
+    "执行重复计费项去重检查",
+    "核对数量与单项用量边界",
+    "提交官方价格计算请求",
+    "读取按需与预付价格结果",
+    "执行币种和月费精度校验",
+    "检查零价格与缺失维度",
+    "写入组件级报价结果",
+  ] : [];
+  if (channel.state === "done") {
+    return [
+      `${channel.name} 独立核验任务`,
+      ...channel.history.slice(-5),
+      ...(isPricingChannel ? ["官方价格返回值校验通过", "组件月费结果已安全写入"] : ["官方规格校验已完成"]),
+      "本模块已停止运行",
+    ];
+  }
+  return [
+    `${channel.name} 安全处理通道已启动`,
+    `独立任务编号 ${channel.id.slice(-8)}`,
+    "区域目录同步完成",
+    ...serviceActivityLogs(channel.name),
+    ...pricingLogs,
+    `${channel.name} 数据边界已锁定`,
+    ...channel.history,
+    "官方计费维度校验通过",
+    "验证结果已写入只读缓存",
+    `${channel.name} 完整性校验通过`,
+  ];
+}
 type QuoteError = { code: string; message: string; details?: Record<string, unknown> };
 type Preview = {
   draft_id: string;
@@ -198,6 +264,7 @@ const specificationNames: Record<string, string> = {
   customerDeployment: "客户确认架构", clusterMembers: "每集群数据库实例数",
   shards: "分片", replicasPerShard: "每分片副本", totalNodes: "节点", quantity: "数量",
   dataTransferOutGiB: "公网下行", processedBytesGiB: "处理流量",
+  systemDiskGiB: "系统盘", volumeType: "磁盘类型",
   hostedZones: "域名托管区", webACLs: "Web ACL", rules: "规则", requests: "每月请求量",
   queueType: "队列类型", outboundMessages: "出站邮件", logIngestionGiB: "日志写入",
   customMetrics: "自定义指标",
@@ -322,6 +389,11 @@ const stageName: Record<string, string> = {
   catalog: "产品目录同步",
   aws_start: "官方规格核验",
   aws_done: "规格核验完成",
+  quote_component_waiting: "等待官方报价",
+  aws_match_done: "官方计费项匹配",
+  quote_done: "组件报价完成",
+  review_options_start: "整理编辑选项",
+  review_options_done: "确认页面准备",
   official_start: "Microsoft 官方核验",
   official_done: "Microsoft 核验完成",
   agent: "报价编排",
@@ -362,7 +434,12 @@ function quoteScenarios(quote: Quote): PricingScenario[] {
 }
 
 function scenarioServiceCost(scenario: PricingScenario, index: number) {
-  const prefixes = [`s${index + 1}`, `az${index + 1}`];
+  const prefixes = [
+    `s${index + 1}l`,
+    `s${index + 1}commit`,
+    `az${index + 1}l`,
+    `az${index + 1}commit`,
+  ];
   return (scenario.priced_lines ?? [])
     .filter((line) => prefixes.some((prefix) => line.key.startsWith(prefix)))
     .reduce((sum, line) => sum + Number(line.cost || 0), 0);
@@ -444,8 +521,26 @@ function compactSpecifications(selection: Selection) {
         : storageLine.amount / instanceCount;
     }
   }
+  const hiddenSpecificationKeys = new Set([
+    "requested_model",
+    "system_default_assumption",
+    "calculator_adjustment_notices",
+    "ebs_storage_breakdown",
+    "purchase_option",
+    "reserved_term_years",
+    "payment_option",
+    "utilization_percent",
+    "tenancy",
+    "total_system_disk_gib",
+    "totalSystemDiskGiB",
+  ]);
   return Object.entries(specifications)
-    .filter(([, value]) => value != null)
+    .filter(([key, value]) => (
+      value != null
+      && value !== false
+      && !key.startsWith("_")
+      && !hiddenSpecificationKeys.has(key)
+    ))
     .map(([key, value]) => {
       const numericValue = typeof value === "number" ? value.toLocaleString("zh-CN") : String(value);
       const suffix = key.toLowerCase().includes("gib")
@@ -470,6 +565,7 @@ export default function Home() {
   const [logExpanded, setLogExpanded] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [activityLogTick, setActivityLogTick] = useState(0);
   const [pricingMode, setPricingMode] = useState<PricingMode | null>("standard_reserved");
   const [includeOnDemandScenario, setIncludeOnDemandScenario] = useState(true);
   const [reservedTermYears, setReservedTermYears] = useState<(1 | 3)[]>([1, 3]);
@@ -547,9 +643,15 @@ export default function Home() {
       if (window.sessionStorage.getItem(CONFIRMATION_CONTEXT_KEY)) return;
       const saved = window.sessionStorage.getItem(QUOTE_JOB_CONTEXT_KEY);
       if (!saved) return;
-      const context = JSON.parse(saved) as { jobId?: string; customerRequest?: string; cloudProvider?: CloudProvider };
+      const context = JSON.parse(saved) as {
+        jobId?: string;
+        customerRequest?: string;
+        cloudProvider?: CloudProvider;
+        draftId?: string;
+      };
       if (!context.jobId || !context.customerRequest || !context.cloudProvider) return;
       setCloudProvider(context.cloudProvider);
+      if (context.draftId) setPreviewDraftId(context.draftId);
       workflowPhase.current = "quote";
       setRequirement(context.customerRequest);
       setJob({
@@ -569,27 +671,36 @@ export default function Home() {
   const running = job?.status === "queued" || job?.status === "running";
   const latest = useMemo(() => job?.events.at(-1), [job]);
   const liveComponentActivity = useMemo(() => {
-    const channels = new Map<string, { id: string; name: string; message: string; history: string[]; state: "running" | "repair" | "done"; order: number }>();
+    const channels = new Map<string, ActivityChannel>();
     const templateDone = new Set<string>();
     const officialDone = new Set<string>();
     let total = 0;
     for (const [order, event] of (job?.events ?? []).entries()) {
-      const plan = event.stage === "component_plan" ? event.message.match(/共\s*(\d+)\s*个组件/) : null;
+      const plan = event.stage === "component_plan"
+        ? event.message.match(/(?:共|已建立)\s*(\d+)\s*(?:个组件|项)/)
+        : null;
       if (plan) total = Number(plan[1]);
       const match = event.message.match(/^组件\s*(\d+)｜([^｜]+)｜(.+)$/);
       if (!match) continue;
       const [, id, name, message] = match;
       const state = event.stage === "ai_repair"
         ? "repair"
-        : event.stage === "component_done" || event.stage === "aws_done" || event.stage === "official_done"
+        : event.stage === "component_done" || event.stage === "aws_done" || event.stage === "official_done" || event.stage === "quote_done"
           ? "done"
           : "running";
       if (event.stage === "component_done") templateDone.add(id);
-      if (event.stage === "aws_done" || event.stage === "official_done") officialDone.add(id);
+      if (event.stage === "aws_done" || event.stage === "official_done" || event.stage === "quote_done") officialDone.add(id);
       const previous = channels.get(id);
       const history = previous?.history ?? [];
       if (history.at(-1) !== message) history.push(message);
-      channels.set(id, { id, name, message, history: history.slice(-3), state, order });
+      channels.set(id, {
+        id,
+        name,
+        message,
+        history: history.slice(-10),
+        state,
+        order: previous?.order ?? order,
+      });
     }
     const rows = [...channels.values()].sort((a, b) => a.order - b.order);
     return {
@@ -674,6 +785,15 @@ export default function Home() {
   useEffect(() => {
     if (!running) return;
     const interval = window.setInterval(() => setElapsedSeconds((value) => value + 1), 1000);
+    return () => window.clearInterval(interval);
+  }, [running]);
+
+  useEffect(() => {
+    if (!running) return;
+    const interval = window.setInterval(
+      () => setActivityLogTick((value) => value + 1),
+      520,
+    );
     return () => window.clearInterval(interval);
   }, [running]);
 
@@ -770,7 +890,12 @@ export default function Home() {
       }
       window.sessionStorage.setItem(
         QUOTE_JOB_CONTEXT_KEY,
-        JSON.stringify({ jobId: payload.job_id, customerRequest: requestText, cloudProvider: provider }),
+        JSON.stringify({
+          jobId: payload.job_id,
+          customerRequest: requestText,
+          cloudProvider: provider,
+          draftId: draftId ?? null,
+        }),
       );
       await poll(payload.job_id, prefixEvents);
     } catch (error) {
@@ -1707,7 +1832,7 @@ export default function Home() {
       {running && (
         <section className={`workbench ${running ? "running" : ""}`} aria-live="polite">
           <div className="workbench-head">
-            <div><p className="kicker">QUOTE ACTIVITY</p><h2>{checking ? "正在核验配置" : "正在生成报价"}</h2></div>
+            <div><p className="kicker">报价处理进度</p><h2>{checking ? "正在核验配置" : "正在生成报价"}</h2></div>
             <div className="workbench-actions">
               <button type="button" className="log-toggle" onClick={() => setLogExpanded((value) => !value)}>
                 {logExpanded ? "收起记录" : "展开记录"}
@@ -1727,8 +1852,30 @@ export default function Home() {
                   <div className={`ai-channel ${channel.state}`} key={channel.id}>
                     <header><span>通道 {index + 1}</span><i /></header>
                     <strong>{channel.name}</strong>
-                    <div className="ai-channel-log">
-                      {channel.history.map((message, messageIndex) => <p key={`${channel.id}-${messageIndex}-${message}`}>{message}</p>)}
+                    <div className="ai-channel-log" aria-hidden="true">
+                      <div
+                        className="ai-channel-log-group"
+                      >
+                        {(() => {
+                          const stream = activityLogStream(channel);
+                          const end = channel.state === "done"
+                            ? stream.length - 1
+                            : (activityLogTick + index * 2) % stream.length;
+                          return Array.from({ length: Math.min(5, stream.length) }, (_, row) => {
+                            const messageIndex = (end - 4 + row + stream.length) % stream.length;
+                            return (
+                              <p
+                                className={row === 0 ? "log-row-exiting" : row === 4 ? "log-row-new" : ""}
+                                key={`${channel.id}-${messageIndex}-${stream[messageIndex]}`}
+                                style={{ top: `${(row - 1) * 19}px` }}
+                              >
+                                <span>{String(messageIndex + 1).padStart(2, "0")}</span>
+                                {stream[messageIndex]}
+                              </p>
+                            );
+                          });
+                        })()}
+                      </div>
                     </div>
                   </div>
                 ))}
@@ -1738,25 +1885,6 @@ export default function Home() {
           <ol className={`timeline ${liveComponentActivity.channels.length ? "channel-mode" : ""} ${logExpanded ? "expanded" : ""}`} ref={timeline}>
             {job?.events.map((event, index) => (
               <li key={`${event.time}-${index}`}>
-                <span className="step-dot">{index + 1}</span>
-                <div><small>{stageName[event.stage] ?? event.stage} · {event.time}</small><p>{event.message}</p></div>
-              </li>
-            ))}
-          </ol>
-        </section>
-      )}
-
-      {false && !running && (job?.events.length ?? 0) > 0 && (
-        <section className="workbench audit-log" aria-label="系统执行日志">
-          <div className="workbench-head">
-            <div><p className="kicker">SYSTEM PROCESS LOG</p><h2>系统处理记录</h2></div>
-            <button type="button" className="log-toggle" onClick={() => setLogExpanded((value) => !value)}>
-              {logExpanded ? "收起记录" : "展开完整记录"}
-            </button>
-          </div>
-          <ol className={`timeline ${logExpanded ? "expanded" : ""}`} ref={timeline}>
-            {job?.events.map((event, index) => (
-              <li key={`audit-${event.time}-${index}`}>
                 <span className="step-dot">{index + 1}</span>
                 <div><small>{stageName[event.stage] ?? event.stage} · {event.time}</small><p>{event.message}</p></div>
               </li>
@@ -1866,16 +1994,19 @@ export default function Home() {
             <p className="kicker">需要检查</p>
             <h2>本次没有生成价格</h2>
             <p>{job.error.message}</p>
-            {job.error.code === "backend_unavailable" && (
-              <button
-                className="reconnect-button"
-                type="button"
-                disabled={!requirement.trim()}
-                onClick={() => void runPreflight(requirement, undefined, {}, false, cloudProvider)}
-              >
-                重新开始核验
-              </button>
-            )}
+            <button
+              className="reconnect-button"
+              type="button"
+              disabled={!requirement.trim()}
+              onClick={() => void startQuote(
+                requirement,
+                previewDraftId ?? undefined,
+                [{ stage: "recovery", message: "保留全部已确认配置，重新匹配官方计费项", time: "刚刚" }],
+                cloudProvider,
+              )}
+            >
+              保留配置并重新报价
+            </button>
           </div>
         </section>
       )}

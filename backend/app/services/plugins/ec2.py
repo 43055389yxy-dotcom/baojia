@@ -40,6 +40,18 @@ class Ec2Plugin(ServicePlugin):
         operating_system = _pricing_operating_system(
             _optional_string(requested.get("operating_system"))
         )
+        requested_architecture = (
+            _optional_string(requested.get("architecture")) or ""
+        ).casefold()
+        if operating_system == "Windows" and requested_architecture in {
+            "arm",
+            "arm64",
+            "aarch64",
+        }:
+            return (
+                "Windows Server 不能运行在 ARM64 EC2 上。"
+                "请把处理器架构改为 x86_64，或保留 ARM64 并改用 Linux。"
+            )
         if not requested_model or operating_system != "Windows":
             return None
 
@@ -203,7 +215,9 @@ class Ec2Plugin(ServicePlugin):
         )
         tenancy = _pricing_tenancy(_optional_string(requested.get("tenancy")))
         options: list[CandidateOption] = []
-        price_list_enabled = requested_model is None
+        price_list_enabled = True
+        price_checked_models: set[str] = set()
+        billable_models: set[str] = set()
         for item in candidate_items:
             product = None
             # Smaller replacement choices do not need a speculative price at
@@ -211,9 +225,12 @@ class Ec2Plugin(ServicePlugin):
             # exact official model.
             if price_list_enabled and _fits(item, min_vcpu, min_memory):
                 try:
+                    price_checked_models.add(str(item["model"]))
                     product = self._compute_product(
                         region, item["model"], operating_system, tenancy
                     )
+                    if product is not None:
+                        billable_models.add(str(item["model"]))
                 except ManualConfirmationRequired:
                     # EC2 Price List is optional in the Calculator pipeline. Once it
                     # fails, finish candidate selection from EC2 API specifications.
@@ -249,6 +266,28 @@ class Ec2Plugin(ServicePlugin):
                     },
                 )
             )
+        # A model can be present in DescribeInstanceTypes yet have no billable
+        # product for the edited OS/tenancy combination (Mac + Windows is a
+        # common example).  Never persist such a model as "ready" and discover
+        # the problem only after the customer approves the entire quote.
+        if price_checked_models and not billable_models and (
+            requested_model is not None or exact_shape_exists
+        ):
+            raise ManualConfirmationRequired(
+                "当前 EC2 规格与所选操作系统、处理器架构或租用方式没有官方计费项",
+                code="ec2_configuration_not_billable",
+                region=region,
+                requested_model=requested_model,
+                operating_system=operating_system,
+                tenancy=tenancy,
+            )
+        if billable_models:
+            options = [
+                option
+                for option in options
+                if option.model not in price_checked_models
+                or option.model in billable_models
+            ]
         exact = next((option for option in options if option.model == requested_model), None)
         if requested_model and exact is None:
             options[
@@ -266,7 +305,19 @@ class Ec2Plugin(ServicePlugin):
                     option.model,
                 )
             )
-        default_model = eligible[0]["model"]
+        priced_defaults = [
+            option for option in options if option.monthly_catalog_cost is not None
+        ]
+        default_model = (
+            min(
+                priced_defaults,
+                key=lambda option: (
+                    option.monthly_catalog_cost or float("inf"), option.model
+                ),
+            ).model
+            if priced_defaults
+            else eligible[0]["model"]
+        )
         default = next(option for option in options if option.model == default_model)
         default.is_default = True
         # Multiple official models can share the exact requested CPU/memory
@@ -360,8 +411,32 @@ class Ec2Plugin(ServicePlugin):
                 )
             _, selected, compute_product = min(priced, key=lambda item: (item[0], item[1]["model"]))
 
+        reserved_years = (
+            int(requested.get("reserved_term_years") or 1)
+            if purchase_option in {"standard_reserved", "convertible_reserved"}
+            else None
+        )
+        reserved_payment = (
+            _optional_string(requested.get("payment_option")) or "no_upfront"
+            if reserved_years is not None
+            else None
+        )
+        reserved_offering_class = (
+            "convertible"
+            if purchase_option == "convertible_reserved"
+            else "standard"
+            if purchase_option == "standard_reserved"
+            else None
+        )
         compute_product = self._compute_product(
-            region, selected["model"], operating_system, tenancy
+            region,
+            selected["model"],
+            operating_system,
+            tenancy,
+            reserved_years=reserved_years,
+            payment_option=reserved_payment,
+            offering_class=reserved_offering_class,
+            hours_per_month=requirement.hours_per_month,
         )
         if compute_product is None:
             raise ManualConfirmationRequired(
@@ -551,7 +626,16 @@ class Ec2Plugin(ServicePlugin):
         )
 
     def _compute_product(
-        self, region: str, model: str, operating_system: str, tenancy: str
+        self,
+        region: str,
+        model: str,
+        operating_system: str,
+        tenancy: str,
+        *,
+        reserved_years: int | None = None,
+        payment_option: str | None = None,
+        offering_class: str | None = None,
+        hours_per_month: float = 730,
     ) -> dict[str, Any] | None:
         products = self.catalog.products(
             "AmazonEC2",
@@ -567,6 +651,41 @@ class Ec2Plugin(ServicePlugin):
         )
         if not products:
             return None
+
+        # Price List can return several records for the same EC2 model, OS and
+        # tenancy.  Some are on-demand-only operation variants while another
+        # record owns the Reserved terms.  Selecting by SKU used to pick an
+        # arbitrary on-demand-only record and falsely report that a valid
+        # 1-year/3-year Reserved offer did not exist.  For a Reserved quote,
+        # bind the product record to the exact commercial terms first.
+        if reserved_years is not None and payment_option is not None:
+            reserved_products: list[tuple[float, str, dict[str, Any]]] = []
+            for product in products:
+                try:
+                    price = PricingCatalog.reserved_price(
+                        product,
+                        years=reserved_years,
+                        payment_option=payment_option,
+                        offering_class=offering_class,
+                        hours_per_month=hours_per_month,
+                    )
+                except ManualConfirmationRequired as exc:
+                    if exc.code in {
+                        "reserved_term_not_found",
+                        "reserved_price_dimensions_missing",
+                    }:
+                        continue
+                    raise
+                reserved_products.append(
+                    (
+                        price.monthly_amortized,
+                        str(product.get("product", {}).get("sku") or ""),
+                        product,
+                    )
+                )
+            if reserved_products:
+                return min(reserved_products, key=lambda item: (item[0], item[1]))[2]
+
         identities = {
             identity: product
             for product in products
@@ -620,16 +739,36 @@ class Ec2Plugin(ServicePlugin):
                     )
             return candidates
 
-        try:
-            if requested_model:
+        discovery_errors: list[Exception] = []
+        successful_query = False
+
+        def query(
+            *, parameters: dict[str, Any], max_items: int | None = None, paginate: bool = True
+        ) -> dict[str, Any] | None:
+            nonlocal successful_query
+            try:
                 response = executor.execute(
                     service="ec2",
                     operation="describe_instance_types",
                     region=region,
-                    parameters={"InstanceTypes": [requested_model]},
-                    paginate=False,
+                    parameters=parameters,
+                    max_items=max_items,
+                    paginate=paginate,
                 )
-                exact_model = parse(response)
+                successful_query = True
+                return response
+            except ManualConfirmationRequired as exc:
+                if exc.code in {"aws_credentials_invalid", "aws_region_not_enabled"}:
+                    raise
+                discovery_errors.append(exc)
+                return None
+
+        try:
+            if requested_model:
+                response = query(
+                    parameters={"InstanceTypes": [requested_model]}, paginate=False
+                )
+                exact_model = parse(response) if response is not None else []
                 if exact_model:
                     return remember(exact_model)
 
@@ -644,29 +783,23 @@ class Ec2Plugin(ServicePlugin):
                         "Values": [str(int(requested_memory * 1024))],
                     },
                 ]
-                response = executor.execute(
-                    service="ec2",
-                    operation="describe_instance_types",
-                    region=region,
+                response = query(
                     parameters={"Filters": exact_filters},
                     max_items=100,
                 )
-                exact_shapes = parse(response)
+                exact_shapes = parse(response) if response is not None else []
                 if exact_shapes:
                     return remember(exact_shapes)
 
             # Only unusual, non-existent shapes need a broader current-generation
             # scan to produce the lower and upper confirmation choices.
-            response = executor.execute(
-                service="ec2",
-                operation="describe_instance_types",
-                region=region,
+            response = query(
                 parameters={
                     "Filters": [{"Name": "current-generation", "Values": ["true"]}]
                 },
                 max_items=1000,
             )
-            candidates = parse(response)
+            candidates = parse(response) if response is not None else []
         except (ManualConfirmationRequired, KeyError) as exc:
             if isinstance(exc, ManualConfirmationRequired) and exc.code in {
                 "aws_credentials_invalid",
@@ -678,6 +811,12 @@ class Ec2Plugin(ServicePlugin):
                 code="ec2_discovery_failed",
                 region=region,
             ) from exc
+        if not successful_query and discovery_errors:
+            raise ManualConfirmationRequired(
+                f"EC2 官方 API 无法确认 {region} 的实例规格或区域支持",
+                code="ec2_discovery_failed",
+                region=region,
+            ) from discovery_errors[-1]
         return remember(candidates)
 
 

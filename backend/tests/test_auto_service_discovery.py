@@ -137,7 +137,9 @@ def test_unknown_service_builds_and_reuses_verified_official_profile(tmp_path: P
     assert "官方目录自动生成" in first["prompt_text"]
     assert "UsageType=APS1-DataProcessed" in first["prompt_text"]
     assert second is not None
-    assert catalog.product_calls == 1
+    # One regional query plus one global-dimension query; the second profile
+    # read is served from the persistent discovery cache.
+    assert catalog.product_calls == 2
     assert discovery.list_profiles()[0]["service_key"] == "appflow"
 
 
@@ -162,7 +164,7 @@ def test_stale_profile_is_refreshed_from_official_catalog(tmp_path: Path) -> Non
     result = discovery.refresh_stale_profiles()
 
     assert result == {"checked": 1, "refreshed": 1, "failed": 0}
-    assert catalog.product_calls == 2
+    assert catalog.product_calls == 4
 
 
 def test_old_profile_schema_is_upgraded_without_waiting_ten_days(tmp_path: Path) -> None:
@@ -198,7 +200,7 @@ def test_old_profile_schema_is_upgraded_without_waiting_ten_days(tmp_path: Path)
     assert upgraded is not None
     assert upgraded["profile_schema_version"] == PROFILE_SCHEMA_VERSION
     assert upgraded["field_bindings"]
-    assert catalog.product_calls == 2
+    assert catalog.product_calls == 4
 
 
 def storage_product() -> dict:

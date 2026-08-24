@@ -369,6 +369,13 @@ async def get_confirmation_session(token: str) -> ConfirmationSessionResponse | 
     session = store.get(token) if store is not None else None
     if session is None:
         return JSONResponse(status_code=404, content={"message": "确认单不存在或已失效"})
+    if store.cloud_provider == "aws":
+        reprocess_request = store.begin_configuration_reprocessing(token)
+        if reprocess_request is not None:
+            quote_jobs.start_preview(reprocess_request)
+            refreshed = store.get(token)
+            if refreshed is not None:
+                session = refreshed
     return session
 
 
@@ -388,6 +395,13 @@ async def submit_confirmation_session(
         return JSONResponse(status_code=422, content={"message": str(exc)})
     if session is None:
         return JSONResponse(status_code=404, content={"message": "确认单不存在或已失效"})
+    if store.cloud_provider == "aws":
+        reprocess_request = store.begin_configuration_reprocessing(token)
+        if reprocess_request is not None:
+            quote_jobs.start_preview(reprocess_request)
+            refreshed = store.get(token)
+            if refreshed is not None:
+                session = refreshed
     return session
 
 
@@ -431,6 +445,13 @@ async def submit_configuration_feedback(
         return JSONResponse(status_code=409, content={"message": str(exc)})
     if session is None:
         return JSONResponse(status_code=404, content={"message": "确认单不存在或已失效"})
+    if store.cloud_provider == "aws":
+        reprocess_request = store.begin_configuration_reprocessing(token)
+        if reprocess_request is not None:
+            quote_jobs.start_preview(reprocess_request)
+            refreshed = store.get(token)
+            if refreshed is not None:
+                session = refreshed
     return session
 
 

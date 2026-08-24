@@ -36,7 +36,8 @@ SERVICE_TEMPLATE_FIELDS: dict[str, tuple[str, ...]] = {
         "deployment", "storage_gib", "storage_type", "storage_iops",
         "storage_throughput_mbps", "purchase_option", "reserved_term_years",
         "payment_option", "utilization_percent", "license_model",
-        "backup_retention_days", "read_replica_count", "aurora_cluster",
+        "backup_retention_days", "read_replica_count", "performance_insights",
+        "enhanced_monitoring", "aurora_cluster",
         "cluster_members",
     ),
     "elasticache": (
@@ -181,9 +182,13 @@ SERVICE_TEMPLATE_FIELDS: dict[str, tuple[str, ...]] = {
     "cloud_map": ("namespaces", "service_instances", "api_calls", "dns_queries"),
     "appconfig": (
         "configuration_requests", "configuration_retrievals",
-        "targets_receiving_configuration",
+        "targets_receiving_configuration", "experiment_hours",
     ),
     "eventbridge": ("events", "event_buses", "schema_discovery_events", "pipes_requests"),
+    "quicksight": (
+        "edition", "users", "author_users", "reader_users",
+        "session_capacity", "spice_gib",
+    ),
 }
 
 
@@ -205,6 +210,49 @@ GENERIC_TEMPLATE_FIELDS = (
 
 COMMON_TEMPLATE_FIELDS = ("system_default_assumption",)
 
+# Safe defaults are values that do not change which product the customer is
+# buying.  Every known template participates in this registry, even when its
+# default mapping is empty.  Product-family decisions (for example the RDS
+# engine) deliberately do not belong here and must remain customer choices.
+SERVICE_SAFE_DEFAULTS: dict[str, dict[str, Any]] = {
+    service: {} for service in SERVICE_TEMPLATE_FIELDS
+}
+SERVICE_SAFE_DEFAULTS.update(
+    {
+    "ec2": {"operating_system": "Linux", "detailed_monitoring": False},
+        "elasticache": {"backup_retention_days": 0},
+        "msk": {"cluster_type": "provisioned", "storage_type": "ebs"},
+        "apigateway": {"api_type": "http"},
+        "rds": {"performance_insights": False, "enhanced_monitoring": False},
+    }
+)
+
+# Fields that represent metered quantities customers may add to a component.
+# Keeping this beside the extraction contracts gives the confirmation UI one
+# provider-owned source of truth instead of a universal frontend menu.
+BILLING_DIMENSION_FIELDS = {
+    "active_series", "alarms", "api_calls", "attachments_gib",
+    "backup_storage_gib", "broker_hours", "collector_hours",
+    "configuration_requests", "configuration_retrievals",
+    "control_plane_hours", "custom_metrics", "data_in_gib",
+    "data_out_gib", "data_processed_gib", "data_retrieval_gib",
+    "data_scanned_gib", "data_transfer_in_gib", "data_transfer_out_gib",
+    "data_transfer_regional_gib", "dns_queries", "duration_gb_seconds",
+    "event_buses", "events", "get_select_requests", "health_checks",
+    "hosted_zones", "hours_per_month", "https_requests", "image_scans",
+    "images", "inbound_messages", "input_tokens", "io_requests",
+    "key_count", "log_ingestion_gib", "log_storage_gib", "managed_storage_gib",
+    "namespaces", "outbound_messages", "output_tokens", "pipes_requests",
+    "provisioned_dpu_hours", "put_copy_post_list_requests", "queries",
+    "query_samples_processed", "read_request_units", "repositories", "requests",
+    "restore_gib", "samples_ingested", "scheduled_invocations", "schedules",
+    "schema_discovery_events", "secret_count", "service_instances",
+    "snapshot_changed_gib", "snapshot_storage_gib", "state_transitions",
+    "storage_gib", "storage_gib_per_broker", "storage_iops",
+    "storage_throughput_mbps", "experiment_hours",
+    "total_storage_gib", "write_request_units",
+}
+
 
 def normalized_service_key(service: str) -> str:
     key = service.strip().casefold()
@@ -216,6 +264,24 @@ def requirement_fields(service: str) -> tuple[str, ...]:
         normalized_service_key(service), GENERIC_TEMPLATE_FIELDS
     )
     return tuple(dict.fromkeys((*fields, *COMMON_TEMPLATE_FIELDS)))
+
+
+def safe_requirement_defaults(service: str) -> dict[str, Any]:
+    """Return system-owned defaults that may never override customer input."""
+
+    return dict(SERVICE_SAFE_DEFAULTS.get(normalized_service_key(service), {}))
+
+
+def billing_dimension_fields(service: str) -> tuple[str, ...]:
+    """Return only real metered fields supported by this AWS service."""
+
+    if normalized_service_key(service) not in SERVICE_TEMPLATE_FIELDS:
+        return ()
+    return tuple(
+        field
+        for field in requirement_fields(service)
+        if field in BILLING_DIMENSION_FIELDS
+    )
 
 
 def component_template(

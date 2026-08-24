@@ -337,6 +337,10 @@ class ConfigurationReviewItem(BaseModel):
     quantity: int = 1
     selected_model: str | None = None
     official_specifications: dict[str, Any] = Field(default_factory=dict)
+    available_shapes: list[dict[str, float]] = Field(default_factory=list)
+    available_options: dict[str, list[Any]] = Field(default_factory=dict)
+    available_billing_fields: list[str] = Field(default_factory=list)
+    available_billing_labels: dict[str, str] = Field(default_factory=dict)
     pricing_status: Literal["ready", "unpriced"] = "ready"
     pricing_notice: str | None = None
     requirements: dict[str, Any] = Field(default_factory=dict)
@@ -350,6 +354,7 @@ class ConfirmationSessionResponse(BaseModel):
         "pending",
         "submitted",
         "reviewing",
+        "processing",
         "configuration_review",
         "approved",
         "completed",

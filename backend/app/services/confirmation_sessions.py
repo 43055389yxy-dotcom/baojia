@@ -10,11 +10,13 @@ from pathlib import Path
 from typing import Literal
 
 from app.domain.customer_configuration import preserve_customer_configuration
+from app.integrations.service_templates import billing_dimension_fields
 from app.domain.models import (
     ConfirmationItem,
     ConfirmationSessionResponse,
     ConfigurationReviewItem,
     ParsedIntent,
+    QuoteRequest,
 )
 
 
@@ -84,7 +86,8 @@ class ConfirmationSessionStore:
                     created_at TEXT NOT NULL,
                     submitted_at TEXT,
                     confirmation_round INTEGER NOT NULL DEFAULT 0,
-                    asked_questions_json TEXT NOT NULL DEFAULT '[]'
+                    asked_questions_json TEXT NOT NULL DEFAULT '[]',
+                    request_json TEXT NOT NULL DEFAULT '{}'
                 )
                 """
             )
@@ -104,6 +107,11 @@ class ConfirmationSessionStore:
                     "ALTER TABLE confirmation_sessions "
                     "ADD COLUMN asked_questions_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            if "request_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE confirmation_sessions "
+                    "ADD COLUMN request_json TEXT NOT NULL DEFAULT '{}'"
+                )
 
     def create_or_replace(
         self,
@@ -114,6 +122,7 @@ class ConfirmationSessionStore:
         intent: ParsedIntent,
         confirmation_text: str,
         items: list[ConfirmationItem],
+        quote_request: QuoteRequest | None = None,
     ) -> str:
         now = datetime.now(UTC).isoformat()
         with self._lock, self._connect() as connection:
@@ -146,7 +155,8 @@ class ConfirmationSessionStore:
                     token, draft_id, customer_request, customer_summary, intent_json,
                     confirmation_text, items_json, answers_json, status, created_at,
                     submitted_at, asked_questions_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 'pending', ?, NULL, ?)
+                    , request_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 'pending', ?, NULL, ?, ?)
                 ON CONFLICT(draft_id) DO UPDATE SET
                     customer_request=excluded.customer_request,
                     customer_summary=excluded.customer_summary,
@@ -154,7 +164,11 @@ class ConfirmationSessionStore:
                     confirmation_text=excluded.confirmation_text,
                     items_json=excluded.items_json,
                     answers_json='{}', status='pending', submitted_at=NULL,
-                    asked_questions_json=excluded.asked_questions_json
+                    asked_questions_json=excluded.asked_questions_json,
+                    request_json=CASE
+                        WHEN excluded.request_json = '{}' THEN confirmation_sessions.request_json
+                        ELSE excluded.request_json
+                    END
                 """,
                 (
                     token,
@@ -166,6 +180,7 @@ class ConfirmationSessionStore:
                     json.dumps([item.model_dump(mode="json") for item in items], ensure_ascii=False),
                     now,
                     json.dumps(asked_questions, ensure_ascii=False),
+                    quote_request.model_dump_json() if quote_request is not None else "{}",
                 ),
             )
         return token
@@ -177,7 +192,7 @@ class ConfirmationSessionStore:
         # A worker can be interrupted after the row was marked ``reviewing``.
         # Never strand the customer on a permanent spinner: after the maximum
         # bounded revision window, restore the same saved configuration table.
-        if str(row["status"]) in {"reviewing", "submitted"} and row["submitted_at"]:
+        if str(row["status"]) in {"reviewing", "submitted", "processing"} and row["submitted_at"]:
             submitted_at = datetime.fromisoformat(str(row["submitted_at"]))
             if (datetime.now(UTC) - submitted_at).total_seconds() > 90:
                 with self._lock, self._connect() as connection:
@@ -186,7 +201,7 @@ class ConfirmationSessionStore:
                         UPDATE confirmation_sessions
                         SET status = 'configuration_review',
                             confirmation_text = ?
-                        WHERE token = ? AND status IN ('reviewing', 'submitted')
+                        WHERE token = ? AND status IN ('reviewing', 'submitted', 'processing')
                         """,
                         ("这次修改没有完成，原配置已保留，请重新提交。", token),
                     )
@@ -213,6 +228,67 @@ class ConfirmationSessionStore:
                     dict(item.requirements.get("_review_selected_specifications"))
                     if isinstance(
                         item.requirements.get("_review_selected_specifications"), dict
+                    )
+                    else {}
+                ),
+                available_shapes=(
+                    [
+                        {
+                            "vcpu": float(shape["vcpu"]),
+                            "memory_gib": float(shape["memory_gib"]),
+                        }
+                        for shape in item.requirements.get(
+                            "_review_available_shapes", []
+                        )
+                        if isinstance(shape, dict)
+                        and isinstance(shape.get("vcpu"), (int, float))
+                        and isinstance(shape.get("memory_gib"), (int, float))
+                    ]
+                    if isinstance(
+                        item.requirements.get("_review_available_shapes"), list
+                    )
+                    else []
+                ),
+                available_options=(
+                    {
+                        str(field): list(values)
+                        for field, values in item.requirements.get(
+                            "_review_field_options", {}
+                        ).items()
+                        if isinstance(values, list)
+                    }
+                    if isinstance(
+                        item.requirements.get("_review_field_options"), dict
+                    )
+                    else {}
+                ),
+                available_billing_fields=list(
+                    dict.fromkeys(
+                        [
+                            *billing_dimension_fields(item.service),
+                            *(
+                                str(field)
+                                for field in item.requirements.get(
+                                    "_review_billing_fields", []
+                                )
+                                if isinstance(field, str) and field
+                            ),
+                        ]
+                    )
+                ),
+                available_billing_labels=(
+                    {
+                        str(field): str(label)
+                        for field, label in item.requirements.get(
+                            "_review_billing_labels", {}
+                        ).items()
+                        if isinstance(field, str)
+                        and field
+                        and isinstance(label, str)
+                        and label
+                    }
+                    if isinstance(
+                        item.requirements.get("_review_billing_labels"), dict
                     )
                     else {}
                 ),
@@ -318,7 +394,7 @@ class ConfirmationSessionStore:
                 """
                 UPDATE confirmation_sessions
                 SET status = 'completed'
-                WHERE draft_id = ? AND status IN ('submitted', 'reviewing', 'approved')
+                WHERE draft_id = ? AND status IN ('submitted', 'reviewing', 'processing', 'approved')
                 """,
                 (draft_id,),
             )
@@ -370,6 +446,44 @@ class ConfirmationSessionStore:
                 (token,),
             )
         return self.get(token)
+
+    def begin_configuration_reprocessing(self, token: str) -> QuoteRequest | None:
+        """Claim a submitted AWS edit and build its self-contained preview request.
+
+        Customer saves must not depend on a salesperson keeping another browser
+        tab alive.  The atomic status transition also prevents that legacy poller
+        from launching a duplicate full-preview job.
+        """
+
+        row = self._row(token)
+        if row is None or str(row["status"]) not in {"reviewing", "submitted"}:
+            return None
+        raw_request = str(row["request_json"] or "{}")
+        try:
+            payload = json.loads(raw_request)
+            if not isinstance(payload, dict):
+                payload = {}
+        except json.JSONDecodeError:
+            payload = {}
+        payload.update(
+            {
+                "cloud_provider": self.cloud_provider,
+                "customer_request": str(row["customer_request"]),
+                "draft_id": str(row["draft_id"]),
+                "confirmation_responses": json.loads(str(row["answers_json"])),
+            }
+        )
+        request = QuoteRequest.model_validate(payload)
+        with self._lock, self._connect() as connection:
+            changed = connection.execute(
+                """
+                UPDATE confirmation_sessions
+                SET status = 'processing'
+                WHERE token = ? AND status IN ('reviewing', 'submitted')
+                """,
+                (token,),
+            ).rowcount
+        return request if changed else None
 
     def submit_configuration_feedback(
         self,

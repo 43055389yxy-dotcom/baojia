@@ -72,3 +72,47 @@ def test_structured_edit_only_changes_targeted_fields() -> None:
     assert revised.requirements["engine"] == "mysql"
     assert revised.requirements["deployment"] == "multi_az"
     assert revised.requirements["storage_gib"] == 10240
+
+
+def test_catalog_compatibility_edit_clears_stale_model_for_every_service() -> None:
+    for service, field, value in (
+        ("ec2", "operating_system", "windows"),
+        ("rds", "engine", "postgresql"),
+        ("elasticache", "engine", "valkey"),
+        ("msk", "cluster_type", "serverless"),
+    ):
+        original = ServiceRequirement(
+            service=service,
+            region="ap-southeast-1",
+            requirements={
+                "requested_model": "old.model",
+                "_review_selected_model": "old.model",
+                "_review_selected_specifications": {"vCPU": 4, "memoryGiB": 16},
+            },
+        )
+
+        revised = apply_component_update(
+            original, {"requirements": {field: value}}
+        )
+
+        assert "requested_model" not in revised.requirements
+        assert "_review_selected_model" not in revised.requirements
+        assert "_review_selected_specifications" not in revised.requirements
+        assert revised.requirements[field] == value
+
+
+def test_region_edit_clears_model_selected_in_another_region() -> None:
+    original = ServiceRequirement(
+        service="opensearch",
+        region="ap-southeast-1",
+        requirements={
+            "requested_model": "m6g.large.search",
+            "_review_selected_model": "m6g.large.search",
+        },
+    )
+
+    revised = apply_component_update(original, {"region": "ap-northeast-1"})
+
+    assert revised.region == "ap-northeast-1"
+    assert "requested_model" not in revised.requirements
+    assert "_review_selected_model" not in revised.requirements

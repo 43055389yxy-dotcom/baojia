@@ -174,6 +174,45 @@ def test_lambda_explicit_requests_memory_and_duration_create_two_usage_dimension
     ]
 
 
+def test_kinesis_explicit_shards_are_priced_as_monthly_shard_hours() -> None:
+    products = [
+        priced_product(
+            "AmazonKinesis",
+            "SAE1-Storage-ShardHour",
+            "ShardHour",
+            0.03,
+            operation="shardHourStorage",
+        ),
+        priced_product(
+            "AmazonKinesis",
+            "SAE1-OnDemand-StreamHour",
+            "StreamHour",
+            0.08,
+        ),
+    ]
+    rates = []
+    for product in products:
+        price, unit = PricingCatalog.on_demand_unit_rate(product)
+        _, usage_type, operation = PricingCatalog.billing_identity(product)
+        rates.append((price, unit, usage_type, operation, product))
+
+    selected = GenericOfficialPlugin._semantic_rates(
+        ServiceRequirement(
+            service="kinesis",
+            quantity=1,
+            hours_per_month=730,
+            requirements={"shards": 2},
+        ),
+        rates,
+    )
+
+    assert len(selected) == 1
+    assert selected[0][1] == 1460
+    assert selected[0][2][0] == 0.03
+    assert selected[0][2][2] == "SAE1-Storage-ShardHour"
+    assert selected[0][1] * selected[0][2][0] == 43.8
+
+
 def test_documentdb_selects_instance_and_preserves_explicit_storage() -> None:
     instance = priced_product("AmazonDocDB", "APS1-InstanceUsage:db.t4g.medium", "Hrs", 0.1)
     instance["product"]["attributes"].update(
@@ -386,3 +425,80 @@ def test_vpc_returns_zero_cost_base_network_without_catalog_lookup() -> None:
     assert selected.model == "VPC + Subnets"
     assert selected.usage_lines == []
     assert "不收取基础费用" in (selected.substitution_notice or "")
+
+
+def test_quicksight_merges_global_subscription_with_regional_catalog() -> None:
+    regional_reader = priced_product(
+        "AmazonQuickSight",
+        "APS1-Reader-Enterprise-Month",
+        "User",
+        3,
+    )
+    regional_reader["product"]["attributes"].update(
+        {
+            "edition": "Enterprise",
+            "group": "Reader Subscription",
+            "location": "Asia Pacific (Singapore)",
+            "regionCode": "ap-southeast-1",
+        }
+    )
+    global_user = priced_product(
+        "AmazonQuickSight",
+        "QS-User-Enterprise-Month",
+        "User",
+        24,
+    )
+    global_user["product"]["attributes"].update(
+        {
+            "edition": "Enterprise",
+            "group": "User Subscription",
+            "location": "Any",
+            "regionCode": "",
+        }
+    )
+    other_region_spice = priced_product(
+        "AmazonQuickSight",
+        "USE1-QS-Enterprise-SPICE",
+        "GB-Mo",
+        0.25,
+    )
+    other_region_spice["product"]["attributes"].update(
+        {
+            "edition": "Enterprise",
+            "group": "SPICE Capacity",
+            "location": "US East (N. Virginia)",
+            "regionCode": "us-east-1",
+        }
+    )
+
+    class QuickSightCatalog:
+        @staticmethod
+        def service_codes() -> list[str]:
+            return ["AmazonQuickSight"]
+
+        @staticmethod
+        def products(
+            service_code: str,
+            filters: dict[str, str],
+            *,
+            max_pages: int = 20,
+        ) -> list[dict]:
+            assert service_code == "AmazonQuickSight"
+            if filters:
+                return [regional_reader]
+            return [regional_reader, global_user, other_region_spice]
+
+    plugin = GenericOfficialPlugin(None, QuickSightCatalog())  # type: ignore[arg-type]
+    selected = plugin.select(
+        ServiceRequirement(
+            service="quicksight",
+            calculator_service_name="Amazon QuickSight",
+            region="ap-southeast-1",
+            requirements={"edition": "enterprise", "users": 10},
+        ),
+        "ap-southeast-1",
+    )
+
+    assert selected.usage_lines[0].service_code == "AmazonQuickSight"
+    assert selected.usage_lines[0].usage_type == "QS-User-Enterprise-Month"
+    assert selected.usage_lines[0].amount == 10

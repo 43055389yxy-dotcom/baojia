@@ -353,9 +353,28 @@ class AutoServiceDiscovery:
         products = self._catalog_products(
             service_code, filters, max_pages=10, refresh=refresh
         )
-        if not products and filters:
-            products = self._catalog_products(
+        if filters:
+            # One ServiceCode can contain both regional usage and global
+            # subscriptions.  Discover both so a newly encountered product can
+            # build a complete cached profile on its first quote.  Only global
+            # records are merged; prices from other regions remain isolated.
+            all_products = self._catalog_products(
                 service_code, {}, max_pages=10, refresh=refresh
+            )
+            seen_skus = {
+                str(item.get("product", {}).get("sku") or item.get("sku") or "")
+                for item in products
+            }
+            products.extend(
+                item
+                for item in all_products
+                if self._is_global_product(item)
+                and str(
+                    item.get("product", {}).get("sku")
+                    or item.get("sku")
+                    or ""
+                )
+                not in seen_skus
             )
         dimensions: list[dict[str, Any]] = []
         attribute_names: set[str] = set()
@@ -422,6 +441,22 @@ class AutoServiceDiscovery:
         }
         profile["prompt_text"] = self._profile_prompt(profile)
         return profile
+
+    @staticmethod
+    def _is_global_product(product: dict[str, Any]) -> bool:
+        attrs = PricingCatalog.attributes(product)
+        region = str(
+            attrs.get("regionCode")
+            or attrs.get("regioncode")
+            or attrs.get("region")
+            or ""
+        ).strip().casefold()
+        location = str(attrs.get("location") or "").strip().casefold()
+        return region in {"", "global"} and location in {
+            "",
+            "any",
+            "global",
+        }
 
     def _catalog_products(
         self,

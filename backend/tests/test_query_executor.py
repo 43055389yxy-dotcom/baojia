@@ -1,3 +1,5 @@
+import uuid
+
 import pytest
 from botocore.exceptions import ClientError
 
@@ -59,6 +61,28 @@ class RegionNotEnabledClients(FakeClients):
         return RegionNotEnabledClient()
 
 
+class TemporarilyUnavailableClient(FakeClient):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def describe_instance_types(self, **parameters: object) -> dict[str, object]:
+        self.calls += 1
+        if self.calls < 3:
+            raise ClientError(
+                {"Error": {"Code": "ServiceUnavailable", "Message": "retry"}},
+                "DescribeInstanceTypes",
+            )
+        return super().describe_instance_types(**parameters)
+
+
+class TemporarilyUnavailableClients(FakeClients):
+    def __init__(self) -> None:
+        self.client = TemporarilyUnavailableClient()
+
+    def regional(self, service: str, region: str) -> FakeClient:
+        return self.client
+
+
 def test_executor_runs_allowlisted_read() -> None:
     executor = ReadOnlyAwsQueryExecutor(FakeClients())  # type: ignore[arg-type]
     result = executor.execute(
@@ -108,3 +132,18 @@ def test_executor_reports_region_opt_in_separately_from_credentials() -> None:
 
     assert error.value.code == "aws_region_not_enabled"
     assert error.value.details["region"] == "ap-southeast-3"
+
+
+def test_executor_retries_temporary_official_api_failure() -> None:
+    clients = TemporarilyUnavailableClients()
+    executor = ReadOnlyAwsQueryExecutor(clients)  # type: ignore[arg-type]
+
+    result = executor.execute(
+        service="ec2",
+        operation="describe_instance_types",
+        region="ap-southeast-1",
+        parameters={"InstanceTypes": ["m7g.large", f"retry-test-{uuid.uuid4().hex}"]},
+    )
+
+    assert result["InstanceTypes"][0]["InstanceType"] == "m7g.large"
+    assert clients.client.calls == 3

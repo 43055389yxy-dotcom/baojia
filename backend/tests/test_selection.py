@@ -1,5 +1,6 @@
 import pytest
 
+import app.services.plugins.ec2 as ec2_module
 import app.services.plugins.rds as rds_module
 
 from app.core.errors import ManualConfirmationRequired
@@ -42,6 +43,43 @@ def test_ec2_selects_smallest_official_fit() -> None:
     )
     assert selected["model"] == "t4g.medium"
     assert substituted is False
+
+
+def test_ec2_exact_model_query_falls_back_to_reviewed_shape_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ShapeFallbackExecutor:
+        def __init__(self, _clients: object) -> None:
+            pass
+
+        def execute(self, **arguments: object) -> dict[str, object]:
+            parameters = arguments.get("parameters")
+            if isinstance(parameters, dict) and parameters.get("InstanceTypes"):
+                raise ManualConfirmationRequired(
+                    "temporary endpoint failure", code="aws_query_execution_failed"
+                )
+            return {
+                "InstanceTypes": [
+                    {
+                        "InstanceType": "m5zn.6xlarge",
+                        "VCpuInfo": {"DefaultVCpus": 24},
+                        "MemoryInfo": {"SizeInMiB": 96 * 1024},
+                        "CurrentGeneration": True,
+                        "ProcessorInfo": {"SupportedArchitectures": ["x86_64"]},
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(ec2_module, "ReadOnlyAwsQueryExecutor", ShapeFallbackExecutor)
+    plugin = Ec2Plugin(None, None)  # type: ignore[arg-type]
+
+    candidates = plugin._official_candidates(
+        "ap-southeast-99", "m5zn.6xlarge", 24, 96
+    )
+
+    assert candidates[0]["model"] == "m5zn.6xlarge"
+    assert candidates[0]["vcpu"] == 24
+    assert candidates[0]["memory_gib"] == 96
 
 
 def test_generic_rds_ssd_defaults_to_official_gp3_value() -> None:
@@ -178,6 +216,59 @@ def test_ec2_default_tenancy_maps_to_shared_pricing_value() -> None:
     assert _pricing_tenancy("default") == "Shared"
     assert _pricing_tenancy("shared") == "Shared"
     assert _pricing_tenancy("dedicated") == "Dedicated"
+
+
+def test_ec2_reserved_quote_selects_product_record_with_exact_reserved_terms() -> None:
+    def product(sku: str, operation: str, *, reserved: bool) -> dict[str, object]:
+        terms: dict[str, object] = {}
+        if reserved:
+            terms = {
+                "offer": {
+                    "termAttributes": {
+                        "LeaseContractLength": "1yr",
+                        "PurchaseOption": "All Upfront",
+                        "OfferingClass": "standard",
+                    },
+                    "priceDimensions": {
+                        "upfront": {
+                            "unit": "Quantity",
+                            "pricePerUnit": {"USD": "1200"},
+                        }
+                    },
+                }
+            }
+        return {
+            "serviceCode": "AmazonEC2",
+            "product": {
+                "sku": sku,
+                "attributes": {
+                    "operation": operation,
+                    "usagetype": "APS1-BoxUsage:t3.xlarge",
+                },
+            },
+            "terms": {"Reserved": terms},
+        }
+
+    on_demand_only = product("000-first", "RunInstances:0800", reserved=False)
+    reserved_record = product("999-reserved", "RunInstances:0002", reserved=True)
+
+    class Catalog:
+        def products(self, *_args: object, **_kwargs: object) -> list[dict[str, object]]:
+            return [on_demand_only, reserved_record]
+
+    plugin = Ec2Plugin(None, Catalog())  # type: ignore[arg-type]
+
+    selected = plugin._compute_product(
+        "ap-southeast-1",
+        "t3.xlarge",
+        "Windows",
+        "Shared",
+        reserved_years=1,
+        payment_option="all_upfront",
+        offering_class="standard",
+    )
+
+    assert selected is reserved_record
 
 
 def test_ec2_compute_shape_is_valid_for_general_application() -> None:
@@ -363,6 +454,29 @@ def test_windows_on_arm_instance_is_customer_conflict_before_pricing(
     assert "c7i.xlarge" in notice
 
 
+def test_windows_and_arm_edit_is_rejected_even_without_a_cached_model() -> None:
+    plugin = Ec2Plugin(None, None)  # type: ignore[arg-type]
+    requirement = ServiceRequirement(
+        service="ec2",
+        region="ap-southeast-1",
+        requirements={
+            "operating_system": "Windows Server 2022",
+            "architecture": "arm64",
+            "vcpu": 12,
+            "memory_gib": 32,
+        },
+    )
+
+    notice = plugin.specified_model_compatibility_notice(
+        requirement, "ap-southeast-1"
+    )
+
+    assert notice is not None
+    assert "Windows Server" in notice
+    assert "ARM64" in notice
+    assert "x86_64" in notice
+
+
 def test_ec2_nonstandard_shape_returns_lower_and_upper_official_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -442,7 +556,30 @@ def test_ec2_replacement_picker_keeps_smaller_official_shapes(
         },
     ]
     monkeypatch.setattr(plugin, "_official_candidates", lambda *_args: official)
-    monkeypatch.setattr(plugin, "_compute_product", lambda *_args: None)
+    monkeypatch.setattr(
+        plugin,
+        "_compute_product",
+        lambda _region, model, *_args: {
+            "serviceCode": "AmazonEC2",
+            "product": {
+                "sku": f"sku-{model}",
+                "attributes": {
+                    "usagetype": f"APS1-BoxUsage:{model}",
+                    "operation": "RunInstances",
+                    "regionCode": "ap-southeast-1",
+                },
+            },
+            "terms": {
+                "OnDemand": {
+                    "term": {
+                        "priceDimensions": {
+                            "rate": {"pricePerUnit": {"USD": "0.1"}}
+                        }
+                    }
+                }
+            },
+        },
+    )
 
     preview = plugin.preview(
         ServiceRequirement(
@@ -484,7 +621,30 @@ def test_ec2_exact_shape_with_multiple_models_does_not_ask_customer_again(
         },
     ]
     monkeypatch.setattr(plugin, "_official_candidates", lambda *_args: official)
-    monkeypatch.setattr(plugin, "_compute_product", lambda *_args: None)
+    monkeypatch.setattr(
+        plugin,
+        "_compute_product",
+        lambda _region, model, *_args: {
+            "serviceCode": "AmazonEC2",
+            "product": {
+                "sku": f"sku-{model}",
+                "attributes": {
+                    "usagetype": f"APS1-BoxUsage:{model}",
+                    "operation": "RunInstances",
+                    "regionCode": "ap-southeast-1",
+                },
+            },
+            "terms": {
+                "OnDemand": {
+                    "term": {
+                        "priceDimensions": {
+                            "rate": {"pricePerUnit": {"USD": "0.1"}}
+                        }
+                    }
+                }
+            },
+        },
+    )
 
     preview = plugin.preview(
         ServiceRequirement(
@@ -523,7 +683,30 @@ def test_self_hosted_workload_requires_customer_to_choose_configuration(
         },
     ]
     monkeypatch.setattr(plugin, "_official_candidates", lambda *_args: official)
-    monkeypatch.setattr(plugin, "_compute_product", lambda *_args: None)
+    monkeypatch.setattr(
+        plugin,
+        "_compute_product",
+        lambda _region, model, *_args: {
+            "serviceCode": "AmazonEC2",
+            "product": {
+                "sku": f"sku-{model}",
+                "attributes": {
+                    "usagetype": f"APS1-BoxUsage:{model}",
+                    "operation": "RunInstances",
+                    "regionCode": "ap-southeast-1",
+                },
+            },
+            "terms": {
+                "OnDemand": {
+                    "term": {
+                        "priceDimensions": {
+                            "rate": {"pricePerUnit": {"USD": "0.1"}}
+                        }
+                    }
+                }
+            },
+        },
+    )
 
     preview = plugin.preview(
         ServiceRequirement(

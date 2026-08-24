@@ -26,6 +26,8 @@ CORE_PROMPT = """你是 AWS 官方成本报价的需求整理员。
    sqs, ses, ebs, data_transfer, global_accelerator, msk, mq, apigateway, scheduler,
    opensearch, documentdb, nat_gateway, secrets_manager, lambda, ecs, fargate, dynamodb, efs, fsx, sns,
    kinesis, emr, redshift, athena, glue, step_functions, bedrock, cloud_map, appconfig, eventbridge。
+   quicksight 使用 Amazon QuickSight；客户明确写出 QuickSight 时必须直接保留，不得改成泛化的
+   “BI 可视化自建或托管”问题。
    遇到列表外的真实 AWS 服务时不得遗漏，使用简短、全小写的
    snake_case 官方服务简称（例如 lambda、dynamodb、step_functions、bedrock），由通用官方目录适配器核价。
    calculator_service_name 使用 AWS 官方服务名；
@@ -80,6 +82,8 @@ Ubuntu、Amazon Linux、CentOS 均按 Linux。只有客户明确写 Windows 或�
 19. 对重复的相同资源，必须严格区分“单项容量、数量、总容量”。标准关系为：单项容量 × 数量 = 总容量。
    客户明确给出其中两项时必须推导第三项；三项都给出但不一致时才写入 ambiguities。绝不能把总容量填入
    单项容量字段，也不能因模型、节点或磁盘存在多个而把一套服务的 quantity 错写成内部节点数。
+20. 客户对第三方软件明确写出“EC2”、真实 EC2 型号或“自建/自行部署”时，表示已经选择
+   EC2 自建架构。必须直接保留该软件、型号、CPU、内存、磁盘和数量，不得再询问托管还是自建。
 """
 
 
@@ -193,6 +197,10 @@ convertible_reserved、compute_savings_plan、ec2_instance_savings_plan；预留
 客户未写操作系统时 operating_system=linux，不得生成确认问题；CentOS 也归一为 linux。
 客户只写 Nacos、XXL-JOB、应用服务器、日志采集器等需要 EC2 承载的工作负载且没有给 CPU/内存/型号时，
 按最低可运行配置硬规则补充 vcpu、memory_gib 和必要的最小系统盘；不得填写具体实例型号。
+客户已经写明 EC2、EC2 型号或“在 EC2 上自建”时，表示运行方式已经确定，不得再询问托管还是自建。
+紧凑写法必须按本组件逐项提取，例如“EC2 m6i.xlarge (4C16G) + gp3 500GB，数量1”应保留
+requested_model=m6i.xlarge、vcpu=4、memory_gib=16、system_disk_gib=500、volume_type=gp3、quantity=1；
+其中 16G 是内存，500GB 才是磁盘，禁止把相邻数字串到错误字段。
 """,
     "eks": """【Amazon EKS】
 字段：cluster_count, kubernetes_version, support_tier, control_plane_hours, worker_management,
@@ -224,6 +232,8 @@ engine 归一为 postgresql、mysql、mariadb、aurora_mysql、aurora_postgresql
 sql_server_standard、sql_server_web、sql_server_enterprise、oracle 或 db2。
 客户明确写出 PostgreSQL/MySQL/其他引擎时，engine 必须原样语义保留；客户写出
 db.* 型号时 requested_model 必须保留。禁止因为已有型号而删除 engine。
+客户只写“数据库”但没有说明数据库类型时，engine 必须保持为空，并在 ambiguities 中一次性让客户选择
+MySQL、PostgreSQL、MariaDB、SQL Server、Oracle 或 Db2；绝不能静默默认成 MySQL。
 deployment 只能为 single_az、multi_az、multi_az_cluster。Single-AZ 与主备自动切换同时出现属于冲突。
 “主备/高可用/Multi-AZ”表示一套数据库部署，quantity=1，不能把主库和备用库计成两套；Multi-AZ
 内部会计算备用容量。客户没有说明部署方式时必须在 ambiguities 询问单可用区还是主备高可用。
@@ -232,6 +242,9 @@ MySQL/PostgreSQL。quantity 表示 Aurora 集群套数，cluster_members 表示�
 要求高可用但未写实例数时，cluster_members 使用可满足高可用的最小值2。不得因为 Aurora 价格位于
 Amazon RDS 官方目录，就把客户配置改写成普通 RDS 或把高可用改成 single_az。
 客户未说 IOPS、吞吐、监控、License Model 时省略；后端使用官方最低/默认值。
+紧凑写法如“RDS MySQL db.t3.large Multi-AZ + 100GB，数量1”中，db.t3.large 只能是
+requested_model，MySQL 是 engine，Multi-AZ 是 deployment=multi_az，独立的 100GB 是
+storage_gib=100；db.* 绝不能识别为 EC2 型号或额外生成一台服务器。
 """,
     "elasticache": """【Amazon ElastiCache 产品族】
 字段：engine, engine_version, memory_gib, shards, replicas_per_shard, requested_model,
@@ -267,6 +280,8 @@ S3 Standard 生命周期转换到 S3 Express One Zone 属于能力冲突。
 只有原文明确出现“请求数/HTTPS 请求”及具体数值时才能写 https_requests；不得写空字符串、
 省略号、unknown、null 文本或任何占位符。缺少该可选字段绝不是客户确认问题。
 CloudFront 未指定地域不是 ambiguity。要求固定公网 IP 时需明确 Anycast Static IP 的额外能力。
+“CloudFront (1TB出站/出网/下行)”表示 data_transfer_out_gib=1024；该流量属于当前 CloudFront
+组件，不能丢失，也不能复制到独立 Data Transfer 或其他组件。
 """,
     "route53": """【Route 53】
 字段：hosted_zones, dns_queries。明确需要域名解析但没给查询量时，保留该服务；
@@ -309,6 +324,15 @@ total_storage_gib 表示全部云盘总容量；任意两项明确时补齐第�
     "data_transfer": """【AWS Data Transfer 独立公网流量】
 字段：data_transfer_out_gib, source_regions, destination。独立列出的公网出网流量使用
 service=data_transfer，不要生成一台虚构 EC2。多个来源区域写 source_regions 数组；合计流量保持总量。
+“Data Transfer (2TB/月)”表示 data_transfer_out_gib=2048。只有客户把流量独立列为一个组件时才使用
+本模板；写在 EC2、CloudFront、S3 等组件内部的流量必须留在原组件，不能跨组件复制。
+""",
+    "quicksight": """【Amazon QuickSight】
+字段：edition, users, author_users, reader_users, session_capacity, spice_gib。
+客户明确写 QuickSight 时直接保留为 Amazon QuickSight，不得改写成“BI 可视化自建软件”，也不得询问
+托管还是自建。Enterprise 写 edition=enterprise；Standard 写 edition=standard。客户只写“10 用户”时
+写 users=10，不得擅自拆成作者和读者；只有原文明说作者、读者或会话容量时才填写对应字段。
+QuickSight 没有 EC2 型号、CPU、内存或系统盘字段，禁止生成承载 QuickSight 的 EC2。
 """,
     "global_accelerator": """【AWS Global Accelerator】
 字段：accelerators, data_transfer_out_gib, source_regions, destination_geography。
@@ -454,6 +478,8 @@ backup_storage_gib, restore_gib。未指定容量模式时采用最低成本默�
 字段：capacity_mode, shards, shard_hours, put_payload_units, data_in_gib, data_out_gib,
 extended_retention_hours。客户未指定 Provisioned 或 On-demand 时采用最低成本有效模式；没给流量时
 不虚构分片和吞吐，仅展示官方单位价。未要求增强扇出或延长保留时省略。
+“Kinesis Data Streams (2 shards)”必须写 shards=2；shard 数是当前 Kinesis 流的分片数，
+不是服务 quantity，也不能变成 DMS 数量或其他组件的节点数。
 """,
         "emr": """【Amazon EMR】
 字段：deployment_type, applications, cluster_count,
@@ -519,9 +545,9 @@ total_storage_gib 是每套全部 Broker 总容量，两者与 broker_count 必�
 只展示官方最低计费单位单价；不得把 ECS 任务数量自动复制为 Cloud Map 实例数量。
 """,
         "appconfig": """【AWS AppConfig】
-字段：configuration_requests, configuration_retrievals, targets_receiving_configuration。
+字段：configuration_requests, configuration_retrievals, targets_receiving_configuration, experiment_hours。
 只在客户明确要求 AWS AppConfig，或客户确认用 Cloud Map + AppConfig 替代第三方服务后使用。
-没给请求、配置获取次数或目标数量时不虚构用量，只展示官方最低计费单位参考价。
+没给请求、接收配置次数、目标数量或实验小时数时不虚构用量，只展示官方最低计费单位参考价。
 """,
         "amp": """【Amazon Managed Service for Prometheus（AMP）】
 service 必须写 amp。字段：active_series, samples_ingested, query_samples_processed,
@@ -570,6 +596,7 @@ PROMPT_META: dict[str, dict[str, str | int]] = {
     "waf": {"title": "AWS WAF", "category": "网络与安全", "order": 21},
     "ebs": {"title": "Amazon EBS", "category": "存储与流量", "order": 30},
     "data_transfer": {"title": "AWS Data Transfer", "category": "存储与流量", "order": 31},
+    "quicksight": {"title": "Amazon QuickSight", "category": "数据与分析", "order": 55},
     "global_accelerator": {"title": "AWS Global Accelerator", "category": "网络与安全", "order": 32},
     "sqs": {"title": "Amazon SQS", "category": "应用集成", "order": 40},
     "ses": {"title": "Amazon SES", "category": "应用集成", "order": 41},
@@ -762,6 +789,7 @@ SERVICE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "backup": ("aws backup", "集中备份", "业务数据备份"),
     "ebs": ("amazon ebs", "ebs", "云硬盘", "云盘"),
     "data_transfer": ("公网出网流量", "公网出站流量", "aws data transfer"),
+    "quicksight": ("amazon quicksight", "quicksight"),
     "global_accelerator": (
         "global accelerator",
         "全球访问加速",
@@ -925,6 +953,16 @@ def build_component_extraction_prompt(service_key: str, source_text: str = "") -
         key,
         "只填写模板中存在且客户原文明确给出的字段；不能创造近义字段。",
     )
+    # Component extraction is intentionally service-scoped.  The old path
+    # only loaded the short critical sentence above, leaving the detailed
+    # EC2/RDS/S3/... prompt library unused and forcing the model to fall back
+    # to generic interpretation.  Load exactly one service prompt here; never
+    # concatenate rules from unrelated services.
+    service_rule = (
+        prompt_text(key)
+        if key in SERVICE_PROMPTS
+        else prompt_text("generic_service")
+    )
     variant_key = _variant_prompt_key(service_key, source_text)
     variant_rule = prompt_text(variant_key) if variant_key else ""
     return f"""你是单个 AWS 组件的固定模板填写器。
@@ -941,6 +979,8 @@ def build_component_extraction_prompt(service_key: str, source_text: str = "") -
    hours_per_month 或 requirements.字段名。片段必须逐字来自当前组件原话，禁止解释或改写。
    使用系统最低运行建议的字段，证据固定写 system_minimum。没有可靠证据就保持字段为 null。
 7. 当前组件特别规则：{critical}
+   当前组件完整模板规则：
+   {service_rule}
    {variant_rule}
 8. 输出前在本次回答内部完成一次自检：逐个核对原文中的所有数字和单位是否都进入正确字段，并检查
    单项容量×数量=总容量。由另外两个客户值计算得到的字段，field_evidence 固定写 system_derived；
@@ -952,6 +992,11 @@ def build_component_audit_prompt(service_key: str) -> str:
 
     key = normalized_service_key(service_key)
     critical = COMPONENT_CRITICAL_RULES.get(key, "不得增加模板外字段。")
+    service_rule = (
+        prompt_text(key)
+        if key in SERVICE_PROMPTS
+        else prompt_text("generic_service")
+    )
     return f"""你是单个 AWS 组件的结构化结果审核员。
 对比客户原话和已填写模板，只检查：漏填、错填、单位错误、数量/单节点规格混淆、改变客户原意。
 不要选型、报价、补默认值或询问缺失的可选参数。输入中明确标记的系统最低运行建议不是客户原话，
@@ -963,7 +1008,8 @@ def build_component_audit_prompt(service_key: str) -> str:
 1. 正确时 valid=true，corrections 为空；错误时 valid=false，issues 简短说明并只在 corrections 写明确修正值。
 2. 只有客户原文本身互相矛盾且无法同时保留时，才写 customer_questions；字段缺失不是客户问题。
 3. corrections.requirements 只能使用原模板字段，不能删除客户明确值，不能增加客户没说的内容。
-4. 当前组件特别规则：{critical}"""
+4. 当前组件特别规则：{critical}
+5. 当前组件完整模板规则：{service_rule}"""
 
 
 def build_intake_prompt() -> str:

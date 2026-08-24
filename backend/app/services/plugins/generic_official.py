@@ -51,6 +51,7 @@ _SERVICE_CODE_ALIASES = {
     "amp": "AmazonPrometheus",
     "prometheus": "AmazonPrometheus",
     "managedprometheus": "AmazonPrometheus",
+    "quicksight": "AmazonQuickSight",
 }
 
 
@@ -137,8 +138,33 @@ class GenericOfficialPlugin:
                 )
 
         raw_products = products(filters)
-        if not raw_products and region != "global":
-            raw_products = products({})
+        if region != "global":
+            # Some AWS products publish a mixture of regional dimensions and
+            # global subscriptions under the same ServiceCode (QuickSight is a
+            # common example).  A successful regional query therefore does not
+            # mean the catalog is complete.  Merge only truly global products
+            # from the unfiltered catalog; never borrow a price from another
+            # AWS region.
+            all_products = products({})
+            global_products = [
+                product
+                for product in all_products
+                if self._is_global_catalog_product(product)
+            ]
+            seen_skus = {
+                str(product.get("product", {}).get("sku") or product.get("sku") or "")
+                for product in raw_products
+            }
+            raw_products.extend(
+                product
+                for product in global_products
+                if str(
+                    product.get("product", {}).get("sku")
+                    or product.get("sku")
+                    or ""
+                )
+                not in seen_skus
+            )
         rates: list[tuple[float, str, str, str, dict[str, object]]] = []
         for product in raw_products:
             try:
@@ -151,6 +177,22 @@ class GenericOfficialPlugin:
             price, unit = priced
             rates.append((price, unit, identity[1], identity[2], product))
         return rates
+
+    @staticmethod
+    def _is_global_catalog_product(product: dict[str, object]) -> bool:
+        attrs = PricingCatalog.attributes(product)
+        region = str(
+            attrs.get("regionCode")
+            or attrs.get("regioncode")
+            or attrs.get("region")
+            or ""
+        ).strip().casefold()
+        location = str(attrs.get("location") or "").strip().casefold()
+        return region in {"", "global"} and location in {
+            "",
+            "any",
+            "global",
+        }
 
     def _refresh_official_profile(
         self, requirement: ServiceRequirement
@@ -509,6 +551,35 @@ class GenericOfficialPlugin:
                 include=("lambda-gb-second",),
                 exclude=("arm",),
             )
+        elif service == "kinesis":
+            # A provisioned Kinesis stream is billed by shard-hour.  Treat an
+            # explicit shard count as workload evidence instead of falling
+            # back to a one-unit reference price (which previously produced a
+            # zero-dollar quote row).
+            shards = requested.get("shards") or requested.get("shard_count")
+            if shards:
+                add(
+                    result,
+                    "Kinesis 预置分片小时价",
+                    (
+                        requirement.quantity
+                        * float(shards)
+                        * requirement.hours_per_month
+                    ),
+                    include_any=("storage-shardhour", "shardhourstorage"),
+                    exclude=("extended",),
+                    unit_contains=("shardhour", "shard hour"),
+                )
+            requests = requested.get("requests") or requested.get("request_count")
+            if requests:
+                add(
+                    result,
+                    "Kinesis 写入负载单价",
+                    float(requests),
+                    include_any=("putrequestpayloadunits", "putrequest"),
+                    exclude=("enhanced",),
+                    unit_contains=("putrequest", "request"),
+                )
         elif service == "dynamodb":
             storage = requested.get("storage_gib")
             add(
@@ -814,6 +885,61 @@ class GenericOfficialPlugin:
                 exclude=("multi-az", "serverless"),
                 model=model or None,
             )
+        elif service == "quicksight":
+            edition = str(requested.get("edition") or "enterprise").casefold()
+            common_exclude = ("free-trial", "free trial", "pro", "-q", "annual")
+            author_users = requested.get("author_users")
+            reader_users = requested.get("reader_users")
+            users = requested.get("users")
+            if author_users:
+                add(
+                    result,
+                    "QuickSight 作者用户月费",
+                    float(author_users),
+                    include=("author subscription", edition),
+                    exclude=common_exclude,
+                    unit_contains=("user",),
+                )
+            if reader_users:
+                add(
+                    result,
+                    "QuickSight 读者用户月费",
+                    float(reader_users),
+                    include=("reader subscription", edition),
+                    exclude=common_exclude,
+                    unit_contains=("user",),
+                )
+            if users and not author_users and not reader_users:
+                # The generic "user" contract is QuickSight's normal monthly
+                # user subscription.  Do not silently reinterpret it as a
+                # cheaper Reader, Pro or Amazon Q entitlement.
+                add(
+                    result,
+                    "QuickSight 用户月费",
+                    float(users),
+                    include=("user subscription", edition, "month"),
+                    exclude=common_exclude,
+                    unit_contains=("user",),
+                )
+            spice = requested.get("spice_gib")
+            if spice:
+                add(
+                    result,
+                    "QuickSight SPICE 容量月费",
+                    float(spice),
+                    include=("spice", edition),
+                    unit_contains=("gb",),
+                )
+            sessions = requested.get("session_capacity")
+            if sessions:
+                add(
+                    result,
+                    "QuickSight 读者会话用量",
+                    float(sessions),
+                    include=("reader", "session"),
+                    exclude=("free",),
+                    unit_contains=("session",),
+                )
         elif service == "kms":
             key_count = float(requested.get("key_count") or requirement.quantity)
             add(

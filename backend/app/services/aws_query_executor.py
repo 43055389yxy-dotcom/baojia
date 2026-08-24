@@ -91,18 +91,47 @@ class ReadOnlyAwsQueryExecutor:
             normalized_operation,
             region,
         )
-        try:
-            if paginate and client.can_paginate(normalized_operation):
-                paginator = client.get_paginator(normalized_operation)
-                pages = paginator.paginate(
-                    **request,
-                    PaginationConfig={"PageSize": min(limit, 100), "MaxItems": limit},
+        payload: dict[str, Any] | None = None
+        last_error: ClientError | BotoCoreError | ParamValidationError | AttributeError | None = None
+        # Botocore already retries many transport failures.  Keep this small
+        # application-level retry as a second safety net because catalog reads
+        # also fail occasionally after a connection-pool or endpoint reset.
+        # These are read-only operations, so retrying cannot duplicate a write.
+        for attempt in range(3):
+            try:
+                if paginate and client.can_paginate(normalized_operation):
+                    paginator = client.get_paginator(normalized_operation)
+                    pages = paginator.paginate(
+                        **request,
+                        PaginationConfig={"PageSize": min(limit, 100), "MaxItems": limit},
+                    )
+                    payload = {"pages": [_json_safe(page) for page in pages]}
+                else:
+                    method = getattr(client, normalized_operation)
+                    payload = _json_safe(method(**request))
+                break
+            except (ClientError, BotoCoreError, ParamValidationError, AttributeError) as exc:
+                last_error = exc
+                if not _is_retryable_read_error(exc) or attempt == 2:
+                    break
+
+        if payload is None:
+            # If AWS is temporarily unavailable after the normal TTL, an exact
+            # response previously returned by the official API is safer than
+            # failing an already-reviewed quote.  This cache never contains a
+            # guessed product and remains bound to the full request key.
+            stale = self._cache.get(cache_key, allow_stale=True)
+            if isinstance(stale, dict):
+                logger.warning(
+                    "Using stale official AWS read cache after query failure "
+                    "service=%s operation=%s region=%s",
+                    normalized_service,
+                    normalized_operation,
+                    region,
                 )
-                payload = {"pages": [_json_safe(page) for page in pages]}
-            else:
-                method = getattr(client, normalized_operation)
-                payload = _json_safe(method(**request))
-        except (ClientError, BotoCoreError, ParamValidationError, AttributeError) as exc:
+                return stale
+            assert last_error is not None
+            exc = last_error
             aws_error_code = ""
             if isinstance(exc, ClientError):
                 aws_error_code = str(
@@ -144,6 +173,7 @@ class ReadOnlyAwsQueryExecutor:
                 operation=normalized_operation,
                 region=region,
             ) from exc
+        assert payload is not None
         logger.info(
             "Completed allowlisted AWS read service=%s operation=%s region=%s",
             normalized_service,
@@ -186,3 +216,26 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value
+
+
+def _is_retryable_read_error(
+    error: ClientError | BotoCoreError | ParamValidationError | AttributeError,
+) -> bool:
+    if isinstance(error, BotoCoreError):
+        return True
+    if not isinstance(error, ClientError):
+        return False
+    code = str(error.response.get("Error", {}).get("Code", "")).casefold()
+    return code in {
+        "internalerror",
+        "internalfailure",
+        "priorrequestnotcomplete",
+        "requestlimitexceeded",
+        "requesttimeout",
+        "requesttimeoutexception",
+        "serviceunavailable",
+        "slowdown",
+        "throttling",
+        "throttlingexception",
+        "toomanyrequestsexception",
+    }
