@@ -11,7 +11,7 @@ from typing import Any
 
 from app.core.errors import ManualConfirmationRequired
 from app.integrations.aws import PricingCatalog
-
+from app.integrations.aws_product_registry import AwsProductRegistry
 
 PROFILE_TTL_SECONDS = 10 * 24 * 60 * 60
 FAILED_RETRY_SECONDS = 6 * 60 * 60
@@ -173,8 +173,10 @@ class AutoServiceDiscovery:
         self,
         catalog: PricingCatalog | None = None,
         database_path: Path | None = None,
+        product_registry: AwsProductRegistry | None = None,
     ):
         self.catalog = catalog
+        self.product_registry = product_registry
         self._database_path = database_path or (
             Path(__file__).resolve().parents[2] / ".cache" / "auto_service_profiles.sqlite3"
         )
@@ -266,13 +268,27 @@ class AutoServiceDiscovery:
         cached = self.get_profile(service_key, region)
         if cached is not None and not force_refresh:
             age = time.time() - float(cached.get("updated_at") or 0)
-            schema_is_current = int(cached.get("profile_schema_version") or 0) >= PROFILE_SCHEMA_VERSION
+            schema_is_current = (
+                int(cached.get("profile_schema_version") or 0)
+                >= PROFILE_SCHEMA_VERSION
+            )
             retry_after = (
                 FAILED_RETRY_SECONDS
                 if cached.get("status") == "failed"
                 else PROFILE_TTL_SECONDS
             )
             if age < retry_after and schema_is_current:
+                service_code = str(cached.get("service_code") or "")
+                if self.product_registry is not None and service_code:
+                    self.product_registry.update_profile(
+                        service_code,
+                        cached,
+                        status=(
+                            "profile_ready"
+                            if cached.get("status") == "verified"
+                            else "needs_review"
+                        ),
+                    )
                 return cached
         if self.catalog is None:
             return cached
@@ -310,8 +326,12 @@ class AutoServiceDiscovery:
                 "AWS 服务自动发现未配置官方目录",
                 code="auto_discovery_catalog_missing",
             )
-        codes = self.catalog.service_codes()
         labels = [service_key, display_name]
+        if self.product_registry is not None:
+            registry_match = self.product_registry.resolve_service_code(*labels)
+            if registry_match:
+                return registry_match
+        codes = self.catalog.service_codes()
         for label in labels:
             exact = [code for code in codes if service_stem(code) == service_stem(label)]
             if len(exact) == 1:
@@ -590,6 +610,13 @@ class AutoServiceDiscovery:
                     error_code,
                     now,
                 ),
+            )
+        service_code = str(profile.get("service_code") or "")
+        if self.product_registry is not None and service_code:
+            self.product_registry.update_profile(
+                service_code,
+                profile,
+                status="profile_ready" if status == "verified" else "needs_review",
             )
 
     def list_profiles(self) -> list[dict[str, Any]]:

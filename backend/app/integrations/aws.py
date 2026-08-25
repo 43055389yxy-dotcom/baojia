@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
+from botocore.loaders import create_loader
 
 from app.core.config import Settings
 from app.core.errors import ManualConfirmationRequired
 from app.integrations.aws_cache import PersistentAwsCache
+from app.integrations.aws_public_catalog import PublicAwsPriceCatalog
 
 RETRY_CONFIG = Config(
     connect_timeout=5,
@@ -88,21 +90,45 @@ class RegionResolver:
                 response = self._ssm.get_parameter(Name=parameter_name)
                 value = response["Parameter"]["Value"]
             except (ClientError, BotoCoreError, KeyError) as exc:
-                raise ManualConfirmationRequired(
-                    f"AWS 官方区域目录无法确认区域 {region}",
-                    code="unsupported_or_unknown_region",
-                    region=region,
-                ) from exc
+                # Botocore ships AWS's signed endpoint metadata with boto3.
+                # It is an official, read-only fallback when the local AWS
+                # credentials cannot call the public SSM parameter.
+                value = self._bundled_region_name(region)
+                if value is None:
+                    raise ManualConfirmationRequired(
+                        f"AWS 官方区域目录无法确认区域 {region}",
+                        code="unsupported_or_unknown_region",
+                        region=region,
+                    ) from exc
             self._cache[region] = value
             return value
+
+    @staticmethod
+    def _bundled_region_name(region: str) -> str | None:
+        endpoints = create_loader().load_data("endpoints")
+        for partition in endpoints.get("partitions", []):
+            metadata = partition.get("regions", {}).get(region)
+            if not isinstance(metadata, dict):
+                continue
+            description = str(metadata.get("description") or "").strip()
+            if description:
+                return description
+        return None
 
 
 class PricingCatalog:
     """Thin fail-closed wrapper over the AWS Price List Query API."""
 
-    def __init__(self, clients: AwsClients, regions: RegionResolver):
+    def __init__(
+        self,
+        clients: AwsClients,
+        regions: RegionResolver,
+        public_catalog: PublicAwsPriceCatalog | None = None,
+    ):
         self._pricing = clients.pricing
         self._regions = regions
+        self._public_catalog = public_catalog or PublicAwsPriceCatalog()
+        self._query_api_available: bool | None = None
         self._persistent_cache = PersistentAwsCache()
         self._product_cache: dict[
             tuple[str, tuple[tuple[str, str], ...], int], list[dict[str, Any]]
@@ -137,6 +163,27 @@ class PricingCatalog:
             for field, value in filters.items()
         ]
         products: list[dict[str, Any]] = []
+        if self._query_api_available is False:
+            try:
+                products = self._public_catalog.products(
+                    service_code,
+                    filters,
+                    max_items=max_pages * 100,
+                )
+            except ManualConfirmationRequired:
+                products = []
+            if products:
+                self._product_cache[cache_key] = products
+                self._persistent_cache.set(persistent_key, products)
+                return products
+            if isinstance(stale, list) and stale:
+                self._product_cache[cache_key] = stale
+                return stale
+            raise ManualConfirmationRequired(
+                "AWS 官方公开价格目录查询失败，禁止继续报价",
+                code="pricing_catalog_unavailable",
+                service_code=service_code,
+            )
         try:
             paginator = self._pricing.get_paginator("get_products")
             pages: Iterator[dict[str, Any]] = paginator.paginate(
@@ -148,6 +195,20 @@ class PricingCatalog:
             for page in pages:
                 products.extend(json.loads(raw) for raw in page.get("PriceList", []))
         except (ClientError, BotoCoreError, ValueError) as exc:
+            if self._is_auth_failure(exc):
+                self._query_api_available = False
+            try:
+                products = self._public_catalog.products(
+                    service_code,
+                    filters,
+                    max_items=max_pages * 100,
+                )
+            except ManualConfirmationRequired:
+                products = []
+            if products:
+                self._product_cache[cache_key] = products
+                self._persistent_cache.set(persistent_key, products)
+                return products
             if isinstance(stale, list) and stale:
                 self._product_cache[cache_key] = stale
                 return stale
@@ -156,6 +217,8 @@ class PricingCatalog:
                 code="pricing_catalog_unavailable",
                 service_code=service_code,
             ) from exc
+        else:
+            self._query_api_available = True
         # One empty response must not immediately become a component failure.
         # Retry every adapter's exact official query once without cache before
         # the adapter decides whether broader semantic discovery is needed.
@@ -229,6 +292,12 @@ class PricingCatalog:
         persistent = self._persistent_cache.get(persistent_key)
         if isinstance(persistent, list):
             return [str(item) for item in persistent]
+        if self._query_api_available is False:
+            values = self._public_catalog.attribute_values(
+                service_code, attribute_name
+            )
+            self._persistent_cache.set(persistent_key, values)
+            return values
         values: list[str] = []
         token: str | None = None
         for _ in range(max_pages):
@@ -242,12 +311,20 @@ class PricingCatalog:
             try:
                 response = self._pricing.get_attribute_values(**kwargs)
             except (ClientError, BotoCoreError) as exc:
-                raise ManualConfirmationRequired(
-                    "AWS Price List 无法读取产品属性值",
-                    code="pricing_attribute_values_unavailable",
-                    service_code=service_code,
-                    attribute=attribute_name,
-                ) from exc
+                if self._is_auth_failure(exc):
+                    self._query_api_available = False
+                try:
+                    values = self._public_catalog.attribute_values(
+                        service_code, attribute_name
+                    )
+                except ManualConfirmationRequired as public_exc:
+                    raise ManualConfirmationRequired(
+                        "AWS Price List 无法读取产品属性值",
+                        code="pricing_attribute_values_unavailable",
+                        service_code=service_code,
+                        attribute=attribute_name,
+                    ) from public_exc
+                break
             values.extend(item["Value"] for item in response.get("AttributeValues", []))
             token = response.get("NextToken")
             if not token:
@@ -258,7 +335,10 @@ class PricingCatalog:
     def service_codes(self) -> list[str]:
         """Return the official Price List service-code registry."""
 
-        persistent_key = self._persistent_cache.key("pricing-service-codes", "all")
+        # v2 includes the unsigned AWS Bulk Offer registry as well as the
+        # credentialed Query API.  The previous cache could contain only the
+        # handful of service codes touched by one local AWS account.
+        persistent_key = self._persistent_cache.key("pricing-service-codes-v2", "all")
         persistent = self._persistent_cache.get(persistent_key)
         if isinstance(persistent, list):
             return [str(item) for item in persistent]
@@ -279,13 +359,43 @@ class PricingCatalog:
                 if not token:
                     break
         except (ClientError, BotoCoreError, KeyError) as exc:
-            raise ManualConfirmationRequired(
-                "AWS Price List 无法读取服务目录",
-                code="pricing_service_registry_unavailable",
-            ) from exc
+            if self._is_auth_failure(exc):
+                self._query_api_available = False
+            try:
+                codes = self._public_catalog.service_codes()
+            except ManualConfirmationRequired as public_exc:
+                raise ManualConfirmationRequired(
+                    "AWS Price List 无法读取服务目录",
+                    code="pricing_service_registry_unavailable",
+                ) from public_exc
+        else:
+            self._query_api_available = True
+            # The Bulk Offer registry is AWS's broader billable-product index.
+            # Merge it when available so newly launched offers are visible even
+            # before a regional Query API cache happens to contain them.
+            try:
+                codes.extend(self._public_catalog.service_codes())
+            except ManualConfirmationRequired:
+                pass
         unique = sorted(set(codes))
         self._persistent_cache.set(persistent_key, unique)
         return unique
+
+    @staticmethod
+    def _is_auth_failure(exc: Exception) -> bool:
+        if not isinstance(exc, ClientError):
+            return False
+        code = str(exc.response.get("Error", {}).get("Code") or "")
+        return code in {
+            "UnrecognizedClientException",
+            "InvalidClientTokenId",
+            "ExpiredToken",
+            "ExpiredTokenException",
+            "SignatureDoesNotMatch",
+            "AuthFailure",
+            "AccessDenied",
+            "AccessDeniedException",
+        }
 
     @staticmethod
     def attributes(product: dict[str, Any]) -> dict[str, str]:

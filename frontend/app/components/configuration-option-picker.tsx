@@ -111,13 +111,20 @@ export function ConfigurationOptionPicker({
   if (!catalog) {
     const buttonValue = (value ?? "").split("；", 1)[0];
     return (
-      <div className={className}>
-        {options.map((option) => (
-          <button type="button" className={buttonValue === option.value ? "selected" : ""} key={option.value} onClick={() => onChange(option.value)}>
-            {option.label}
-          </button>
-        ))}
-      </div>
+      <label className={`${className} configuration-picker-result`.trim()}>
+        <span>请选择</span>
+        <select
+          className="configuration-picker-select"
+          aria-label="选择确认项"
+          value={options.some((option) => option.value === buttonValue) ? buttonValue : ""}
+          onChange={(event) => onChange(event.target.value)}
+        >
+          <option value="">请选择一个选项</option>
+          {options.map((option) => (
+            <option value={option.value} key={option.value}>{option.label}</option>
+          ))}
+        </select>
+      </label>
     );
   }
 

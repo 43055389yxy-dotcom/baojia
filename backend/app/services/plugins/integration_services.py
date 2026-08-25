@@ -121,9 +121,7 @@ class MskPlugin(_NoConfirmationPlugin):
                 catalog_memory = float(attrs.get("memoryGib") or 0)
             except (TypeError, ValueError):
                 catalog_vcpu, catalog_memory = 0, 0
-            vcpu, memory = official_specs.get(
-                model, (catalog_vcpu, catalog_memory)
-            )
+            vcpu, memory = official_specs.get(model, (catalog_vcpu, catalog_memory))
             specifications = {
                 **({"vCPU": vcpu} if vcpu > 0 else {}),
                 **({"memoryGiB": memory} if memory > 0 else {}),
@@ -202,16 +200,12 @@ class MskPlugin(_NoConfirmationPlugin):
             model = _msk_model(product)
             if model.startswith("express."):
                 continue
-            if requested_model and model != requested_model.removeprefix("kafka."):
-                continue
             try:
                 catalog_vcpu = float(attrs.get("vcpu") or 0)
                 catalog_memory = float(attrs.get("memoryGib") or 0)
             except (TypeError, ValueError):
                 continue
-            vcpu, memory = official_specs.get(
-                model, (catalog_vcpu, catalog_memory)
-            )
+            vcpu, memory = official_specs.get(model, (catalog_vcpu, catalog_memory))
             if min_vcpu is not None and vcpu < min_vcpu:
                 continue
             if min_memory is not None and memory < min_memory:
@@ -228,7 +222,12 @@ class MskPlugin(_NoConfirmationPlugin):
                 vcpu=min_vcpu,
                 memory_gib=min_memory,
             )
-        _, model, broker_product = min(candidates, key=lambda item: (item[0], item[1]))
+        normalized_requested = requested_model.removeprefix("kafka.")
+        exact = next(
+            (item for item in candidates if item[1] == normalized_requested),
+            None,
+        )
+        _, model, broker_product = exact or min(candidates, key=lambda item: (item[0], item[1]))
         attrs = PricingCatalog.attributes(broker_product)
         selected_vcpu, selected_memory = official_specs.get(
             model,
@@ -273,11 +272,20 @@ class MskPlugin(_NoConfirmationPlugin):
             )
 
         auto_selected = not requested_model
+        substituted = bool(requested_model and exact is None)
         notice = None
         if storage_gib is None:
             notice = "客户未提供每个 Broker 的存储容量；存储仅展示 AWS 官方单位价，不计入月费合计。"
         if auto_selected:
-            selected_notice = f"客户未指定 Broker 型号；按满足已知规格的最低官方小时价选择 {model}。"
+            selected_notice = (
+                f"客户未指定 Broker 型号；按满足已知规格的最低官方小时价选择 {model}。"
+            )
+            notice = f"{selected_notice}{notice or ''}"
+        elif substituted:
+            selected_notice = (
+                f"客户指定的 {requested_model} 在当前区域不可报价；已在相同或不低于原配置且"
+                f"可报价的 Broker 中，自动替换为最低价的 {model}。"
+            )
             notice = f"{selected_notice}{notice or ''}"
         requested_shape: list[str] = []
         selected_shape: list[str] = []
@@ -287,9 +295,8 @@ class MskPlugin(_NoConfirmationPlugin):
         if min_memory is not None:
             requested_shape.append(f"{min_memory:g} GiB 内存")
             selected_shape.append(f"{selected_memory:g} GiB 内存")
-        shape_was_raised = (
-            (min_vcpu is not None and selected_vcpu > min_vcpu)
-            or (min_memory is not None and selected_memory > min_memory)
+        shape_was_raised = (min_vcpu is not None and selected_vcpu > min_vcpu) or (
+            min_memory is not None and selected_memory > min_memory
         )
         if shape_was_raised:
             shape_notice = (

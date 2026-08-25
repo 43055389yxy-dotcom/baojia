@@ -5,13 +5,18 @@ import { ConfigurationOptionPicker, type ConfigurationChoice } from "../../compo
 
 type Item = {
   question: string;
+  answer_key?: string | null;
   options: ConfigurationChoice[];
   dependent_options?: ConfigurationChoice[];
   dependent_on_values?: string[];
   component_id?: string | null;
   service?: string | null;
-  selection_mode?: "buttons" | "catalog";
+  selection_mode?: "text" | "buttons" | "catalog";
 };
+
+function confirmationAnswerKey(item: Item): string {
+  return item.answer_key ?? item.question;
+}
 
 function confirmationComplete(item: Item, answer?: string): boolean {
   const compact = answer?.trim() ?? "";
@@ -20,8 +25,22 @@ function confirmationComplete(item: Item, answer?: string): boolean {
   const requiresDependentChoice = (item.dependent_on_values ?? []).includes(baseValue);
   return !requiresDependentChoice || /；选择\s+[^；]+；机器数量\s+\d+/.test(compact);
 }
+
+function isRegionConfirmation(item: Item): boolean {
+  const question = item.question.trim();
+  return question.includes("区域") && (
+    question.includes("部署在哪")
+    || question.includes("哪个 AWS 区域")
+    || question.includes("请选择区域")
+    || question.includes("未指定区域")
+  );
+}
 type ConfigurationItem = {
   component_id: string;
+  component_number?: string | null;
+  parent_component_id?: string | null;
+  parent_component_number?: string | null;
+  parent_display_name?: string | null;
   service: string;
   display_name: string;
   region?: string | null;
@@ -34,9 +53,36 @@ type ConfigurationItem = {
   available_billing_labels?: Record<string, string>;
   pricing_status: "ready" | "unpriced";
   pricing_notice?: string | null;
+  pricing_issue_code?: string | null;
+  pricing_issue_category?: "retryable" | "compatibility" | "catalog_mapping" | "system_configuration" | "unsupported" | null;
   requirements: Record<string, unknown>;
   source_text: string;
 };
+
+function hierarchyOrderedConfigurationItems(items: ConfigurationItem[]) {
+  const entries = items.map((item, originalIndex) => ({ item, originalIndex }));
+  const knownIds = new Set(entries.map(({ item }) => item.component_id));
+  const children = new Map<string, typeof entries>();
+  entries.forEach((entry) => {
+    const parentId = entry.item.parent_component_id;
+    if (!parentId || !knownIds.has(parentId) || parentId === entry.item.component_id) return;
+    children.set(parentId, [...(children.get(parentId) ?? []), entry]);
+  });
+  const ordered: typeof entries = [];
+  const visited = new Set<string>();
+  const append = (entry: (typeof entries)[number]) => {
+    if (visited.has(entry.item.component_id)) return;
+    visited.add(entry.item.component_id);
+    ordered.push(entry);
+    (children.get(entry.item.component_id) ?? []).forEach(append);
+  };
+  entries
+    .filter((entry) => !entry.item.parent_component_id
+      || !knownIds.has(entry.item.parent_component_id))
+    .forEach(append);
+  entries.forEach(append);
+  return ordered;
+}
 type EditableValue = string | number | boolean | null;
 type ComponentUpdate = {
   region?: string;
@@ -45,7 +91,7 @@ type ComponentUpdate = {
 };
 type ComponentDraft = {
   region: string;
-  quantity: number;
+  quantity: number | "";
   requirements: Record<string, EditableValue>;
 };
 type Session = {
@@ -134,7 +180,7 @@ const FIELD_LABELS: Record<string, string> = {
 
 const AWS_SERVICE_EDIT_FIELDS: Record<string, string[]> = {
   ec2: ["vcpu", "memory_gib", "system_disk_gib", "operating_system", "architecture", "purpose"],
-  rds: ["engine", "vcpu", "memory_gib", "storage_gib", "deployment", "storage_type", "backup_retention_days", "read_replica_count"],
+  rds: ["engine", "engine_version", "vcpu", "memory_gib", "storage_gib", "deployment", "storage_type", "backup_retention_days", "read_replica_count"],
   elasticache: ["engine", "vcpu", "memory_gib", "node_count", "shards", "replicas_per_shard", "deployment"],
   s3: ["storage_gib", "storage_class"],
   msk: ["broker_count", "vcpu", "memory_gib", "storage_gib_per_broker", "cluster_type"],
@@ -168,6 +214,7 @@ const AWS_SERVICE_OPTIONAL_USAGE_FIELDS: Record<string, string[]> = {
   waf: ["requests"],
   sqs: ["requests"],
   ses: ["outbound_messages", "inbound_messages", "attachments_gib"],
+  pinpoint: ["outbound_messages"],
   cloudwatch: ["log_ingestion_gib", "log_storage_gib", "custom_metrics", "alarms"],
   amp: ["active_series", "samples_ingested", "query_samples_processed", "collector_hours", "storage_gib"],
   prometheus: ["active_series", "samples_ingested", "query_samples_processed", "collector_hours", "storage_gib"],
@@ -319,6 +366,18 @@ function buildComponentDraft(item: ConfigurationItem, isAzure = false): Componen
     }
   });
   if (item.selected_model) requirements.requested_model = item.selected_model;
+  // Old S3 confirmation rows can already display "Standard" from the
+  // selected plan while lacking the equivalent editable requirement. Carry
+  // that official selection into the editor so it never opens on a misleading
+  // "请选择" placeholder.
+  if (
+    !isAzure
+    && item.service === "s3"
+    && !requirements.storage_class
+    && /standard|标准存储/i.test(String(item.selected_model ?? ""))
+  ) {
+    requirements.storage_class = "standard";
+  }
   const usesInstanceSizing = isAzure || AWS_INSTANCE_SIZED_SERVICES.has(item.service);
   if (usesInstanceSizing && typeof item.official_specifications?.vCPU === "number") {
     requirements.vcpu = item.official_specifications.vCPU as number;
@@ -563,6 +622,55 @@ function isGlobalService(item: ConfigurationItem): boolean {
     || ["global", "全球"].includes(String(item.region ?? "").toLowerCase());
 }
 
+function customerQuestionContext(
+  question: Item,
+  configurations: ConfigurationItem[],
+): { title: string; source: string } | null {
+  const component = configurations.find(
+    (item) => item.component_id === question.component_id,
+  );
+  if (!component) return null;
+  const source = component.source_text?.trim();
+  if (!source) {
+    return {
+      title: `对应组件：${displayServiceName(component)}`,
+      source: "该组件没有单独保存客户原话。",
+    };
+  }
+  const relationOnly = /^(?:用于|基于|依赖|关联|连接|挂载|保护|提供给|承载)/.test(source);
+  if (component.service === "ec2" && relationOnly) {
+    const componentIndex = configurations.findIndex(
+      (candidate) => candidate.component_id === component.component_id,
+    );
+    const containedParent = configurations.find((candidate) => (
+      candidate.component_id !== component.component_id
+      && Boolean(candidate.source_text?.trim())
+      && candidate.source_text.includes(source)
+      && (candidate.service !== "ec2" || candidate.source_text.trim().length > source.length)
+    ));
+    const previous = componentIndex > 0 ? configurations[componentIndex - 1] : null;
+    const parent = containedParent
+      || (previous && ["vpc", "eks"].includes(previous.service) ? previous : null);
+    if (parent) {
+      const parentName = parent.source_text.split(/[：:]/, 1)[0]?.trim()
+        || displayServiceName(parent);
+      return { title: `由“${parentName}”需求衍生`, source: `创建原因：${source}` };
+    }
+    return { title: "系统衍生的 EC2 计算资源", source: `创建原因：${source}` };
+  }
+  return {
+    title: `对应组件：${displayServiceName(component)}`,
+    source: `客户原话：${source}`,
+  };
+}
+
+function estimatedReviewDuration(componentCount: number): string {
+  if (componentCount <= 10) return "1–3 分钟";
+  if (componentCount <= 25) return "2–5 分钟";
+  if (componentCount <= 50) return "4–8 分钟";
+  return "6–12 分钟";
+}
+
 function displayPlan(item: ConfigurationItem): string {
   if (item.service === "eks") return "AWS 托管控制面";
   const requested = typeof item.requirements.requested_model === "string"
@@ -600,14 +708,25 @@ function displayQuantity(item: ConfigurationItem): string {
 }
 
 function isTechnicalPricingIssue(item: ConfigurationItem): boolean {
-  return item.pricing_status !== "ready"
-    && /官方.*(?:接口|目录|规格).*(?:暂时|超时|未返回|不可用)|稍后重试/.test(
-      item.pricing_notice ?? "",
-    );
+  if (item.pricing_status === "ready") return false;
+  if (item.pricing_issue_category) return item.pricing_issue_category === "retryable";
+  // Compatibility with confirmation sessions created before issue categories
+  // were persisted.  New sessions always use the structured category above.
+  return /官方.*(?:接口|目录|规格).*(?:暂时|超时|未返回|不可用)|稍后重试/.test(
+    item.pricing_notice ?? "",
+  );
+}
+
+function pricingNoticeClass(item: ConfigurationItem): string {
+  if (isTechnicalPricingIssue(item)) return "technical-pricing-notice";
+  if (item.pricing_issue_category === "compatibility") return "compatibility-pricing-notice";
+  return "customer-pricing-notice";
 }
 
 function requiresCustomerConfiguration(item: ConfigurationItem): boolean {
-  return item.pricing_status !== "ready" && !isTechnicalPricingIssue(item);
+  return item.pricing_status !== "ready"
+    && !isTechnicalPricingIssue(item)
+    && !["compatibility", "catalog_mapping"].includes(item.pricing_issue_category ?? "");
 }
 
 export default function CustomerConfirmationPage() {
@@ -626,6 +745,8 @@ export default function CustomerConfirmationPage() {
   const [additionalFields, setAdditionalFields] = useState<Record<string, string[]>>({});
   const [additionalFieldChoice, setAdditionalFieldChoice] = useState<Record<string, string>>({});
   const [fieldUnits, setFieldUnits] = useState<Record<string, "gib" | "tib">>({});
+  const [liveFieldOptions, setLiveFieldOptions] = useState<Record<string, EditableValue[]>>({});
+  const [loadedOfficialOptionComponents, setLoadedOfficialOptionComponents] = useState<string[]>([]);
   const [editingComponents, setEditingComponents] = useState<Record<string, boolean>>({});
   const [pendingEditorSwitch, setPendingEditorSwitch] = useState<{
     fromId: string;
@@ -641,11 +762,16 @@ export default function CustomerConfirmationPage() {
   const [queuedComponentIds, setQueuedComponentIds] = useState<string[]>([]);
   const [submittedComponentSnapshots, setSubmittedComponentSnapshots] = useState<Record<string, string>>({});
   const [failedComponentIds, setFailedComponentIds] = useState<string[]>([]);
+  const [componentEditorNotices, setComponentEditorNotices] = useState<Record<string, string>>({});
   const [transientNotice, setTransientNotice] = useState("");
   const [recentlyUpdatedComponentIds, setRecentlyUpdatedComponentIds] = useState<string[]>([]);
   const [addingConfigurationInProgress, setAddingConfigurationInProgress] = useState(() => {
     if (typeof window === "undefined" || !token) return false;
     return window.sessionStorage.getItem(`astraquote:addition:${token}`) === "active";
+  });
+  const [regionConfirmationInProgress, setRegionConfirmationInProgress] = useState(() => {
+    if (typeof window === "undefined" || !token) return false;
+    return window.sessionStorage.getItem(`astraquote:region-confirmation:${token}`) === "active";
   });
   const regionalRegions = useMemo(() => Array.from(new Set(
     (session?.configuration_items ?? [])
@@ -659,7 +785,7 @@ export default function CustomerConfirmationPage() {
   );
   const hasPendingStructuredUpdates = Object.keys(componentUpdates).length > 0;
   const hasPendingConfigurationChanges = hasPendingComponentFeedback
-    || (isAzureConfirmation && hasPendingStructuredUpdates)
+    || hasPendingStructuredUpdates
     || Object.values(deletedComponents).some(Boolean)
     || additionFeedback.trim().length > 0;
   const customerBlockingItems = (session?.configuration_items ?? []).filter(
@@ -671,16 +797,18 @@ export default function CustomerConfirmationPage() {
   const isConfigurationRefreshActive = (
     refreshingComponentIds.length > 0 || addingConfigurationInProgress
   ) && ["reviewing", "submitted", "processing"].includes(session?.status ?? "");
-  const hasInlineAdditionQuestions = Boolean(
-    addingConfigurationInProgress
-    && session?.status === "pending"
+  const hasStandaloneConfirmationQuestions = Boolean(
+    session?.status === "pending"
     && session.confirmation_items.length > 0
-    && session.configuration_items.length > 0,
   );
-  const showConfigurationReview = session?.status === "configuration_review"
-    || ((isConfigurationRefreshActive || hasInlineAdditionQuestions)
-      && Boolean(session?.configuration_items.length));
   const isSessionReviewing = ["reviewing", "submitted", "processing"].includes(session?.status ?? "");
+  const customerAnswersReviewInProgress = isSessionReviewing
+    && !regionConfirmationInProgress
+    && !isConfigurationRefreshActive
+    && Boolean(session?.confirmation_items.length);
+  const showConfigurationReview = session?.status === "configuration_review"
+    || ((isConfigurationRefreshActive || isSessionReviewing)
+      && Boolean(session?.configuration_items.length));
 
   function discardComponentDraft(componentId: string) {
     setComponentDrafts((current) => {
@@ -741,6 +869,44 @@ export default function CustomerConfirmationPage() {
       ...current,
       [componentId]: buildComponentDraft(item, isAzureConfirmation),
     }));
+    if (!isAzureConfirmation) {
+      void loadOfficialFieldOptions(item);
+    }
+  }
+
+  async function loadOfficialFieldOptions(item: ConfigurationItem) {
+    const region = item.region?.trim();
+    if (!region) return;
+    if (loadedOfficialOptionComponents.includes(item.component_id)) return;
+    try {
+      const response = await fetch(`${API_BASE}/api/aws/configuration-field-options`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          service: item.service,
+          region,
+          requirements: item.requirements,
+        }),
+        cache: "no-store",
+      });
+      if (!response.ok) return;
+      const payload = await response.json() as Record<string, EditableValue[]>;
+      setLiveFieldOptions((existing) => ({
+        ...existing,
+        ...Object.fromEntries(
+          Object.entries(payload)
+            .filter(([, values]) => Array.isArray(values) && values.length > 0)
+            .map(([field, values]) => [`${item.component_id}:${field}`, values]),
+        ),
+      }));
+    } catch {
+      // Existing editable controls remain available if AWS is offline.
+    } finally {
+      setLoadedOfficialOptionComponents((existing) => Array.from(new Set([
+        ...existing,
+        item.component_id,
+      ])));
+    }
   }
 
   function completeEditorSwitch(saveCurrent: boolean) {
@@ -777,6 +943,12 @@ export default function CustomerConfirmationPage() {
     value: EditableValue,
   ) {
     const componentId = item.component_id;
+    setComponentEditorNotices((current) => {
+      if (!current[componentId]) return current;
+      const next = { ...current };
+      delete next[componentId];
+      return next;
+    });
     setComponentDrafts((current) => {
       const draft = current[componentId] ?? buildComponentDraft(item, isAzureConfirmation);
       if (scope === "requirements") {
@@ -788,7 +960,13 @@ export default function CustomerConfirmationPage() {
           },
         };
       }
-      return { ...current, [componentId]: { ...draft, [scope]: value } };
+      return {
+        ...current,
+        [componentId]: {
+          ...draft,
+          [scope]: scope === "quantity" ? Number(value) : String(value ?? ""),
+        },
+      };
     });
     setComponentUpdates((current) => {
       const update = current[componentId] ?? {};
@@ -801,7 +979,66 @@ export default function CustomerConfirmationPage() {
           },
         };
       }
-      return { ...current, [componentId]: { ...update, [scope]: value } };
+      return {
+        ...current,
+        [componentId]: {
+          ...update,
+          [scope]: scope === "quantity" ? Number(value) : String(value ?? ""),
+        },
+      };
+    });
+  }
+
+  function updateTransientNumericField(
+    item: ConfigurationItem,
+    scope: "quantity" | "requirements",
+    field: string,
+    rawValue: string,
+    multiplier = 1,
+  ) {
+    if (rawValue !== "") {
+      updateComponentField(item, scope, field, Number(rawValue) * multiplier);
+      return;
+    }
+    const componentId = item.component_id;
+    setComponentEditorNotices((current) => {
+      if (!current[componentId]) return current;
+      const next = { ...current };
+      delete next[componentId];
+      return next;
+    });
+    // Empty is a temporary editing state, not a request to delete the field.
+    // Keep the input mounted so the customer can type the replacement value,
+    // and remove only the unfinished value from the pending server payload.
+    setComponentDrafts((current) => {
+      const draft = current[componentId] ?? buildComponentDraft(item, isAzureConfirmation);
+      if (scope === "quantity") {
+        return { ...current, [componentId]: { ...draft, quantity: "" } };
+      }
+      return {
+        ...current,
+        [componentId]: {
+          ...draft,
+          requirements: { ...draft.requirements, [field]: "" },
+        },
+      };
+    });
+    setComponentUpdates((current) => {
+      const next = { ...current };
+      const update = next[componentId];
+      if (!update) return current;
+      const revised: ComponentUpdate = { ...update };
+      if (scope === "quantity") {
+        delete revised.quantity;
+      } else if (revised.requirements) {
+        const requirements = { ...revised.requirements };
+        delete requirements[field];
+        if (Object.keys(requirements).length > 0) revised.requirements = requirements;
+        else delete revised.requirements;
+      }
+      if (Object.keys(revised).length > 0) next[componentId] = revised;
+      else delete next[componentId];
+      return next;
     });
   }
 
@@ -820,9 +1057,23 @@ export default function CustomerConfirmationPage() {
       .then((payload) => {
         setSession(payload);
         setAnswers(payload.answers ?? {});
+        if (
+          ["reviewing", "submitted", "processing"].includes(payload.status)
+          && payload.confirmation_items.length > 0
+          && payload.confirmation_items.every(isRegionConfirmation)
+        ) {
+          setRegionConfirmationInProgress(true);
+          window.sessionStorage.setItem(`astraquote:region-confirmation:${token}`, "active");
+        }
+        if (!["reviewing", "submitted", "processing"].includes(payload.status)) {
+          setRegionConfirmationInProgress(false);
+          window.sessionStorage.removeItem(`astraquote:region-confirmation:${token}`);
+        }
         if (["configuration_review", "approved", "completed"].includes(payload.status)) {
           setAddingConfigurationInProgress(false);
           window.sessionStorage.removeItem(`astraquote:addition:${token}`);
+          setRegionConfirmationInProgress(false);
+          window.sessionStorage.removeItem(`astraquote:region-confirmation:${token}`);
         }
       })
       .catch((reason) => setError(reason instanceof Error ? reason.message : "无法读取确认单"))
@@ -953,12 +1204,16 @@ export default function CustomerConfirmationPage() {
             window.sessionStorage.removeItem(`astraquote:addition:${token}`);
           }
           if (payload.status === "pending") setAnswers({});
+          if (!["reviewing", "submitted", "processing"].includes(payload.status)) {
+            setRegionConfirmationInProgress(false);
+            window.sessionStorage.removeItem(`astraquote:region-confirmation:${token}`);
+          }
         })
         .catch(() => undefined);
     };
     const timer = window.setInterval(refresh, 1800);
     return () => window.clearInterval(timer);
-  }, [token, session?.status, refreshingComponentIds, addingConfigurationInProgress, submittedComponentSnapshots, deletedComponents]);
+  }, [token, session?.status, refreshingComponentIds, addingConfigurationInProgress, submittedComponentSnapshots, deletedComponents, isAzureConfirmation]);
 
   useEffect(() => {
     if (recentlyUpdatedComponentIds.length === 0) return;
@@ -980,11 +1235,23 @@ export default function CustomerConfirmationPage() {
 
   async function submit() {
     if (!session || session.confirmation_items.some(
-      (item) => !confirmationComplete(item, answers[item.question]),
+      (item) => !confirmationComplete(item, answers[confirmationAnswerKey(item)]),
     )) return;
+    const pendingSession = session;
+    const isRegionOnlyRound = session.confirmation_items.length > 0
+      && session.confirmation_items.every(isRegionConfirmation);
     setReviewSeconds(0);
     setSubmitting(true);
     setError("");
+    if (isRegionOnlyRound) {
+      setRegionConfirmationInProgress(true);
+      window.sessionStorage.setItem(`astraquote:region-confirmation:${token}`, "active");
+    }
+    // Close the question dialog immediately after a valid submission.  The
+    // retained configuration table becomes the progress surface while the
+    // server continues processing; if the request fails, restore the dialog
+    // with every answer still present so the customer can retry.
+    setSession((current) => current ? { ...current, status: "submitted" } : current);
     try {
       const response = await fetch(`${API_BASE}/api/confirmation-sessions/${token}`, {
         method: "POST",
@@ -999,11 +1266,20 @@ export default function CustomerConfirmationPage() {
           ? (payload as Session).configuration_items
           : current?.configuration_items ?? [],
       }));
+      if (!["reviewing", "submitted", "processing"].includes((payload as Session).status)) {
+        setRegionConfirmationInProgress(false);
+        window.sessionStorage.removeItem(`astraquote:region-confirmation:${token}`);
+      }
       if (["configuration_review", "approved", "completed"].includes((payload as Session).status)) {
         setAddingConfigurationInProgress(false);
         window.sessionStorage.removeItem(`astraquote:addition:${token}`);
       }
     } catch (reason) {
+      setSession(pendingSession);
+      if (isRegionOnlyRound) {
+        setRegionConfirmationInProgress(false);
+        window.sessionStorage.removeItem(`astraquote:region-confirmation:${token}`);
+      }
       setError(reason instanceof Error ? reason.message : "提交失败，请重试");
     } finally {
       setSubmitting(false);
@@ -1035,6 +1311,39 @@ export default function CustomerConfirmationPage() {
     additionOnly = false,
   ) {
     if (!session) return;
+    if (componentId && !deletedComponents[componentId]) {
+      const item = session.configuration_items.find(
+        (candidate) => candidate.component_id === componentId,
+      );
+      const draft = item ? componentDrafts[componentId] : undefined;
+      if (item && draft) {
+        if (draft.quantity === "" || !Number.isFinite(draft.quantity) || draft.quantity < 1) {
+          setComponentEditorNotices((current) => ({
+            ...current,
+            [componentId]: "请填写 1 到 10000 之间的完整数量后再保存。",
+          }));
+          return;
+        }
+        const visibleFields = editableRequirementFields(
+          item,
+          draft,
+          additionalFields[componentId] ?? [],
+          isAzureConfirmation,
+        );
+        const unfinishedField = visibleFields.find(
+          (field) => field in draft.requirements
+            && NUMERIC_CONFIGURATION_FIELDS.has(field)
+            && (draft.requirements[field] === "" || draft.requirements[field] === null),
+        );
+        if (unfinishedField) {
+          setComponentEditorNotices((current) => ({
+            ...current,
+            [componentId]: `请先填写完整的${editableFieldLabel(unfinishedField)}，再保存本项。`,
+          }));
+          return;
+        }
+      }
+    }
     const componentChanges: Record<string, string> = {};
     const candidateIds = additionOnly
       ? []
@@ -1059,7 +1368,15 @@ export default function CustomerConfirmationPage() {
     const addedConfiguration = componentId ? "" : additionFeedback.trim();
     if (Object.keys(componentChanges).length === 0
       && Object.keys(structuredUpdates).length === 0
-      && !addedConfiguration) return;
+      && !addedConfiguration) {
+      if (componentId) {
+        setComponentEditorNotices((current) => ({
+          ...current,
+          [componentId]: "当前配置没有实际变化。GiB/TiB 只切换显示单位；请修改数值或其他字段后再保存。",
+        }));
+      }
+      return;
+    }
     // Only one revision can own the server-side confirmation draft at a time.
     // Keep later row submissions locally and send them as soon as the current
     // component returns to configuration review. This avoids a 409 response
@@ -1175,23 +1492,29 @@ export default function CustomerConfirmationPage() {
     return (
       <div className={`customer-questions ${className}`.trim()}>
         {session.confirmation_items.map((item, index) => {
-          const answer = answers[item.question] ?? "";
+          const answerKey = confirmationAnswerKey(item);
+          const answer = answers[answerKey] ?? "";
+          const context = customerQuestionContext(item, session.configuration_items);
           const baseValue = answer.split("；", 1)[0];
           const showDependentConfiguration = (
             item.dependent_on_values ?? []
           ).includes(baseValue) && (item.dependent_options?.length ?? 0) > 0;
-          return <article key={item.question}>
+          return <article key={answerKey}>
             <label><b>{index + 1}</b><span>{item.question}</span></label>
+            {context && <div className="customer-question-context">
+              <strong>{context.title}</strong>
+              <span>{context.source}</span>
+            </div>}
             {item.options.length > 0 && <ConfigurationOptionPicker
               className="customer-options"
               options={item.options}
-              value={answers[item.question]}
+              value={answers[answerKey]}
               catalog={item.selection_mode === "catalog" || item.options.some((option) => Boolean(option.model))}
               requireMachineCount={/自建/.test(item.question) && item.options.some((option) => Boolean(option.model))}
               initialMachineCount={session.configuration_items.find(
                 (configuration) => configuration.component_id === item.component_id,
               )?.quantity ?? Number(item.question.match(/当前\s*(\d+)\s*台/)?.[1] ?? 1)}
-              onChange={(selected) => setAnswers((current) => ({ ...current, [item.question]: selected }))}
+              onChange={(selected) => setAnswers((current) => ({ ...current, [answerKey]: selected }))}
             />}
             {showDependentConfiguration && <ConfigurationOptionPicker
               className="customer-options dependent-configuration-picker"
@@ -1204,17 +1527,21 @@ export default function CustomerConfirmationPage() {
               )?.quantity ?? 1}
               onChange={(selected) => setAnswers((current) => ({
                 ...current,
-                [item.question]: selected ? `${baseValue}；${selected}` : baseValue,
+                [answerKey]: selected ? `${baseValue}；${selected}` : baseValue,
               }))}
             />}
-            {item.options.length === 0 && <input
-              value={answers[item.question] ?? ""}
+            {item.selection_mode === "text" && item.options.length === 0 && <input
+              value={answers[answerKey] ?? ""}
               onChange={(event) => setAnswers((current) => ({
                 ...current,
-                [item.question]: event.target.value,
+                [answerKey]: event.target.value,
               }))}
               placeholder="填写您的选择"
             />}
+            {item.selection_mode !== "text" && item.options.length === 0 && <div
+              className="configuration-picker-empty"
+              role="alert"
+            >官方可选项尚未加载完成，系统已阻止手动填写，请刷新后重试。</div>}
           </article>;
         })}
       </div>
@@ -1222,7 +1549,7 @@ export default function CustomerConfirmationPage() {
   }
 
   return (
-    <main className={`customer-confirm-page ${showConfigurationReview ? "configuration-review-page" : ""}`}>
+    <main className={`customer-confirm-page ${showConfigurationReview ? "configuration-review-page" : ""} ${hasStandaloneConfirmationQuestions ? "question-entry-page" : ""}`.trim()}>
       <header><span>A</span><strong>AstraQuote</strong></header>
       <section>
         {loading ? <div className="customer-confirm-state">正在读取确认单…</div> : error && !session ? (
@@ -1235,6 +1562,25 @@ export default function CustomerConfirmationPage() {
             <p>销售人员稍后会向您发送正式报价单，感谢您的配合。</p>
             <span>本页面无需继续操作，您可以直接关闭。</span>
           </div>
+        ) : regionConfirmationInProgress && isSessionReviewing && session ? (
+          <div className="customer-region-processing-state" role="status" aria-live="polite">
+            <i aria-hidden="true" />
+            <small>正在运行</small>
+            <h1>正在按所选地区核验配置</h1>
+            <p>系统正在查询该地区支持的官方产品、型号和价格，请稍候。</p>
+            <div className="customer-review-progress" aria-hidden="true"><i /></div>
+            <span>处理完成后会自动显示下一步，无需刷新页面</span>
+          </div>
+        ) : customerAnswersReviewInProgress && session ? (
+          <div className="customer-answer-processing-state" role="status" aria-live="polite">
+            <i aria-hidden="true" />
+            <small>正在处理</small>
+            <h1>正在处理客户回答</h1>
+            <p className="customer-processing-elapsed">已用时 {String(Math.floor(reviewSeconds / 60)).padStart(2, "0")}:{String(reviewSeconds % 60).padStart(2, "0")}</p>
+            <p className="customer-processing-estimate">预计需要 {estimatedReviewDuration(session.configuration_items.length)}，组件越多处理时间越长</p>
+            <div className="customer-review-progress" aria-hidden="true"><i /></div>
+            <span>完成后自动进入配置确认</span>
+          </div>
         ) : showConfigurationReview && session ? (
           <>
             <div className="customer-confirm-title customer-review-heading">
@@ -1246,19 +1592,19 @@ export default function CustomerConfirmationPage() {
                 {transientNotice}
               </div>
             )}
-            {(isConfigurationRefreshActive || hasInlineAdditionQuestions) && (
+            {(isConfigurationRefreshActive || isSessionReviewing) && (
               <div className="configuration-refresh-status" role="status">
                 <i />
-                <span>{hasInlineAdditionQuestions
-                  ? "新增配置需要补充信息"
-                  : addingConfigurationInProgress && refreshingComponentIds.length === 0
+                <span>{addingConfigurationInProgress && refreshingComponentIds.length === 0
                     ? "正在添加配置"
-                    : `正在更新 ${refreshingComponentIds.length} 项配置`}</span>
+                    : refreshingComponentIds.length > 0
+                      ? `正在更新 ${refreshingComponentIds.length} 项配置`
+                      : "正在处理您刚才提交的选择"}</span>
                 <small>未修改的配置保持不变</small>
                 {addingConfigurationInProgress && (
                   <div className="customer-addition-progress" aria-label="新增配置处理进度">
                     <span className="done">1 识别需求</span>
-                    <span className={hasInlineAdditionQuestions ? "active" : isSessionReviewing ? "active" : "done"}>
+                    <span className={isSessionReviewing ? "active" : "done"}>
                       2 补充与校验
                     </span>
                     <span>3 加入表格</span>
@@ -1299,42 +1645,13 @@ export default function CustomerConfirmationPage() {
                 </div>
               </div>
             )}
-            {hasInlineAdditionQuestions && (
-              <div className="customer-addition-modal-backdrop" role="presentation">
-                <section
-                  className="customer-addition-modal"
-                  role="dialog"
-                  aria-modal="true"
-                  aria-labelledby="addition-question-title"
-                >
-                  <header>
-                    <div>
-                      <small>新增配置 · 补充信息</small>
-                      <h2 id="addition-question-title">请选择缺少的配置</h2>
-                      <p>选择后会继续处理，当前表格内容不会改变。</p>
-                    </div>
-                  </header>
-                  {renderConfirmationItems("customer-addition-questions")}
-                  {error && <p className="customer-submit-error">{error}</p>}
-                  <footer>
-                    <button
-                      className="customer-submit"
-                      type="button"
-                      disabled={submitting || session.confirmation_items.some(
-                        (item) => !confirmationComplete(item, answers[item.question]),
-                      )}
-                      onClick={() => void submit()}
-                    >{submitting ? "正在继续处理…" : "确认并继续添加"}</button>
-                  </footer>
-                </section>
-              </div>
-            )}
             <div className="customer-configuration-table customer-review-table">
               <table>
                 <colgroup><col className="review-index-column" /><col className="review-service-column" /><col className="review-detail-column" /><col className="review-action-column" /></colgroup>
                 <thead><tr><th>序号</th><th>{isAzureConfirmation ? "Azure 服务" : "AWS 服务"}</th><th>配置详情</th><th>操作</th></tr></thead>
                 <tbody>
-                  {session.configuration_items.map((item, index) => {
+                  {hierarchyOrderedConfigurationItems(session.configuration_items)
+                    .map(({ item }, index) => {
                     const feedback = componentFeedback[item.component_id] ?? "";
                     const structuredUpdate = componentUpdates[item.component_id];
                     const draft = componentDrafts[item.component_id]
@@ -1363,19 +1680,24 @@ export default function CustomerConfirmationPage() {
                     ].filter(Boolean).join(" ");
                     return (
                       <Fragment key={item.component_id}>
-                        <tr className={rowClassName}>
-                          <td className="review-index-cell">{String(index + 1).padStart(2, "0")}</td>
-                          <td className="review-service-cell"><strong>{displayServiceName(item)}</strong></td>
+                        <tr className={`${rowClassName} ${item.parent_component_id ? "review-child-row" : ""}`.trim()}>
+                          <td className="review-index-cell">{item.component_number ?? String(index + 1).padStart(2, "0")}</td>
+                          <td className="review-service-cell"><strong>{item.parent_component_id ? "↳ " : ""}{displayServiceName(item)}</strong>{item.parent_component_number && <small className="component-parent-label">由 {item.parent_component_number} · {item.parent_display_name ?? "父组件"} 衍生</small>}</td>
                           <td className="review-detail-cell">
-                            <span>{sharedRegion && !isGlobalService(item) ? "" : `${displayRegion(item)} · `}{displayPlan(item)} · {displayQuantity(item)}</span>
-                            <small>{configurationText(item.requirements, item.service, item.official_specifications)}</small>
-                            {item.pricing_status !== "ready" && <small className={isTechnicalPricingIssue(item)
-                              ? "technical-pricing-notice"
-                              : "customer-pricing-notice"}>
-                              {isTechnicalPricingIssue(item)
-                                ? "官方目录暂时未响应，确认后系统会自动重试，无需修改配置。"
-                                : (item.pricing_notice ?? "此配置需要调整后才能报价。")}
-                            </small>}
+                            <div className="configuration-comparison">
+                              <div className="configuration-comparison-source">
+                                <small className="configuration-comparison-label">客户原话</small>
+                                <p>{item.source_text?.trim() || "客户未提供单独说明"}</p>
+                              </div>
+                              <div className="configuration-comparison-result">
+                                <small className="configuration-comparison-label">生成配置</small>
+                                <span>{sharedRegion && !isGlobalService(item) ? "" : `${displayRegion(item)} · `}{displayPlan(item)} · {displayQuantity(item)}</span>
+                                <small>{configurationText(item.requirements, item.service, item.official_specifications)}</small>
+                                {item.pricing_status !== "ready" && <small className={pricingNoticeClass(item)}>
+                                  {item.pricing_notice ?? "此配置尚未完成官方核验。"}
+                                </small>}
+                              </div>
+                            </div>
                           </td>
                           <td className="review-action-cell">
                             {isRefreshing ? <span className="row-refresh-state"><i />更新中</span> : isQueuedComponent ? <span className="row-refresh-state queued"><i />等待提交</span> : <div className="review-action-buttons">
@@ -1448,8 +1770,8 @@ export default function CustomerConfirmationPage() {
                                         min="1"
                                         max="10000"
                                         value={draft.quantity}
-                                        onChange={(event) => updateComponentField(
-                                          item, "quantity", "quantity", Math.max(1, Number(event.target.value) || 1),
+                                        onChange={(event) => updateTransientNumericField(
+                                          item, "quantity", "quantity", event.target.value,
                                         )}
                                       />
                                     </label>
@@ -1470,7 +1792,13 @@ export default function CustomerConfirmationPage() {
                                       const isNumeric = NUMERIC_CONFIGURATION_FIELDS.has(field);
                                       const isCpu = field === "vcpu" || field.endsWith("_vcpu");
                                       const isMemory = field === "memory_gib" || field.endsWith("_memory_gib");
-                                      let selectOptions = configuredFieldOptions(item, field);
+                                      let selectOptions = [
+                                        ...configuredFieldOptions(item, field),
+                                        ...(liveFieldOptions[`${item.component_id}:${field}`] ?? []),
+                                      ].filter((option, optionIndex, allOptions) => allOptions.findIndex(
+                                        (candidate) => String(candidate).toLowerCase()
+                                          === String(option).toLowerCase(),
+                                      ) === optionIndex);
                                       const currentOperatingSystem = String(
                                         draft.requirements.operating_system ?? "",
                                       ).toLowerCase();
@@ -1624,13 +1952,12 @@ export default function CustomerConfirmationPage() {
                                             step="any"
                                             value={value === "" ? "" : Number(value) / (selectedUnit === "tib" ? 1024 : 1)}
                                             placeholder="请输入用量"
-                                            onChange={(event) => updateComponentField(
+                                            onChange={(event) => updateTransientNumericField(
                                               item,
                                               "requirements",
                                               field,
-                                              event.target.value === ""
-                                                ? null
-                                                : Number(event.target.value) * (selectedUnit === "tib" ? 1024 : 1),
+                                              event.target.value,
+                                              selectedUnit === "tib" ? 1024 : 1,
                                             )}
                                           />
                                           <select
@@ -1650,14 +1977,19 @@ export default function CustomerConfirmationPage() {
                                           step={isNumeric ? "any" : undefined}
                                           value={String(value)}
                                           placeholder={isNumeric ? "请输入数字" : `请输入${billingFieldLabel}`}
-                                          onChange={(event) => updateComponentField(
-                                            item,
-                                            "requirements",
-                                            field,
-                                            isNumeric
-                                              ? (event.target.value === "" ? null : Number(event.target.value))
-                                              : event.target.value,
-                                          )}
+                                          onChange={(event) => isNumeric
+                                            ? updateTransientNumericField(
+                                                item,
+                                                "requirements",
+                                                field,
+                                                event.target.value,
+                                              )
+                                            : updateComponentField(
+                                                item,
+                                                "requirements",
+                                                field,
+                                                event.target.value,
+                                              )}
                                         />}
                                         </label>
                                         {isAdditionalField && <button
@@ -1721,10 +2053,15 @@ export default function CustomerConfirmationPage() {
                                     <button
                                       type="button"
                                       className={isRefreshing ? "is-refreshing" : ""}
-                                      disabled={!structuredUpdate || isSubmittingComponent || isQueuedComponent || isRefreshing}
+                                      disabled={isSubmittingComponent || isQueuedComponent || isRefreshing}
                                       onClick={() => void submitConfigurationFeedback(item.component_id)}
                                     >{isRefreshing ? "更新中…" : isSubmittingComponent ? "提交中…" : isQueuedComponent ? "等待提交" : failedComponentIds.includes(item.component_id) ? "重新尝试" : "保存本项"}</button>
                                   </div>
+                                  {componentEditorNotices[item.component_id] && (
+                                    <p className="customer-component-editor-notice" role="status">
+                                      {componentEditorNotices[item.component_id]}
+                                    </p>
+                                  )}
                                   {pendingEditorSwitch?.fromId === item.component_id && (
                                     <div className="customer-editor-switch-confirmation" role="alert">
                                       <span>{pendingEditorSwitch.toId
@@ -1786,18 +2123,28 @@ export default function CustomerConfirmationPage() {
             )}
             {error && <p className="customer-submit-error">{error}</p>}
           </>
-        ) : session ? (
-          <>
-            <div className="customer-confirm-title"><h1>请选择配置</h1><p>请完成下面每个组件的选择。</p></div>
+        ) : hasStandaloneConfirmationQuestions && session ? (
+          <div className="customer-question-page">
+            <div className="customer-confirm-title customer-question-heading">
+              <small>{addingConfigurationInProgress ? "新增配置 · 补充信息" : "配置校验 · 需要确认"}</small>
+              <h1>{addingConfigurationInProgress ? "请补充新增配置信息" : "请一次确认全部问题"}</h1>
+              <p>所有待确认项都集中在本页，填写完成后统一提交。</p>
+            </div>
             {isSessionReviewing && <div className="configuration-refresh-status customer-inline-review" role="status">
               <i />
               <span>正在处理您刚才提交的选择</span>
               <small>当前内容保留在本页，不需要重新填写</small>
             </div>}
-            {renderConfirmationItems()}
-            {error && <p className="customer-submit-error">{error}</p>}
-            <button className="customer-submit" type="button" disabled={submitting || isSessionReviewing || session.confirmation_items.some((item) => !confirmationComplete(item, answers[item.question]))} onClick={() => void submit()}>{submitting || isSessionReviewing ? "正在处理…" : "全部填写完成，统一提交"}</button>
-          </>
+            <div className="customer-question-scroll">
+              {renderConfirmationItems()}
+            </div>
+            <div className="customer-question-footer">
+              {error && <p className="customer-submit-error">{error}</p>}
+              <button className="customer-submit" type="button" disabled={submitting || isSessionReviewing || session.confirmation_items.some((item) => !confirmationComplete(item, answers[confirmationAnswerKey(item)]))} onClick={() => void submit()}>{submitting || isSessionReviewing ? "正在处理…" : addingConfigurationInProgress ? "确认并继续添加" : "全部填写完成，统一提交"}</button>
+            </div>
+          </div>
+        ) : session ? (
+          <div className="customer-confirm-state">确认页面正在准备下一步…</div>
         ) : null}
       </section>
     </main>

@@ -1,3 +1,6 @@
+import pytest
+
+from app.core.errors import ManualConfirmationRequired
 from app.domain.models import ServiceRequirement
 from app.integrations.aws import PricingCatalog
 from app.services.plugins.generic_official import GenericOfficialPlugin
@@ -73,7 +76,7 @@ class FakeCatalog:
         ]
 
 
-def test_generic_plugin_discovers_service_and_uses_one_minimum_official_unit() -> None:
+def test_generic_plugin_without_usage_exposes_reference_rate_only() -> None:
     plugin = GenericOfficialPlugin(None, FakeCatalog())  # type: ignore[arg-type]
     requirement = ServiceRequirement(
         service="lambda",
@@ -85,9 +88,32 @@ def test_generic_plugin_discovers_service_and_uses_one_minimum_official_unit() -
     selected = plugin.select(requirement, "ap-southeast-1")
 
     assert preview.requires_confirmation is False
+    assert selected.usage_lines == []
+    assert selected.reference_rates[0].service_code == "AWSLambda"
+    assert selected.reference_rates[0].unit_price == 0.0000002
+
+
+def test_codedeploy_to_ec2_is_a_valid_zero_cost_official_result() -> None:
+    class CatalogMustNotBeCalled:
+        @staticmethod
+        def service_codes() -> list[str]:
+            raise AssertionError("CodeDeploy EC2 pricing must not query catalog")
+
+    plugin = GenericOfficialPlugin(None, CatalogMustNotBeCalled())  # type: ignore[arg-type]
+    selected = plugin.select(
+        ServiceRequirement(
+            service="codedeploy",
+            calculator_service_name="AWS CodeDeploy",
+            region="ap-southeast-1",
+            source_text="使用 CodeDeploy 持续部署到 EC2",
+        ),
+        "ap-southeast-1",
+    )
+
+    assert selected.model == "EC2 部署（无额外服务费）"
+    assert selected.usage_lines == []
     assert selected.reference_rates == []
-    assert selected.usage_lines[0].service_code == "AWSLambda"
-    assert selected.usage_lines[0].amount == 1
+    assert "不收取额外服务费" in selected.rationale
 
 
 def test_generic_plugin_resolves_official_code_by_unique_stem() -> None:
@@ -376,10 +402,10 @@ def test_managed_grafana_without_user_count_returns_official_reference_rate() ->
         "ap-southeast-1",
     )
 
-    assert selected.reference_rates == []
-    assert selected.usage_lines[0].service_code == "AmazonGrafana"
-    assert selected.usage_lines[0].amount == 1
-    assert selected.usage_lines[0].usage_type.endswith("ViewerUser")
+    assert selected.usage_lines == []
+    assert selected.reference_rates[0].service_code == "AmazonGrafana"
+    assert selected.reference_rates[0].unit_price == 5
+    assert selected.reference_rates[0].usage_type.endswith("ViewerUser")
 
 
 def test_redshift_capacity_uses_ra3_compute_and_managed_storage() -> None:
@@ -425,6 +451,209 @@ def test_vpc_returns_zero_cost_base_network_without_catalog_lookup() -> None:
     assert selected.model == "VPC + Subnets"
     assert selected.usage_lines == []
     assert "不收取基础费用" in (selected.substitution_notice or "")
+
+
+def test_memorydb_keeps_redis_engine_and_uses_its_own_reserved_term() -> None:
+    redis = priced_product(
+        "AmazonMemoryDB",
+        "APE1-NodeUsage:db.r6g.xlarge",
+        "Hrs",
+        0.812,
+        operation="CreateCluster",
+    )
+    redis["product"]["attributes"].update(
+        {
+            "instanceType": "db.r6g.xlarge",
+            "engine": "Redis",
+            "vcpu": "4",
+            "memory": "26.32 GiB",
+            "regionCode": "ap-east-1",
+        }
+    )
+    redis["terms"]["Reserved"] = {
+        "one-year-all-upfront": {
+            "termAttributes": {
+                "LeaseContractLength": "1yr",
+                "PurchaseOption": "All Upfront",
+            },
+            "priceDimensions": {
+                "upfront": {
+                    "unit": "Quantity",
+                    "pricePerUnit": {"USD": "4552.397"},
+                }
+            },
+        }
+    }
+    valkey = priced_product(
+        "AmazonMemoryDB",
+        "APE1-NodeUsage:db.r6g.xlarge:Valkey",
+        "Hrs",
+        0.5684,
+        operation="CreateCluster",
+    )
+    valkey["product"]["attributes"].update(
+        {
+            "instanceType": "db.r6g.xlarge",
+            "engine": "Valkey",
+            "vcpu": "4",
+            "memory": "26.32 GiB",
+            "regionCode": "ap-east-1",
+        }
+    )
+
+    class MemoryDbCatalog:
+        @staticmethod
+        def service_codes() -> list[str]:
+            return ["AmazonMemoryDB"]
+
+        @staticmethod
+        def products(
+            service_code: str,
+            filters: dict[str, str],
+            *,
+            max_pages: int = 20,
+        ) -> list[dict]:
+            assert service_code == "AmazonMemoryDB"
+            return [redis, valkey]
+
+    plugin = GenericOfficialPlugin(None, MemoryDbCatalog())  # type: ignore[arg-type]
+    base = {
+        "service": "memorydb",
+        "calculator_service_name": "Amazon MemoryDB",
+        "region": "ap-east-1",
+        "quantity": 1,
+        "hours_per_month": 730,
+    }
+
+    on_demand = plugin.select(
+        ServiceRequirement(
+            **base,
+            requirements={
+                "requested_model": "db.r6g.xlarge",
+                "engine": "Redis",
+                "purchase_option": "on_demand",
+            },
+        ),
+        "ap-east-1",
+    )
+    reserved = plugin.select(
+        ServiceRequirement(
+            **base,
+            requirements={
+                "requested_model": "db.r6g.xlarge",
+                "engine": "Redis",
+                "purchase_option": "reserved",
+                "reserved_term_years": 1,
+                "payment_option": "all_upfront",
+            },
+        ),
+        "ap-east-1",
+    )
+
+    assert on_demand.usage_lines[0].usage_type == "APE1-NodeUsage:db.r6g.xlarge"
+    assert on_demand.usage_lines[0].amount == 730
+    assert reserved.usage_lines == []
+    assert reserved.monthly_commitment_cost == 4552.397 / 12
+    assert reserved.upfront_commitment_cost == 4552.397
+
+
+def test_memorydb_unavailable_model_uses_cheapest_same_capacity_official_node() -> None:
+    replacement = priced_product(
+        "AmazonMemoryDB",
+        "APE1-NodeUsage:db.r6g.xlarge",
+        "Hrs",
+        0.812,
+        operation="CreateCluster",
+    )
+    replacement["product"]["attributes"].update(
+        {
+            "instanceType": "db.r6g.xlarge",
+            "engine": "Redis",
+            "vcpu": "4",
+            "memory": "26.32 GiB",
+            "regionCode": "ap-east-1",
+        }
+    )
+    snapshot = priced_product(
+        "AmazonMemoryDB",
+        "APE1-SnapshotUsage",
+        "GB-Mo",
+        0.023,
+    )
+
+    class ReplacementCatalog:
+        @staticmethod
+        def service_codes() -> list[str]:
+            return ["AmazonMemoryDB"]
+
+        @staticmethod
+        def products(
+            service_code: str,
+            filters: dict[str, str],
+            *,
+            max_pages: int = 20,
+            refresh: bool = False,
+        ) -> list[dict]:
+            return [replacement, snapshot]
+
+    selected = GenericOfficialPlugin(
+        None, ReplacementCatalog()  # type: ignore[arg-type]
+    ).select(
+        ServiceRequirement(
+            service="memorydb",
+            calculator_service_name="Amazon MemoryDB",
+            region="ap-east-1",
+            hours_per_month=730,
+            requirements={
+                "requested_model": "db.r7g.xlarge",
+                "engine": "Redis",
+                "vcpu": 4,
+                "memory_gib": 26.32,
+            },
+        ),
+        "ap-east-1",
+    )
+
+    assert selected.model == "db.r6g.xlarge"
+    assert selected.usage_lines[0].usage_type == "APE1-NodeUsage:db.r6g.xlarge"
+    assert selected.usage_lines[0].amount == 730
+    assert "同配置" in (selected.substitution_notice or "")
+    assert "db.r7g.xlarge" in (selected.substitution_notice or "")
+
+
+def test_regional_service_without_catalog_is_not_mislabeled_as_timeout() -> None:
+    class EmptyPinpointCatalog:
+        @staticmethod
+        def service_codes() -> list[str]:
+            return ["AmazonPinpoint"]
+
+        @staticmethod
+        def products(
+            service_code: str,
+            filters: dict[str, str],
+            *,
+            max_pages: int = 20,
+            refresh: bool = False,
+        ) -> list[dict]:
+            return []
+
+    plugin = GenericOfficialPlugin(
+        None, EmptyPinpointCatalog()  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ManualConfirmationRequired) as captured:
+        plugin.select(
+            ServiceRequirement(
+                service="pinpoint",
+                calculator_service_name="Amazon Pinpoint",
+                region="ap-east-1",
+                requirements={"outbound_messages": 1_000_000},
+            ),
+            "ap-east-1",
+        )
+
+    assert captured.value.code == "service_region_not_supported"
+    assert captured.value.details["region"] == "ap-east-1"
 
 
 def test_quicksight_merges_global_subscription_with_regional_catalog() -> None:

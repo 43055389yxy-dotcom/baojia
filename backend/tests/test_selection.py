@@ -73,9 +73,7 @@ def test_ec2_exact_model_query_falls_back_to_reviewed_shape_catalog(
     monkeypatch.setattr(ec2_module, "ReadOnlyAwsQueryExecutor", ShapeFallbackExecutor)
     plugin = Ec2Plugin(None, None)  # type: ignore[arg-type]
 
-    candidates = plugin._official_candidates(
-        "ap-southeast-99", "m5zn.6xlarge", 24, 96
-    )
+    candidates = plugin._official_candidates("ap-southeast-99", "m5zn.6xlarge", 24, 96)
 
     assert candidates[0]["model"] == "m5zn.6xlarge"
     assert candidates[0]["vcpu"] == 24
@@ -94,37 +92,88 @@ def test_generic_rds_ssd_defaults_to_official_gp3_value() -> None:
     assert _resolve_volume_type("通用型 SSD", values) == "General Purpose-GP3"
 
 
+def test_rds_bare_community_patch_does_not_become_literal_rds_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Executor:
+        def __init__(self, _clients: object) -> None:
+            pass
+
+        def execute(self, **arguments: object) -> dict[str, object]:
+            captured.update(arguments)
+            return {"OrderableDBInstanceOptions": [{"DBInstanceClass": "db.m6g.large"}]}
+
+    monkeypatch.setattr(rds_module, "ReadOnlyAwsQueryExecutor", Executor)
+    plugin = RdsPlugin(None, None)  # type: ignore[arg-type]
+
+    classes = plugin._orderable_classes("ap-southeast-1", "mysql", "5.7.44")
+
+    assert classes == {"db.m6g.large"}
+    assert "EngineVersion" not in captured["parameters"]
+
+
+def test_rds_unavailable_legacy_model_falls_back_to_orderable_engine_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    class Executor:
+        def __init__(self, _clients: object) -> None:
+            pass
+
+        def execute(self, **arguments: object) -> dict[str, object]:
+            parameters = dict(arguments.get("parameters") or {})
+            captured.append(parameters)
+            if parameters.get("DBInstanceClass") == "db.m4.xlarge":
+                return {"OrderableDBInstanceOptions": []}
+            return {
+                "OrderableDBInstanceOptions": [
+                    {"DBInstanceClass": "db.m6g.xlarge"},
+                    {"DBInstanceClass": "db.m7g.xlarge"},
+                ]
+            }
+
+    monkeypatch.setattr(rds_module, "ReadOnlyAwsQueryExecutor", Executor)
+    plugin = RdsPlugin(None, None)  # type: ignore[arg-type]
+
+    classes = plugin._orderable_classes(
+        "us-east-1",
+        "mysql",
+        "8.4.11",
+        requested_model="db.m4.xlarge",
+    )
+
+    assert classes == {"db.m6g.xlarge", "db.m7g.xlarge"}
+    assert captured == [
+        {"Engine": "mysql", "DBInstanceClass": "db.m4.xlarge"},
+        {"Engine": "mysql"},
+    ]
+
+
 def test_aurora_cluster_uses_member_instance_pricing_dimension() -> None:
-    assert _billing_deployment(
-        "aurora_mysql", {"deployment": "multi_az", "aurora_cluster": True}
-    ) == "single_az"
+    assert (
+        _billing_deployment("aurora_mysql", {"deployment": "multi_az", "aurora_cluster": True})
+        == "single_az"
+    )
     assert _billing_deployment("mysql", {"deployment": "multi_az"}) == "multi_az"
     requirement = ServiceRequirement(
         service="rds",
         quantity=2,
         requirements={"engine": "aurora_mysql", "cluster_members": 3},
     )
-    assert _priced_instance_count(
-        requirement, "aurora_mysql", requirement.requirements
-    ) == 6
+    assert _priced_instance_count(requirement, "aurora_mysql", requirement.requirements) == 6
     assert _display_name("aurora_mysql") == "Amazon Aurora MySQL"
 
 
 def test_aurora_defaults_to_standard_instance_usage_product() -> None:
-    standard = {
-        "product": {"attributes": {"usagetype": "APS1-InstanceUsage:db.r7g.large"}}
-    }
+    standard = {"product": {"attributes": {"usagetype": "APS1-InstanceUsage:db.r7g.large"}}}
     io_optimized = {
-        "product": {
-            "attributes": {
-                "usagetype": "APS1-InstanceUsageIOOptimized:db.r7g.large"
-            }
-        }
+        "product": {"attributes": {"usagetype": "APS1-InstanceUsageIOOptimized:db.r7g.large"}}
     }
 
-    assert _preferred_rds_products(
-        [io_optimized, standard], "aurora_mysql"
-    ) == [standard]
+    assert _preferred_rds_products([io_optimized, standard], "aurora_mysql") == [standard]
     assert _preferred_rds_products([io_optimized, standard], "mysql") == [
         io_optimized,
         standard,
@@ -444,9 +493,7 @@ def test_windows_on_arm_instance_is_customer_conflict_before_pricing(
         },
     )
 
-    notice = plugin.specified_model_compatibility_notice(
-        requirement, "ap-southeast-1"
-    )
+    notice = plugin.specified_model_compatibility_notice(requirement, "ap-southeast-1")
 
     assert notice is not None
     assert "ARM" in notice
@@ -467,9 +514,7 @@ def test_windows_and_arm_edit_is_rejected_even_without_a_cached_model() -> None:
         },
     )
 
-    notice = plugin.specified_model_compatibility_notice(
-        requirement, "ap-southeast-1"
-    )
+    notice = plugin.specified_model_compatibility_notice(requirement, "ap-southeast-1")
 
     assert notice is not None
     assert "Windows Server" in notice
@@ -571,11 +616,7 @@ def test_ec2_replacement_picker_keeps_smaller_official_shapes(
             },
             "terms": {
                 "OnDemand": {
-                    "term": {
-                        "priceDimensions": {
-                            "rate": {"pricePerUnit": {"USD": "0.1"}}
-                        }
-                    }
+                    "term": {"priceDimensions": {"rate": {"pricePerUnit": {"USD": "0.1"}}}}
                 }
             },
         },
@@ -636,11 +677,7 @@ def test_ec2_exact_shape_with_multiple_models_does_not_ask_customer_again(
             },
             "terms": {
                 "OnDemand": {
-                    "term": {
-                        "priceDimensions": {
-                            "rate": {"pricePerUnit": {"USD": "0.1"}}
-                        }
-                    }
+                    "term": {"priceDimensions": {"rate": {"pricePerUnit": {"USD": "0.1"}}}}
                 }
             },
         },
@@ -698,11 +735,7 @@ def test_self_hosted_workload_requires_customer_to_choose_configuration(
             },
             "terms": {
                 "OnDemand": {
-                    "term": {
-                        "priceDimensions": {
-                            "rate": {"pricePerUnit": {"USD": "0.1"}}
-                        }
-                    }
+                    "term": {"priceDimensions": {"rate": {"pricePerUnit": {"USD": "0.1"}}}}
                 }
             },
         },
@@ -759,9 +792,7 @@ def test_redis_confirmed_official_model_does_not_ask_again(
     monkeypatch.setattr(
         plugin,
         "nearby_candidates",
-        lambda *_args, **_kwargs: [
-            {"model": "cache.r4.large", "memory_gib": 12.3, "vcpu": 2.0}
-        ],
+        lambda *_args, **_kwargs: [{"model": "cache.r4.large", "memory_gib": 12.3, "vcpu": 2.0}],
     )
     requirement = ServiceRequirement(
         service="elasticache",
@@ -787,9 +818,7 @@ def test_redis_exact_model_is_authoritative_over_descriptive_memory(
         requirement: ServiceRequirement, *_args: object, **_kwargs: object
     ) -> list[dict[str, object]]:
         if requirement.requirements.get("requested_model"):
-            return [
-                {"model": "cache.t4g.medium", "memory_gib": 3.09, "vcpu": 2.0}
-            ]
+            return [{"model": "cache.t4g.medium", "memory_gib": 3.09, "vcpu": 2.0}]
         return [
             {"model": "cache.t4g.medium", "memory_gib": 3.09, "vcpu": 2.0},
             {"model": "cache.m7g.large", "memory_gib": 6.38, "vcpu": 2.0},
@@ -856,7 +885,7 @@ def test_invalid_redis_family_size_uses_meaningful_lower_and_upper_neighbors() -
     ]
 
 
-def test_invalid_explicit_redis_model_question_names_original_model(
+def test_invalid_explicit_redis_model_is_auto_replaced_without_customer_question(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plugin = RedisPlugin(None, None)  # type: ignore[arg-type]
@@ -875,9 +904,9 @@ def test_invalid_explicit_redis_model_question_names_original_model(
 
     preview = plugin.preview(requirement, "ap-southeast-1")
 
-    assert preview.requires_confirmation is True
-    assert "cache.r7g.medium" in (preview.confirmation_reason or "")
-    assert "当前区域支持的配置" in (preview.confirmation_reason or "")
+    assert preview.requires_confirmation is False
+    assert preview.selected_model == "cache.t4g.medium"
+    assert preview.confirmation_reason is None
     assert len(preview.candidates) == 2
 
 
@@ -912,6 +941,7 @@ def test_redis_preview_without_model_or_capacity_requires_catalog_choice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plugin = RedisPlugin(None, None)  # type: ignore[arg-type]
+
     def lowest_candidates(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
         return [
             {"model": "cache.t4g.micro", "memory_gib": 0.5, "vcpu": 2, "region": "ap-southeast-3"},

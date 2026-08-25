@@ -46,12 +46,17 @@ SERVICE_TEMPLATE_FIELDS: dict[str, tuple[str, ...]] = {
         "backup_retention_days", "purchase_option", "reserved_term_years",
         "payment_option", "utilization_percent",
     ),
+    "memorydb": (
+        "requested_model", "engine", "engine_version", "memory_gib",
+        "node_count", "shards", "replicas_per_shard", "snapshot_retention_days",
+        "data_transfer_in_gib", "data_transfer_out_gib",
+    ),
     "elb": (
         "load_balancer_type", "scheme", "processed_bytes_gib",
         "processed_bytes_ec2_ip_gib_per_hour", "new_connections_per_second",
         "average_connection_duration_seconds", "active_connections_per_minute",
         "requests_per_second", "rule_evaluations_per_request",
-        "rule_evaluations_per_second", "lcu_count", "listeners",
+        "rule_evaluations_per_second", "lcu_count", "listeners", "requests",
     ),
     "s3": (
         "storage_gib", "storage_class", "put_copy_post_list_requests",
@@ -62,6 +67,7 @@ SERVICE_TEMPLATE_FIELDS: dict[str, tuple[str, ...]] = {
     "waf": ("web_acls", "rules", "requests", "protected_resource"),
     "sqs": ("requests", "queue_type", "payload_size_kib"),
     "ses": ("outbound_messages", "inbound_messages", "attachments_gib"),
+    "pinpoint": ("outbound_messages",),
     "cloudwatch": (
         "log_ingestion_gib", "log_storage_gib", "custom_metrics", "alarms",
         "include_logs", "include_metrics",

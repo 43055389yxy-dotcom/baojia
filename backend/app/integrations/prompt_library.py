@@ -22,7 +22,7 @@ CORE_PROMPT = """你是 AWS 官方成本报价的需求整理员。
    单纯缺少 CPU、内存、型号或可选参数，不应直接询问客户。例外：RDS 数据库未说明 Single-AZ
    还是主备高可用（Multi-AZ）时必须询问，因为该选择会显著影响架构和价格。
 4. 常用 service 必须使用下面的稳定标识（不得输出 AWS SDK/API 别名）：
-   ec2, eks, ecr, rds, elasticache, elb, s3, cloudfront, route53, waf, cloudwatch, backup,
+   ec2, eks, ecr, rds, elasticache, memorydb, elb, s3, cloudfront, route53, vpc, waf, cloudwatch, backup,
    sqs, ses, ebs, data_transfer, global_accelerator, msk, mq, apigateway, scheduler,
    opensearch, documentdb, nat_gateway, secrets_manager, lambda, ecs, fargate, dynamodb, efs, fsx, sns,
    kinesis, emr, redshift, athena, glue, step_functions, bedrock, cloud_map, appconfig, eventbridge。
@@ -259,6 +259,14 @@ memory_gib=8、shards=1、replicas_per_shard=2；没有出现“分片”二字�
 客户未说版本、快照、监控、数据传输监控时省略并默认关闭，不得为这些项目提问。
 整套容量与每节点容量互相矛盾、或同可用区同时要求单区故障切换时才写 ambiguities。
 """,
+    "memorydb": """【Amazon MemoryDB】
+字段：requested_model, engine, engine_version, memory_gib, node_count, shards,
+replicas_per_shard, snapshot_retention_days, data_transfer_in_gib, data_transfer_out_gib。
+客户明确写 Amazon MemoryDB/MemoryDB 时必须保持 service=memorydb，绝不能改成 ElastiCache。
+Redis 只表示兼容引擎，不改变产品身份。db.r7g.xlarge 等型号必须原样写 requested_model；型号家族名
+中的 r7g 绝不是 7GB 内存。只有紧随 GB/GiB 的独立容量数字才可写 memory_gib，例如 26.32 GiB
+必须完整保留为 26.32，禁止截断、取整或从型号反推。
+""",
     "elb": """【Elastic Load Balancing 产品族】
 字段：load_balancer_type, processed_bytes_gib, processed_bytes_ec2_ip_gib_per_hour,
 new_connections_per_second, average_connection_duration_seconds, active_connections_per_minute,
@@ -301,6 +309,10 @@ WAF 明确保护 CloudFront 时 region 写 global；global 是全局范围，不
     "ses": """【Amazon SES】
 字段：outbound_messages。邮件验证码或通知默认普通出站邮件；没给邮件量时保留服务，
 后端只展示出站邮件的官方单位价，不虚构邮件量、也不计入月费，请勿提问。
+""",
+    "pinpoint": """【Amazon Pinpoint】
+字段：outbound_messages。必须保留 Amazon Pinpoint 产品身份，不得因邮件用途改写为 Amazon SES。
+客户给出每月邮件封数时写入 outbound_messages；没给用量时只展示官方单位价，不虚构月用量。
 """,
     "cloudwatch": """【Amazon CloudWatch】
 字段：log_ingestion_gib, custom_metrics, include_logs, include_metrics。
@@ -396,6 +408,8 @@ io_requests, engine_version。
     "vpc": """【Amazon VPC】
 字段：vpc_count, public_subnets, private_subnets。VPC 与子网本身没有基础小时费，明确需要时必须保留服务，
 不得因零基础费用删除，也不得向客户提问。NAT Gateway、公网 IPv4、流量等只有客户明确列出时才单独计费。
+Public-VPC、Private-VPC、公有/私有 VPC 都属于 Amazon VPC 网络，绝不是软件，也不得转换成 EC2 自建；
+两项分别列出时必须保持为两个独立 VPC 组件，不能合并或相互复制字段。
 “WAF 挂载 ALB”等关联说明不得复制生成第二个 ALB。
 """,
     "dms": """【AWS DMS】
@@ -586,6 +600,7 @@ PROMPT_META: dict[str, dict[str, str | int]] = {
     "ecr": {"title": "Amazon ECR", "category": "容器", "order": 19},
     "rds": {"title": "Amazon RDS", "category": "数据库", "order": 11},
     "elasticache": {"title": "Amazon ElastiCache", "category": "常用组件", "order": 12},
+    "memorydb": {"title": "Amazon MemoryDB", "category": "数据库", "order": 12},
     "s3": {"title": "Amazon S3", "category": "常用组件", "order": 13},
     "elb": {"title": "Elastic Load Balancing", "category": "常用组件", "order": 14},
     "cloudfront": {"title": "Amazon CloudFront", "category": "常用组件", "order": 15},
@@ -600,6 +615,7 @@ PROMPT_META: dict[str, dict[str, str | int]] = {
     "global_accelerator": {"title": "AWS Global Accelerator", "category": "网络与安全", "order": 32},
     "sqs": {"title": "Amazon SQS", "category": "应用集成", "order": 40},
     "ses": {"title": "Amazon SES", "category": "应用集成", "order": 41},
+    "pinpoint": {"title": "Amazon Pinpoint", "category": "应用集成", "order": 42},
     "msk": {"title": "Amazon MSK", "category": "数据与分析", "order": 50},
     "apigateway": {"title": "Amazon API Gateway", "category": "应用集成", "order": 42},
     "scheduler": {"title": "Amazon EventBridge Scheduler", "category": "应用集成", "order": 43},
@@ -770,6 +786,7 @@ SERVICE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "eks": ("amazon eks", "eks 集群", "kubernetes 集群"),
     "ecr": ("amazon ecr", "ecr 私有仓库", "容器镜像仓库"),
     "rds": ("rds", "aurora", "mysql", "postgresql", "postgres", "mariadb", "sql server", "数据库"),
+    "memorydb": ("amazon memorydb", "memorydb"),
     "elasticache": ("elasticache", "redis", "valkey", "缓存"),
     "elb": ("alb", "nlb", "elb", "load balancer", "负载均衡"),
     "s3": ("amazon s3", "s3", "对象存储"),
@@ -779,6 +796,7 @@ SERVICE_KEYWORDS: dict[str, tuple[str, ...]] = {
     # “消息队列”本身不能证明是 SQS；Kafka、Amazon MQ 等也属于消息队列。
     "sqs": ("amazon sqs", "sqs", "异步队列"),
     "ses": ("amazon ses", "ses", "邮件验证码", "邮件通知"),
+    "pinpoint": ("amazon pinpoint", "pinpoint"),
     "cloudwatch": ("cloudwatch", "日志和监控", "日志监控"),
     "amp": (
         "amazon managed service for prometheus",
@@ -813,7 +831,7 @@ SERVICE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "documentdb": ("amazon documentdb", "documentdb", "mongodb", "mongo db"),
     "nat_gateway": ("nat gateway", "nat 网关", "公网出口"),
     "secrets_manager": ("secrets manager", "secret 管理"),
-    "vpc": ("aws vpc", "amazon vpc", "vpc +", "vpc：", "vpc｜"),
+    "vpc": ("aws vpc", "amazon vpc", "public-vpc", "private-vpc", "public vpc", "private vpc", "vpc +", "vpc：", "vpc｜"),
     "dms": ("aws dms", "amazon dms", "database migration service"),
     "kms": ("aws kms", "amazon kms", "key management service", "/ kms", "+ kms"),
     "xray": ("aws x-ray", "amazon x-ray", "x-ray", "xray"),
@@ -880,6 +898,7 @@ COMPONENT_CRITICAL_RULES: dict[str, str] = {
     "ec2": "型号写 requested_model；CPU、内存、系统盘、数据盘、操作系统分别填写，不能互相替代。CentOS/Ubuntu/Amazon Linux 归一为 linux。",
     "rds": "db.* 写 requested_model；引擎、Multi-AZ、存储和数量分别保留。不能根据型号反推客户未写的 CPU 或内存。",
     "elasticache": "cache.* 写 requested_model；8GB×3节点表示 memory_gib=8、node_count=3，不等于3个分片；一主一从表示 shards=1、replicas_per_shard=1。",
+    "memorydb": "db.* 型号写 requested_model；MemoryDB 产品身份不得改成 ElastiCache；型号中的 r7g 不是内存，明确的 GiB 容量必须完整保留。",
     "msk": "kafka.* 写 requested_model；Broker 数写 broker_count；每节点磁盘写 storage_gib_per_broker；服务 quantity 表示集群套数。",
     "mq": "RabbitMQ/ActiveMQ 写 engine_type；节点或 Broker 数写 broker_count；每节点 CPU、内存、磁盘分别写 vcpu、memory_gib、storage_gib_per_broker；服务 quantity 表示 Amazon MQ 部署套数，不能把 Broker 数写成部署数量或 EC2 数量。",
     "apigateway": "只保留 API 类型、请求量、请求大小和出站流量；向外部系统提供 API 是入站网关，调用外部 API 是出站调用，二者不能混淆。",

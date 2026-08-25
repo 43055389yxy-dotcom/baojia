@@ -7,23 +7,33 @@ import sqlite3
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from app.domain.customer_configuration import preserve_customer_configuration
-from app.integrations.service_templates import billing_dimension_fields
+from app.domain.component_hierarchy import component_hierarchy
+from app.domain.component_integrity import ensure_component_keys
 from app.domain.models import (
+    ConfigurationReviewItem,
     ConfirmationItem,
     ConfirmationSessionResponse,
-    ConfigurationReviewItem,
     ParsedIntent,
     QuoteRequest,
 )
-
+from app.domain.pricing_issues import (
+    PricingIssueCategory,
+    classify_persisted_pricing_issue,
+    legacy_pricing_issue_message,
+)
+from app.integrations.service_templates import billing_dimension_fields
 
 CONFIGURATION_FEEDBACK_QUESTION = "【客户对最终配置表的修改意见】"
 CONFIGURATION_COMPONENT_FEEDBACK_PREFIX = "【组件修改】"
 CONFIGURATION_COMPONENT_UPDATE_PREFIX = "【组件字段修改】"
 CONFIGURATION_COMPONENT_DELETE = "__DELETE_COMPONENT__"
+# A large, fully independent component set can legitimately need 2-5 minutes.
+# The job runner restores the table immediately on a known failure, so this is
+# only a crash-recovery ceiling and must never interrupt a healthy quote.
+CONFIGURATION_REPROCESSING_STALE_SECONDS = 8 * 60
 
 
 class ConfirmationSessionStore:
@@ -68,6 +78,52 @@ class ConfirmationSessionStore:
                 ).strip("_-")
                 service["product_identity"] = normalized or None
         return ParsedIntent.model_validate(payload)
+
+    @staticmethod
+    def _pricing_issue_category(item: object) -> PricingIssueCategory | None:
+        requirements = getattr(item, "requirements", {})
+        reason = str(requirements.get("_quote_skip_reason") or "")
+        if not reason:
+            return None
+        stored = str(requirements.get("_quote_skip_category") or "")
+        if stored in {
+            "retryable",
+            "compatibility",
+            "catalog_mapping",
+            "system_configuration",
+            "unsupported",
+        }:
+            return cast(PricingIssueCategory, stored)
+        return classify_persisted_pricing_issue(
+            reason=reason,
+            code=str(requirements.get("_quote_skip_code") or ""),
+            service=str(getattr(item, "service", "")),
+            requirements=requirements,
+        )
+
+    @classmethod
+    def _pricing_notice(cls, item: object) -> str | None:
+        requirements = getattr(item, "requirements", {})
+        reason = str(requirements.get("_quote_skip_reason") or "")
+        if not reason:
+            return None
+        if requirements.get("_quote_skip_category") or requirements.get(
+            "_quote_skip_code"
+        ):
+            return reason
+        category = cls._pricing_issue_category(item)
+        if category is None:
+            return reason
+        return legacy_pricing_issue_message(
+            reason=reason,
+            category=category,
+            service=str(getattr(item, "service", "")),
+            display_name=str(
+                getattr(item, "calculator_service_name", None)
+                or getattr(item, "service", "AWS 服务")
+            ),
+            requirements=requirements,
+        )
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -124,6 +180,7 @@ class ConfirmationSessionStore:
         items: list[ConfirmationItem],
         quote_request: QuoteRequest | None = None,
     ) -> str:
+        ensure_component_keys(intent)
         now = datetime.now(UTC).isoformat()
         with self._lock, self._connect() as connection:
             existing = connection.execute(
@@ -194,7 +251,9 @@ class ConfirmationSessionStore:
         # bounded revision window, restore the same saved configuration table.
         if str(row["status"]) in {"reviewing", "submitted", "processing"} and row["submitted_at"]:
             submitted_at = datetime.fromisoformat(str(row["submitted_at"]))
-            if (datetime.now(UTC) - submitted_at).total_seconds() > 90:
+            if (
+                datetime.now(UTC) - submitted_at
+            ).total_seconds() > CONFIGURATION_REPROCESSING_STALE_SECONDS:
                 with self._lock, self._connect() as connection:
                     connection.execute(
                         """
@@ -210,11 +269,48 @@ class ConfirmationSessionStore:
                     return None
         intent = self._parse_persisted_intent(str(row["intent_json"]))
         if self.cloud_provider == "aws":
+            # Keep old customer links consistent with the live quote boundary:
+            # derived EKS Worker rows are rebuilt from the parent source before
+            # they are displayed or edited.
+            from app.integrations.deepseek import DeepSeekIntentParser
+
             preserve_customer_configuration(intent)
+            DeepSeekIntentParser._split_eks_worker_nodes(intent)
             self._normalize_review_group_quantities(intent)
+            normalized_intent_json = intent.model_dump_json()
+            if normalized_intent_json != str(row["intent_json"]):
+                # The customer must edit the exact list that will later be
+                # processed. Persist old-draft migration immediately; showing
+                # a repaired list while submitting indexes against stale JSON
+                # made Save appear unresponsive or modify the wrong row.
+                with self._lock, self._connect() as connection:
+                    connection.execute(
+                        "UPDATE confirmation_sessions SET intent_json = ? WHERE token = ?",
+                        (normalized_intent_json, str(row["token"])),
+                    )
+        hierarchy = component_hierarchy(intent.services)
+        session_status = str(row["status"])
+        stable_review_ids = session_status == "configuration_review"
+        review_parent_ids = {
+            str(index): item.component_key
+            for index, item in enumerate(intent.services)
+            if item.component_key
+        }
         configuration_items = [
             ConfigurationReviewItem(
-                component_id=str(index),
+                component_id=(
+                    item.component_key
+                    if stable_review_ids and item.component_key
+                    else str(index)
+                ),
+                component_number=hierarchy[index].component_number,
+                parent_component_id=(
+                    review_parent_ids.get(hierarchy[index].parent_component_id or "")
+                    if stable_review_ids
+                    else hierarchy[index].parent_component_id
+                ),
+                parent_component_number=hierarchy[index].parent_component_number,
+                parent_display_name=hierarchy[index].parent_display_name,
                 service=item.service,
                 display_name=item.calculator_service_name or item.service,
                 region=item.region,
@@ -298,16 +394,22 @@ class ConfirmationSessionStore:
                     else "ready"
                 ),
                 pricing_notice=(
-                    str(item.requirements.get("_quote_skip_reason"))
-                    if item.requirements.get("_quote_skip_reason")
+                    self._pricing_notice(item)
+                ),
+                pricing_issue_code=(
+                    str(item.requirements.get("_quote_skip_code"))
+                    if item.requirements.get("_quote_skip_code")
                     else None
+                ),
+                pricing_issue_category=(
+                    self._pricing_issue_category(item)
                 ),
                 requirements={
                     key: value
                     for key, value in item.requirements.items()
                     if not key.startswith("_") and key != "system_default_assumption"
                 },
-                source_text=item.source_text,
+                source_text=item.original_source_text or item.source_text,
             )
             for index, item in enumerate(intent.services)
         ]
@@ -338,22 +440,55 @@ class ConfirmationSessionStore:
             ),
         )
 
+    def replace_pending_confirmation_items(
+        self,
+        token: str,
+        items: list[ConfirmationItem],
+    ) -> None:
+        """Persist hydrated choices for an older, still unanswered link."""
+
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE confirmation_sessions
+                SET items_json = ?
+                WHERE token = ? AND status = 'pending'
+                """,
+                (
+                    json.dumps(
+                        [item.model_dump(mode="json") for item in items],
+                        ensure_ascii=False,
+                    ),
+                    token,
+                ),
+            )
+
     def submit(self, token: str, answers: dict[str, str]) -> ConfirmationSessionResponse | None:
         row = self._row(token)
         if row is None:
             return None
-        questions = {
-            str(item.get("question"))
+        items = [
+            item
             for item in json.loads(str(row["items_json"]))
-        }
-        cleaned = {
-            question: answer.strip()
-            for question, answer in answers.items()
-            if question in questions and answer.strip()
-        }
-        if set(cleaned) != questions:
-            missing = questions - cleaned.keys()
-            raise ValueError(f"尚有 {len(missing)} 项未填写")
+            if isinstance(item, dict) and item.get("question")
+        ]
+        # New pages submit the opaque answer_key. Continue accepting the old
+        # question-text key for confirmation links created before this change.
+        cleaned: dict[str, str] = {}
+        missing = 0
+        for item in items:
+            question = str(item["question"])
+            answer_key = str(item.get("answer_key") or question)
+            raw_answer = answers.get(answer_key)
+            if raw_answer is None and answer_key == question:
+                raw_answer = answers.get(question)
+            answer = str(raw_answer or "").strip()
+            if not answer:
+                missing += 1
+                continue
+            cleaned[answer_key] = answer
+        if missing:
+            raise ValueError(f"尚有 {missing} 项未填写")
         submitted_at = datetime.now(UTC).isoformat()
         with self._lock, self._connect() as connection:
             connection.execute(
@@ -408,6 +543,7 @@ class ConfirmationSessionStore:
     ) -> str | None:
         """Reuse the same link for the final, price-free configuration review."""
 
+        ensure_component_keys(intent)
         now = datetime.now(UTC).isoformat()
         with self._lock, self._connect() as connection:
             row = connection.execute(
@@ -500,18 +636,45 @@ class ConfirmationSessionStore:
         if str(row["status"]) != "configuration_review":
             raise ValueError("当前确认单还没有进入最终配置确认阶段")
         intent = self._parse_persisted_intent(str(row["intent_json"]))
-        valid_component_ids = {str(index) for index in range(len(intent.services))}
-        cleaned_components = {
-            str(component_id): value.strip()
-            for component_id, value in (component_feedback or {}).items()
-            if value.strip()
+        if self.cloud_provider == "aws":
+            from app.integrations.deepseek import DeepSeekIntentParser
+
+            preserve_customer_configuration(intent)
+            DeepSeekIntentParser._split_eks_worker_nodes(intent)
+            with self._lock, self._connect() as connection:
+                connection.execute(
+                    "UPDATE confirmation_sessions SET intent_json = ? WHERE token = ?",
+                    (intent.model_dump_json(), token),
+                )
+        stable_to_index = {
+            item.component_key: str(index)
+            for index, item in enumerate(intent.services)
+            if item.component_key
         }
-        cleaned_updates = {
-            str(component_id): update
-            for component_id, update in (component_updates or {}).items()
-            if update
-        }
-        invalid_ids = (set(cleaned_components) | set(cleaned_updates)) - valid_component_ids
+
+        def resolved_component_id(component_id: object) -> str | None:
+            value = str(component_id)
+            if value in stable_to_index:
+                return stable_to_index[value]
+            if value.isdigit() and 0 <= int(value) < len(intent.services):
+                return value
+            return None
+
+        invalid_ids: set[str] = set()
+        cleaned_components: dict[str, str] = {}
+        for component_id, value in (component_feedback or {}).items():
+            resolved = resolved_component_id(component_id)
+            if resolved is None:
+                invalid_ids.add(str(component_id))
+            elif value.strip():
+                cleaned_components[resolved] = value.strip()
+        cleaned_updates: dict[str, dict[str, object]] = {}
+        for component_id, update in (component_updates or {}).items():
+            resolved = resolved_component_id(component_id)
+            if resolved is None:
+                invalid_ids.add(str(component_id))
+            elif update:
+                cleaned_updates[resolved] = update
         if invalid_ids:
             raise ValueError("配置项已变更，请刷新页面后重新填写")
         cleaned_feedback = (feedback or "").strip()
@@ -573,7 +736,10 @@ class ConfirmationSessionStore:
             return None
         intent = self._parse_persisted_intent(str(row["intent_json"]))
         if self.cloud_provider == "aws":
+            from app.integrations.deepseek import DeepSeekIntentParser
+
             preserve_customer_configuration(intent)
+            DeepSeekIntentParser._split_eks_worker_nodes(intent)
         return str(row["customer_request"]), intent
 
     def partition_answers_by_component(
@@ -590,15 +756,30 @@ class ConfirmationSessionStore:
             ).fetchone()
         if row is None:
             return {}, dict(answers)
-        question_components = {
-            str(item.get("question")): str(item.get("component_id"))
-            for item in json.loads(str(row["items_json"]))
-            if item.get("question") and item.get("component_id") is not None
-        }
+        answer_bindings: dict[str, tuple[str, str | None]] = {}
+        ambiguous_legacy_questions: set[str] = set()
+        for item in json.loads(str(row["items_json"])):
+            if not isinstance(item, dict) or not item.get("question"):
+                continue
+            question = str(item["question"])
+            component_id = (
+                str(item["component_id"])
+                if item.get("component_id") is not None
+                else None
+            )
+            answer_key = str(item.get("answer_key") or question)
+            answer_bindings[answer_key] = (question, component_id)
+            existing = answer_bindings.get(question)
+            if existing is None:
+                answer_bindings[question] = (question, component_id)
+            elif existing[1] != component_id:
+                ambiguous_legacy_questions.add(question)
+        for question in ambiguous_legacy_questions:
+            answer_bindings.pop(question, None)
         component_answers: dict[int, dict[str, str]] = {}
         global_answers: dict[str, str] = {}
-        for question, answer in answers.items():
-            component_id = question_components.get(question)
+        for answer_key, answer in answers.items():
+            question, component_id = answer_bindings.get(answer_key, (answer_key, None))
             if component_id is not None and component_id.isdigit():
                 component_answers.setdefault(int(component_id), {})[question] = answer
             else:

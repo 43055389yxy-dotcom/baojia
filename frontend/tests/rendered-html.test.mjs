@@ -89,20 +89,26 @@ test("final customer review keeps the instruction concise", async () => {
   assert.match(confirmationPage, /原内容已保留，请点击“重新尝试”/);
   assert.match(confirmationPage, /queuedComponentIds/);
   assert.match(confirmationPage, /submittedComponentSnapshots/);
+  assert.match(confirmationPage, /\/api\/aws\/configuration-field-options/);
+  assert.match(confirmationPage, /loadOfficialFieldOptions/);
+  assert.match(confirmationPage, /updateTransientNumericField/);
+  assert.match(confirmationPage, /rawValue !== ""/);
+  assert.match(confirmationPage, /hierarchyOrderedConfigurationItems/);
   assert.match(confirmationPage, /customer-transient-toast/);
-  assert.match(confirmationPage, /请先修改不可用配置/);
+  assert.match(confirmationPage, /请先修改.*项不可用配置/);
   assert.match(confirmationPage, /isSubmittingComponent \|\| isQueuedComponent \|\| isRefreshing/);
   assert.match(confirmationPage, /isRefreshing \? "更新中…"/);
   assert.doesNotMatch(confirmationPage, /请返回报价页面重新分析/);
 });
 
-test("customer questions use a short action-only heading", async () => {
+test("customer questions are collected on one concise page", async () => {
   const confirmationPage = await readFile(
     new URL("../app/confirm/[token]/page.tsx", import.meta.url),
     "utf8",
   );
 
-  assert.match(confirmationPage, /请选择配置/);
-  assert.match(confirmationPage, /请完成下面每个组件的选择/);
+  assert.match(confirmationPage, /请一次确认全部问题/);
+  assert.match(confirmationPage, /所有待确认项都集中在本页/);
+  assert.match(confirmationPage, /全部填写完成，统一提交/);
   assert.doesNotMatch(confirmationPage, /仅填写需要您决定的项目|需求摘要/);
 });

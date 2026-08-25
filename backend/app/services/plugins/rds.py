@@ -22,6 +22,26 @@ class RdsPlugin(ServicePlugin):
     kind = ServiceKind.RDS
     display_name = "Amazon RDS"
 
+    def configuration_field_options(
+        self,
+        requirement: ServiceRequirement,
+        default_region: str,
+    ) -> dict[str, list[str]]:
+        """Return official finite choices used by the customer edit form."""
+
+        requested = canonicalize_requirement_fields(requirement.requirements, service="rds")
+        engine = _text(requested.get("engine"))
+        if not engine:
+            return {}
+        versions = self._supported_engine_versions(
+            requirement.region or default_region,
+            _rds_api_engine(engine),
+        )
+        current = _text(requested.get("engine_version"))
+        if current and current not in versions:
+            versions.append(current)
+        return {"engine_version": versions} if versions else {}
+
     def preview(self, requirement: ServiceRequirement, default_region: str) -> PreviewSelection:
         region = requirement.region or default_region
         requested = canonicalize_requirement_fields(requirement.requirements, service="rds")
@@ -41,6 +61,10 @@ class RdsPlugin(ServicePlugin):
             engine,
             requested.get("engine_version"),
             requested_model=requested_model,
+            exact_engine_version=(
+                requirement.field_sources.get("requirements.engine_version")
+                == "customer_confirmation"
+            ),
         )
         product_filters = {
             "regionCode": region,
@@ -83,8 +107,7 @@ class RdsPlugin(ServicePlugin):
             min_vcpu is not None
             and min_memory is not None
             and any(
-                item["vcpu"] == min_vcpu and item["memory_gib"] == min_memory
-                for item in eligible
+                item["vcpu"] == min_vcpu and item["memory_gib"] == min_memory for item in eligible
             )
         )
         if requested_model:
@@ -178,12 +201,7 @@ class RdsPlugin(ServicePlugin):
         # ranks non-underprovisioned official products by monthly price, so a
         # non-exact shape must not be sent back to the customer.
         requires_confirmation = bool(
-            (
-                not requested_model
-                and len(options) > 1
-                and not exact_shape_exists
-            )
-            or (requested_model and default.model != requested_model)
+            not requested_model and len(options) > 1 and not exact_shape_exists
         )
         if requires_confirmation:
             for option in options:
@@ -235,6 +253,10 @@ class RdsPlugin(ServicePlugin):
             engine,
             requested.get("engine_version"),
             requested_model=requested_model,
+            exact_engine_version=(
+                requirement.field_sources.get("requirements.engine_version")
+                == "customer_confirmation"
+            ),
         )
         product_filters = {
             "regionCode": region,
@@ -300,7 +322,7 @@ class RdsPlugin(ServicePlugin):
         if substitution:
             notice_parts.append(
                 f"客户指定的 {requested_model} 在目标区域不可订购或与规格/部署模式冲突，"
-                f"已替换为最接近的 {selected['model']}。"
+                f"已在相同或不低于原配置且可报价的实例中，自动替换为最低价的 {selected['model']}。"
             )
         elif min_memory is not None and selected["memory_gib"] > min_memory:
             notice_parts.append(
@@ -321,9 +343,7 @@ class RdsPlugin(ServicePlugin):
         if _is_aurora_engine(engine):
             customer_deployment = _text(requested.get("deployment")) or "single_az"
             availability = (
-                "高可用"
-                if customer_deployment in {"multi_az", "multi_az_cluster"}
-                else "单可用区"
+                "高可用" if customer_deployment in {"multi_az", "multi_az_cluster"} else "单可用区"
             )
             architecture = (
                 f"Aurora {availability}集群；{requirement.quantity} 套集群，"
@@ -342,6 +362,7 @@ class RdsPlugin(ServicePlugin):
             ),
             specifications={
                 "engine": attrs.get("databaseEngine"),
+                "engineVersion": requested.get("engine_version"),
                 "deploymentOption": attrs.get("deploymentOption"),
                 "vCPU": selected["vcpu"],
                 "memoryGiB": selected["memory_gib"],
@@ -439,6 +460,7 @@ class RdsPlugin(ServicePlugin):
         engine_version: object,
         *,
         requested_model: str | None = None,
+        exact_engine_version: bool = False,
     ) -> set[str]:
         api_engine = _rds_api_engine(engine)
         kwargs: dict[str, Any] = {"Engine": api_engine}
@@ -450,21 +472,46 @@ class RdsPlugin(ServicePlugin):
             # Customers normally provide a major family such as MySQL 8.0 or
             # PostgreSQL 16. The RDS orderable-options API expects a full engine
             # build for EngineVersion, so major-family text must not be sent as-is.
-            if re.fullmatch(r"\d+(?:\.\d+){2,}(?:[-.][A-Za-z0-9]+)*", version):
+            # A bare community patch such as MySQL 5.7.44 is not necessarily
+            # the literal RDS build name (AWS appends an RDS release suffix).
+            # It does not change the instance-class price, so validate against
+            # the supported family and let RDS resolve its maintained patch.
+            if exact_engine_version or (
+                re.search(r"[A-Za-z]", version)
+                and re.fullmatch(r"\d+(?:\.\d+){2,}(?:[-.][A-Za-z0-9]+)*", version)
+            ):
                 kwargs["EngineVersion"] = version
         try:
-            classes: set[str] = set()
-            response = ReadOnlyAwsQueryExecutor(self.clients).execute(
-                service="rds",
-                operation="describe_orderable_db_instance_options",
-                region=region,
-                parameters=kwargs,
-                max_items=1000,
-            )
-            for page in response.get("pages", [response]):
-                classes.update(
-                    item["DBInstanceClass"] for item in page["OrderableDBInstanceOptions"]
+            executor = ReadOnlyAwsQueryExecutor(self.clients)
+
+            def query_classes(parameters: dict[str, Any]) -> set[str]:
+                result: set[str] = set()
+                response = executor.execute(
+                    service="rds",
+                    operation="describe_orderable_db_instance_options",
+                    region=region,
+                    parameters=parameters,
+                    max_items=1000,
                 )
+                for page in response.get("pages", [response]):
+                    result.update(
+                        item["DBInstanceClass"]
+                        for item in page.get("OrderableDBInstanceOptions", [])
+                    )
+                return result
+
+            classes = query_classes(kwargs)
+            if not classes and requested_model:
+                # An unavailable legacy class is not an unsupported database
+                # version. Re-query the same engine without the class filter;
+                # the normal candidate ranking below can then replace the old
+                # class with the cheapest orderable instance that preserves
+                # the requested CPU and memory. Previously this empty exact
+                # query was mislabeled as a version error and sent customers
+                # around the same version-confirmation loop indefinitely.
+                broad_kwargs = dict(kwargs)
+                broad_kwargs.pop("DBInstanceClass", None)
+                classes = query_classes(broad_kwargs)
         except (ManualConfirmationRequired, KeyError) as exc:
             if isinstance(exc, ManualConfirmationRequired) and exc.code in {
                 "aws_credentials_invalid",
@@ -478,11 +525,74 @@ class RdsPlugin(ServicePlugin):
                 region=region,
             ) from exc
         if not classes:
+            requested_version = _text(engine_version)
+            supported_versions = self._supported_engine_versions(
+                region,
+                api_engine,
+                exclude=requested_version,
+            )
             raise ManualConfirmationRequired(
                 f"RDS 引擎 {engine} 或指定版本在 {region} 不受支持",
                 code="unsupported_rds_engine_or_region",
+                engine=engine,
+                requested_version=requested_version,
+                region=region,
+                supported_engine_versions=supported_versions,
             )
         return classes
+
+    def _supported_engine_versions(
+        self,
+        region: str,
+        api_engine: str,
+        *,
+        exclude: str = "",
+    ) -> list[str]:
+        """Return a short official version list suitable for customer choice.
+
+        RDS can publish many patch releases for the same maintained major
+        family. Presenting all of them makes the confirmation form unusable,
+        so retain the newest patch in each family and let the normal orderable
+        API verify the customer's final choice on the next pass.
+        """
+
+        try:
+            response = ReadOnlyAwsQueryExecutor(self.clients).execute(
+                service="rds",
+                operation="describe_db_engine_versions",
+                region=region,
+                parameters={"Engine": api_engine},
+                max_items=1000,
+            )
+        except (ManualConfirmationRequired, KeyError):
+            return []
+
+        versions: set[str] = set()
+        for page in response.get("pages", [response]):
+            for item in page.get("DBEngineVersions", []):
+                version = _text(item.get("EngineVersion"))
+                if version and version != exclude:
+                    versions.add(version)
+
+        newest_by_family: dict[tuple[int, ...], str] = {}
+        for version in versions:
+            numbers = tuple(int(part) for part in re.findall(r"\d+", version))
+            if not numbers:
+                continue
+            family_width = 1 if api_engine == "postgres" else 2
+            family = numbers[:family_width]
+            current = newest_by_family.get(family)
+            if current is None or _version_sort_key(version) > _version_sort_key(current):
+                newest_by_family[family] = version
+        return sorted(
+            newest_by_family.values(),
+            key=_version_sort_key,
+            reverse=True,
+        )[:8]
+
+
+def _version_sort_key(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in re.findall(r"\d+", version))
 
 
 def _rds_candidates(
@@ -515,9 +625,7 @@ def _rds_candidates(
     ]
 
 
-def _preferred_rds_products(
-    products: list[dict[str, Any]], engine: str
-) -> list[dict[str, Any]]:
+def _preferred_rds_products(products: list[dict[str, Any]], engine: str) -> list[dict[str, Any]]:
     """Keep the lowest/default billing variant for one RDS instance shape.
 
     Aurora publishes both Standard and I/O-Optimized instance usage products
@@ -532,8 +640,7 @@ def _preferred_rds_products(
     standard = [
         product
         for product in products
-        if "iooptimized"
-        not in _normalize(PricingCatalog.attributes(product).get("usagetype", ""))
+        if "iooptimized" not in _normalize(PricingCatalog.attributes(product).get("usagetype", ""))
     ]
     return standard or products
 
@@ -559,8 +666,24 @@ def _select_rds(
             "AWS 官方 RDS 目录中没有满足需求且可订购的实例",
             code="rds_specification_not_found",
         )
-    eligible.sort(key=lambda item: (item["memory_gib"], item["vcpu"], item["model"]))
+    eligible.sort(
+        key=lambda item: (
+            _rds_candidate_rate(item),
+            item["memory_gib"],
+            item["vcpu"],
+            item["model"],
+        )
+    )
     return eligible[0], requested_model is not None
+
+
+def _rds_candidate_rate(item: dict[str, Any]) -> float:
+    rates = [
+        rate
+        for product in item.get("products", [])
+        if (rate := PricingCatalog.on_demand_rate(product)) is not None
+    ]
+    return min(rates) if rates else float("inf")
 
 
 def _reasonable_rds_candidates(
@@ -733,9 +856,7 @@ def _resolve_volume_type(requested: str | None, official_values: list[str]) -> s
             "AWS 官方目录没有返回 RDS 存储类型", code="rds_storage_type_unavailable"
         )
     if _is_generic_ssd(requested):
-        matches = [
-            value for value in official_values if _normalize(value) == "generalpurposegp3"
-        ]
+        matches = [value for value in official_values if _normalize(value) == "generalpurposegp3"]
     elif requested:
         normalized = _normalize(requested)
         matches = [value for value in official_values if normalized in _normalize(value)]

@@ -4,7 +4,7 @@ import logging
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -49,6 +49,7 @@ class BcmQuoteResult:
     rate_type: str
     rate_timestamp: datetime | None
     estimate_id: str
+    failed_groups: set[str] = field(default_factory=set)
 
 
 class BcmWorkloadEstimator:
@@ -60,6 +61,7 @@ class BcmWorkloadEstimator:
         self._settings = settings
         self._estimate_ids = list(settings.bcm_workload_estimate_ids)
         self._account_id: str | None = None
+        self._owned_estimate_ids: set[str] = set()
         self._lock = threading.Lock()
 
     def quote(self, lines: list[UsageLine]) -> BcmQuoteResult:
@@ -179,6 +181,11 @@ class BcmWorkloadEstimator:
         )
 
     def _verify_owned(self, estimate_id: str) -> None:
+        # The configured pool is private to this application. Once ownership
+        # is verified, avoid repeating the same STS/tag round trip for every
+        # independently priced component in the same running process.
+        if estimate_id in self._owned_estimate_ids:
+            return
         account_id = self._get_account_id()
         arn = f"arn:aws:bcm-pricing-calculator::{account_id}:workload-estimate/{estimate_id}"
         try:
@@ -195,6 +202,7 @@ class BcmWorkloadEstimator:
                 estimate_id=estimate_id,
                 required_tag=f"{OWNER_TAG_KEY}={OWNER_TAG_VALUE}",
             )
+        self._owned_estimate_ids.add(estimate_id)
 
     def _get_account_id(self) -> str:
         if self._account_id:

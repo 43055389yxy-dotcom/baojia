@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
 type PromptItem = {
@@ -27,12 +28,10 @@ export default function PromptLibraryPage() {
 
   useEffect(() => {
     const selected = new URLSearchParams(window.location.search).get("provider") === "azure" ? "azure" : "aws";
-    setProvider(selected);
+    queueMicrotask(() => setProvider(selected));
   }, []);
 
   useEffect(() => {
-    setLibrary(null);
-    setMessage("");
     void fetch(`${API_BASE}/api/prompt-library?provider=${provider}`, { cache: "no-store" })
       .then(async (response) => {
         if (!response.ok) throw new Error("无法读取提示词规则库");
@@ -87,14 +86,21 @@ export default function PromptLibraryPage() {
     }
   }
 
+  function switchProvider(nextProvider: "aws" | "azure") {
+    if (nextProvider === provider) return;
+    setLibrary(null);
+    setMessage("");
+    setProvider(nextProvider);
+  }
+
   return (
     <main className="prompt-app">
       <header className="site-header prompt-header">
-        <a className="brand" href="/" aria-label="返回智能报价">
+        <Link className="brand" href="/" aria-label="返回智能报价">
           <span>A</span><strong>AstraQuote</strong>
-        </a>
+        </Link>
         <div className="product-title"><strong>提示词管理</strong><span>开发调试</span></div>
-        <a className="prompt-nav-link" href="/">返回报价</a>
+        <Link className="prompt-nav-link" href="/">返回报价</Link>
       </header>
 
       <section className="prompt-page-title">
@@ -110,8 +116,8 @@ export default function PromptLibraryPage() {
       </section>
 
       <nav className="cloud-provider-switch prompt-provider-switch" aria-label="提示词云平台">
-        <button className={provider === "aws" ? "selected" : ""} onClick={() => setProvider("aws")}>AWS 提示词</button>
-        <button className={provider === "azure" ? "selected" : ""} onClick={() => setProvider("azure")}>Microsoft Azure 提示词</button>
+        <button className={provider === "aws" ? "selected" : ""} onClick={() => switchProvider("aws")}>AWS 提示词</button>
+        <button className={provider === "azure" ? "selected" : ""} onClick={() => switchProvider("azure")}>Microsoft Azure 提示词</button>
       </nav>
 
       {message && <div className="prompt-message">{message}</div>}

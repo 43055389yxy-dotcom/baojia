@@ -62,14 +62,10 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
     kind = ServiceKind.OPENSEARCH
     display_name = "Amazon OpenSearch Service"
 
-    def preview(
-        self, requirement: ServiceRequirement, default_region: str
-    ) -> PreviewSelection:
+    def preview(self, requirement: ServiceRequirement, default_region: str) -> PreviewSelection:
         """Require a regional catalog choice when the customer omitted a model."""
 
-        requested = canonicalize_requirement_fields(
-            requirement.requirements, service="opensearch"
-        )
+        requested = canonicalize_requirement_fields(requirement.requirements, service="opensearch")
         requested_model = str(requested.get("requested_model") or "").strip().lower()
         min_vcpu = required_float(requested, "vcpu")
         min_memory = required_float(requested, "memory_gib")
@@ -105,12 +101,8 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
 
         def distance(item: tuple[float, str, float, float, dict[str, Any]]) -> float:
             _, _, vcpu, memory, _ = item
-            return (
-                abs(vcpu - min_vcpu) / max(min_vcpu, 1) if min_vcpu is not None else 0
-            ) + (
-                abs(memory - min_memory) / max(min_memory, 1)
-                if min_memory is not None
-                else 0
+            return (abs(vcpu - min_vcpu) / max(min_vcpu, 1) if min_vcpu is not None else 0) + (
+                abs(memory - min_memory) / max(min_memory, 1) if min_memory is not None else 0
             )
 
         available = sorted(
@@ -148,9 +140,7 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
                     model=model,
                     family="opensearch",
                     specifications={"vCPU": vcpu, "memoryGiB": memory},
-                    monthly_catalog_cost=(
-                        rate * requirement.hours_per_month * data_nodes
-                    ),
+                    monthly_catalog_cost=(rate * requirement.hours_per_month * data_nodes),
                     rationale="AWS 官方目录中的可用 OpenSearch 节点规格。",
                     official_product={
                         "source": "AWS Price List",
@@ -177,9 +167,7 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
 
     def select(self, requirement: ServiceRequirement, default_region: str) -> SelectedResource:
         region = requirement.region or default_region
-        requested = canonicalize_requirement_fields(
-            requirement.requirements, service="opensearch"
-        )
+        requested = canonicalize_requirement_fields(requirement.requirements, service="opensearch")
         requested_model = str(requested.get("requested_model") or "").strip().lower()
         min_vcpu = required_float(requested, "vcpu")
         min_memory = required_float(requested, "memory_gib")
@@ -188,9 +176,8 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
             or required_float(requested, "nodes")
             or requirement.quantity
         )
-        storage_gib = (
-            required_float(requested, "storage_gib_per_node")
-            or required_float(requested, "storage_gib")
+        storage_gib = required_float(requested, "storage_gib_per_node") or required_float(
+            requested, "storage_gib"
         )
         products = self.catalog.products(
             "AmazonES",
@@ -198,8 +185,10 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
             max_pages=20,
         )
         candidates: list[tuple[float, str, float, float, dict[str, Any]]] = []
+        catalog_shapes: list[tuple[float, str, float, float, dict[str, Any]]] = []
         normalized_requested = (
-            requested_model if not requested_model or requested_model.endswith(".search")
+            requested_model
+            if not requested_model or requested_model.endswith(".search")
             else f"{requested_model}.search"
         )
         for product in products:
@@ -223,6 +212,7 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
             rate = PricingCatalog.on_demand_rate(product)
             if rate is None:
                 continue
+            catalog_shapes.append((rate, model, vcpu, memory, product))
             if normalized_requested and model != normalized_requested:
                 continue
             if min_vcpu is not None and vcpu < min_vcpu:
@@ -230,10 +220,57 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
             if min_memory is not None and memory < min_memory:
                 continue
             candidates.append((rate, model, vcpu, memory, product))
+        substituted = False
+        if not candidates and normalized_requested:
+            candidates = [
+                item
+                for item in catalog_shapes
+                if (min_vcpu is None or item[2] >= min_vcpu)
+                and (min_memory is None or item[3] >= min_memory)
+            ]
+            substituted = bool(candidates)
         if not candidates:
+
+            def distance(
+                item: tuple[float, str, float, float, dict[str, Any]],
+            ) -> tuple[bool, float, float, str]:
+                rate, model, vcpu, memory, _ = item
+                underprovisioned = not (
+                    (min_vcpu is None or vcpu >= min_vcpu)
+                    and (min_memory is None or memory >= min_memory)
+                )
+                shape_distance = (
+                    abs(vcpu - min_vcpu) / max(min_vcpu, 1) if min_vcpu is not None else 0
+                ) + (abs(memory - min_memory) / max(min_memory, 1) if min_memory is not None else 0)
+                return (underprovisioned, shape_distance, rate, model)
+
+            nearby_candidates: list[dict[str, Any]] = []
+            seen_models: set[str] = set()
+            for rate, model, vcpu, memory, product in sorted(catalog_shapes, key=distance):
+                if model in seen_models:
+                    continue
+                seen_models.add(model)
+                nearby_candidates.append(
+                    {
+                        "model": model,
+                        "family": "opensearch",
+                        "vcpu": vcpu,
+                        "memory_gib": memory,
+                        "monthly_catalog_cost": (rate * requirement.hours_per_month * data_nodes),
+                        "rationale": "当前区域官方目录中的相近 OpenSearch 节点规格。",
+                        "official_product": {
+                            "source": "AWS Price List",
+                            "sku": product.get("product", {}).get("sku"),
+                            "regionCode": region,
+                        },
+                    }
+                )
+                if len(nearby_candidates) >= 20:
+                    break
             raise ManualConfirmationRequired(
                 "AWS 官方目录没有返回符合要求的 OpenSearch 节点规格",
                 code="opensearch_specification_not_found",
+                nearby_candidates=nearby_candidates,
             )
         _, model, vcpu, memory, instance_product = min(
             candidates, key=lambda item: (item[0], item[1])
@@ -269,11 +306,14 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
                     "AWS 官方目录没有返回 OpenSearch EBS 存储计费项",
                     code="opensearch_storage_not_found",
                 )
-            lines.append(
-                _usage(storage_product, "osstore", data_nodes * storage_gib, "opensearch")
-            )
+            lines.append(_usage(storage_product, "osstore", data_nodes * storage_gib, "opensearch"))
         notice = None
-        if not requested_model:
+        if substituted:
+            notice = (
+                f"客户指定的 {requested_model} 在当前区域不可报价；已在相同或不低于原配置且"
+                f"可报价的节点中，自动替换为最低价的 {model}。"
+            )
+        elif not requested_model:
             requested_shape: list[str] = []
             if min_vcpu is not None:
                 requested_shape.append(f"{min_vcpu:g} vCPU")
@@ -349,9 +389,7 @@ class NatGatewayPlugin(_NoConfirmationPlugin):
             data_gib = required_float(requirement.requirements, key)
             if data_gib is not None:
                 break
-        lines = [
-            _usage(hourly, "nathour", quantity * requirement.hours_per_month, "nat")
-        ]
+        lines = [_usage(hourly, "nathour", quantity * requirement.hours_per_month, "nat")]
         references: list[ReferenceRate] = []
         if data_gib is None:
             references.append(_reference(processed, "NAT Gateway 每 GB 数据处理单价"))
@@ -363,7 +401,10 @@ class NatGatewayPlugin(_NoConfirmationPlugin):
             region=region,
             model="NAT Gateway",
             architecture=f"{quantity} 个 NAT Gateway",
-            specifications={"quantity": quantity, **({"processedGiB": data_gib} if data_gib is not None else {})},
+            specifications={
+                "quantity": quantity,
+                **({"processedGiB": data_gib} if data_gib is not None else {}),
+            },
             official_product={"source": "AWS Price List", "regionCode": region},
             rationale="按 NAT Gateway 小时费和数据处理费提交 BCM。",
             substitution_notice=(

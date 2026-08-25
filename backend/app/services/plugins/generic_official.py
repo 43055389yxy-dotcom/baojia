@@ -42,6 +42,7 @@ _SERVICE_CODE_ALIASES = {
     "documentdb": "AmazonDocDB",
     "docdb": "AmazonDocDB",
     "mongodb": "AmazonDocDB",
+    "memorydb": "AmazonMemoryDB",
     "vpc": "AmazonVPC",
     "dms": "AWSDatabaseMigrationSvc",
     "kms": "awskms",
@@ -52,6 +53,7 @@ _SERVICE_CODE_ALIASES = {
     "prometheus": "AmazonPrometheus",
     "managedprometheus": "AmazonPrometheus",
     "quicksight": "AmazonQuickSight",
+    "pinpoint": "AmazonPinpoint",
 }
 
 
@@ -87,6 +89,7 @@ class GenericOfficialPlugin:
         self.clients = clients
         self.catalog = catalog
         self.auto_discovery = auto_discovery
+        self._unavailable_region_cache: set[tuple[str, str]] = set()
 
     def _service_code(self, requirement: ServiceRequirement) -> str:
         labels = [requirement.service, requirement.calculator_service_name or ""]
@@ -214,6 +217,32 @@ class GenericOfficialPlugin:
 
     def select(self, requirement: ServiceRequirement, default_region: str) -> SelectedResource:
         region = requirement.region or default_region
+        # CodeDeploy does not add a service charge for deployments to EC2.
+        # Treat that as a valid zero-cost official result instead of forcing a
+        # pricing-catalog lookup that has no positive dimension to return.
+        if _stem(requirement.service) == "codedeploy":
+            source = (requirement.source_text or "").casefold()
+            is_on_premises = any(
+                marker in source
+                for marker in ("on-prem", "on premises", "本地实例", "本地服务器")
+            )
+            if not is_on_premises:
+                return SelectedResource(
+                    service=requirement.service,
+                    display_name=requirement.calculator_service_name or "AWS CodeDeploy",
+                    region=region,
+                    model="EC2 部署（无额外服务费）",
+                    architecture="使用 AWS CodeDeploy 部署到 Amazon EC2",
+                    specifications=dict(requirement.requirements),
+                    official_product={
+                        "source": "AWS CodeDeploy Pricing",
+                        "pricingMode": "no-additional-charge-for-ec2",
+                    },
+                    rationale="部署到 Amazon EC2 的 CodeDeploy 服务不收取额外服务费。",
+                    substitution_notice=None,
+                    usage_lines=[],
+                    reference_rates=[],
+                )
         is_unknown_service = requirement.service not in SERVICE_TEMPLATE_FIELDS
         profile = None
         # A stable service-code alias is enough to query the official catalog.
@@ -241,6 +270,23 @@ class GenericOfficialPlugin:
         service_code = str((profile or {}).get("service_code") or service_code)
         if not service_code:
             service_code = self._service_code(requirement)
+        unavailable_key = (service_code, region)
+        if unavailable_key in self._unavailable_region_cache:
+            raise ManualConfirmationRequired(
+                (
+                    f"{requirement.calculator_service_name or requirement.service} 在 {region} "
+                    "没有官方区域计费目录，请调整该组件区域"
+                    if region != "global"
+                    else "AWS 官方目录在当前区域没有返回该产品的计费项"
+                ),
+                code=(
+                    "service_region_not_supported"
+                    if region != "global"
+                    else "generic_semantic_rate_not_found"
+                ),
+                service_code=service_code,
+                region=region,
+            )
         if _stem(requirement.service) == "vpc":
             return SelectedResource(
                 service=requirement.service,
@@ -264,6 +310,36 @@ class GenericOfficialPlugin:
         selected_rates = self._semantic_rates(requirement, rates)
         auto_discovered = False
         strict_semantic_services = {"emr", "redshift", "athena"}
+        service_stem = _stem(requirement.service)
+
+        # Known generic products already have complete official product rows in
+        # the persistent local catalog. Try those rows before forcing a network
+        # refresh. The previous order refreshed MemoryDB on every pricing
+        # scenario even though the node catalog was already cached locally.
+        if not selected_rates and service_stem not in strict_semantic_services:
+            selected_rates = self._auto_semantic_rates(
+                requirement,
+                rates,
+                profile=profile if is_unknown_service else None,
+            )
+            auto_discovered = bool(selected_rates)
+
+        def has_instance_rate() -> bool:
+            return any(
+                bool(PricingCatalog.attributes(rate[4]).get("instanceType"))
+                for _, _, rate in selected_rates
+            )
+
+        # An explicit MemoryDB node can never degrade into a snapshot-storage
+        # reference row. If the cached regional catalog cannot find an exact or
+        # same-capacity replacement, force one bounded refresh and then return a
+        # precise component error rather than a plausible-looking wrong price.
+        memorydb_requires_node = bool(
+            service_stem == "memorydb"
+            and requirement.requirements.get("requested_model")
+        )
+        if memorydb_requires_node and selected_rates and not has_instance_rate():
+            selected_rates = []
 
         # A stale or incomplete catalog page must not stop the quote. Refresh
         # only this component and run the same deterministic field mapping
@@ -275,6 +351,28 @@ class GenericOfficialPlugin:
             if refreshed_rates:
                 rates = refreshed_rates
                 selected_rates = self._semantic_rates(requirement, rates)
+                if not selected_rates and service_stem not in strict_semantic_services:
+                    selected_rates = self._auto_semantic_rates(
+                        requirement,
+                        rates,
+                        profile=profile if is_unknown_service else None,
+                    )
+                    auto_discovered = bool(selected_rates)
+                if memorydb_requires_node and selected_rates and not has_instance_rate():
+                    selected_rates = []
+
+        # Known products such as MemoryDB may use the generic adapter but
+        # still have full regional product records (including Reserved terms)
+        # in the live catalog. Derive from those records before consulting the
+        # lightweight discovery profile, whose cached dimensions intentionally
+        # omit commercial term payloads.
+        if not selected_rates and service_stem not in strict_semantic_services:
+            selected_rates = self._auto_semantic_rates(
+                requirement,
+                rates,
+                profile=profile if is_unknown_service else None,
+            )
+            auto_discovered = bool(selected_rates)
 
         # If the service has never been quoted, build/refresh its official
         # field profile from AWS and retry this component once more.
@@ -292,12 +390,29 @@ class GenericOfficialPlugin:
                     )
                 auto_discovered = bool(selected_rates)
 
-        if not selected_rates and _stem(requirement.service) not in strict_semantic_services:
+        if not selected_rates and service_stem not in strict_semantic_services:
             selected_rates = self._auto_semantic_rates(
                 requirement, rates, profile=profile if is_unknown_service else None
             )
             auto_discovered = bool(selected_rates)
         if not selected_rates:
+            if memorydb_requires_node:
+                raise ManualConfirmationRequired(
+                    "当前区域没有客户指定的 MemoryDB 节点，也没有足够规格信息选择同配置替代节点",
+                    code="memorydb_specification_not_found",
+                    requested_model=requirement.requirements.get("requested_model"),
+                    region=region,
+                )
+            if not rates:
+                self._unavailable_region_cache.add(unavailable_key)
+                if region != "global":
+                    raise ManualConfirmationRequired(
+                        f"{requirement.calculator_service_name or requirement.service} 在 {region} "
+                        "没有官方区域计费目录，请调整该组件区域",
+                        code="service_region_not_supported",
+                        service_code=service_code,
+                        region=region,
+                    )
             raise ManualConfirmationRequired(
                 "AWS 官方目录没有返回可安全展示的新组件计费项",
                 code="generic_semantic_rate_not_found",
@@ -305,10 +420,10 @@ class GenericOfficialPlugin:
             )
 
         # When the official field is known but the customer did not provide a
-        # usage amount, apply the same minimum-unit rule consistently across
-        # both established and first-use generic services. Keep only the
-        # lowest positive matching dimension and charge exactly one official
-        # unit; never manufacture a monthly volume.
+        # usage amount, keep exactly one representative official dimension as
+        # a reference rate. A unit price is not a monthly workload: submitting
+        # one invented unit to BCM made Athena's "$5/TB" instruction become a
+        # fake $5 monthly charge.
         if selected_rates and all(amount is None for _, amount, _ in selected_rates):
             positive = [item for item in selected_rates if item[2][0] > 0]
             pool = positive or selected_rates
@@ -316,13 +431,41 @@ class GenericOfficialPlugin:
                 pool,
                 key=lambda item: (item[2][0], item[2][1], item[2][2], item[2][3]),
             )
-            selected_rates = [(description, 1.0, rate)]
+            selected_rates = [(description, None, rate)]
 
         display_name = requirement.calculator_service_name or requirement.service
         usage_lines: list[UsageLine] = []
         reference_rates: list[ReferenceRate] = []
+        reserved_compute_rate = None
+        if (
+            service_stem == "memorydb"
+            and requirement.requirements.get("purchase_option") == "reserved"
+        ):
+            reserved_compute_rate = next(
+                (
+                    rate
+                    for _, amount, rate in selected_rates
+                    if amount is not None
+                    and PricingCatalog.attributes(rate[4]).get("instanceType")
+                ),
+                None,
+            )
+        monthly_commitment_cost = 0.0
+        upfront_commitment_cost = 0.0
+        if reserved_compute_rate is not None:
+            reserved = PricingCatalog.reserved_price(
+                reserved_compute_rate[4],
+                years=int(requirement.requirements.get("reserved_term_years") or 1),
+                payment_option=str(
+                    requirement.requirements.get("payment_option") or "no_upfront"
+                ),
+            )
+            monthly_commitment_cost = reserved.monthly_amortized * requirement.quantity
+            upfront_commitment_cost = reserved.upfront * requirement.quantity
         for index, (description, amount, rate) in enumerate(selected_rates, start=1):
             price, unit, usage_type, operation, _ = rate
+            if rate is reserved_compute_rate:
+                continue
             if amount is not None and amount > 0:
                 usage_lines.append(
                     UsageLine(
@@ -346,14 +489,17 @@ class GenericOfficialPlugin:
                     )
                 )
         has_usage = bool(usage_lines)
-        selected_model = str(requirement.requirements.get("requested_model") or "").strip()
-        if not selected_model:
-            for _, _, selected_rate in selected_rates:
-                attrs = PricingCatalog.attributes(selected_rate[4])
-                if attrs.get("instanceType"):
-                    selected_model = str(attrs["instanceType"])
-                    break
-        service_stem = _stem(requirement.service)
+        has_billable_cost = has_usage or monthly_commitment_cost > 0 or upfront_commitment_cost > 0
+        requested_model = str(requirement.requirements.get("requested_model") or "").strip()
+        selected_model = requested_model
+        selected_instance_model = ""
+        for _, _, selected_rate in selected_rates:
+            attrs = PricingCatalog.attributes(selected_rate[4])
+            if attrs.get("instanceType"):
+                selected_instance_model = str(attrs["instanceType"])
+                break
+        if selected_instance_model and (not selected_model or service_stem == "memorydb"):
+            selected_model = selected_instance_model
         if service_stem == "athena":
             selected_model = "按查询数据扫描量计费"
         elif service_stem == "emr" and not selected_model:
@@ -361,13 +507,30 @@ class GenericOfficialPlugin:
         elif service_stem == "redshift" and not selected_model:
             selected_model = "Amazon Redshift 数据仓库"
 
-        architecture = "按客户明确用量核价" if has_usage else "官方单位参考价"
+        architecture = "按客户明确用量核价" if has_billable_cost else "官方单位参考价"
+        if reserved_compute_rate is not None:
+            architecture = "AWS 官方 MemoryDB 预留节点"
         if service_stem == "athena":
             architecture = "无服务器查询，按扫描数据量计费"
         elif service_stem == "emr":
             architecture = "按主节点、核心节点和任务节点分别核价"
         elif service_stem == "redshift":
             architecture = "按计算节点与数据仓库存储分别核价"
+        substitution_notices: list[str] = []
+        if (
+            service_stem == "memorydb"
+            and requested_model
+            and selected_instance_model
+            and requested_model.casefold() != selected_instance_model.casefold()
+        ):
+            substitution_notices.append(
+                f"客户指定的 {requested_model} 在当前区域没有官方计费项，已保持不低于客户确认的"
+                f"同配置处理器和内存，并自动改用其中价格最低的 {selected_instance_model}。"
+            )
+        if not has_billable_cost or reference_rates:
+            substitution_notices.append(
+                "未提供完整用量的部分仅展示对应官方单位价，不计入月费合计。"
+            )
         return SelectedResource(
             service=requirement.service,
             display_name=display_name,
@@ -381,13 +544,11 @@ class GenericOfficialPlugin:
                 if auto_discovered
                 else "按服务语义匹配 AWS 官方计费维度，不使用无关的最低价目录项。"
             ),
-            substitution_notice=(
-                None
-                if has_usage and not reference_rates
-                else "未提供完整用量的部分仅展示对应官方单位价，不计入月费合计。"
-            ),
+            substitution_notice=" ".join(substitution_notices) or None,
             usage_lines=usage_lines,
             reference_rates=reference_rates,
+            monthly_commitment_cost=monthly_commitment_cost,
+            upfront_commitment_cost=upfront_commitment_cost,
         )
 
     @staticmethod
@@ -1036,15 +1197,27 @@ class GenericOfficialPlugin:
         model = str(requested.get("requested_model") or "").strip().casefold()
         min_vcpu = requested.get("vcpu")
         min_memory = requested.get("memory_gib")
+        requested_engine = str(
+            requested.get("engine") or requested.get("engine_type") or ""
+        ).strip().casefold()
 
-        def hourly_instance(rate) -> bool:
+        def hourly_instance(rate, *, enforce_model: bool = True) -> bool:
             attrs, text = details(rate)
             unit = str(rate[1]).casefold()
             instance = str(attrs.get("instanceType") or "").casefold()
             if not instance or not any(token in unit for token in ("hrs", "hour")):
                 return False
-            if model and model not in {instance, f"db.{instance}", f"cache.{instance}"}:
+            if (
+                enforce_model
+                and model
+                and model not in {instance, f"db.{instance}", f"cache.{instance}"}
+            ):
                 return False
+            if _stem(requirement.service) == "memorydb" and requested_engine:
+                if requested_engine == "redis" and "valkey" in text:
+                    return False
+                if requested_engine == "valkey" and "valkey" not in text:
+                    return False
             try:
                 if min_vcpu is not None and float(attrs.get("vcpu") or 0) < float(min_vcpu):
                     return False
@@ -1062,6 +1235,18 @@ class GenericOfficialPlugin:
                 "AWS 官方最低匹配实例小时价",
                 requirement.quantity * requirement.hours_per_month,
                 hourly_instance,
+            )
+        elif _stem(requirement.service) == "memorydb" and model and (
+            min_vcpu is not None or min_memory is not None
+        ):
+            # The requested family may not be sold in this region. MemoryDB
+            # node families are interchangeable for pricing purposes when the
+            # replacement preserves the confirmed CPU and memory floors. Rank
+            # every valid replacement by its real official hourly rate.
+            choose(
+                "AWS 官方同配置最低价实例小时价",
+                requirement.quantity * requirement.hours_per_month,
+                lambda rate: hourly_instance(rate, enforce_model=False),
             )
 
         # For a first-use service, prefer the persisted binding between the
@@ -1131,6 +1316,18 @@ class GenericOfficialPlugin:
                 ),
             ),
             (
+                "outbound_messages",
+                "AWS 官方出站消息单价",
+                lambda rate: any(
+                    token in str(rate[1]).casefold()
+                    for token in ("message", "email", "request")
+                )
+                or any(
+                    token in details(rate)[1]
+                    for token in ("email", "message", "outbound")
+                ),
+            ),
+            (
                 "data_processed_gib",
                 "AWS 官方数据处理单价",
                 lambda rate: str(rate[1]).casefold() in {"gb", "gbyte", "gigabyte"}
@@ -1164,8 +1361,8 @@ class GenericOfficialPlugin:
             return result
 
         # With no customer usage, select one real, smallest official billing
-        # unit. This is the system-wide minimum-unit rule requested for
-        # first-use services; it never invents a monthly workload quantity.
+        # dimension for display only. ``None`` keeps it out of the monthly
+        # estimate while still exposing the exact AWS unit price.
         preferred = [
             rate
             for rate in safe_rates
@@ -1183,7 +1380,7 @@ class GenericOfficialPlugin:
             if identity in used:
                 continue
             used.add(identity)
-            result.append((f"AWS 官方最小 {rate[1]} 计费单位", 1.0, rate))
+            result.append((f"AWS 官方最小 {rate[1]} 计费单位", None, rate))
             break
         return result
 

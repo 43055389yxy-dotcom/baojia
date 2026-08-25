@@ -40,9 +40,7 @@ class Ec2Plugin(ServicePlugin):
         operating_system = _pricing_operating_system(
             _optional_string(requested.get("operating_system"))
         )
-        requested_architecture = (
-            _optional_string(requested.get("architecture")) or ""
-        ).casefold()
+        requested_architecture = (_optional_string(requested.get("architecture")) or "").casefold()
         if operating_system == "Windows" and requested_architecture in {
             "arm",
             "arm64",
@@ -65,9 +63,7 @@ class Ec2Plugin(ServicePlugin):
             return None
 
         compatible_model = self.compatible_x86_model(requirement, default_region)
-        alternative_text = (
-            f"（例如 {compatible_model}）" if compatible_model else ""
-        )
+        alternative_text = f"（例如 {compatible_model}）" if compatible_model else ""
         return (
             f"您指定 {requested_model} 并要求 Windows Server；该型号是 ARM 架构，"
             f"不支持 Windows。请确认：改用 Linux 保留 {requested_model}，还是保留 Windows "
@@ -95,8 +91,7 @@ class Ec2Plugin(ServicePlugin):
         compatible = [
             item
             for item in alternatives
-            if "x86_64"
-            in {str(value).casefold() for value in item.get("architectures", [])}
+            if "x86_64" in {str(value).casefold() for value in item.get("architectures", [])}
         ]
         if not compatible:
             return None
@@ -146,10 +141,9 @@ class Ec2Plugin(ServicePlugin):
             return []
 
         def distance(item: dict[str, Any]) -> float:
-            return (
-                abs(item["vcpu"] - requested_vcpu) / max(requested_vcpu, 1)
-                + abs(item["memory_gib"] - requested_memory) / max(requested_memory, 1)
-            )
+            return abs(item["vcpu"] - requested_vcpu) / max(requested_vcpu, 1) + abs(
+                item["memory_gib"] - requested_memory
+            ) / max(requested_memory, 1)
 
         unique: dict[str, dict[str, Any]] = {}
         for item in sorted(pool, key=lambda candidate: (distance(candidate), candidate["model"])):
@@ -196,16 +190,14 @@ class Ec2Plugin(ServicePlugin):
             min_vcpu is not None
             and min_memory is not None
             and any(
-                item["vcpu"] == min_vcpu and item["memory_gib"] == min_memory
-                for item in official
+                item["vcpu"] == min_vcpu and item["memory_gib"] == min_memory for item in official
             )
         )
         candidate_items = eligible
         if requested_model is None and not exact_shape_exists:
             candidate_items = _rank_reasonable_ec2(
                 official,
-                business_type=_optional_string(requested.get("business_type"))
-                or "general_purpose",
+                business_type=_optional_string(requested.get("business_type")) or "general_purpose",
                 architecture=_optional_string(requested.get("architecture")),
                 min_vcpu=min_vcpu,
                 min_memory=min_memory,
@@ -270,8 +262,10 @@ class Ec2Plugin(ServicePlugin):
         # product for the edited OS/tenancy combination (Mac + Windows is a
         # common example).  Never persist such a model as "ready" and discover
         # the problem only after the customer approves the entire quote.
-        if price_checked_models and not billable_models and (
-            requested_model is not None or exact_shape_exists
+        if (
+            price_checked_models
+            and not billable_models
+            and (requested_model is not None or exact_shape_exists)
         ):
             raise ManualConfirmationRequired(
                 "当前 EC2 规格与所选操作系统、处理器架构或租用方式没有官方计费项",
@@ -285,8 +279,7 @@ class Ec2Plugin(ServicePlugin):
             options = [
                 option
                 for option in options
-                if option.model not in price_checked_models
-                or option.model in billable_models
+                if option.model not in price_checked_models or option.model in billable_models
             ]
         exact = next((option for option in options if option.model == requested_model), None)
         if requested_model and exact is None:
@@ -305,15 +298,11 @@ class Ec2Plugin(ServicePlugin):
                     option.model,
                 )
             )
-        priced_defaults = [
-            option for option in options if option.monthly_catalog_cost is not None
-        ]
+        priced_defaults = [option for option in options if option.monthly_catalog_cost is not None]
         default_model = (
             min(
                 priced_defaults,
-                key=lambda option: (
-                    option.monthly_catalog_cost or float("inf"), option.model
-                ),
+                key=lambda option: (option.monthly_catalog_cost or float("inf"), option.model),
             ).model
             if priced_defaults
             else eligible[0]["model"]
@@ -325,11 +314,9 @@ class Ec2Plugin(ServicePlugin):
         # cheapest ranked exact model automatically instead of incorrectly
         # telling the customer that the shape does not exist. Ask for a
         # replacement only when the requested shape itself is unavailable.
-        customer_must_select = bool(
-            requirement.field_sources.get("_customer_select_configuration")
-        )
+        customer_must_select = bool(requirement.field_sources.get("_customer_select_configuration"))
         requires_confirmation = customer_must_select or bool(
-            exact is None and len(options) > 1 and not exact_shape_exists
+            not requested_model and exact is None and len(options) > 1 and not exact_shape_exists
         )
         confirmation_reason = None
         if customer_must_select:
@@ -354,7 +341,12 @@ class Ec2Plugin(ServicePlugin):
             selection_reason=(
                 "客户指定型号已确认可用，直接采用。"
                 if requested_model and exact
-                else "先按业务类型与官方规格筛选；能取得目录价时仅用它辅助排序。"
+                else (
+                    f"客户指定型号 {requested_model} 在当前区域不可用；已在相同或不低于原配置、"
+                    "且可取得官方价格的型号中自动选择最低价。"
+                    if requested_model
+                    else "先按业务类型与官方规格筛选；能取得目录价时仅用它辅助排序。"
+                )
             ),
             candidates=options,
             requires_confirmation=requires_confirmation,
@@ -462,18 +454,13 @@ class Ec2Plugin(ServicePlugin):
             reserved = PricingCatalog.reserved_price(
                 compute_product,
                 years=int(requested.get("reserved_term_years") or 1),
-                payment_option=_optional_string(requested.get("payment_option"))
-                or "no_upfront",
+                payment_option=_optional_string(requested.get("payment_option")) or "no_upfront",
                 offering_class=(
-                    "convertible"
-                    if purchase_option == "convertible_reserved"
-                    else "standard"
+                    "convertible" if purchase_option == "convertible_reserved" else "standard"
                 ),
                 hours_per_month=requirement.hours_per_month,
             )
-            monthly_commitment_cost = (
-                reserved.monthly_amortized * requirement.quantity
-            )
+            monthly_commitment_cost = reserved.monthly_amortized * requirement.quantity
             upfront_commitment_cost = reserved.upfront * requirement.quantity
         else:
             raise ManualConfirmationRequired(
@@ -523,8 +510,8 @@ class Ec2Plugin(ServicePlugin):
             transfer_product = PricingCatalog.require_unique(
                 transfer_products, context=f"公网出站流量 ({region})"
             )
-            transfer_service, transfer_usage, transfer_operation = (
-                PricingCatalog.billing_identity(transfer_product)
+            transfer_service, transfer_usage, transfer_operation = PricingCatalog.billing_identity(
+                transfer_product
             )
             usage_lines.append(
                 UsageLine(
@@ -540,8 +527,8 @@ class Ec2Plugin(ServicePlugin):
         notice = None
         if substitution:
             notice = (
-                f"客户指定的 {requested_model} 不可用或与规格冲突，已选择满足要求且最接近的 "
-                f"{selected['model']}。"
+                f"客户指定的 {requested_model} 在当前区域不可用或与配置冲突；系统已在"
+                f"相同或不低于原配置且可报价的型号中，自动替换为最低价的 {selected['model']}。"
             )
         elif min_memory is not None and selected["memory_gib"] > min_memory:
             notice = (
@@ -765,9 +752,7 @@ class Ec2Plugin(ServicePlugin):
 
         try:
             if requested_model:
-                response = query(
-                    parameters={"InstanceTypes": [requested_model]}, paginate=False
-                )
+                response = query(parameters={"InstanceTypes": [requested_model]}, paginate=False)
                 exact_model = parse(response) if response is not None else []
                 if exact_model:
                     return remember(exact_model)
@@ -794,9 +779,7 @@ class Ec2Plugin(ServicePlugin):
             # Only unusual, non-existent shapes need a broader current-generation
             # scan to produce the lower and upper confirmation choices.
             response = query(
-                parameters={
-                    "Filters": [{"Name": "current-generation", "Values": ["true"]}]
-                },
+                parameters={"Filters": [{"Name": "current-generation", "Values": ["true"]}]},
                 max_items=1000,
             )
             candidates = parse(response) if response is not None else []

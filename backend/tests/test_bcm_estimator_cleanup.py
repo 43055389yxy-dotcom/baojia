@@ -97,6 +97,42 @@ def test_configured_pool_is_cleared_and_never_deleted(monkeypatch) -> None:
     assert bcm.deleted == []
 
 
+def test_owned_pool_tag_is_verified_once_per_running_estimator() -> None:
+    class TaggedBcm(FakeBcm):
+        def __init__(self) -> None:
+            super().__init__()
+            self.tag_reads = 0
+
+        def list_tags_for_resource(self, *, arn: str) -> dict[str, object]:
+            self.tag_reads += 1
+            return {"tags": {"Application": "aws-smart-quote"}}
+
+    class FakeSts:
+        @staticmethod
+        def get_caller_identity() -> dict[str, str]:
+            return {"Account": "123456789012"}
+
+    class FakeSession:
+        @staticmethod
+        def client(name: str) -> FakeSts:
+            assert name == "sts"
+            return FakeSts()
+
+    bcm = TaggedBcm()
+    clients = AwsClients(
+        session=FakeSession(), pricing=None, bcm=bcm, ssm=None  # type: ignore[arg-type]
+    )
+    estimator = BcmWorkloadEstimator(
+        clients,
+        Settings(bcm_workload_estimate_ids=["pool-estimate"]),
+    )
+
+    estimator._verify_owned("pool-estimate")
+    estimator._verify_owned("pool-estimate")
+
+    assert bcm.tag_reads == 1
+
+
 def test_transient_bcm_create_failure_is_retried_with_one_idempotency_token(
     monkeypatch,
 ) -> None:

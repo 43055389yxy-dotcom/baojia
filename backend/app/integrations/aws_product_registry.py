@@ -1,0 +1,415 @@
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any
+
+from app.integrations.aws_public_catalog import PublicAwsPriceCatalog
+
+PRODUCT_REGISTRY_SCHEMA_VERSION = 2
+
+
+def _service_key(service_code: str) -> str:
+    value = re.sub(r"(?<!^)(?=[A-Z])", "_", service_code).casefold()
+    value = re.sub(r"[^a-z0-9]+", "_", value).strip("_")
+    for prefix in ("amazon_", "aws_"):
+        if value.startswith(prefix):
+            value = value[len(prefix) :]
+    return value or service_code.casefold()
+
+
+def _aliases(service_code: str) -> list[str]:
+    spaced = re.sub(r"(?<!^)(?=[A-Z])", " ", service_code).strip()
+    stripped = re.sub(r"^(Amazon|AWS)\s*", "", spaced, flags=re.IGNORECASE).strip()
+    values = {
+        service_code,
+        spaced,
+        stripped,
+        _service_key(service_code),
+        _service_key(service_code).replace("_", " "),
+    }
+    return sorted(value for value in values if value)
+
+
+def _canonical(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.casefold())
+
+
+class AwsProductRegistry:
+    """Persistent identity registry for every official AWS price-list offer.
+
+    One row represents one AWS product boundary. Later field templates and
+    billing dimensions are attached to that same boundary, so new products do
+    not share a mutable, universal component template.
+    """
+
+    def __init__(
+        self,
+        public_catalog: PublicAwsPriceCatalog | None = None,
+        database_path: Path | None = None,
+    ) -> None:
+        self.public_catalog = public_catalog or PublicAwsPriceCatalog()
+        self._database_path = database_path or (
+            Path(__file__).resolve().parents[2]
+            / ".cache"
+            / "aws_product_registry.sqlite3"
+        )
+        self._database_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self._database_path, timeout=10)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        return connection
+
+    def _initialize(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS aws_product_registry (
+                    service_code TEXT PRIMARY KEY,
+                    service_key TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    aliases_json TEXT NOT NULL,
+                    offer_json TEXT NOT NULL,
+                    field_template_json TEXT NOT NULL DEFAULT '{}',
+                    policy_json TEXT NOT NULL DEFAULT '{}',
+                    identity_status TEXT NOT NULL,
+                    profile_status TEXT NOT NULL,
+                    schema_version INTEGER NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_aws_product_service_key "
+                "ON aws_product_registry(service_key)"
+            )
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(aws_product_registry)"
+                ).fetchall()
+            }
+            if "field_template_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE aws_product_registry ADD COLUMN "
+                    "field_template_json TEXT NOT NULL DEFAULT '{}'"
+                )
+            if "policy_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE aws_product_registry ADD COLUMN "
+                    "policy_json TEXT NOT NULL DEFAULT '{}'"
+                )
+
+    def sync(self, *, refresh: bool = False) -> dict[str, Any]:
+        offers = self.public_catalog.offers(refresh=refresh)
+        now = time.time()
+        current_codes = {offer.service_code for offer in offers}
+        inserted = 0
+        updated = 0
+        with self._lock, self._connect() as connection:
+            existing = {
+                str(row["service_code"]): {
+                    "profile_status": str(row["profile_status"]),
+                    "offer": json.loads(str(row["offer_json"])),
+                    "field_template": json.loads(str(row["field_template_json"])),
+                    "policy": json.loads(str(row["policy_json"])),
+                }
+                for row in connection.execute(
+                    "SELECT service_code, profile_status, offer_json, "
+                    "field_template_json, policy_json "
+                    "FROM aws_product_registry"
+                ).fetchall()
+            }
+            for offer in offers:
+                payload = asdict(offer)
+                previous = existing.get(offer.service_code)
+                if previous and isinstance(previous.get("offer"), dict):
+                    for key in (
+                        "available_regions",
+                        "region_count",
+                        "region_publication_date",
+                    ):
+                        if previous["offer"].get(key) is not None:
+                            payload[key] = previous["offer"][key]
+                profile_status = (
+                    str(previous["profile_status"])
+                    if previous
+                    else "identity_ready"
+                )
+                field_template = (
+                    previous.get("field_template")
+                    if previous and previous.get("field_template")
+                    else {
+                        "service_code": offer.service_code,
+                        "fields": [],
+                        "source": "official_dimensions_on_first_use",
+                        "isolation": "strict_component_boundary",
+                    }
+                )
+                policy = self._base_policy(offer.service_code)
+                if previous and isinstance(previous.get("policy"), dict):
+                    policy.update(previous["policy"])
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO aws_product_registry (
+                        service_code, service_key, display_name, aliases_json,
+                        offer_json, field_template_json, policy_json,
+                        identity_status, profile_status,
+                        schema_version, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        offer.service_code,
+                        _service_key(offer.service_code),
+                        offer.service_code,
+                        json.dumps(_aliases(offer.service_code), ensure_ascii=False),
+                        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                        json.dumps(field_template, ensure_ascii=False, separators=(",", ":")),
+                        json.dumps(policy, ensure_ascii=False, separators=(",", ":")),
+                        "official",
+                        profile_status,
+                        PRODUCT_REGISTRY_SCHEMA_VERSION,
+                        now,
+                    ),
+                )
+                if offer.service_code in existing:
+                    updated += 1
+                else:
+                    inserted += 1
+            if current_codes:
+                placeholders = ",".join("?" for _ in current_codes)
+                connection.execute(
+                    f"UPDATE aws_product_registry SET identity_status = 'retired' "
+                    f"WHERE service_code NOT IN ({placeholders})",
+                    tuple(sorted(current_codes)),
+                )
+        return {
+            "official_offer_count": len(offers),
+            "inserted": inserted,
+            "updated": updated,
+            "schema_version": PRODUCT_REGISTRY_SCHEMA_VERSION,
+            "publication_date": (
+                offers[0].publication_date if offers else None
+            ),
+        }
+
+    @staticmethod
+    def _base_policy(service_code: str) -> dict[str, Any]:
+        """Return the invariant contract shared by every AWS product row.
+
+        This is deliberately structural rather than a universal product
+        template: products keep separate fields and prices, while only the
+        customer's quote-wide region is allowed to cross a component boundary.
+        """
+
+        return {
+            "service_code": service_code,
+            "identity_source": "aws_bulk_offer_index",
+            "specification_source": "aws_price_list",
+            "final_price_source": "aws_bcm_or_official_price_dimension",
+            "customer_explicit_value_priority": "highest",
+            "cross_component_inheritance": "region_only",
+            "missing_value": "service_specific_default_or_confirmation",
+            "price_failure": "retain_component_and_retry_official_sources",
+            "zero_price": "allowed_only_for_explicit_zero_base_resources",
+            "edit_recalculation": "affected_component_only_from_intake",
+        }
+
+    def update_profile(
+        self,
+        service_code: str,
+        profile: dict[str, Any],
+        *,
+        status: str,
+    ) -> None:
+        """Attach one verified official field contract to its own product row."""
+
+        fields = [
+            str(field)
+            for field in profile.get("fields", [])
+            if isinstance(field, str) and field
+        ]
+        bindings = [
+            dict(binding)
+            for binding in profile.get("field_bindings", [])
+            if isinstance(binding, dict)
+        ]
+        template = {
+            "service_code": service_code,
+            "fields": fields,
+            "field_bindings": bindings,
+            "attribute_names": list(profile.get("attribute_names") or []),
+            "official_dimension_count": len(profile.get("dimensions") or []),
+            "source": "aws_price_list_dimensions",
+            "region": profile.get("region"),
+            "isolation": "strict_component_boundary",
+            "profile_schema_version": profile.get("profile_schema_version"),
+        }
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT policy_json FROM aws_product_registry WHERE service_code = ?",
+                (service_code,),
+            ).fetchone()
+            if row is None:
+                return
+            policy = json.loads(str(row["policy_json"]))
+            policy["field_discovery"] = "verified"
+            policy["billing_dimension_count"] = len(profile.get("dimensions") or [])
+            connection.execute(
+                "UPDATE aws_product_registry SET field_template_json = ?, "
+                "policy_json = ?, profile_status = ?, schema_version = ?, "
+                "updated_at = ? WHERE service_code = ?",
+                (
+                    json.dumps(template, ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(policy, ensure_ascii=False, separators=(",", ":")),
+                    status,
+                    PRODUCT_REGISTRY_SCHEMA_VERSION,
+                    time.time(),
+                    service_code,
+                ),
+            )
+
+    def sync_region_availability(
+        self,
+        *,
+        workers: int = 12,
+        only_missing: bool = True,
+    ) -> dict[str, int]:
+        products = self.list_products()
+        pending = [
+            product
+            for product in products
+            if product["identity_status"] == "official"
+            and (
+                not only_missing
+                or not isinstance(product.get("offer"), dict)
+                or not product["offer"].get("available_regions")
+            )
+        ]
+        result = {"checked": len(pending), "updated": 0, "failed": 0}
+
+        def discover(service_code: str) -> tuple[str, list[str], str | None]:
+            regions, publication_date = self.public_catalog.available_regions(service_code)
+            return service_code, regions, publication_date
+
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+            futures = {
+                executor.submit(discover, str(product["service_code"])): product
+                for product in pending
+            }
+            for future in as_completed(futures):
+                try:
+                    service_code, regions, publication_date = future.result()
+                except Exception:
+                    result["failed"] += 1
+                    continue
+                with self._lock, self._connect() as connection:
+                    row = connection.execute(
+                        "SELECT offer_json FROM aws_product_registry "
+                        "WHERE service_code = ?",
+                        (service_code,),
+                    ).fetchone()
+                    if row is None:
+                        result["failed"] += 1
+                        continue
+                    offer = json.loads(str(row["offer_json"]))
+                    offer["available_regions"] = regions
+                    offer["region_count"] = len(regions)
+                    offer["region_publication_date"] = publication_date
+                    connection.execute(
+                        "UPDATE aws_product_registry SET offer_json = ?, updated_at = ? "
+                        "WHERE service_code = ?",
+                        (
+                            json.dumps(
+                                offer, ensure_ascii=False, separators=(",", ":")
+                            ),
+                            time.time(),
+                            service_code,
+                        ),
+                    )
+                result["updated"] += 1
+        return result
+
+    def mark_profile_status(self, service_code: str, status: str) -> None:
+        allowed = {
+            "identity_ready",
+            "profile_ready",
+            "pricing_ready",
+            "needs_review",
+            "zero_base_fee",
+            "composite",
+        }
+        if status not in allowed:
+            raise ValueError(f"unsupported AWS product profile status: {status}")
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "UPDATE aws_product_registry SET profile_status = ?, updated_at = ? "
+                "WHERE service_code = ?",
+                (status, time.time(), service_code),
+            )
+
+    def list_products(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM aws_product_registry ORDER BY service_code"
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            result.append(
+                {
+                    "service_code": str(row["service_code"]),
+                    "service_key": str(row["service_key"]),
+                    "display_name": str(row["display_name"]),
+                    "aliases": json.loads(str(row["aliases_json"])),
+                    "offer": json.loads(str(row["offer_json"])),
+                    "field_template": json.loads(str(row["field_template_json"])),
+                    "policy": json.loads(str(row["policy_json"])),
+                    "identity_status": str(row["identity_status"]),
+                    "profile_status": str(row["profile_status"]),
+                    "schema_version": int(row["schema_version"]),
+                    "updated_at": float(row["updated_at"]),
+                }
+            )
+        return result
+
+    def resolve_service_code(self, *labels: str) -> str | None:
+        targets = {_canonical(label) for label in labels if _canonical(label)}
+        if not targets:
+            return None
+        matches: set[str] = set()
+        for product in self.list_products():
+            identities = {
+                _canonical(str(product["service_code"])),
+                _canonical(str(product["service_key"])),
+                *(_canonical(str(alias)) for alias in product["aliases"]),
+            }
+            if identities & targets:
+                matches.add(str(product["service_code"]))
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    def coverage(self) -> dict[str, Any]:
+        products = self.list_products()
+        status_counts: dict[str, int] = {}
+        for product in products:
+            status = str(product["profile_status"])
+            status_counts[status] = status_counts.get(status, 0) + 1
+        return {
+            "total": len(products),
+            "official": sum(
+                1 for item in products if item["identity_status"] == "official"
+            ),
+            "retired": sum(
+                1 for item in products if item["identity_status"] == "retired"
+            ),
+            "profile_status": status_counts,
+        }

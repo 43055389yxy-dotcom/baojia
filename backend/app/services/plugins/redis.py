@@ -45,11 +45,7 @@ class RedisPlugin(ServicePlugin):
                 code="elasticache_specification_not_found",
             )
         default_index = next(
-            (
-                index
-                for index, item in enumerate(candidates)
-                if _fits(item, min_memory, min_vcpu)
-            ),
+            (index for index, item in enumerate(candidates) if _fits(item, min_memory, min_vcpu)),
             0,
         )
         options = [
@@ -71,10 +67,7 @@ class RedisPlugin(ServicePlugin):
             min_memory is not None
             and any(
                 option.specifications.get("memoryGiB") == min_memory
-                and (
-                    min_vcpu is None
-                    or option.specifications.get("vCPU") == min_vcpu
-                )
+                and (min_vcpu is None or option.specifications.get("vCPU") == min_vcpu)
                 for option in options
             )
         )
@@ -89,12 +82,7 @@ class RedisPlugin(ServicePlugin):
         # the customer selects an official model, that model is authoritative
         # and this question is resolved.
         requires_confirmation = bool(
-            (requested_model and selected.model != requested_model)
-            or (
-                not requested_model
-                and len(options) > 1
-                and not exact_shape_exists
-            )
+            not requested_model and len(options) > 1 and not exact_shape_exists
         )
         # A lower/upper sizing question is a real customer decision.  Do not
         # preselect either answer or persist a provisional model as if the
@@ -164,8 +152,7 @@ class RedisPlugin(ServicePlugin):
         candidates = [
             item
             for item in _cache_candidates(products, api_engine)
-            if min_vcpu is None
-            or (item["vcpu"] is not None and item["vcpu"] >= min_vcpu)
+            if min_vcpu is None or (item["vcpu"] is not None and item["vcpu"] >= min_vcpu)
         ]
         candidates.sort(
             key=lambda item: (
@@ -205,22 +192,14 @@ class RedisPlugin(ServicePlugin):
 
         if requested_model:
             exact_model = next(
-                (
-                    item
-                    for item in unique
-                    if item["model"].casefold() == requested_model.casefold()
-                ),
+                (item for item in unique if item["model"].casefold() == requested_model.casefold()),
                 None,
             )
             chosen = (
-                [exact_model]
-                if exact_model
-                else _invalid_model_neighbors(unique, requested_model)
+                [exact_model] if exact_model else _invalid_model_neighbors(unique, requested_model)
             )
         elif min_memory is not None:
-            exact_memory = next(
-                (item for item in unique if item["memory_gib"] == min_memory), None
-            )
+            exact_memory = next((item for item in unique if item["memory_gib"] == min_memory), None)
             if exact_memory:
                 chosen = [exact_memory]
             else:
@@ -346,7 +325,7 @@ class RedisPlugin(ServicePlugin):
         if substitution:
             notice = (
                 f"客户指定的 {requested_model} 不存在、区域不支持或与规格冲突，"
-                f"已选择最接近的 {selected['model']}。"
+                f"已在相同或不低于原配置且可报价的节点中，自动替换为最低价的 {selected['model']}。"
             )
         elif min_memory is not None and selected["memory_gib"] > min_memory:
             notice = (
@@ -581,8 +560,7 @@ def _invalid_model_neighbors(
     same_size = [
         item
         for item in candidates
-        if model_parts(item)[1] == requested_size
-        and model_parts(item)[0] != requested_family
+        if model_parts(item)[1] == requested_size and model_parts(item)[0] != requested_family
     ]
 
     lower = None
@@ -623,8 +601,7 @@ def _select_cache(
         (
             item
             for item in candidates
-            if requested_model
-            and item["model"].casefold() == requested_model.casefold()
+            if requested_model and item["model"].casefold() == requested_model.casefold()
         ),
         None,
     )
@@ -632,11 +609,6 @@ def _select_cache(
     # descriptive, rounded, or AI-extracted and must never silently replace it.
     if exact:
         return exact, False
-    if requested_model:
-        raise ManualConfirmationRequired(
-            "客户指定的 ElastiCache 型号在目标区域不可用，需要客户选择替代型号",
-            code="invalid_redis_model_without_replacement_basis",
-        )
     eligible = [item for item in candidates if _fits(item, min_memory, min_vcpu)]
     if not eligible:
         raise ManualConfirmationRequired(

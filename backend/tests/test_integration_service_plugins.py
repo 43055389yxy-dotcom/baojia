@@ -4,6 +4,7 @@ from typing import Any
 
 import pytest
 
+from app.core.errors import ManualConfirmationRequired
 from app.domain.models import ServiceRequirement
 from app.services.plugins import integration_services
 from app.services.plugins.auxiliary_services import EbsPlugin, GlobalAcceleratorPlugin
@@ -570,6 +571,41 @@ def test_opensearch_nonstandard_shape_auto_selects_non_underprovisioned_option()
         "m7g.xlarge.search",
         "m7g.large.search",
     ]
+
+
+def test_opensearch_unavailable_model_auto_selects_cheapest_same_shape() -> None:
+    lower = product(
+        "AmazonES", "APS1-ESInstance:m7g.large", "ESDomain", 0.12, "Hrs",
+        location="Asia Pacific (Singapore)",
+        productFamily="Amazon OpenSearch Service Instance",
+        instanceType="m7g.large.search", vcpu="2", memoryGib="8",
+    )
+    upper = product(
+        "AmazonES", "APS1-ESInstance:m7g.xlarge", "ESDomain", 0.24, "Hrs",
+        location="Asia Pacific (Singapore)",
+        productFamily="Amazon OpenSearch Service Instance",
+        instanceType="m7g.xlarge.search", vcpu="4", memoryGib="16",
+    )
+    plugin = OpenSearchPlugin(  # type: ignore[arg-type]
+        None, FakeCatalog({"AmazonES": [lower, upper]})
+    )
+
+    selected = plugin.select(
+        ServiceRequirement(
+            service="opensearch",
+            region="ap-southeast-1",
+            requirements={
+                "requested_model": "missing.xlarge.search",
+                "vcpu": 4,
+                "memory_gib": 8,
+                "data_nodes": 1,
+            },
+        ),
+        "ap-southeast-1",
+    )
+
+    assert selected.model == "m7g.xlarge.search"
+    assert "自动替换为最低价" in (selected.substitution_notice or "")
 
 
 def test_nat_gateway_without_traffic_quotes_hours_and_returns_unit_rate() -> None:

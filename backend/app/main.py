@@ -22,10 +22,16 @@ from app.domain.models import (
     QuotePreviewResponse,
     QuoteRequest,
     QuoteResponse,
+    SalesRegionPreflightRequest,
+    SalesRegionPreflightResponse,
+    ServiceKind,
+    ServiceRequirement,
 )
 from app.integrations.ai_gateway import AiGateway
 from app.integrations.auto_service_discovery import AutoServiceDiscovery
 from app.integrations.aws import AwsClients, PricingCatalog, RegionResolver
+from app.integrations.aws_adaptation_audit import AwsAdaptationAudit
+from app.integrations.aws_product_registry import AwsProductRegistry
 from app.integrations.azure_auto_service_discovery import AzureAutoServiceDiscovery
 from app.integrations.azure_catalog import AzureOfficialCatalog
 from app.integrations.azure_intent import AzureIntentParser
@@ -74,7 +80,12 @@ settings = get_settings()
 clients = AwsClients.from_settings(settings)
 regions = RegionResolver(clients)
 catalog = PricingCatalog(clients, regions)
-auto_service_discovery = AutoServiceDiscovery(catalog)
+aws_product_registry = AwsProductRegistry()
+aws_adaptation_audit = AwsAdaptationAudit(aws_product_registry)
+auto_service_discovery = AutoServiceDiscovery(
+    catalog,
+    product_registry=aws_product_registry,
+)
 plugins = PluginRegistry(
     [
         Ec2Plugin(clients, catalog),
@@ -173,6 +184,28 @@ async def warm_common_aws_catalogs() -> None:
         await asyncio.to_thread(catalog_warmer.warm)
 
     asyncio.create_task(delayed_warmup())
+
+    async def sync_full_aws_product_registry() -> None:
+        # Identity metadata is tiny compared with regional price files. Sync it
+        # first so every current and future AWS offer has its own isolated
+        # product boundary before any on-demand field discovery begins.
+        await asyncio.sleep(5)
+        try:
+            result = await asyncio.to_thread(aws_product_registry.sync)
+            region_result = await asyncio.to_thread(
+                aws_product_registry.sync_region_availability
+            )
+            logger.info(
+                "AWS full product registry synchronized: identity=%s regions=%s",
+                result,
+                region_result,
+            )
+        except Exception:
+            # Foreground quoting remains available from the previous registry
+            # and normal Price List cache while the public index is unavailable.
+            logger.exception("AWS full product registry synchronization failed")
+
+    asyncio.create_task(sync_full_aws_product_registry())
 
     async def delayed_azure_warmup() -> None:
         await asyncio.sleep(30)
@@ -294,6 +327,21 @@ async def list_services() -> dict[str, Any]:
     return {"services": plugins.list()}
 
 
+@app.get("/api/aws-product-registry")
+async def get_aws_product_registry(details: bool = False) -> dict[str, Any]:
+    """Expose read-only AWS product adaptation coverage for auditing."""
+
+    payload: dict[str, Any] = {
+        "coverage": aws_product_registry.coverage(),
+        "adaptationAudit": aws_adaptation_audit.report(),
+        "catalogSource": "AWS Bulk Price List",
+        "componentIsolation": "region-only inheritance",
+    }
+    if details:
+        payload["products"] = aws_product_registry.list_products()
+    return payload
+
+
 class PromptUpdate(BaseModel):
     content: str = Field(min_length=1, max_length=50000)
 
@@ -345,6 +393,111 @@ async def preview_quote(request: QuoteRequest) -> QuotePreviewResponse:
     return await quote_service.preview(request)
 
 
+AWS_SALES_REGION_NAMES = {
+    "af-south-1": "非洲（开普敦）",
+    "ap-east-1": "亚太地区（香港）",
+    "ap-east-2": "亚太地区（台北）",
+    "ap-northeast-1": "亚太地区（东京）",
+    "ap-northeast-2": "亚太地区（首尔）",
+    "ap-northeast-3": "亚太地区（大阪）",
+    "ap-south-1": "亚太地区（孟买）",
+    "ap-south-2": "亚太地区（海得拉巴）",
+    "ap-southeast-1": "新加坡",
+    "ap-southeast-2": "亚太地区（悉尼）",
+    "ap-southeast-3": "亚太地区（雅加达）",
+    "ap-southeast-4": "亚太地区（墨尔本）",
+    "ap-southeast-5": "亚太地区（马来西亚）",
+    "ap-southeast-6": "亚太地区（新西兰）",
+    "ap-southeast-7": "亚太地区（泰国）",
+    "ca-central-1": "加拿大（中部）",
+    "ca-west-1": "加拿大西部（卡尔加里）",
+    "eu-central-1": "欧洲（法兰克福）",
+    "eu-central-2": "欧洲（苏黎世）",
+    "eu-north-1": "欧洲（斯德哥尔摩）",
+    "eu-south-1": "欧洲（米兰）",
+    "eu-south-2": "欧洲（西班牙）",
+    "eu-west-1": "欧洲（爱尔兰）",
+    "eu-west-2": "欧洲（伦敦）",
+    "eu-west-3": "欧洲（巴黎）",
+    "il-central-1": "以色列（特拉维夫）",
+    "me-central-1": "中东（阿联酋）",
+    "me-south-1": "中东（巴林）",
+    "mx-central-1": "墨西哥（中部）",
+    "sa-east-1": "南美洲（圣保罗）",
+    "us-east-1": "美国东部（弗吉尼亚北部）",
+    "us-east-2": "美国东部（俄亥俄）",
+    "us-west-1": "美国西部（加利福尼亚北部）",
+    "us-west-2": "美国西部（俄勒冈）",
+}
+
+AWS_SALES_REGION_PRIORITY = (
+    "ap-east-1",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "ap-south-1",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ap-southeast-3",
+    "ap-southeast-4",
+    "eu-central-1",
+    "eu-west-2",
+    "eu-west-3",
+    "us-east-1",
+    "us-west-2",
+)
+
+
+def _sales_region_options() -> list[dict[str, str]]:
+    official = DeepSeekIntentParser.official_aws_region_labels()
+    return [
+        {
+            "code": code,
+            "label": (
+                f"{AWS_SALES_REGION_NAMES[code]} / {official_name}"
+                if code in AWS_SALES_REGION_NAMES
+                else official_name
+            ),
+        }
+        for code, official_name in sorted(
+            official.items(),
+            key=lambda item: (
+                item[0] not in AWS_SALES_REGION_PRIORITY,
+                (
+                    AWS_SALES_REGION_PRIORITY.index(item[0])
+                    if item[0] in AWS_SALES_REGION_PRIORITY
+                    else len(AWS_SALES_REGION_PRIORITY)
+                ),
+                item[0],
+            ),
+        )
+    ]
+
+
+@app.post(
+    "/api/quotes/region-preflight",
+    response_model=SalesRegionPreflightResponse,
+)
+async def sales_region_preflight(
+    request: SalesRegionPreflightRequest,
+) -> SalesRegionPreflightResponse:
+    """Resolve AWS regions before starting AI/component catalog work."""
+
+    result = await quote_service.identify_sales_region(request.customer_request)
+    detected = [
+        str(region)
+        for region in result.get("regions", [])
+        if isinstance(region, str)
+    ]
+    requires_confirmation = bool(result.get("requires_confirmation")) or not detected
+    return SalesRegionPreflightResponse(
+        detected_regions=detected,
+        selected_region=detected[0] if len(detected) == 1 else None,
+        requires_confirmation=requires_confirmation,
+        options=_sales_region_options() if requires_confirmation else [],
+    )
+
+
 def _confirmation_store_for_token(token: str) -> ConfirmationSessionStore | None:
     if token.startswith("aws_"):
         return aws_confirmation_sessions
@@ -369,6 +522,11 @@ async def get_confirmation_session(token: str) -> ConfirmationSessionResponse | 
     session = store.get(token) if store is not None else None
     if session is None:
         return JSONResponse(status_code=404, content={"message": "确认单不存在或已失效"})
+    if store.cloud_provider == "aws" and session.status == "pending":
+        hydrated = await quote_service.hydrate_confirmation_session_choices(session)
+        if hydrated.confirmation_items != session.confirmation_items:
+            store.replace_pending_confirmation_items(token, hydrated.confirmation_items)
+            session = hydrated
     if store.cloud_provider == "aws":
         reprocess_request = store.begin_configuration_reprocessing(token)
         if reprocess_request is not None:
@@ -377,6 +535,54 @@ async def get_confirmation_session(token: str) -> ConfirmationSessionResponse | 
             if refreshed is not None:
                 session = refreshed
     return session
+
+
+class AwsConfigurationOptionsRequest(BaseModel):
+    service: str = Field(
+        min_length=2, max_length=80, pattern=r"^[a-z0-9_\-]+$"
+    )
+    region: str = Field(min_length=5, max_length=32)
+    requirements: dict[str, Any] = Field(default_factory=dict)
+
+
+@app.post("/api/aws/configuration-field-options")
+async def get_aws_configuration_field_options(
+    request: AwsConfigurationOptionsRequest,
+) -> dict[str, list[Any]]:
+    """Return finite official edit choices through one product-neutral API."""
+
+    service_aliases = {
+        "aurora": "rds",
+        "redis": "elasticache",
+        "valkey": "elasticache",
+    }
+    try:
+        kind = ServiceKind(service_aliases.get(request.service, request.service))
+    except ValueError:
+        return {}
+    requirement = ServiceRequirement(
+        service=request.service,
+        region=request.region,
+        requirements=request.requirements,
+    )
+    plugin = plugins.get(kind)
+    provider = getattr(plugin, "configuration_field_options", None)
+    if not callable(provider):
+        return {}
+    try:
+        options = await asyncio.wait_for(
+            asyncio.to_thread(provider, requirement, request.region),
+            timeout=8,
+        )
+    except Exception:
+        options = {}
+    if not isinstance(options, dict):
+        return {}
+    return {
+        str(field): [value for value in values if isinstance(value, (str, int, float, bool))]
+        for field, values in options.items()
+        if isinstance(field, str) and isinstance(values, list)
+    }
 
 
 @app.post(

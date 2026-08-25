@@ -60,6 +60,80 @@ def test_confirmation_session_round_trip(tmp_path: Path) -> None:
     assert completed.status == "completed"
 
 
+def test_saved_eks_worker_quantity_is_reconciled_before_customer_display(
+    tmp_path: Path,
+) -> None:
+    store = ConfirmationSessionStore(tmp_path / "sessions.sqlite3")
+    source = (
+        "Amazon EKS：数量2，每个集群配置3个Worker节点，"
+        "Worker节点单台4核8GB/100GB存储"
+    )
+    intent = ParsedIntent(
+        customer_summary="EKS",
+        services=[
+            ServiceRequirement(service="eks", quantity=2, source_text=source),
+            ServiceRequirement(
+                service="ec2",
+                derived_from_service="eks",
+                calculator_service_name="Amazon EC2 (EKS Worker Nodes)",
+                quantity=2,
+                source_text=source,
+            ),
+        ],
+    )
+    token = store.create_or_replace(
+        draft_id="eksworkers01",
+        customer_request=source,
+        customer_summary="EKS",
+        intent=intent,
+        confirmation_text="请确认",
+        items=[],
+    )
+
+    session = store.get(token)
+
+    assert session is not None
+    worker = next(
+        item for item in session.configuration_items if "Worker" in item.display_name
+    )
+    assert worker.quantity == 6
+    assert worker.component_number == "1.1"
+    assert worker.parent_component_number == "1"
+
+
+def test_configuration_review_uses_stable_ids_for_parent_and_child(
+    tmp_path: Path,
+) -> None:
+    store = ConfirmationSessionStore(tmp_path / "sessions.sqlite3")
+    source = "Amazon EKS：数量1，3个Worker节点，单台4核8GB/100GB存储"
+    intent = ParsedIntent(
+        customer_summary="EKS",
+        services=[ServiceRequirement(service="eks", quantity=1, source_text=source)],
+    )
+    token = store.create_or_replace(
+        draft_id="stable-review-ids",
+        customer_request=source,
+        customer_summary="EKS",
+        intent=intent,
+        confirmation_text="",
+        items=[],
+    )
+    store.prepare_configuration_review(draft_id="stable-review-ids", intent=intent)
+
+    review = store.get(token)
+
+    assert review is not None
+    parent = next(item for item in review.configuration_items if item.service == "eks")
+    child = next(
+        item
+        for item in review.configuration_items
+        if item.parent_component_number == parent.component_number
+    )
+    assert parent.component_id.startswith("cmp_")
+    assert child.component_id.startswith("cmp_")
+    assert child.parent_component_id == parent.component_id
+
+
 def test_aws_and_azure_confirmation_storage_are_physically_isolated(
     tmp_path: Path,
 ) -> None:
@@ -241,7 +315,7 @@ def test_stale_configuration_update_returns_to_editable_table(tmp_path: Path) ->
     )
     store.prepare_configuration_review(draft_id="draft-stale-feedback", intent=intent)
     store.submit_configuration_feedback(token, component_feedback={"0": "改成4核8G"})
-    stale_time = (datetime.now(UTC) - timedelta(minutes=3)).isoformat()
+    stale_time = (datetime.now(UTC) - timedelta(minutes=9)).isoformat()
     with store._connect() as connection:
         connection.execute(
             "UPDATE confirmation_sessions SET submitted_at = ? WHERE token = ?",
@@ -253,6 +327,37 @@ def test_stale_configuration_update_returns_to_editable_table(tmp_path: Path) ->
     assert recovered is not None
     assert recovered.status == "configuration_review"
     assert "原配置已保留" in recovered.confirmation_text
+
+
+def test_normal_five_minute_configuration_update_is_not_treated_as_stale(
+    tmp_path: Path,
+) -> None:
+    store = ConfirmationSessionStore(tmp_path / "sessions.sqlite3")
+    intent = ParsedIntent(
+        customer_summary="test",
+        services=[ServiceRequirement(service="future_product", source_text="20项配置")],
+    )
+    token = store.create_or_replace(
+        draft_id="long-valid-job",
+        customer_request="20项独立配置",
+        customer_summary="test",
+        intent=intent,
+        confirmation_text="最终配置",
+        items=[],
+    )
+    store.prepare_configuration_review(draft_id="long-valid-job", intent=intent)
+    store.submit_configuration_feedback(token, component_feedback={"0": "修改用量"})
+    active_time = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE confirmation_sessions SET submitted_at = ? WHERE token = ?",
+            (active_time, token),
+        )
+
+    active = store.get(token)
+
+    assert active is not None
+    assert active.status == "reviewing"
 
 
 def test_legacy_product_identity_is_normalized_when_session_is_loaded(
@@ -412,6 +517,63 @@ def test_customer_answers_are_partitioned_by_component(tmp_path: Path) -> None:
 
     assert component == {0: {rds_question: "主备"}}
     assert global_answers == {region_question: "法兰克福"}
+
+
+def test_identical_visible_questions_keep_independent_component_answers(
+    tmp_path: Path,
+) -> None:
+    store = ConfirmationSessionStore(tmp_path / "independent-answers.sqlite3")
+    intent = ParsedIntent(
+        customer_summary="two independent EC2 components",
+        services=[
+            ServiceRequirement(service="ec2"),
+            ServiceRequirement(service="ec2"),
+        ],
+    )
+    question = "EC2 还没有指定型号，请选择需要的型号。"
+    first = ConfirmationItem(
+        question=question,
+        answer_key="component-0:first",
+        component_id="0",
+        service="ec2",
+    )
+    second = ConfirmationItem(
+        question=question,
+        answer_key="component-1:second",
+        component_id="1",
+        service="ec2",
+    )
+    token = store.create_or_replace(
+        draft_id="draft-independent-answers",
+        customer_request="two EC2 components",
+        customer_summary="test",
+        intent=intent,
+        confirmation_text="confirm all",
+        items=[first, second],
+    )
+
+    submitted = store.submit(
+        token,
+        {
+            first.answer_key or "": "选择 t3.small",
+            second.answer_key or "": "选择 c7g.xlarge",
+        },
+    )
+    assert submitted is not None
+    assert submitted.answers == {
+        "component-0:first": "选择 t3.small",
+        "component-1:second": "选择 c7g.xlarge",
+    }
+
+    component, global_answers = store.partition_answers_by_component(
+        "draft-independent-answers", submitted.answers
+    )
+
+    assert component == {
+        0: {question: "选择 t3.small"},
+        1: {question: "选择 c7g.xlarge"},
+    }
+    assert global_answers == {}
 
 
 def test_confirmation_round_survives_replacing_the_same_draft(tmp_path: Path) -> None:

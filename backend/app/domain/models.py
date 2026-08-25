@@ -53,6 +53,21 @@ class ServiceRequirement(BaseModel):
     # newly-added AWS service without waiting for a backend enum release.
     service: str = Field(min_length=2, max_length=80, pattern=r"^[a-z0-9_\-]+$")
     calculator_service_name: str | None = Field(default=None, min_length=2, max_length=160)
+    # Internal identity is deliberately independent from list position and
+    # mutable customer text.  It survives edits, AI cleanup, catalog repair and
+    # pricing so a value can never be restored onto a neighbouring component.
+    component_key: str | None = Field(default=None, min_length=8, max_length=80)
+    # A separately priced component may be created solely to satisfy another
+    # component (for example EKS worker EC2). Store that lineage outside the
+    # pricing requirements so every adapter still receives an isolated,
+    # product-only configuration.
+    derived_from_service: str | None = Field(
+        default=None, min_length=2, max_length=80, pattern=r"^[a-z0-9_\-]+$"
+    )
+    # Stable parent identity for separately priced derived resources.  The
+    # display layer may still number rows as 8 / 8.1, but all calculations use
+    # this key rather than source-text containment or the current row index.
+    parent_component_key: str | None = Field(default=None, min_length=8, max_length=80)
     # Stable customer-facing product identity. Several AWS products share a
     # Price List service code or a backend plugin (for example RDS/Aurora and
     # ALB/NLB), but that implementation detail must never collapse the product
@@ -65,6 +80,9 @@ class ServiceRequirement(BaseModel):
     hours_per_month: float = Field(default=730, gt=0, le=744)
     requirements: dict[str, Any] = Field(default_factory=dict)
     source_text: str = ""
+    # Immutable customer wording used for review, identity and reconciliation.
+    # ``source_text`` may contain later edit annotations for the AI audit trail.
+    original_source_text: str | None = None
     query_action: str | None = None
     # Exact snippets copied from this component's customer text. Keys use
     # ``region``, ``quantity`` or ``requirements.<field>`` paths.  This is
@@ -92,6 +110,13 @@ class QuoteRequest(BaseModel):
     selected_models: dict[str, str] = Field(default_factory=dict)
     draft_id: str | None = Field(default=None, min_length=12, max_length=12)
     confirmation_responses: dict[str, str] = Field(default_factory=dict)
+    # Sales confirms the quote-wide AWS deployment region before the slower
+    # component/catalog pass begins. Explicit component regions in customer
+    # text still take priority; this value fills only unresolved components.
+    sales_region: str | None = Field(
+        default=None,
+        pattern=r"^(?:af|ap|ca|cn|eu|il|me|mx|sa|us)(?:-gov)?-[a-z0-9-]+-\d$",
+    )
     pricing_mode: Literal[
         "on_demand", "standard_reserved", "convertible_reserved"
     ] = "on_demand"
@@ -130,6 +155,22 @@ class QuoteRequest(BaseModel):
         return self
 
 
+class SalesRegionPreflightRequest(BaseModel):
+    customer_request: str = Field(min_length=3, max_length=12000)
+
+
+class SalesRegionOption(BaseModel):
+    code: str
+    label: str
+
+
+class SalesRegionPreflightResponse(BaseModel):
+    detected_regions: list[str] = Field(default_factory=list)
+    selected_region: str | None = None
+    requires_confirmation: bool = False
+    options: list[SalesRegionOption] = Field(default_factory=list)
+
+
 class UsageLine(BaseModel):
     key: str = Field(pattern=r"^[A-Za-z0-9]{1,10}$")
     service_code: str
@@ -152,6 +193,11 @@ class ReferenceRate(BaseModel):
 
 
 class SelectedResource(BaseModel):
+    component_id: str | None = None
+    component_number: str | None = None
+    parent_component_id: str | None = None
+    parent_component_number: str | None = None
+    parent_display_name: str | None = None
     service: str
     display_name: str
     region: str
@@ -165,6 +211,9 @@ class SelectedResource(BaseModel):
     official_product: dict[str, Any]
     rationale: str
     substitution_notice: str | None = None
+    pricing_status: Literal["priced", "reference_only", "free", "unpriced"] = "priced"
+    pricing_issue_code: str | None = None
+    pricing_notice: str | None = None
     # Informational dependencies/coverage notes for the final quote. These do
     # not trigger customer confirmation and never add cost by themselves.
     remarks: list[str] = Field(default_factory=list)
@@ -187,6 +236,10 @@ class CandidateOption(BaseModel):
 
 class PreviewSelection(BaseModel):
     component_id: str
+    component_number: str | None = None
+    parent_component_id: str | None = None
+    parent_component_number: str | None = None
+    parent_display_name: str | None = None
     service: str
     display_name: str
     region: str
@@ -201,6 +254,14 @@ class PreviewSelection(BaseModel):
     confirmation_reason: str | None = None
     status: Literal["ready", "customer_issue", "technical_issue", "unsupported"] = "ready"
     issue_message: str | None = None
+    issue_code: str | None = None
+    issue_category: Literal[
+        "retryable",
+        "compatibility",
+        "catalog_mapping",
+        "system_configuration",
+        "unsupported",
+    ] | None = None
 
 
 class ConfirmationOption(BaseModel):
@@ -213,12 +274,18 @@ class ConfirmationOption(BaseModel):
 
 class ConfirmationItem(BaseModel):
     question: str
+    # Stable submission identity. The customer sees ``question``, while the
+    # browser submits this key so two components may ask identical wording
+    # without one answer overwriting the other.
+    answer_key: str | None = None
     options: list[ConfirmationOption] = Field(default_factory=list)
     dependent_options: list[ConfirmationOption] = Field(default_factory=list)
     dependent_on_values: list[str] = Field(default_factory=list)
     component_id: str | None = None
     service: str | None = None
-    selection_mode: Literal["buttons", "catalog"] = "buttons"
+    # Text entry is opt-in.  A finite-choice question must never silently fall
+    # back to a free-form input merely because its official options are empty.
+    selection_mode: Literal["text", "buttons", "catalog"] = "text"
 
 
 class ExpertReview(BaseModel):
@@ -331,6 +398,10 @@ class ConfigurationFeedbackSubmission(BaseModel):
 
 class ConfigurationReviewItem(BaseModel):
     component_id: str
+    component_number: str | None = None
+    parent_component_id: str | None = None
+    parent_component_number: str | None = None
+    parent_display_name: str | None = None
     service: str
     display_name: str
     region: str | None = None
@@ -343,6 +414,14 @@ class ConfigurationReviewItem(BaseModel):
     available_billing_labels: dict[str, str] = Field(default_factory=dict)
     pricing_status: Literal["ready", "unpriced"] = "ready"
     pricing_notice: str | None = None
+    pricing_issue_code: str | None = None
+    pricing_issue_category: Literal[
+        "retryable",
+        "compatibility",
+        "catalog_mapping",
+        "system_configuration",
+        "unsupported",
+    ] | None = None
     requirements: dict[str, Any] = Field(default_factory=dict)
     source_text: str = ""
 
@@ -395,6 +474,11 @@ class QuoteResponse(BaseModel):
     share_url: str | None = None
     calculator_details: list[str] = Field(default_factory=list)
     pricing_scenarios: list[PricingScenario] = Field(default_factory=list)
+    # A completed API job may still be a partial commercial result when one
+    # isolated component has no verified price. Expose that truth explicitly
+    # so the customer never mistakes an incomplete subtotal for a full quote.
+    is_partial: bool = False
+    incomplete_component_ids: list[str] = Field(default_factory=list)
 
     @field_validator("total_cost")
     @classmethod
@@ -417,6 +501,12 @@ class PricingScenario(BaseModel):
     upfront_cost: float = Field(default=0, ge=0)
     currency: Literal["USD"] = "USD"
     priced_lines: list[PricedLine] = Field(default_factory=list)
+    # Stable component-id -> monthly cost binding. The frontend must never
+    # infer ownership from row position or a partial string prefix such as
+    # ``s1`` (which also matches ``s10`` and ``s11``).
+    component_costs: dict[str, float] = Field(default_factory=dict)
+    is_partial: bool = False
+    incomplete_component_ids: list[str] = Field(default_factory=list)
 
 
 class ErrorResponse(BaseModel):

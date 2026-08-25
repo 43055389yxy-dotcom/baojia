@@ -342,7 +342,7 @@ def test_unknown_service_can_quote_explicit_usage_without_custom_adapter(tmp_pat
     assert "自动建立" in selected.rationale
 
 
-def test_unknown_service_without_usage_uses_one_minimum_official_unit(tmp_path: Path) -> None:
+def test_unknown_service_without_usage_exposes_reference_unit_only(tmp_path: Path) -> None:
     catalog = AppFlowCatalog()
     discovery = AutoServiceDiscovery(
         catalog,  # type: ignore[arg-type]
@@ -363,6 +363,6 @@ def test_unknown_service_without_usage_uses_one_minimum_official_unit(tmp_path: 
         "ap-southeast-1",
     )
 
-    assert selected.reference_rates == []
-    assert selected.usage_lines[0].service_code == "AmazonAppFlow"
-    assert selected.usage_lines[0].amount == 1
+    assert selected.usage_lines == []
+    assert selected.reference_rates[0].service_code == "AmazonAppFlow"
+    assert selected.reference_rates[0].unit_price == 0.02

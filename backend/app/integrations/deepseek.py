@@ -7,10 +7,20 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 
+from botocore.loaders import create_loader
 from pydantic import ValidationError
 
 from app.core.config import Settings
 from app.core.errors import ConfigurationError, ManualConfirmationRequired
+from app.domain.component_integrity import (
+    CUSTOMER_OVERRIDE_SOURCES,
+    canonical_component_source,
+    capture_customer_ledger,
+    enforce_component_integrity,
+    ensure_component_keys,
+    overlay_customer_fields,
+    restore_customer_ledger,
+)
 from app.domain.customer_configuration import preserve_customer_configuration
 from app.domain.models import ParsedIntent, ServiceRequirement
 from app.domain.requirement_fields import (
@@ -41,9 +51,7 @@ logger = logging.getLogger(__name__)
 AiTranscriptReporter = Callable[[str, str], Awaitable[None]]
 
 
-def _official_profile_cache_model(
-    model_name: str, profile: dict[str, object] | None
-) -> str | None:
+def _official_profile_cache_model(model_name: str, profile: dict[str, object] | None) -> str | None:
     """Version unknown-component results with their official field contract.
 
     Existing dedicated component templates keep their historical cache key.
@@ -100,6 +108,7 @@ def _redact_transcript(value: str) -> str:
     for pattern, replacement in patterns:
         result = re.sub(pattern, replacement, result)
     return result
+
 
 BARE_EC2_MODEL_PATTERN = re.compile(
     r"(?<!db\.)(?<!cache\.)\b((?!db\.|cache\.)(?=[a-z0-9-]*\d)[a-z][a-z0-9-]*\."
@@ -242,6 +251,76 @@ class DeepSeekIntentParser:
             return [AiGateway(stable_settings)]
         return [self._gateway]
 
+    async def identify_sales_region(self, text: str) -> dict[str, object]:
+        """Use one small AI pass to understand region wording before intake.
+
+        This pass never extracts services, specifications, quantities or
+        prices. Python only validates that the model returned real AWS region
+        codes; interpretation of abbreviations, typos and natural language
+        remains owned by the AI.
+        """
+
+        allowed_regions = sorted(self.official_aws_region_labels())
+        prompt = """你只负责识别客户需求中的 AWS 部署地区，不分析产品、规格、数量或价格。
+理解中文、英文、简称、常见拼写错误和自然表达，例如 SG、新加坡区、Tokyo、东京机房。
+如果原文明确包含一个或多个地区，返回对应 AWS region code。
+如果只是模糊范围（例如“东南亚”“离中国近”“海外”）或完全没写地区，不得猜测，
+regions 返回空数组并把 requires_confirmation 设为 true。
+只返回 JSON：{"regions":["ap-southeast-1"],"requires_confirmation":false,"reason":"简短依据"}。"""
+        content = (
+            f"允许返回的 AWS 地区代码：{json.dumps(allowed_regions, ensure_ascii=False)}"
+            f"\n\n客户原文：\n{text}"
+        )
+        try:
+            raw = await self._gateway.complete_json(
+                system_prompt=prompt,
+                user_content=content,
+                timeout_seconds=18,
+                expected_keys=("regions", "requires_confirmation"),
+                max_attempts=1,
+            )
+        except Exception:
+            logger.exception("AI sales-region preflight failed")
+            return {
+                "regions": [],
+                "requires_confirmation": True,
+                "reason": "地区专用识别未能唯一确认，请销售选择。",
+            }
+        raw_regions = raw.get("regions")
+        regions = (
+            list(
+                dict.fromkeys(
+                    str(region).strip().casefold()
+                    for region in raw_regions
+                    if isinstance(region, str) and str(region).strip().casefold() in allowed_regions
+                )
+            )
+            if isinstance(raw_regions, list)
+            else []
+        )
+        requires_confirmation = bool(raw.get("requires_confirmation")) or not regions
+        return {
+            "regions": regions,
+            "requires_confirmation": requires_confirmation,
+            "reason": str(raw.get("reason") or "").strip(),
+        }
+
+    @staticmethod
+    def official_aws_region_labels() -> dict[str, str]:
+        """Return botocore's bundled official commercial AWS region names."""
+
+        endpoints = create_loader().load_data("endpoints")
+        labels: dict[str, str] = {}
+        for partition in endpoints.get("partitions", []):
+            if partition.get("partition") != "aws":
+                continue
+            for code, metadata in partition.get("regions", {}).items():
+                if not isinstance(metadata, dict):
+                    continue
+                description = str(metadata.get("description") or code).strip()
+                labels[str(code)] = description or str(code)
+        return labels
+
     async def _complete_component_json(
         self,
         *,
@@ -278,7 +357,9 @@ class DeepSeekIntentParser:
         service identity or silently replace customer-written requirements.
         """
 
-        prompt = build_service_prompt(component.service) + """
+        prompt = (
+            build_service_prompt(component.service)
+            + """
 
 【官方查询纠错】
 当前组件提交到服务器里的 AWS 官方规格/价格查询后失败。只修正这一项的结构化查询参数。
@@ -289,6 +370,7 @@ class DeepSeekIntentParser:
 返回严格 JSON：
 {"component":{"service":"原服务","calculator_service_name":"原名称","region":null,"quantity":1,"hours_per_month":730,"requirements":{},"source_text":"原文","query_action":null},"customer_question":null}
 """
+        )
         content = (
             # Repair is component-scoped. Sending the complete quote here let
             # the model borrow values from neighbouring services.
@@ -430,14 +512,23 @@ class DeepSeekIntentParser:
                         ),
                     )
                 if len(candidate.services) != len(intent.services):
-                    logger.warning("Confirmation cleanup changed service count; keeping guarded draft")
+                    logger.warning(
+                        "Confirmation cleanup changed service count; keeping guarded draft"
+                    )
                     return intent
-                if [item.service for item in candidate.services] != [item.service for item in intent.services]:
-                    logger.warning("Confirmation cleanup changed service order; keeping guarded draft")
+                if [item.service for item in candidate.services] != [
+                    item.service for item in intent.services
+                ]:
+                    logger.warning(
+                        "Confirmation cleanup changed service order; keeping guarded draft"
+                    )
                     return intent
                 candidate.services = [
                     candidate_item.model_copy(
                         update={
+                            "component_key": guarded_item.component_key,
+                            "parent_component_key": guarded_item.parent_component_key,
+                            "derived_from_service": guarded_item.derived_from_service,
                             "region": guarded_item.region,
                             "quantity": guarded_item.quantity,
                             "hours_per_month": guarded_item.hours_per_month,
@@ -460,8 +551,17 @@ class DeepSeekIntentParser:
                 )
             return cleaned
         except Exception:
-            logger.exception("Confirmation cleanup failed; continuing with deterministically resolved draft")
-            return intent
+            logger.exception("Confirmation cleanup failed; keeping customer questions open")
+            fallback = intent.model_copy(deep=True)
+            fallback.ambiguities = list(
+                dict.fromkeys(
+                    [
+                        *fallback.ambiguities,
+                        "系统暂时无法可靠复核客户刚才的回答，请稍后重新提交；原配置和回答均已保留。",
+                    ]
+                )
+            )
+            return fallback
 
     async def revise_configuration_from_feedback(
         self,
@@ -516,13 +616,9 @@ class DeepSeekIntentParser:
             self._drop_unrequested_section_services(f"{original_text}\n{feedback}", revised)
             self._merge_duplicate_service_fragments(revised)
             self._sanitize_parsed_requirements(revised)
-            self._reconcile_explicit_regions(
-                f"{original_text}\n{feedback}", revised
-            )
+            self._reconcile_explicit_regions(f"{original_text}\n{feedback}", revised)
             self._normalize_invalid_global_regions(revised)
-            self._inherit_single_workload_region(
-                revised, f"{original_text}\n{feedback}"
-            )
+            self._inherit_single_workload_region(revised, f"{original_text}\n{feedback}")
             self._ensure_missing_region_ambiguity(revised)
             self._replace_untrusted_customer_summary(revised)
             if reporter:
@@ -577,9 +673,7 @@ class DeepSeekIntentParser:
         ).strip()
         previous_review_specs = (
             dict(component.requirements.get("_review_selected_specifications"))
-            if isinstance(
-                component.requirements.get("_review_selected_specifications"), dict
-            )
+            if isinstance(component.requirements.get("_review_selected_specifications"), dict)
             else {}
         )
         # A previous preview may have attached an internal catalogue choice.
@@ -591,6 +685,8 @@ class DeepSeekIntentParser:
             "_review_selected_model",
             "_review_selected_specifications",
             "_quote_skip_reason",
+            "_quote_skip_code",
+            "_quote_skip_category",
         ):
             editing_component.requirements.pop(derived_field, None)
         # Closed confirmation choices are deterministic. Do not spend several
@@ -616,9 +712,7 @@ class DeepSeekIntentParser:
         # re-recognition, not an in-place patch of an old JSON object.
         template = component_template(editing_component)
         allowed = allowed_requirement_fields(component.service)
-        template["requirements"] = {
-            key: None for key in template["requirements"] if key in allowed
-        }
+        template["requirements"] = {key: None for key in template["requirements"] if key in allowed}
         numbered_fields = [
             "region",
             "quantity",
@@ -641,8 +735,7 @@ class DeepSeekIntentParser:
             f"{component.source_text}\n\n"
             "按编号逐项从原话和最新修改重新提取：\n"
             + "\n".join(
-                f"{number}. {field}"
-                for number, field in enumerate(numbered_fields, start=1)
+                f"{number}. {field}" for number, field in enumerate(numbered_fields, start=1)
             )
             + "\n\n"
             f"需要返回的完整模板：\n{json.dumps(template, ensure_ascii=False)}"
@@ -675,8 +768,7 @@ class DeepSeekIntentParser:
                     component=editing_component,
                     prompt=prompt,
                     content=(
-                        content
-                        + "\n\n上一版没有应用客户最新修改。请从空模板重新识别该组件，"
+                        content + "\n\n上一版没有应用客户最新修改。请从空模板重新识别该组件，"
                         "至少修改对应字段；客户最新修改不得被当前旧配置覆盖。"
                     ),
                     semaphore=asyncio.Semaphore(1),
@@ -715,8 +807,7 @@ class DeepSeekIntentParser:
                     content=(
                         content
                         + "\n\n独立一致性复核发现以下问题，请根据客户最新修改重新生成完整模板。"
-                        "旧值与最新修改冲突时必须删除旧值：\n- "
-                        + "\n- ".join(audit_issues)
+                        "旧值与最新修改冲突时必须删除旧值：\n- " + "\n- ".join(audit_issues)
                     ),
                     semaphore=asyncio.Semaphore(1),
                     reporter=reporter,
@@ -735,17 +826,12 @@ class DeepSeekIntentParser:
                 )
                 if remaining_issues:
                     raise ValueError(
-                        "客户修改与重新识别结果仍不一致："
-                        + "；".join(remaining_issues)
+                        "客户修改与重新识别结果仍不一致：" + "；".join(remaining_issues)
                     )
         revised.service = component.service
         revised.calculator_service_name = component.calculator_service_name
         revised.requirements = canonicalize_requirement_fields(
-            {
-                key: value
-                for key, value in revised.requirements.items()
-                if key in allowed
-            },
+            {key: value for key, value in revised.requirements.items() if key in allowed},
             service=component.service,
         )
         # The model still receives the full component template, but purchase
@@ -806,11 +892,12 @@ class DeepSeekIntentParser:
             "reference_lcu_unit_only",
             "system_default_assumption",
             "_quote_skip_reason",
+            "_quote_skip_code",
+            "_quote_skip_category",
         ):
             revised.requirements.pop(derived_field, None)
         changes_model = bool(
-            selected_model
-            or re.search(r"型号|机型|实例类型|sku", feedback, re.IGNORECASE)
+            selected_model or re.search(r"型号|机型|实例类型|sku", feedback, re.IGNORECASE)
         )
         changes_shape = bool(
             re.search(
@@ -833,12 +920,16 @@ class DeepSeekIntentParser:
             revised.requirements["requested_model"] = previous_review_model
             official_vcpu = previous_review_specs.get("vCPU")
             official_memory = previous_review_specs.get("memoryGiB")
-            if "vcpu" in allowed and isinstance(official_vcpu, (int, float)) and not isinstance(
-                official_vcpu, bool
+            if (
+                "vcpu" in allowed
+                and isinstance(official_vcpu, (int, float))
+                and not isinstance(official_vcpu, bool)
             ):
                 revised.requirements["vcpu"] = float(official_vcpu)
-            if "memory_gib" in allowed and isinstance(official_memory, (int, float)) and not isinstance(
-                official_memory, bool
+            if (
+                "memory_gib" in allowed
+                and isinstance(official_memory, (int, float))
+                and not isinstance(official_memory, bool)
             ):
                 revised.requirements["memory_gib"] = float(official_memory)
         elif changes_shape and not changes_model:
@@ -868,7 +959,8 @@ class DeepSeekIntentParser:
             path: source
             for path, source in revised.field_sources.items()
             if (
-                path == "region" and revised.region is not None
+                path == "region"
+                and revised.region is not None
                 or path == "quantity"
                 or path == "hours_per_month"
                 or path.startswith("requirements.")
@@ -879,7 +971,8 @@ class DeepSeekIntentParser:
             path
             for path in revised.locked_fields
             if (
-                path == "region" and revised.region is not None
+                path == "region"
+                and revised.region is not None
                 or path == "quantity"
                 or path == "hours_per_month"
                 or path.startswith("requirements.")
@@ -1018,16 +1111,21 @@ class DeepSeekIntentParser:
             # the generic ``节点`` label from stealing role-specific edits
             # such as ``核心节点数量改成 7``.
             role_node_prefixes = (
-                "核心", "数据", "主", "任务", "工作", "计算", "消息代理",
-                "Broker", "Worker",
+                "核心",
+                "数据",
+                "主",
+                "任务",
+                "工作",
+                "计算",
+                "消息代理",
+                "Broker",
+                "Worker",
             )
             label_parts: list[str] = []
             for label in sorted(labels, key=len, reverse=True):
                 escaped = re.escape(label)
                 if label.casefold() == "节点":
-                    guards = "".join(
-                        rf"(?<!{re.escape(prefix)})" for prefix in role_node_prefixes
-                    )
+                    guards = "".join(rf"(?<!{re.escape(prefix)})" for prefix in role_node_prefixes)
                     escaped = f"{guards}{escaped}"
                 label_parts.append(escaped)
             label_pattern = "|".join(label_parts)
@@ -1059,9 +1157,7 @@ class DeepSeekIntentParser:
             )
             return to_gib(match.group(1), match.group(2)) if match else None
 
-        size_pattern = (
-            r"(\d+(?:\.\d+)?)\s*(?:个)?\s*(gib|gb|g|tib|tb|t)"
-        )
+        size_pattern = r"(\d+(?:\.\d+)?)\s*(?:个)?\s*(gib|gb|g|tib|tb|t)"
         size_matches = list(re.finditer(size_pattern, normalized_feedback, re.I))
         single_size = (
             to_gib(size_matches[0].group(1), size_matches[0].group(2))
@@ -1076,14 +1172,22 @@ class DeepSeekIntentParser:
             if service == "elasticache" and not re.search(r"存储|磁盘", folded, re.I):
                 target.requirements["memory_gib"] = single_size
             elif service in {
-                "rds", "s3", "documentdb", "dynamodb", "efs", "fsx",
-                "sagemaker", "redshift",
+                "rds",
+                "s3",
+                "documentdb",
+                "dynamodb",
+                "efs",
+                "fsx",
+                "sagemaker",
+                "redshift",
             }:
                 if has_storage_label or service in {"s3", "efs", "fsx"}:
                     target.requirements["storage_gib"] = single_size
                     if service == "redshift" and (
                         "managed_storage_gib" in target.requirements
-                        or str(target.requirements.get("requested_model") or "").casefold().startswith("ra3")
+                        or str(target.requirements.get("requested_model") or "")
+                        .casefold()
+                        .startswith("ra3")
                     ):
                         target.requirements["managed_storage_gib"] = single_size
             elif service in {"opensearch", "msk", "mq"} and has_storage_label:
@@ -1153,12 +1257,11 @@ class DeepSeekIntentParser:
             if service == "redshift":
                 if "storage_gib" in allowed:
                     target.requirements["storage_gib"] = storage
-                if (
-                    "managed_storage_gib" in allowed
-                    and (
-                        "managed_storage_gib" in target.requirements
-                        or str(target.requirements.get("requested_model") or "").casefold().startswith("ra3")
-                    )
+                if "managed_storage_gib" in allowed and (
+                    "managed_storage_gib" in target.requirements
+                    or str(target.requirements.get("requested_model") or "")
+                    .casefold()
+                    .startswith("ra3")
                 ):
                     target.requirements["managed_storage_gib"] = storage
 
@@ -1199,9 +1302,10 @@ class DeepSeekIntentParser:
                 target.requirements[field] = int(value)
 
         negative_ha = bool(re.search(r"不要|取消|不需要|关闭|单节点|单可用区", feedback, re.I))
-        high_availability = bool(
-            re.search(r"高可用|主备|故障切换|多可用区|multi[ -]?az", feedback, re.I)
-        ) and not negative_ha
+        high_availability = (
+            bool(re.search(r"高可用|主备|故障切换|多可用区|multi[ -]?az", feedback, re.I))
+            and not negative_ha
+        )
         if high_availability:
             if service == "rds":
                 target.requirements["deployment"] = "multi_az"
@@ -1224,9 +1328,7 @@ class DeepSeekIntentParser:
                     int(target.requirements.get("replicas_per_shard") or 0), 1
                 )
 
-    async def parse(
-        self, text: str, reporter: AiTranscriptReporter | None = None
-    ) -> ParsedIntent:
+    async def parse(self, text: str, reporter: AiTranscriptReporter | None = None) -> ParsedIntent:
         if not self._settings.ai_api_key:
             raise ConfigurationError("后端未配置解析服务，不能处理客户需求")
         ai_text = self._text_for_ai(text)
@@ -1248,8 +1350,7 @@ class DeepSeekIntentParser:
                 await reporter(
                     "ai_prompt",
                     _redact_transcript(
-                        f"【第一遍整理·系统提示】\n{system_prompt}"
-                        f"\n\n【客户原文】\n{ai_text}"
+                        f"【第一遍整理·系统提示】\n{system_prompt}\n\n【客户原文】\n{ai_text}"
                     ),
                 )
         try:
@@ -1294,7 +1395,8 @@ class DeepSeekIntentParser:
                     if ai_calls >= 2:
                         raise
                     repair_prompt = (
-                        system_prompt + "\n上一次输出未通过结构校验。只修复 JSON 字段和类型，不得改变、"
+                        system_prompt
+                        + "\n上一次输出未通过结构校验。只修复 JSON 字段和类型，不得改变、"
                         "增加或遗漏客户需求。必须删除 schema 未定义的字段。"
                     )
                     repair_input = (
@@ -1395,6 +1497,7 @@ class DeepSeekIntentParser:
             self._append_vague_value_questions(parsed)
             self._append_missing_required_choice_questions(parsed)
             self._split_eks_worker_nodes(parsed)
+            enforce_component_integrity(parsed)
             # Derived child resources (for example EKS worker EC2) are created
             # after the first merge pass. Run the same identity-safe merge once
             # more so an AI-extracted child and a deterministic child can never
@@ -1402,11 +1505,17 @@ class DeepSeekIntentParser:
             # different source ownership remain separate.
             self._merge_duplicate_service_fragments(parsed)
             self._drop_embedded_ebs_duplicates(parsed)
+            customer_ledger = capture_customer_ledger(parsed)
             self._normalize_cluster_group_quantities(parsed)
             self._drop_specs_inferred_from_models(ai_text, parsed)
             self._normalize_invalid_global_regions(parsed)
             self._inherit_single_workload_region(parsed, ai_text)
             self._ensure_missing_region_ambiguity(parsed)
+            # Every operation above is automated cleanup. Restore all fields
+            # tied to customer evidence by stable component identity before
+            # the draft leaves the parser; a reorder can no longer move a
+            # value to another row and a sanitizer can no longer erase it.
+            restore_customer_ledger(parsed, customer_ledger)
             self._order_services_by_source(ai_text, parsed)
             self._replace_untrusted_customer_summary(parsed)
             # From here on the program deliberately does not reinterpret the
@@ -1445,6 +1554,7 @@ class DeepSeekIntentParser:
         *,
         reporter: AiTranscriptReporter | None = None,
     ) -> ParsedIntent:
+        ensure_component_keys(intent)
         semaphore = asyncio.Semaphore(max(1, len(intent.services)))
 
         async def clean_one(
@@ -1463,9 +1573,7 @@ class DeepSeekIntentParser:
                     f"组件 {index + 1}｜{display_name}｜正在执行结构化参数解析",
                 )
             cache_input = component.model_copy(deep=True)
-            is_unknown_service = (
-                self._service_key(component.service) not in SERVICE_TEMPLATE_FIELDS
-            )
+            is_unknown_service = self._service_key(component.service) not in SERVICE_TEMPLATE_FIELDS
             # Unknown services must load the current AWS field contract before
             # consulting the result cache. Otherwise a 90-day-old, incomplete
             # extraction can bypass a newly learned official dimension.
@@ -1516,9 +1624,7 @@ class DeepSeekIntentParser:
                 reporter=reporter,
                 component_number=index + 1,
             )
-            prompt = build_component_extraction_prompt(
-                component.service, component.source_text
-            )
+            prompt = build_component_extraction_prompt(component.service, component.source_text)
             if generated_prompt:
                 prompt = f"{prompt}\n\n{generated_prompt}"
             template = component_template(component, extra_fields=extra_fields)
@@ -1526,10 +1632,7 @@ class DeepSeekIntentParser:
                 "region",
                 "quantity",
                 "hours_per_month",
-                *(
-                    f"requirements.{field}"
-                    for field in template.get("requirements", {})
-                ),
+                *(f"requirements.{field}" for field in template.get("requirements", {})),
             ]
             content = (
                 f"当前组件客户原话：\n{component.source_text}\n\n"
@@ -1537,8 +1640,7 @@ class DeepSeekIntentParser:
                 f"{json.dumps(runtime_defaults, ensure_ascii=False)}\n\n"
                 "按编号逐项检查以下字段；原文没有就保持 null：\n"
                 + "\n".join(
-                    f"{number}. {field}"
-                    for number, field in enumerate(numbered_fields, start=1)
+                    f"{number}. {field}" for number, field in enumerate(numbered_fields, start=1)
                 )
                 + "\n\n"
                 "完整固定模板：\n"
@@ -1589,6 +1691,10 @@ class DeepSeekIntentParser:
                             component.service, extra_fields=extra_fields
                         ),
                     )
+                    self._overlay_literal_component_facts(
+                        component.source_text,
+                        cleaned,
+                    )
                     remaining_issues = await self._component_audit_issues(
                         index=index,
                         original_component=component,
@@ -1598,18 +1704,20 @@ class DeepSeekIntentParser:
                         reporter=reporter,
                     )
                     if remaining_issues:
-                        return index, component, [
-                            f"{display_name} 的识别结果与客户原话仍不一致，"
-                            "系统已保留原始需求，请重新提交这一项。"
-                        ]
+                        return (
+                            index,
+                            component,
+                            [
+                                f"{display_name} 的识别结果与客户原话仍不一致，"
+                                "系统已保留原始需求，请重新提交这一项。"
+                            ],
+                        )
 
                 extracted_requirements = {
                     key: value
                     for key, value in cleaned.requirements.items()
                     if key
-                    in allowed_requirement_fields(
-                        component.service, extra_fields=extra_fields
-                    )
+                    in allowed_requirement_fields(component.service, extra_fields=extra_fields)
                 }
                 merged_requirements = dict(runtime_defaults)
                 merged_requirements.update(extracted_requirements)
@@ -1619,9 +1727,7 @@ class DeepSeekIntentParser:
                 # as customer-locked input on collision.
                 merged_requirements.update(component.requirements)
                 if runtime_defaults and default_reason:
-                    merged_requirements.setdefault(
-                        "system_default_assumption", default_reason
-                    )
+                    merged_requirements.setdefault("system_default_assumption", default_reason)
 
                 cleaned.service = component.service
                 cleaned.calculator_service_name = component.calculator_service_name
@@ -1642,9 +1748,7 @@ class DeepSeekIntentParser:
                 )
                 for field in runtime_defaults:
                     if field not in component.requirements:
-                        cleaned.field_evidence.setdefault(
-                            f"requirements.{field}", "system_minimum"
-                        )
+                        cleaned.field_evidence.setdefault(f"requirements.{field}", "system_minimum")
                 cleaned.source_text = component.source_text
                 cleaned.query_action = None
                 self._restore_authoritative_component_fields(component, cleaned)
@@ -1693,10 +1797,7 @@ class DeepSeekIntentParser:
         merged_ambiguities: list[str] = []
         seen_ambiguities: set[str] = set()
         component_ambiguities = [
-            (
-                f"【组件{index + 1}·"
-                f"{component.calculator_service_name or component.service}】{item}"
-            )
+            (f"【组件{index + 1}·{component.calculator_service_name or component.service}】{item}")
             for index, component, ambiguities in results
             for item in ambiguities
         ]
@@ -1763,9 +1864,7 @@ class DeepSeekIntentParser:
             "mq": ("broker_count", "storage_gib_per_broker", "total_storage_gib"),
         }
         contract = repeated_contracts.get(service)
-        if contract and re.search(
-            r"每|单(?:个|台|块|节点)|总共|合计|总存储|总容量", source, re.I
-        ):
+        if contract and re.search(r"每|单(?:个|台|块|节点)|总共|合计|总存储|总容量", source, re.I):
             count_field, per_field, total_field = contract
             count_missing = (
                 filled.quantity == 1 and not filled.field_evidence.get("quantity")
@@ -1854,11 +1953,7 @@ class DeepSeekIntentParser:
         issues = raw.get("issues")
         if not isinstance(issues, list):
             return deterministic_issues
-        ai_issues = [
-            str(issue).strip()[:300]
-            for issue in issues
-            if str(issue).strip()
-        ]
+        ai_issues = [str(issue).strip()[:300] for issue in issues if str(issue).strip()]
         return list(dict.fromkeys([*deterministic_issues, *ai_issues]))[:8]
 
     @classmethod
@@ -1912,7 +2007,128 @@ class DeepSeekIntentParser:
                 f"客户原话“{evidence}”明确要求 {field_name}={wanted}，"
                 f"当前结果为 {actual if actual not in (None, '') else '缺失'}"
             )
-        return issues[:8]
+        issues.extend(cls._uncovered_quantitative_claim_issues(source, filled))
+        return list(dict.fromkeys(issues))[:8]
+
+    @staticmethod
+    def _uncovered_quantitative_claim_issues(
+        source: str,
+        filled: ServiceRequirement,
+    ) -> list[str]:
+        """Reject silent loss of explicit quantities for every service.
+
+        This is intentionally field-name agnostic at the product level. New
+        AWS products still have to bind every literal CPU, capacity, usage or
+        named resource count to one non-empty structured field with matching
+        source evidence before they can leave isolated extraction.
+        """
+
+        if re.search(r"^客户最新修改\s*[:：]", source, re.I | re.M):
+            # The revision pipeline has a separate newest-value overlay and
+            # semantic re-audit. Historical values deliberately remain in the
+            # same source for untouched-field recovery, so treating both old
+            # and new numbers as simultaneously required would create a false
+            # retry loop.
+            return []
+        evidence_by_path = {
+            path: re.sub(r"\s+", "", str(evidence)).casefold()
+            for path, evidence in filled.field_evidence.items()
+            if str(evidence) not in {"system_minimum", "system_derived"}
+        }
+        # Persisted legacy drafts and lightweight test gateways can predate the
+        # evidence contract. Existing literal reconciliation still protects
+        # them; quantitative coverage becomes mandatory as soon as the current
+        # component extractor supplies evidence for any field.
+        if not evidence_by_path:
+            return []
+
+        def value_for(path: str) -> object:
+            if path == "quantity":
+                return filled.quantity
+            if path.startswith("requirements."):
+                return filled.requirements.get(path.split(".", 1)[1])
+            return getattr(filled, path, None)
+
+        def numeric_values(value: object) -> list[float]:
+            if isinstance(value, bool):
+                return []
+            if isinstance(value, (int, float)):
+                return [float(value)]
+            if isinstance(value, list):
+                return [number for item in value for number in numeric_values(item)]
+            if isinstance(value, dict):
+                return [number for item in value.values() for number in numeric_values(item)]
+            return []
+
+        if not any(numeric_values(value_for(path)) for path in evidence_by_path):
+            return []
+
+        def compatible(path: str, category: str) -> bool:
+            field = path.removeprefix("requirements.").casefold()
+            if category == "cpu":
+                return "vcpu" in field or field in {"cpu", "cores"}
+            if category == "capacity":
+                return any(
+                    marker in field
+                    for marker in (
+                        "gib", "gb", "storage", "disk", "memory", "transfer",
+                        "processed_bytes", "data_", "size",
+                    )
+                )
+            if category == "messages":
+                return "message" in field or "deliver" in field
+            if category == "requests":
+                return any(marker in field for marker in ("request", "quer", "transition"))
+            if category == "quantity":
+                return path == "quantity"
+            if category == "role_count":
+                return any(
+                    marker in field
+                    for marker in (
+                        "count", "node", "shard", "replica", "rule", "user",
+                        "instance", "broker", "task", "cluster", "deployment",
+                    )
+                )
+            return False
+
+        claim_patterns = (
+            ("quantity", re.compile(r"数量\s*[:：]?\s*(\d[\d,]*(?:\.\d+)?)", re.I)),
+            ("cpu", re.compile(r"(?<![a-z0-9.])(\d+(?:\.\d+)?)\s*(?:核|v\s*cpu|vcpu|c(?![a-z]))", re.I)),
+            ("capacity", re.compile(r"(?<![a-z0-9.])(\d+(?:\.\d+)?)\s*(tib|tb|t|gib|gb|g)(?![a-z])", re.I)),
+            ("messages", re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*封", re.I)),
+            ("requests", re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次)?\s*(?:api\s*)?请求", re.I)),
+            ("role_count", re.compile(r"(\d+)\s*(?:个|台)?\s*(?:worker|工作)?\s*(?:节点|分片|副本|规则|用户)", re.I)),
+        )
+        issues: list[str] = []
+        for category, pattern in claim_patterns:
+            for match in pattern.finditer(source):
+                claim = match.group(0)
+                if "美元" in source[match.end() : match.end() + 4] or "$" in source[max(0, match.start() - 2) : match.start()]:
+                    continue
+                raw_number = match.group(1).replace(",", "")
+                wanted = float(raw_number)
+                unit = match.group(2).casefold() if match.lastindex and match.lastindex >= 2 and match.group(2) else ""
+                if category == "capacity" and unit in {"tib", "tb", "t"}:
+                    wanted *= 1024
+                elif category in {"messages", "requests"}:
+                    wanted *= {"万": 10_000, "亿": 100_000_000}.get(match.group(2), 1)
+                compact_claim = re.sub(r"\s+", "", claim).casefold()
+                covered = False
+                for path, evidence in evidence_by_path.items():
+                    if compact_claim not in evidence or not compatible(path, category):
+                        continue
+                    values = numeric_values(value_for(path))
+                    # Topology fields such as deployment can encode a count
+                    # semantically without storing the literal as a number.
+                    if category == "role_count" and "deployment" in path.casefold():
+                        covered = True
+                        break
+                    if any(abs(value - wanted) < 1e-6 for value in values):
+                        covered = True
+                        break
+                if not covered:
+                    issues.append(f"客户原话中的“{claim}”没有进入对应的结构化字段")
+        return issues
 
     @classmethod
     def _needs_revision_component_audit(
@@ -1926,9 +2142,7 @@ class DeepSeekIntentParser:
         if cls._needs_selective_component_audit(original_component, revised):
             return True
         service = cls._service_key(revised.service)
-        if service in {
-            "opensearch", "msk", "eks", "elasticache", "rds", "aurora", "ebs"
-        }:
+        if service in {"opensearch", "msk", "eks", "elasticache", "rds", "aurora", "ebs"}:
             return bool(
                 re.search(
                     r"每(?:个|台|节点|块|套)?|总(?:容量|存储|数量)|"
@@ -1960,14 +2174,8 @@ class DeepSeekIntentParser:
             component.service = current_key
             return
 
-        catalog = {
-            key: display
-            for key, display, _markers in self._INVENTORY_DEFINITIONS
-        }
-        choices = "\n".join(
-            f"- {key}: {catalog.get(key, key)}"
-            for key in SERVICE_TEMPLATE_FIELDS
-        )
+        catalog = {key: display for key, display, _markers in self._INVENTORY_DEFINITIONS}
+        choices = "\n".join(f"- {key}: {catalog.get(key, key)}" for key in SERVICE_TEMPLATE_FIELDS)
         prompt = (
             "你只负责判断一段客户原话对应哪个 AWS 服务，不提取参数、不报价。\n"
             "只能返回严格 JSON："
@@ -1977,10 +2185,7 @@ class DeepSeekIntentParser:
             "允许的稳定标识如下：\n"
             f"{choices}"
         )
-        content = (
-            f"当前临时名称：{component.service}\n"
-            f"客户原话：\n{component.source_text}"
-        )
+        content = f"当前临时名称：{component.service}\n客户原话：\n{component.source_text}"
         if reporter:
             await reporter(
                 "component_classify",
@@ -2009,9 +2214,7 @@ class DeepSeekIntentParser:
                     f"{component.calculator_service_name or candidate}",
                 )
         except Exception:
-            logger.exception(
-                "Unknown component classification failed for %s", component.service
-            )
+            logger.exception("Unknown component classification failed for %s", component.service)
 
     async def _fill_component_template_with_retries(
         self,
@@ -2061,8 +2264,7 @@ class DeepSeekIntentParser:
                     "ai_response",
                     _redact_transcript(
                         f"【组件 {index + 1} · {component.service} 系统输出"
-                        f"·第 {attempt} 次】\n"
-                        + json.dumps(raw, ensure_ascii=False, indent=2)
+                        f"·第 {attempt} 次】\n" + json.dumps(raw, ensure_ascii=False, indent=2)
                     ),
                 )
             try:
@@ -2112,8 +2314,7 @@ class DeepSeekIntentParser:
         if reporter:
             await reporter(
                 "catalog",
-                f"【组件 {component_number}】正在读取 AWS 官方目录并建立新组件缓存："
-                f"{display_name}",
+                f"【组件 {component_number}】正在读取 AWS 官方目录并建立新组件缓存：{display_name}",
             )
         try:
             async with semaphore:
@@ -2200,7 +2401,10 @@ class DeepSeekIntentParser:
         if DeepSeekIntentParser._service_key(component.service) != "ec2":
             return False
         requirements = component.requirements
-        if any(requirements.get(field) not in (None, "") for field in ("requested_model", "vcpu", "memory_gib")):
+        if any(
+            requirements.get(field) not in (None, "")
+            for field in ("requested_model", "vcpu", "memory_gib")
+        ):
             return False
         source = component.source_text
         has_model = bool(BARE_EC2_MODEL_PATTERN.search(source))
@@ -2248,9 +2452,7 @@ class DeepSeekIntentParser:
         unknown_fields: list[str] = []
         for raw_field, value in requirements.items():
             field = str(raw_field)
-            canonical = canonical_requirement_field_name(
-                field, service=component.service
-            )
+            canonical = canonical_requirement_field_name(field, service=component.service)
             if canonical not in allowed:
                 unknown_fields.append(field)
                 continue
@@ -2330,14 +2532,19 @@ class DeepSeekIntentParser:
             return
         count_field, per_field, total_field = contract
         count_raw = (
-            payload.get("quantity") if quantity_is_explicit else None
-        ) if count_field == "quantity" else requirements.get(count_field)
+            (payload.get("quantity") if quantity_is_explicit else None)
+            if count_field == "quantity"
+            else requirements.get(count_field)
+        )
         values = [count_raw, requirements.get(per_field), requirements.get(total_field)]
         present = [value not in (None, "") and not isinstance(value, bool) for value in values]
         if sum(present) != 2:
             return
         try:
-            numeric = [float(value) if is_present else None for value, is_present in zip(values, present, strict=True)]
+            numeric = [
+                float(value) if is_present else None
+                for value, is_present in zip(values, present, strict=True)
+            ]
         except (TypeError, ValueError):
             return
         count, per, total = numeric
@@ -2375,11 +2582,15 @@ class DeepSeekIntentParser:
         """Reject unsupported AI-filled values before they reach an adapter."""
 
         requirements = provided_payload.get("requirements")
-        provided_paths = {
-            f"requirements.{field}"
-            for field, value in requirements.items()
-            if value not in (None, "")
-        } if isinstance(requirements, dict) else set()
+        provided_paths = (
+            {
+                f"requirements.{field}"
+                for field, value in requirements.items()
+                if value not in (None, "")
+            }
+            if isinstance(requirements, dict)
+            else set()
+        )
         for field in ("region", "quantity", "hours_per_month"):
             if provided_payload.get(field) not in (None, ""):
                 provided_paths.add(field)
@@ -2415,11 +2626,7 @@ class DeepSeekIntentParser:
         original_paths = {
             "region" if component.region == original.region else "",
             "quantity" if component.quantity == original.quantity else "",
-            (
-                "hours_per_month"
-                if component.hours_per_month == original.hours_per_month
-                else ""
-            ),
+            ("hours_per_month" if component.hours_per_month == original.hours_per_month else ""),
             *(
                 f"requirements.{field}"
                 for field, value in component.requirements.items()
@@ -2432,9 +2639,7 @@ class DeepSeekIntentParser:
             if path not in valid_evidence and path not in original_paths
         )
         if missing:
-            raise ValueError(
-                "以下非空字段缺少逐字客户原文证据：" + "、".join(missing)
-            )
+            raise ValueError("以下非空字段缺少逐字客户原文证据：" + "、".join(missing))
         component.field_evidence = valid_evidence
 
     @classmethod
@@ -2565,9 +2770,17 @@ class DeepSeekIntentParser:
                 r"(\d+)\s*(?:台|套|个|块|卷)(?!\s*(?:核|gib|gb|tb))",
             ]
         elif field in {
-            "broker_count", "data_nodes", "node_count", "worker_node_count",
-            "worker_nodes_per_cluster", "instance_count", "cluster_count",
-            "replication_instances", "nodes", "master_nodes", "core_nodes",
+            "broker_count",
+            "data_nodes",
+            "node_count",
+            "worker_node_count",
+            "worker_nodes_per_cluster",
+            "instance_count",
+            "cluster_count",
+            "replication_instances",
+            "nodes",
+            "master_nodes",
+            "core_nodes",
             "task_nodes",
         }:
             # Count evidence is role-sensitive.  A bare pattern such as
@@ -2610,17 +2823,13 @@ class DeepSeekIntentParser:
             )
         elif field.endswith("_gib") or "storage_gib" in field:
             values: list[float] = []
-            for match in re.finditer(
-                r"(\d+(?:\.\d+)?)\s*(tib|tb|t|gib|gb|g)", snippet, re.I
-            ):
+            for match in re.finditer(r"(\d+(?:\.\d+)?)\s*(tib|tb|t|gib|gb|g)", snippet, re.I):
                 number = float(match.group(1))
                 if match.group(2).casefold() in {"tib", "tb", "t"}:
                     number *= 1024
                 values.append(number)
             if values and not any(abs(float(value) - item) < 1e-6 for item in values):
-                raise ValueError(
-                    f"字段 {path}={value} 与原文证据中的容量 {snippet!r} 不一致"
-                )
+                raise ValueError(f"字段 {path}={value} 与原文证据中的容量 {snippet!r} 不一致")
             return
         else:
             return
@@ -2631,11 +2840,21 @@ class DeepSeekIntentParser:
             for match in re.finditer(pattern, snippet, re.I)
         ]
         if (
-            field in {
-                "quantity", "broker_count", "data_nodes", "node_count",
-                "worker_node_count", "worker_nodes_per_cluster",
-                "instance_count", "cluster_count", "replication_instances",
-                "nodes", "master_nodes", "core_nodes", "task_nodes",
+            field
+            in {
+                "quantity",
+                "broker_count",
+                "data_nodes",
+                "node_count",
+                "worker_node_count",
+                "worker_nodes_per_cluster",
+                "instance_count",
+                "cluster_count",
+                "replication_instances",
+                "nodes",
+                "master_nodes",
+                "core_nodes",
+                "task_nodes",
             }
             and re.search(r"\d", snippet)
             and not values
@@ -2645,9 +2864,7 @@ class DeepSeekIntentParser:
                 "可能把容量、CPU或其他数字误当成了数量"
             )
         if values and not any(abs(float(value) - item) < 1e-6 for item in values):
-            raise ValueError(
-                f"字段 {path}={value} 与原文证据中的数值 {snippet!r} 不一致"
-            )
+            raise ValueError(f"字段 {path}={value} 与原文证据中的数值 {snippet!r} 不一致")
 
     async def _audit_component_template(
         self,
@@ -2670,9 +2887,7 @@ class DeepSeekIntentParser:
         if reporter:
             await reporter(
                 "ai_prompt",
-                _redact_transcript(
-                    f"【组件 {index + 1} · 模板对照审核】\n{prompt}\n\n{content}"
-                ),
+                _redact_transcript(f"【组件 {index + 1} · 模板对照审核】\n{prompt}\n\n{content}"),
             )
         try:
             async with semaphore:
@@ -2716,9 +2931,7 @@ class DeepSeekIntentParser:
                     filled.hours_per_month = float(hours)
                 requirement_corrections = corrections.get("requirements")
                 if isinstance(requirement_corrections, dict):
-                    allowed = allowed_requirement_fields(
-                        filled.service, extra_fields=extra_fields
-                    )
+                    allowed = allowed_requirement_fields(filled.service, extra_fields=extra_fields)
                     for key, value in requirement_corrections.items():
                         path = f"requirements.{key}"
                         if (
@@ -2762,11 +2975,14 @@ class DeepSeekIntentParser:
         applies to every current and future component.
         """
 
+        filled.component_key = original.component_key
+        filled.parent_component_key = original.parent_component_key
+        filled.derived_from_service = original.derived_from_service
         locked = set(original.locked_fields)
         locked.update(
             path
             for path, source in original.field_sources.items()
-            if source in {"customer_confirmation", "customer_correction"}
+            if source in CUSTOMER_OVERRIDE_SOURCES
         )
         for path in locked:
             if path == "region":
@@ -2777,7 +2993,9 @@ class DeepSeekIntentParser:
                 filled.hours_per_month = original.hours_per_month
             elif path.startswith("requirements."):
                 field = path.split(".", 1)[1]
-                if field in original.requirements:
+                if original.field_sources.get(path) == "customer_confirmation_removed":
+                    filled.requirements.pop(field, None)
+                elif field in original.requirements:
                     filled.requirements[field] = original.requirements[field]
 
         merged_sources = dict(filled.field_sources)
@@ -2864,7 +3082,9 @@ class DeepSeekIntentParser:
             r"\s*(?:\d+\s*[.、:：]?\s*)?(?:同意|可以|确认|是|接受|按建议)\s*[。.!！]?\s*",
             re.IGNORECASE,
         )
-        supplements = [reply.strip() for reply in replies if reply.strip() and not affirmative.fullmatch(reply)]
+        supplements = [
+            reply.strip() for reply in replies if reply.strip() and not affirmative.fullmatch(reply)
+        ]
         if supplements:
             return f"{base}\n\n客户补充确认：\n" + "\n".join(supplements)
         return base
@@ -2875,15 +3095,12 @@ class DeepSeekIntentParser:
 
         request_text = text.split("【客户确认回复】", 1)[0]
         source = request_text.casefold()
-        segments = [
-            item.strip()
-            for item in re.split(r"[\n。；]+", source)
-            if item.strip()
-        ]
+        segments = [item.strip() for item in re.split(r"[\n。；]+", source) if item.strip()]
 
         notices: list[str] = []
         rds_segments = [
-            item for item in segments
+            item
+            for item in segments
             if any(marker in item for marker in ("rds", "数据库", "mysql", "postgresql"))
         ]
         if any(
@@ -2899,10 +3116,15 @@ class DeepSeekIntentParser:
         ):
             notices.append("ALB 不支持固定公网 IP")
         if any(
-            any(marker in item for marker in (
-                "全部放在一个可用区", "都放在一个可用区",
-                "全部放在同一个可用区", "都放在同一个可用区",
-            ))
+            any(
+                marker in item
+                for marker in (
+                    "全部放在一个可用区",
+                    "都放在一个可用区",
+                    "全部放在同一个可用区",
+                    "都放在同一个可用区",
+                )
+            )
             and "可用区故障" in item
             for item in segments
         ):
@@ -2913,8 +3135,7 @@ class DeepSeekIntentParser:
         ):
             notices.append("RDS Multi-AZ 主备模式的备用库不能用于只读查询")
         if any(
-            "redis" in item and "同一个可用区" in item and "可用区故障" in item
-            for item in segments
+            "redis" in item and "同一个可用区" in item and "可用区故障" in item for item in segments
         ):
             notices.append("Redis 同可用区部署与单可用区故障自动切换要求冲突")
         if any(
@@ -2924,7 +3145,8 @@ class DeepSeekIntentParser:
         ):
             notices.append("NLB 不支持按 URL 路径转发")
         if any(
-            "s3 standard" in item and "s3 express one zone" in item
+            "s3 standard" in item
+            and "s3 express one zone" in item
             and any(marker in item for marker in ("自动转", "转成", "生命周期"))
             for item in segments
         ):
@@ -2944,8 +3166,7 @@ class DeepSeekIntentParser:
         )
         if total_cache and per_node and float(total_cache.group(1)) != float(per_node.group(1)):
             notices.append(
-                f"Redis 整套 {total_cache.group(1)}G 与每节点 "
-                f"{per_node.group(1)}G 的要求冲突"
+                f"Redis 整套 {total_cache.group(1)}G 与每节点 {per_node.group(1)}G 的要求冲突"
             )
 
         combined = list(dict.fromkeys([*parsed.ambiguities, *notices]))
@@ -2964,11 +3185,14 @@ class DeepSeekIntentParser:
             affirmative = r"(?:同意|可以|确认|是|接受|按建议)"
             numbered = {
                 int(match.group(1))
-                for match in re.finditer(rf"(?:^|[\s,，;；])\s*(\d+)\s*[.、:：]?\s*{affirmative}", reply)
+                for match in re.finditer(
+                    rf"(?:^|[\s,，;；])\s*(\d+)\s*[.、:：]?\s*{affirmative}", reply
+                )
             }
             if numbered:
                 remaining = [
-                    notice for index, notice in enumerate(remaining, start=1)
+                    notice
+                    for index, notice in enumerate(remaining, start=1)
                     if index not in numbered
                 ]
                 continue
@@ -3060,6 +3284,7 @@ class DeepSeekIntentParser:
             ("waf", ("aws waf", "waf", "web 防火墙", "web防火墙"), ("waf",)),
             ("sqs", ("amazon sqs", "sqs：", "sqs｜", "异步队列"), ("sqs",)),
             ("ses", ("amazon ses", "ses", "邮件验证码", "邮件通知"), ("ses",)),
+            ("pinpoint", ("amazon pinpoint", "pinpoint"), ("pinpoint",)),
             ("cloudwatch", ("cloudwatch", "日志和监控", "日志监控"), ("cloudwatch",)),
             (
                 "ebs",
@@ -3106,7 +3331,11 @@ class DeepSeekIntentParser:
             # is stronger evidence than the model's service label, so normalize
             # it to EC2 instead of deleting a valid workload.
             evidence = item.source_text or ""
-            if key not in explicit and "ec2" in explicit and BARE_EC2_MODEL_PATTERN.search(evidence):
+            if (
+                key not in explicit
+                and "ec2" in explicit
+                and BARE_EC2_MODEL_PATTERN.search(evidence)
+            ):
                 item.service = "ec2"
                 item.calculator_service_name = "Amazon Elastic Compute Cloud (EC2)"
                 key = "ec2"
@@ -3139,6 +3368,7 @@ class DeepSeekIntentParser:
                 "sql server",
                 "sqlserver",
             ),
+            "memorydb": ("amazon memorydb", "memorydb"),
             "elasticache": ("elasticache", "redis", "valkey", "memcached"),
             "elb": (
                 "负载均衡",
@@ -3202,6 +3432,8 @@ class DeepSeekIntentParser:
             return "ec2"
         if canonical in {"rds", "amazonrds", "aurora"} or "rds" in canonical:
             return "rds"
+        if "memorydb" in canonical:
+            return "memorydb"
         if any(marker in canonical for marker in ("elasticache", "redis", "valkey", "memcached")):
             return "elasticache"
         if any(
@@ -3309,8 +3541,17 @@ class DeepSeekIntentParser:
         # RDS and Aurora share one AWS pricing family, but inventory labels are
         # customer-facing.  Aurora identity is restored from the explicit
         # engine/source by preserve_customer_configuration().
-        ("rds", "Amazon RDS", ("amazon rds", "rds for", "amazon aurora", "aurora mysql", "aurora postgresql")),
-        ("elasticache", "Amazon ElastiCache", ("amazon elasticache", "elasticache for", "redis", "valkey")),
+        (
+            "rds",
+            "Amazon RDS",
+            ("amazon rds", "rds for", "amazon aurora", "aurora mysql", "aurora postgresql"),
+        ),
+        ("memorydb", "Amazon MemoryDB", ("amazon memorydb", "memorydb for redis", "memorydb")),
+        (
+            "elasticache",
+            "Amazon ElastiCache",
+            ("amazon elasticache", "elasticache for", "redis", "valkey"),
+        ),
         (
             "opensearch",
             "Amazon OpenSearch Service",
@@ -3329,9 +3570,32 @@ class DeepSeekIntentParser:
             ("amazon documentdb", "documentdb", "mongodb", "mongo db"),
         ),
         ("nat_gateway", "AWS NAT Gateway", ("nat gateway", "nat 网关", "公网出口")),
-        ("vpc", "Amazon Virtual Private Cloud (VPC)", ("aws vpc", "amazon vpc", "vpc +", "vpc＋", "vpc：", "vpc｜")),
-        ("dms", "AWS Database Migration Service (DMS)", ("aws dms", "amazon dms", "database migration service", "dms：", "dms｜")),
-        ("kms", "AWS Key Management Service (KMS)", ("aws kms", "amazon kms", "key management service", "/ kms", "+ kms", "kms：", "kms｜")),
+        (
+            "vpc",
+            "Amazon Virtual Private Cloud (VPC)",
+            (
+                "aws vpc",
+                "amazon vpc",
+                "public-vpc",
+                "private-vpc",
+                "public vpc",
+                "private vpc",
+                "vpc +",
+                "vpc＋",
+                "vpc：",
+                "vpc｜",
+            ),
+        ),
+        (
+            "dms",
+            "AWS Database Migration Service (DMS)",
+            ("aws dms", "amazon dms", "database migration service", "dms：", "dms｜"),
+        ),
+        (
+            "kms",
+            "AWS Key Management Service (KMS)",
+            ("aws kms", "amazon kms", "key management service", "/ kms", "+ kms", "kms：", "kms｜"),
+        ),
         ("xray", "AWS X-Ray", ("aws x-ray", "amazon x-ray", "x-ray", "xray")),
         (
             "msk",
@@ -3350,8 +3614,12 @@ class DeepSeekIntentParser:
             "emr",
             "Amazon EMR",
             (
-                "amazon emr", "emr hbase", "spark 大数据计算集群",
-                "spark大数据计算集群", "spark 集群", "spark集群",
+                "amazon emr",
+                "emr hbase",
+                "spark 大数据计算集群",
+                "spark大数据计算集群",
+                "spark 集群",
+                "spark集群",
             ),
         ),
         ("glue", "AWS Glue", ("aws glue", "amazon glue")),
@@ -3359,17 +3627,34 @@ class DeepSeekIntentParser:
         ("s3", "Amazon Simple Storage Service (S3)", ("amazon s3", "s3：", "s3｜", "对象存储")),
         ("efs", "Amazon Elastic File System (EFS)", ("amazon efs", "efs：", "efs｜")),
         ("apigateway", "Amazon API Gateway", ("amazon api gateway", "api gateway")),
-        ("scheduler", "Amazon EventBridge Scheduler", ("eventbridge scheduler", "amazon eventbridge scheduler")),
+        (
+            "scheduler",
+            "Amazon EventBridge Scheduler",
+            ("eventbridge scheduler", "amazon eventbridge scheduler"),
+        ),
         (
             "eks",
             "Amazon Elastic Kubernetes Service (EKS)",
             (
-                "amazon eks", "eks 集群", "eks集群", "kubernetes 集群",
-                "kubernetes集群", "k8s 集群", "k8s集群",
+                "amazon eks",
+                "eks 集群",
+                "eks集群",
+                "kubernetes 集群",
+                "kubernetes集群",
+                "k8s 集群",
+                "k8s集群",
             ),
         ),
-        ("ecr", "Amazon Elastic Container Registry (ECR)", ("amazon ecr", "ecr 私有仓库", "容器镜像仓库")),
-        ("elb", "Elastic Load Balancing", ("application load balancer", "network load balancer", "负载均衡", " alb", " nlb")),
+        (
+            "ecr",
+            "Amazon Elastic Container Registry (ECR)",
+            ("amazon ecr", "ecr 私有仓库", "容器镜像仓库"),
+        ),
+        (
+            "elb",
+            "Elastic Load Balancing",
+            ("application load balancer", "network load balancer", "负载均衡", " alb", " nlb"),
+        ),
         ("cloudfront", "Amazon CloudFront", ("amazon cloudfront", "cloudfront", "cdn")),
         ("route53", "Amazon Route 53", ("route 53", "route53", "域名解析")),
         ("waf", "AWS WAF", ("aws waf", "waf", "web 应用防火墙", "web 防火墙")),
@@ -3380,7 +3665,11 @@ class DeepSeekIntentParser:
             ("amazon managed service for prometheus", "prometheus", " amp：", "amp｜"),
         ),
         ("backup", "AWS Backup", ("aws backup",)),
-        ("ebs", "Amazon Elastic Block Store (EBS)", ("amazon ebs", "ebs 云硬盘", "独立 ebs", "云硬盘")),
+        (
+            "ebs",
+            "Amazon Elastic Block Store (EBS)",
+            ("amazon ebs", "ebs 云硬盘", "独立 ebs", "云硬盘"),
+        ),
         (
             "data_transfer",
             "AWS Data Transfer",
@@ -3389,6 +3678,7 @@ class DeepSeekIntentParser:
         ("sqs", "Amazon SQS", ("amazon sqs", "sqs：", "sqs｜")),
         ("sns", "Amazon SNS", ("amazon sns", "sns 主题", "sns 通知")),
         ("ses", "Amazon SES", ("amazon ses", "ses：", "ses｜")),
+        ("pinpoint", "Amazon Pinpoint", ("amazon pinpoint", "pinpoint：", "pinpoint｜")),
         ("fsx", "Amazon FSx", ("amazon fsx", "fsx 文件系统")),
         ("global_accelerator", "AWS Global Accelerator", ("global accelerator", "全球访问加速")),
         ("secrets_manager", "AWS Secrets Manager", ("secrets manager",)),
@@ -3456,6 +3746,10 @@ class DeepSeekIntentParser:
         for key, display, markers in cls._INVENTORY_DEFINITIONS:
             if any(cls._inventory_marker_matches(line, marker) for marker in markers):
                 found.append((key, display))
+        # MemoryDB uses Redis compatibility, but the word Redis is an engine
+        # here rather than evidence for a second ElastiCache component.
+        if re.search(r"(?<![a-z0-9])(?:amazon\s+)?memorydb(?![a-z0-9])", folded, re.I):
+            found = [item for item in found if item[0] != "elasticache"]
         # An explicitly named third-party product is authoritative. Capability
         # words such as “服务注册发现” must never silently replace Nacos with a
         # partial AWS product and discard its configuration-center function or
@@ -3495,7 +3789,9 @@ class DeepSeekIntentParser:
         # explicitly inbound/public API requirement as API Gateway, but never
         # infer it from the opposite direction ("调用外部 API").
         outbound_api_only = bool(
-            re.search(r"(?:调用|访问|请求)\s*(?:第三方|外部)(?:系统)?\s*(?:的)?\s*api", folded, re.I)
+            re.search(
+                r"(?:调用|访问|请求)\s*(?:第三方|外部)(?:系统)?\s*(?:的)?\s*api", folded, re.I
+            )
         )
         inbound_api = bool(
             re.search(
@@ -3513,23 +3809,47 @@ class DeepSeekIntentParser:
         if inbound_api and not outbound_api_only and "apigateway" not in existing_keys:
             found.append(("apigateway", "Amazon API Gateway"))
             existing_keys.add("apigateway")
+        # A numbered Public/Private VPC block owns the networking boundary.
+        # Mentions of API or EC2 in its explanatory text are downstream
+        # workloads carried by the VPC, not additional product declarations.
+        # Restrict this to the component heading so a real EC2/API Gateway row
+        # elsewhere in the same request is unaffected.
+        heading = re.split(r"[：:]", cls._strip_numbered_requirement_prefix(line), maxsplit=1)[0]
+        if (
+            re.search(r"(?=.*\bwaf\b)(?=.*\balb\b)", heading, re.I)
+            or re.search(
+                r"waf\s*[+＋/&和与]\s*(?:application\s+load\s+balancer|负载均衡)",
+                heading,
+                re.I,
+            )
+        ):
+            found = [item for item in found if item[0] != "vpc"]
+            existing_keys = {key for key, _ in found}
+        if re.search(
+            r"\b(?:amazon\s+)?vpc\b|\b(?:public|private)[-_ ]?vpc\b|公有\s*vpc|私有\s*vpc",
+            heading,
+            re.I,
+        ):
+            found = [item for item in found if item[0] not in {"ec2", "apigateway"}]
+            existing_keys = {key for key, _ in found}
         # Managed-first is a product invariant.  When EC2 is mentioned only as
         # a host for software that has an AWS managed equivalent, retain the
         # managed service and suppress the self-hosted EC2 wrapper.
         self_hosted = any(
             marker in folded
             for marker in (
-                "自建", "自行部署", "自己部署", "部署在 ec2", "运行在 ec2",
-                "self-hosted", "self hosted",
+                "自建",
+                "自行部署",
+                "自己部署",
+                "部署在 ec2",
+                "运行在 ec2",
+                "self-hosted",
+                "self hosted",
             )
         )
         managed_software_keys = {"msk", "mq", "opensearch", "documentdb", "eks"}
         if self_hosted and any(key in managed_software_keys for key, _ in found):
-            found = [
-                (key, display)
-                for key, display in found
-                if key != "ec2"
-            ]
+            found = [(key, display) for key, display in found if key != "ec2"]
         if any(key == "elb" for key, _ in found):
             relationship = any(
                 marker in folded
@@ -3681,9 +4001,7 @@ class DeepSeekIntentParser:
                 if (
                     spaced
                     and int(spaced.group(1)) == expected_number
-                    and not cls._looks_like_numbered_component_field(
-                        spaced.group(2)
-                    )
+                    and not cls._looks_like_numbered_component_field(spaced.group(2))
                 ):
                     marker = spaced
             marker_number = int(marker.group(1)) if marker else None
@@ -3782,9 +4100,7 @@ class DeepSeekIntentParser:
         return [candidate for candidate in candidates if candidate[0] in owners]
 
     @classmethod
-    def _fallback_numbered_block_services(
-        cls, block: str
-    ) -> list[tuple[str, str]]:
+    def _fallback_numbered_block_services(cls, block: str) -> list[tuple[str, str]]:
         """Classify only unambiguous generic sales headings locally.
 
         This is intentionally small and semantic: it is used only after the
@@ -3803,7 +4119,9 @@ class DeepSeekIntentParser:
             add("ec2", "Amazon EC2")
         if re.search(r"数据库|mysql|postgresql|mariadb|sql\s*server|aurora", folded):
             add("rds", "Amazon RDS")
-        if re.search(r"缓存|redis|valkey|memcached", folded):
+        if re.search(r"(?:amazon\s+)?memorydb", folded):
+            add("memorydb", "Amazon MemoryDB")
+        elif re.search(r"缓存|redis|valkey|memcached", folded):
             add("elasticache", "Amazon ElastiCache")
         if re.search(r"对象存储|图片.*附件|附件.*图片", folded):
             add("s3", "Amazon Simple Storage Service (S3)")
@@ -3886,10 +4204,28 @@ class DeepSeekIntentParser:
 
         folded = line.strip().casefold()
         explicit = {
-            "计算资源：", "计算资源:", "数据库：", "数据库:", "缓存：", "缓存:",
-            "存储：", "存储:", "消息队列：", "消息队列:", "搜索：", "搜索:",
-            "容器：", "容器:", "网络：", "网络:", "安全：", "安全:",
-            "监控：", "监控:", "日志：", "日志:",
+            "计算资源：",
+            "计算资源:",
+            "数据库：",
+            "数据库:",
+            "缓存：",
+            "缓存:",
+            "存储：",
+            "存储:",
+            "消息队列：",
+            "消息队列:",
+            "搜索：",
+            "搜索:",
+            "容器：",
+            "容器:",
+            "网络：",
+            "网络:",
+            "安全：",
+            "安全:",
+            "监控：",
+            "监控:",
+            "日志：",
+            "日志:",
         }
         if folded in explicit:
             return True
@@ -3899,9 +4235,7 @@ class DeepSeekIntentParser:
         )
 
     @classmethod
-    def _reconcile_explicit_component_inventory(
-        cls, text: str, parsed: ParsedIntent
-    ) -> None:
+    def _reconcile_explicit_component_inventory(cls, text: str, parsed: ParsedIntent) -> None:
         """Guarantee one component card for every explicitly named service row.
 
         AI remains responsible for interpreting colloquial requirements.  This
@@ -4065,9 +4399,7 @@ class DeepSeekIntentParser:
                 matched.source_text = line
             inventoried.append(matched)
 
-        inventoried.extend(
-            item for index, item in enumerate(filtered) if index not in used
-        )
+        inventoried.extend(item for index, item in enumerate(filtered) if index not in used)
         parsed.services = inventoried[:25]
         # Merge heading/detail fragments before launching isolated component
         # extraction.  This both preserves all explicit fields and prevents two
@@ -4107,9 +4439,7 @@ class DeepSeekIntentParser:
                 if not segment:
                     continue
                 declared = {
-                    key
-                    for key, _ in cls._inventory_keys_for_line(segment)
-                    if key in service_keys
+                    key for key, _ in cls._inventory_keys_for_line(segment) if key in service_keys
                 }
                 if declared:
                     active = declared
@@ -4164,11 +4494,7 @@ class DeepSeekIntentParser:
         # workload and must enter the managed-vs-self-hosted decision first.
         # Official future AWS services remain untouched because their headings
         # identify them as AWS/Amazon services.
-        original_blocks = (
-            cls._numbered_requirement_blocks(original_text)
-            if original_text
-            else []
-        )
+        original_blocks = cls._numbered_requirement_blocks(original_text) if original_text else []
 
         def customer_explicitly_selected_ec2(product: str, source: str) -> bool:
             """Treat an explicit EC2 host/model as a completed architecture choice."""
@@ -4209,8 +4535,7 @@ class DeepSeekIntentParser:
                 for notice in parsed.ambiguities
                 if product.casefold() not in notice.casefold()
                 or not any(
-                    marker in notice.casefold()
-                    for marker in ("自建", "托管", "managed", "aws")
+                    marker in notice.casefold() for marker in ("自建", "托管", "managed", "aws")
                 )
             ]
 
@@ -4239,16 +4564,13 @@ class DeepSeekIntentParser:
                 continue
             managed_equivalent = cls._fully_managed_equivalent(product)
             if managed_equivalent is not None:
-                cls._apply_fully_managed_equivalent(
-                    item, product, source, managed_equivalent
-                )
+                cls._apply_fully_managed_equivalent(item, product, source, managed_equivalent)
                 parsed.ambiguities = [
                     notice
                     for notice in parsed.ambiguities
                     if product.casefold() not in notice.casefold()
                     or not any(
-                        marker in notice.casefold()
-                        for marker in ("自建", "托管", "managed", "aws")
+                        marker in notice.casefold() for marker in ("自建", "托管", "managed", "aws")
                     )
                 ]
                 continue
@@ -4260,8 +4582,7 @@ class DeepSeekIntentParser:
                 )
             )
             has_machine_shape = any(
-                key in item.requirements
-                for key in ("vcpu", "memory_gib", "system_disk_gib")
+                key in item.requirements for key in ("vcpu", "memory_gib", "system_disk_gib")
             )
             if not has_node_deployment and not has_machine_shape:
                 continue
@@ -4302,9 +4623,7 @@ class DeepSeekIntentParser:
             # customer question. Replace every such note with one stable,
             # actionable choice so the UI can always render the two buttons.
             parsed.ambiguities = [
-                notice
-                for notice in parsed.ambiguities
-                if "nacos" not in notice.casefold()
+                notice for notice in parsed.ambiguities if "nacos" not in notice.casefold()
             ]
             parsed.ambiguities.append(question)
 
@@ -4340,24 +4659,19 @@ class DeepSeekIntentParser:
                 continue
             managed_equivalent = cls._fully_managed_equivalent(product)
             if managed_equivalent is not None:
-                cls._apply_fully_managed_equivalent(
-                    item, product, source, managed_equivalent
-                )
+                cls._apply_fully_managed_equivalent(item, product, source, managed_equivalent)
                 parsed.ambiguities = [
                     notice
                     for notice in parsed.ambiguities
                     if product.casefold() not in notice.casefold()
                     or not any(
-                        marker in notice.casefold()
-                        for marker in ("自建", "托管", "managed", "aws")
+                        marker in notice.casefold() for marker in ("自建", "托管", "managed", "aws")
                     )
                 ]
                 continue
             item.calculator_service_name = f"Amazon EC2（自建 {product}）"
             item.requirements.setdefault("operating_system", "linux")
-            item.field_sources.setdefault(
-                "_pending_architecture_decision", "system_policy"
-            )
+            item.field_sources.setdefault("_pending_architecture_decision", "system_policy")
             quantity = max(int(item.quantity or 1), 1)
             details = [f"{quantity} 个节点"]
             vcpu = item.requirements.get("vcpu")
@@ -4377,8 +4691,7 @@ class DeepSeekIntentParser:
                 for notice in parsed.ambiguities
                 if product.casefold() not in notice.casefold()
                 or not any(
-                    marker in notice.casefold()
-                    for marker in ("自建", "托管", "managed", "aws")
+                    marker in notice.casefold() for marker in ("自建", "托管", "managed", "aws")
                 )
             ]
             parsed.ambiguities.append(question)
@@ -4392,10 +4705,7 @@ class DeepSeekIntentParser:
             notice
             for notice in parsed.ambiguities
             if "自建" in notice
-            and any(
-                marker in notice.casefold()
-                for marker in ("托管", "managed", "aws")
-            )
+            and any(marker in notice.casefold() for marker in ("托管", "managed", "aws"))
         ]
         for item in parsed.services:
             if cls._service_key(item.service) != "ec2":
@@ -4409,14 +4719,10 @@ class DeepSeekIntentParser:
                 for product in products
                 for notice in architecture_notices
             ):
-                item.field_sources.setdefault(
-                    "_pending_architecture_decision", "system_policy"
-                )
+                item.field_sources.setdefault("_pending_architecture_decision", "system_policy")
 
     @classmethod
-    def _fully_managed_equivalent(
-        cls, product: str
-    ) -> tuple[str, str] | None:
+    def _fully_managed_equivalent(cls, product: str) -> tuple[str, str] | None:
         """Return only high-confidence, functionally direct AWS mappings.
 
         This is the deterministic guard behind the managed-first policy.  The
@@ -4472,9 +4778,7 @@ class DeepSeekIntentParser:
         # in the architecture-question code.
         canonical_product = re.sub(r"[^a-z0-9]+", "", product.casefold())
         for service, display_name, _markers in cls._INVENTORY_DEFINITIONS:
-            canonical_display = re.sub(
-                r"[^a-z0-9]+", "", display_name.casefold()
-            )
+            canonical_display = re.sub(r"[^a-z0-9]+", "", display_name.casefold())
             if (
                 service != "ec2"
                 and service in SERVICE_TEMPLATE_FIELDS
@@ -4545,9 +4849,7 @@ class DeepSeekIntentParser:
         if engine is not None:
             item.requirements["engine"] = engine
             item.field_sources["requirements.engine"] = "customer_text"
-            item.locked_fields = sorted(
-                set(item.locked_fields) | {"requirements.engine"}
-            )
+            item.locked_fields = sorted(set(item.locked_fields) | {"requirements.engine"})
 
         if service == "msk":
             broker_match = re.search(
@@ -4559,18 +4861,10 @@ class DeepSeekIntentParser:
                 re.I,
             )
             if broker_match:
-                count = next(
-                    int(group)
-                    for group in broker_match.groups()
-                    if group is not None
-                )
+                count = next(int(group) for group in broker_match.groups() if group is not None)
                 item.requirements["broker_count"] = max(count, 1)
-                item.field_sources[
-                    "requirements.broker_count"
-                ] = "customer_text"
-                item.locked_fields = sorted(
-                    set(item.locked_fields) | {"requirements.broker_count"}
-                )
+                item.field_sources["requirements.broker_count"] = "customer_text"
+                item.locked_fields = sorted(set(item.locked_fields) | {"requirements.broker_count"})
             # Broker nodes are members of one MSK cluster, not independent
             # copies of the complete service. A separately stated cluster
             # count is restored by the shared topology normalizer later.
@@ -4623,9 +4917,7 @@ class DeepSeekIntentParser:
             if not re.search(r"(?<![a-z0-9])prometheus(?![a-z0-9])", evidence, re.I):
                 continue
             item.service = "amp"
-            item.calculator_service_name = (
-                "Amazon Managed Service for Prometheus (AMP)"
-            )
+            item.calculator_service_name = "Amazon Managed Service for Prometheus (AMP)"
             item.product_identity = "prometheus"
 
     @classmethod
@@ -4634,8 +4926,14 @@ class DeepSeekIntentParser:
 
         represented = {cls._service_key(item.service) for item in parsed.services}
         definitions = {
-            "eks": ("Amazon Elastic Kubernetes Service (EKS)", ("amazon eks", "eks 集群", "kubernetes 集群")),
-            "ecr": ("Amazon Elastic Container Registry (ECR)", ("amazon ecr", "ecr 私有仓库", "容器镜像仓库")),
+            "eks": (
+                "Amazon Elastic Kubernetes Service (EKS)",
+                ("amazon eks", "eks 集群", "kubernetes 集群"),
+            ),
+            "ecr": (
+                "Amazon Elastic Container Registry (ECR)",
+                ("amazon ecr", "ecr 私有仓库", "容器镜像仓库"),
+            ),
             "elb": ("Elastic Load Balancing", ("负载均衡", "load balancer", "alb", "nlb")),
             "s3": ("Amazon Simple Storage Service (S3)", ("amazon s3", "s3", "对象存储")),
             "route53": ("Amazon Route 53", ("route 53", "route53", "域名解析")),
@@ -4678,8 +4976,13 @@ class DeepSeekIntentParser:
             "apigateway": (
                 "Amazon API Gateway",
                 (
-                    "amazon api gateway", "api gateway", "api 入口", "对外api",
-                    "对外 api", "提供api给外部", "提供 api 给外部",
+                    "amazon api gateway",
+                    "api gateway",
+                    "api 入口",
+                    "对外api",
+                    "对外 api",
+                    "提供api给外部",
+                    "提供 api 给外部",
                 ),
             ),
             "opensearch": (
@@ -4691,9 +4994,37 @@ class DeepSeekIntentParser:
                 ("amazon documentdb", "documentdb", "mongodb", "mongo db"),
             ),
             "nat_gateway": ("AWS NAT Gateway", ("nat gateway", "nat 网关", "公网出口")),
-            "vpc": ("Amazon Virtual Private Cloud (VPC)", ("aws vpc", "amazon vpc", "vpc +", "vpc＋", "vpc：", "vpc｜")),
-            "dms": ("AWS Database Migration Service (DMS)", ("aws dms", "amazon dms", "database migration service", "dms：", "dms｜")),
-            "kms": ("AWS Key Management Service (KMS)", ("aws kms", "amazon kms", "key management service", "/ kms", "+ kms", "kms：", "kms｜")),
+            "vpc": (
+                "Amazon Virtual Private Cloud (VPC)",
+                (
+                    "aws vpc",
+                    "amazon vpc",
+                    "public-vpc",
+                    "private-vpc",
+                    "public vpc",
+                    "private vpc",
+                    "vpc +",
+                    "vpc＋",
+                    "vpc：",
+                    "vpc｜",
+                ),
+            ),
+            "dms": (
+                "AWS Database Migration Service (DMS)",
+                ("aws dms", "amazon dms", "database migration service", "dms：", "dms｜"),
+            ),
+            "kms": (
+                "AWS Key Management Service (KMS)",
+                (
+                    "aws kms",
+                    "amazon kms",
+                    "key management service",
+                    "/ kms",
+                    "+ kms",
+                    "kms：",
+                    "kms｜",
+                ),
+            ),
             "xray": ("AWS X-Ray", ("aws x-ray", "amazon x-ray", "x-ray", "xray")),
             "secrets_manager": ("AWS Secrets Manager", ("secrets manager", "secret 管理")),
         }
@@ -4729,7 +5060,11 @@ class DeepSeekIntentParser:
             elif key == "msk":
                 model = re.search(r"\b(kafka\.[a-z0-9][a-z0-9.-]*)\b", source_line, re.I)
                 brokers = re.search(r"(\d+)\s*(?:个)?\s*broker", source_line, re.I)
-                storage = re.search(r"(?:每\s*broker|broker)[^\d]{0,12}(\d+(?:\.\d+)?)\s*(?:gib|gb|g)", source_line, re.I)
+                storage = re.search(
+                    r"(?:每\s*broker|broker)[^\d]{0,12}(\d+(?:\.\d+)?)\s*(?:gib|gb|g)",
+                    source_line,
+                    re.I,
+                )
                 if model:
                     requirements["requested_model"] = model.group(1).lower()
                 if brokers:
@@ -4742,9 +5077,7 @@ class DeepSeekIntentParser:
                     requirements["engine_type"] = "rabbitmq"
                 elif "activemq" in lowered or "active mq" in lowered:
                     requirements["engine_type"] = "activemq"
-                brokers = re.search(
-                    r"(\d+)\s*(?:个)?\s*(?:broker|节点)", source_line, re.I
-                )
+                brokers = re.search(r"(\d+)\s*(?:个)?\s*(?:broker|节点)", source_line, re.I)
                 if brokers:
                     requirements["broker_count"] = int(brokers.group(1))
             elif key == "opensearch":
@@ -4834,7 +5167,9 @@ class DeepSeekIntentParser:
             source = (item.source_text or "").strip()
             source_is_customer_text = bool(source)
             written_in_request = normalized in full_text
-            written_in_component = normalized in source.casefold() if source_is_customer_text else True
+            written_in_component = (
+                normalized in source.casefold() if source_is_customer_text else True
+            )
             if not written_in_request or not written_in_component:
                 item.requirements.pop("requested_model", None)
 
@@ -4907,7 +5242,15 @@ class DeepSeekIntentParser:
                     )
                 if not source:
                     service_markers = (
-                        ("rds", "数据库", "mysql", "postgresql", "postgres", "mariadb", "sql server")
+                        (
+                            "rds",
+                            "数据库",
+                            "mysql",
+                            "postgresql",
+                            "postgres",
+                            "mariadb",
+                            "sql server",
+                        )
                         if key == "rds"
                         else ("elasticache", "redis", "valkey", "缓存")
                     )
@@ -4923,9 +5266,7 @@ class DeepSeekIntentParser:
                 if any(marker in folded for marker in markers):
                     item.requirements["engine"] = engine
                     path = "requirements.engine"
-                    evidence = next(
-                        (marker for marker in markers if marker in folded), engine
-                    )
+                    evidence = next((marker for marker in markers if marker in folded), engine)
                     item.field_sources[path] = "customer_text"
                     item.field_evidence[path] = evidence
                     item.locked_fields = sorted(set(item.locked_fields) | {path})
@@ -4955,11 +5296,16 @@ class DeepSeekIntentParser:
                     # Keep the customer architecture here. The RDS adapter
                     # privately maps Aurora members to AWS catalog dimensions.
                     requirements["aurora_cluster"] = True
-                    if any(marker in folded for marker in ("multi-az", "multi az", "主备", "高可用")):
+                    if any(
+                        marker in folded for marker in ("multi-az", "multi az", "主备", "高可用")
+                    ):
                         requirements["deployment"] = "multi_az"
                     elif any(marker in folded for marker in ("single-az", "single az", "单可用区")):
                         requirements["deployment"] = "single_az"
-                elif any(marker in folded for marker in ("multi-az", "multi az", "主备", "1主1备", "高可用")):
+                elif any(
+                    marker in folded
+                    for marker in ("multi-az", "multi az", "主备", "1主1备", "高可用")
+                ):
                     requirements["deployment"] = "multi_az"
                 elif any(marker in folded for marker in ("single-az", "single az", "单可用区")):
                     requirements["deployment"] = "single_az"
@@ -5014,8 +5360,17 @@ class DeepSeekIntentParser:
         if words:
             raw = words.group(1)
             chinese = {
-                "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
-                "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+                "一": 1,
+                "二": 2,
+                "两": 2,
+                "三": 3,
+                "四": 4,
+                "五": 5,
+                "六": 6,
+                "七": 7,
+                "八": 8,
+                "九": 9,
+                "十": 10,
             }
             return chinese.get(raw, int(raw) if raw.isdigit() else 0)
         if re.search(r"一主一从|主备模式|主从模式", source, re.I):
@@ -5063,8 +5418,17 @@ class DeepSeekIntentParser:
         """
 
         chinese_counts = {
-            "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
-            "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+            "一": 1,
+            "二": 2,
+            "两": 2,
+            "三": 3,
+            "四": 4,
+            "五": 5,
+            "六": 6,
+            "七": 7,
+            "八": 8,
+            "九": 9,
+            "十": 10,
         }
         internal_topology_fields: dict[str, tuple[str, ...]] = {
             "msk": ("broker_count",),
@@ -5125,9 +5489,7 @@ class DeepSeekIntentParser:
             )
             if explicit_cluster_count:
                 value = next(
-                    int(group)
-                    for group in explicit_cluster_count.groups()
-                    if group is not None
+                    int(group) for group in explicit_cluster_count.groups() if group is not None
                 )
                 item.quantity = max(value, 1)
                 continue
@@ -5168,9 +5530,7 @@ class DeepSeekIntentParser:
             )
             if explicit_deployment_count:
                 item.quantity = next(
-                    int(group)
-                    for group in explicit_deployment_count.groups()
-                    if group is not None
+                    int(group) for group in explicit_deployment_count.groups() if group is not None
                 )
             else:
                 # Primary and standby are members inside the Multi-AZ price,
@@ -5209,6 +5569,11 @@ class DeepSeekIntentParser:
             match_index: int | None = None
             for index, existing in enumerate(merged):
                 if cls._service_key(existing.service) != key:
+                    continue
+                if (
+                    existing.parent_component_key
+                    or item.parent_component_key
+                ) and existing.parent_component_key != item.parent_component_key:
                     continue
                 existing_source = (existing.source_text or "").strip()
                 same_source = bool(source and existing_source and source == existing_source)
@@ -5255,6 +5620,7 @@ class DeepSeekIntentParser:
                 **existing.field_evidence,
             }
             existing.locked_fields = sorted(existing_locked | incoming_locked)
+            overlay_customer_fields(existing, item)
             if source and source not in (existing.source_text or ""):
                 existing.source_text = "\n".join(
                     part for part in (existing.source_text, source) if part
@@ -5300,9 +5666,7 @@ class DeepSeekIntentParser:
                 source,
                 re.I,
             )
-            if vague_count and not (
-                key == "eks" and re.search(r"几个服务", source, re.I)
-            ):
+            if vague_count and not (key == "eks" and re.search(r"几个服务", source, re.I)):
                 questions.append(
                     f"{display}（客户原话：{source[:100]}）的数量写的是"
                     f"“{vague_count.group(0).strip()}”，请确认具体数量。"
@@ -5524,9 +5888,7 @@ class DeepSeekIntentParser:
             )
             if not match:
                 return None
-            multiplier = {"万": 10_000, "亿": 100_000_000}.get(
-                match.group(2), 1
-            )
+            multiplier = {"万": 10_000, "亿": 100_000_000}.get(match.group(2), 1)
             return float(match.group(1)) * multiplier, match.group(0)
 
         for item in parsed.services:
@@ -5561,31 +5923,31 @@ class DeepSeekIntentParser:
                 if explicit_requests is not None:
                     request_count, evidence = explicit_requests
                     requirements["requests"] = request_count
-                    item.field_sources[
-                        "requirements.requests"
-                    ] = "customer_text"
+                    item.field_sources["requirements.requests"] = "customer_text"
                     item.field_evidence["requirements.requests"] = evidence
-                    item.locked_fields = sorted(
-                        set(item.locked_fields) | {"requirements.requests"}
-                    )
+                    item.locked_fields = sorted(set(item.locked_fields) | {"requirements.requests"})
             if service == "ec2":
-                quantity_match = re.search(
-                    r"(\d+)\s*(?:台|个\s*(?:worker|工作)?节点)",
-                    source,
-                    flags=re.IGNORECASE,
-                ) or re.search(
-                    r"(?:数量|实例数量)\s*[:：]?\s*(\d+)",
-                    source,
-                    flags=re.IGNORECASE,
-                ) or re.search(
-                    # Compact sales notation: ``m6i.xlarge ×2``. Bind the
-                    # multiplier to an EC2-shaped model so CPU text such as
-                    # ``4C16G`` cannot be mistaken for instance quantity.
-                    r"(?<![a-z0-9])(?=[a-z0-9-]*\d)(?:[a-z][a-z0-9-]*\.)"
-                    r"[a-z0-9.-]+(?:\s*[（(][^）)\n]{0,30}[）)])?"
-                    r"\s*[×x*]\s*(\d+)(?!\d)",
-                    source,
-                    flags=re.IGNORECASE,
+                quantity_match = (
+                    re.search(
+                        r"(\d+)\s*(?:台|个\s*(?:worker|工作)?节点)",
+                        source,
+                        flags=re.IGNORECASE,
+                    )
+                    or re.search(
+                        r"(?:数量|实例数量)\s*[:：]?\s*(\d+)",
+                        source,
+                        flags=re.IGNORECASE,
+                    )
+                    or re.search(
+                        # Compact sales notation: ``m6i.xlarge ×2``. Bind the
+                        # multiplier to an EC2-shaped model so CPU text such as
+                        # ``4C16G`` cannot be mistaken for instance quantity.
+                        r"(?<![a-z0-9])(?=[a-z0-9-]*\d)(?:[a-z][a-z0-9-]*\.)"
+                        r"[a-z0-9.-]+(?:\s*[（(][^）)\n]{0,30}[）)])?"
+                        r"\s*[×x*]\s*(\d+)(?!\d)",
+                        source,
+                        flags=re.IGNORECASE,
+                    )
                 )
                 if quantity_match:
                     item.quantity = int(quantity_match.group(1))
@@ -5634,9 +5996,7 @@ class DeepSeekIntentParser:
                 )
                 disk_value: float | None = None
                 if disk_match:
-                    disk_value = gib(
-                        disk_match.group(1), disk_match.group(2)
-                    )
+                    disk_value = gib(disk_match.group(1), disk_match.group(2))
                 else:
                     # Compact lists often omit the disk noun, for example
                     # ``EC2 c6i.xlarge (4C8G) + 200G``. Once a CPU/RAM pair
@@ -5650,9 +6010,7 @@ class DeepSeekIntentParser:
                         flags=re.IGNORECASE,
                     )
                     if disk_match:
-                        disk_value = gib(
-                            disk_match.group(1), disk_match.group(2)
-                        )
+                        disk_value = gib(disk_match.group(1), disk_match.group(2))
                 if not disk_match:
                     disk_match = re.search(
                         r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tib|tb|t)"
@@ -5661,15 +6019,11 @@ class DeepSeekIntentParser:
                         flags=re.IGNORECASE,
                     )
                     if disk_match:
-                        disk_value = gib(
-                            disk_match.group(1), disk_match.group(2)
-                        )
+                        disk_value = gib(disk_match.group(1), disk_match.group(2))
                 if disk_match and disk_value is not None:
                     requirements["system_disk_gib"] = disk_value
                     lock(item, "system_disk_gib", disk_match.group(0))
-                if volume_match := re.search(
-                    r"\b(gp[23]|io[12]|st1|sc1)\b", source, re.I
-                ):
+                if volume_match := re.search(r"\b(gp[23]|io[12]|st1|sc1)\b", source, re.I):
                     requirements["volume_type"] = volume_match.group(1).lower()
                     lock(item, "volume_type", volume_match.group(0))
                 data_disk_match = re.search(
@@ -5680,16 +6034,12 @@ class DeepSeekIntentParser:
                 )
                 if data_disk_match:
                     volume_type = "gp3"
-                    nearby_type = re.search(
-                        r"\b(gp[23]|io[12]|st1|sc1)\b", source, re.IGNORECASE
-                    )
+                    nearby_type = re.search(r"\b(gp[23]|io[12]|st1|sc1)\b", source, re.IGNORECASE)
                     if nearby_type:
                         volume_type = nearby_type.group(1).lower()
                     requirements["additional_ebs_volumes"] = [
                         {
-                            "size_gib": gib(
-                                data_disk_match.group(1), data_disk_match.group(2)
-                            ),
+                            "size_gib": gib(data_disk_match.group(1), data_disk_match.group(2)),
                             "volume_type": volume_type,
                             "count_per_instance": 1,
                         }
@@ -5722,9 +6072,7 @@ class DeepSeekIntentParser:
                     re.I,
                 )
                 if cluster_match:
-                    cluster_count = int(
-                        next(group for group in cluster_match.groups() if group)
-                    )
+                    cluster_count = int(next(group for group in cluster_match.groups() if group))
                     item.quantity = max(cluster_count, 1)
                     requirements["cluster_count"] = max(cluster_count, 1)
 
@@ -5745,16 +6093,12 @@ class DeepSeekIntentParser:
                     re.I,
                 )
                 if per_cluster_match:
-                    count = int(
-                        next(group for group in per_cluster_match.groups() if group)
-                    )
+                    count = int(next(group for group in per_cluster_match.groups() if group))
                     requirements["worker_nodes_per_cluster"] = count
                     worker_count_path = "requirements.worker_nodes_per_cluster"
                     worker_count_evidence = per_cluster_match.group(0)
                 elif total_worker_match:
-                    count = int(
-                        next(group for group in total_worker_match.groups() if group)
-                    )
+                    count = int(next(group for group in total_worker_match.groups() if group))
                     requirements["worker_node_count"] = count
                     worker_count_path = "requirements.worker_node_count"
                     worker_count_evidence = total_worker_match.group(0)
@@ -5764,9 +6108,7 @@ class DeepSeekIntentParser:
                 if worker_count_path:
                     item.field_sources[worker_count_path] = "customer_text"
                     item.field_evidence[worker_count_path] = worker_count_evidence
-                    item.locked_fields = sorted(
-                        set(item.locked_fields) | {worker_count_path}
-                    )
+                    item.locked_fields = sorted(set(item.locked_fields) | {worker_count_path})
 
                 worker_shape = re.search(
                     r"(?:每\s*(?:台|个)(?:\s*(?:worker|工作)?\s*节点)?"
@@ -5787,9 +6129,7 @@ class DeepSeekIntentParser:
                         path = f"requirements.{field}"
                         item.field_sources[path] = "customer_text"
                         item.field_evidence[path] = evidence
-                        item.locked_fields = sorted(
-                            set(item.locked_fields) | {path}
-                        )
+                        item.locked_fields = sorted(set(item.locked_fields) | {path})
             elif service == "lambda":
                 if match := re.search(
                     r"(?:请求量|请求数|requests?)\s*(\d+(?:\.\d+)?)\s*(万|亿)?(?:\s*(?:次|个))?",
@@ -5990,12 +6330,19 @@ class DeepSeekIntentParser:
                 # Athena has no customer-managed cluster or instance.  Remove
                 # generic fallback fields even if a model response invented them.
                 for field in (
-                    "requested_model", "nodes", "node_count", "cluster_count",
-                    "vcpu", "memory_gib", "storage_gib",
+                    "requested_model",
+                    "nodes",
+                    "node_count",
+                    "cluster_count",
+                    "vcpu",
+                    "memory_gib",
+                    "storage_gib",
                 ):
                     requirements.pop(field, None)
             elif service == "glue":
-                if match := re.search(r"(\d+)\s*(?:个)?\s*etl\s*(?:任务|作业|jobs?)?", source, re.I):
+                if match := re.search(
+                    r"(\d+)\s*(?:个)?\s*etl\s*(?:任务|作业|jobs?)?", source, re.I
+                ):
                     requirements["job_count"] = int(match.group(1))
             elif service == "cognito":
                 if match := re.search(r"(\d+(?:\.\d+)?)\s*(万|亿)?\s*(?:个)?用户", source, re.I):
@@ -6014,9 +6361,7 @@ class DeepSeekIntentParser:
                     r"(?:broker\s*(?:数量|节点)?|节点(?:数量)?)\s*[:：]?\s*(\d+)",
                     source,
                     re.I,
-                ) or re.search(
-                    r"(\d+)\s*(?:个)?\s*(?:broker|节点)", source, re.I
-                )
+                ) or re.search(r"(\d+)\s*(?:个)?\s*(?:broker|节点)", source, re.I)
                 if broker_match:
                     requirements["broker_count"] = int(broker_match.group(1))
                     item.field_sources["requirements.broker_count"] = "customer_text"
@@ -6024,9 +6369,7 @@ class DeepSeekIntentParser:
                     item.locked_fields = sorted(
                         set(item.locked_fields) | {"requirements.broker_count"}
                     )
-                if model_match := re.search(
-                    r"\b(mq\.[a-z][a-z0-9.-]+)\b", source, re.I
-                ):
+                if model_match := re.search(r"\b(mq\.[a-z][a-z0-9.-]+)\b", source, re.I):
                     requirements["requested_model"] = model_match.group(1).lower()
                 shape_match = re.search(
                     r"(\d+(?:\.\d+)?)\s*(?:核|vcpu)[^。；,，\n]{0,12}?"
@@ -6042,8 +6385,7 @@ class DeepSeekIntentParser:
                     item.field_evidence["requirements.vcpu"] = shape_match.group(0)
                     item.field_evidence["requirements.memory_gib"] = shape_match.group(0)
                     item.locked_fields = sorted(
-                        set(item.locked_fields)
-                        | {"requirements.vcpu", "requirements.memory_gib"}
+                        set(item.locked_fields) | {"requirements.vcpu", "requirements.memory_gib"}
                     )
                 storage = first(
                     r"(?:每(?:个)?(?:broker|节点)[^。；,，\n]{0,16}?)?"
@@ -6164,20 +6506,18 @@ class DeepSeekIntentParser:
                     re.I,
                 ):
                     requirements["requested_model"] = match.group(1).lower()
-                broker_match = re.search(
-                    r"broker\s*数量\s*[:：]?\s*(\d+)", source, re.I
-                ) or re.search(
-                    r"(?<![\w.-])(\d+)[ \t]*(?:个)?[ \t]*broker(?:节点)?\b",
-                    source,
-                    re.I,
-                ) or re.search(
-                    r"(?m)^\s*配置\s*[:：]?\s*(\d+)\s*(?:个)?节点\s*$", source, re.I
+                broker_match = (
+                    re.search(r"broker\s*数量\s*[:：]?\s*(\d+)", source, re.I)
+                    or re.search(
+                        r"(?<![\w.-])(\d+)[ \t]*(?:个)?[ \t]*broker(?:节点)?\b",
+                        source,
+                        re.I,
+                    )
+                    or re.search(r"(?m)^\s*配置\s*[:：]?\s*(\d+)\s*(?:个)?节点\s*$", source, re.I)
                 )
                 if broker_match:
                     requirements["broker_count"] = int(broker_match.group(1))
-                elif match := re.search(
-                    r"(?<![\w.-])(\d+)\s*(?:个)?\s*节点", source, re.I
-                ):
+                elif match := re.search(r"(?<![\w.-])(\d+)\s*(?:个)?\s*节点", source, re.I):
                     requirements["broker_count"] = int(match.group(1))
                 shape_match = re.search(
                     r"(\d+(?:\.\d+)?)\s*(?:核|vcpu)[^。；,，\n]{0,12}?"
@@ -6434,9 +6774,7 @@ class DeepSeekIntentParser:
                     source,
                     re.IGNORECASE,
                 ):
-                    multiplier = {"万": 10_000, "亿": 100_000_000}.get(
-                        match.group(2), 1
-                    )
+                    multiplier = {"万": 10_000, "亿": 100_000_000}.get(match.group(2), 1)
                     requirements["requests"] = float(match.group(1)) * multiplier
 
     @classmethod
@@ -6596,25 +6934,37 @@ class DeepSeekIntentParser:
             explicit_total = total_result[0] if total_result else None
             explicit_count = count_result[0] if count_result else None
 
-            def set_requirement(field: str, value: int | float, evidence: str) -> None:
+            def set_requirement(
+                field: str,
+                value: int | float,
+                evidence: str,
+                component: ServiceRequirement = item,
+            ) -> None:
                 path = f"requirements.{field}"
-                item.requirements[field] = clean_number(float(value))
-                item.field_sources[path] = "customer_text"
-                item.field_evidence[path] = evidence
-                item.locked_fields = sorted(set(item.locked_fields) | {path})
+                component.requirements[field] = clean_number(float(value))
+                component.field_sources[path] = "customer_text"
+                component.field_evidence[path] = evidence
+                component.locked_fields = sorted(set(component.locked_fields) | {path})
 
-            def set_count(value: int, evidence: str) -> None:
-                if count_path == "quantity":
-                    item.quantity = value
+            def set_count(
+                value: int,
+                evidence: str,
+                component: ServiceRequirement = item,
+                component_count_path: str = count_path,
+            ) -> None:
+                if component_count_path == "quantity":
+                    component.quantity = value
                     path = "quantity"
-                    item.field_evidence[path] = evidence
+                    component.field_evidence[path] = evidence
                 else:
-                    field = count_path.split(".", 1)[1]
-                    item.requirements[field] = value
-                    path = count_path
-                    item.field_evidence[path] = evidence
-                item.field_sources[path] = "customer_text"
-                item.locked_fields = sorted(set(item.locked_fields) | {path})
+                    field = component_count_path.split(".", 1)[1]
+                    component.requirements[field] = value
+                    path = component_count_path
+                    component.field_evidence[path] = evidence
+                component.field_sources[path] = "customer_text"
+                component.locked_fields = sorted(
+                    set(component.locked_fields) | {path}
+                )
 
             if explicit_per is not None:
                 set_requirement(per_field, explicit_per, per_result[1])
@@ -6667,8 +7017,10 @@ class DeepSeekIntentParser:
     def _split_eks_worker_nodes(cls, parsed: ParsedIntent) -> None:
         """Move EKS node sizing to separately priced EC2 worker nodes."""
 
+        ensure_component_keys(parsed)
         additions: list[ServiceRequirement] = []
-        for item in parsed.services:
+        duplicate_worker_ids: set[int] = set()
+        for item in list(parsed.services):
             if cls._service_key(item.service) != "eks":
                 continue
             source = item.source_text or ""
@@ -6752,29 +7104,90 @@ class DeepSeekIntentParser:
                 and worker_memory > 0
             )
 
+            worker_disk = requirements.get("worker_system_disk_gib")
+            if not isinstance(worker_disk, (int, float)) or isinstance(worker_disk, bool):
+                # Recover the per-worker disk from the immutable customer
+                # source.  Never derive it from a stale total: with two EKS
+                # clusters, three workers each and 100 GiB per worker, the
+                # only correct total is 600 GiB, not the historical 300 GiB.
+                disk_match = re.search(
+                    r"(?:worker|工作)\s*节点[^。；\n]{0,80}?"
+                    r"(?:单台|每台|每节点)?[^。；\n]{0,24}?"
+                    r"\d+(?:\.\d+)?\s*(?:核|vcpu)[^。；\n]{0,20}?"
+                    r"\d+(?:\.\d+)?\s*(?:gib|gb|g)\s*[/＋+]\s*"
+                    r"(\d+(?:\.\d+)?)\s*(tib|tb|t|gib|gb|g)\s*(?:存储|磁盘|系统盘)",
+                    source,
+                    re.I,
+                ) or re.search(
+                    r"(?:worker|工作)\s*节点[^。；\n]{0,80}?"
+                    r"(?:系统盘|磁盘|存储)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*"
+                    r"(tib|tb|t|gib|gb|g)",
+                    source,
+                    re.I,
+                )
+                if disk_match:
+                    worker_disk = float(disk_match.group(1))
+                    if disk_match.group(2).casefold() in {"tib", "tb", "t"}:
+                        worker_disk *= 1024
+                    if float(worker_disk).is_integer():
+                        worker_disk = int(worker_disk)
+
             # An explicit worker count is itself a billable EC2 requirement.
             # If the customer omitted its model/shape, retain the worker fleet
             # and let the EC2 adapter select the least expensive valid size.
             # Requiring a shape here silently removed real worker nodes.
             if node_count_value:
                 node_count = int(node_count_value)
-                compact_eks_source = re.sub(r"\s+", "", source).casefold()
-                existing_worker = next(
-                    (
-                        candidate
-                        for candidate in parsed.services
-                        if cls._service_key(candidate.service) == "ec2"
-                        and bool(re.search(r"worker|工作节点", candidate.source_text, re.I))
-                        and re.sub(r"\s+", "", candidate.source_text).casefold()
-                        in compact_eks_source
+                parent_key = item.component_key
+                parent_source = canonical_component_source(source)
+                existing_workers = [
+                    candidate
+                    for candidate in parsed.services
+                    if candidate is not item
+                    and cls._service_key(candidate.service) == "ec2"
+                    and (
+                        candidate.parent_component_key == parent_key
+                        or (
+                            candidate.parent_component_key is None
+                            and candidate.derived_from_service == "eks"
+                            and bool(canonical_component_source(candidate.source_text))
+                            and (
+                                canonical_component_source(candidate.source_text) == parent_source
+                                or canonical_component_source(candidate.source_text) in parent_source
+                            )
+                        )
+                        or (
+                            candidate.parent_component_key is None
+                            and bool(re.search(r"worker|工作节点", candidate.source_text, re.I))
+                            and bool(canonical_component_source(candidate.source_text))
+                            and (
+                                canonical_component_source(candidate.source_text) == parent_source
+                                or canonical_component_source(candidate.source_text) in parent_source
+                            )
+                        )
+                    )
+                ]
+                # If an old draft already contains both the edited worker and
+                # a newly regenerated duplicate, keep the row with the most
+                # customer-owned fields and merge the rest into it.
+                existing_workers.sort(
+                    key=lambda candidate: sum(
+                        source_kind in CUSTOMER_OVERRIDE_SOURCES
+                        for source_kind in candidate.field_sources.values()
                     ),
-                    None,
+                    reverse=True,
                 )
+                existing_worker = existing_workers[0] if existing_workers else None
+                if existing_worker is not None:
+                    for duplicate in existing_workers[1:]:
+                        overlay_customer_fields(existing_worker, duplicate)
+                        for field, value in duplicate.requirements.items():
+                            existing_worker.requirements.setdefault(field, value)
+                        duplicate_worker_ids.add(id(duplicate))
                 worker_requirements: dict[str, object] = {
                     **(
                         {"requested_model": requested_model.strip()}
-                        if isinstance(requested_model, str)
-                        and requested_model.strip()
+                        if isinstance(requested_model, str) and requested_model.strip()
                         else {}
                     ),
                     **(
@@ -6785,35 +7198,60 @@ class DeepSeekIntentParser:
                         if has_worker_shape
                         else {}
                     ),
-                    **(
-                        {"system_disk_gib": requirements["worker_system_disk_gib"]}
-                        if isinstance(
-                            requirements.get("worker_system_disk_gib"),
-                            (int, float),
-                        )
-                        else {}
-                    ),
+                    **({"system_disk_gib": worker_disk} if worker_disk is not None else {}),
                     "operating_system": "Linux",
                 }
                 if existing_worker is not None:
-                    existing_worker.quantity = node_count
+                    existing_has_shape = all(
+                        isinstance(existing_worker.requirements.get(field), (int, float))
+                        and not isinstance(existing_worker.requirements.get(field), bool)
+                        and float(existing_worker.requirements[field]) > 0
+                        for field in ("vcpu", "memory_gib")
+                    )
+                    existing_has_model = bool(
+                        str(existing_worker.requirements.get("requested_model") or "").strip()
+                    )
+                    existing_worker.derived_from_service = "eks"
+                    existing_worker.parent_component_key = parent_key
+                    existing_worker.component_key = (
+                        existing_worker.component_key or f"{parent_key}:eks_worker"
+                    )
+                    if (
+                        existing_worker.field_sources.get("quantity")
+                        not in CUSTOMER_OVERRIDE_SOURCES
+                    ):
+                        existing_worker.quantity = node_count
+                        existing_worker.field_sources["quantity"] = "customer_text"
                     existing_worker.region = existing_worker.region or item.region
-                    existing_worker.calculator_service_name = (
-                        "Amazon EC2 (EKS Worker Nodes)"
-                    )
-                    existing_worker.requirements.update(worker_requirements)
-                    existing_worker.source_text = source
-                    existing_worker.field_sources.update(
-                        {
-                            "quantity": "customer_text",
-                            **{
-                                f"requirements.{key}": "customer_text"
-                                for key in worker_requirements
-                                if key != "operating_system"
-                            },
-                            "requirements.operating_system": "system_minimum",
-                        }
-                    )
+                    existing_worker.calculator_service_name = "Amazon EC2 (EKS Worker Nodes)"
+                    for key, value in worker_requirements.items():
+                        path = f"requirements.{key}"
+                        if existing_worker.field_sources.get(path) in CUSTOMER_OVERRIDE_SOURCES:
+                            continue
+                        existing_worker.requirements[key] = value
+                        existing_worker.field_sources[path] = (
+                            "system_minimum" if key == "operating_system" else "customer_text"
+                        )
+                    if not any(
+                        source_kind in CUSTOMER_OVERRIDE_SOURCES
+                        for source_kind in existing_worker.field_sources.values()
+                    ):
+                        existing_worker.source_text = source
+                    if not any(
+                        (
+                            requested_model,
+                            has_worker_shape,
+                            existing_has_model,
+                            existing_has_shape,
+                        )
+                    ):
+                        existing_worker.field_sources[
+                            "_customer_select_configuration"
+                        ] = "system_policy"
+                    else:
+                        existing_worker.field_sources.pop(
+                            "_customer_select_configuration", None
+                        )
                     existing_worker.locked_fields = sorted(
                         set(existing_worker.locked_fields)
                         | {"quantity"}
@@ -6827,6 +7265,9 @@ class DeepSeekIntentParser:
                     additions.append(
                         ServiceRequirement(
                             service="ec2",
+                            component_key=f"{parent_key}:eks_worker",
+                            derived_from_service="eks",
+                            parent_component_key=parent_key,
                             calculator_service_name="Amazon EC2 (EKS Worker Nodes)",
                             region=item.region,
                             quantity=node_count,
@@ -6841,6 +7282,13 @@ class DeepSeekIntentParser:
                                     if key != "operating_system"
                                 },
                                 "requirements.operating_system": "system_minimum",
+                                **(
+                                    {
+                                        "_customer_select_configuration": "system_policy"
+                                    }
+                                    if not requested_model and not has_worker_shape
+                                    else {}
+                                ),
                             },
                             locked_fields=[
                                 "quantity",
@@ -6854,13 +7302,32 @@ class DeepSeekIntentParser:
                     )
             # These fields never belong to the EKS control-plane line.
             for field in (
-                "vcpu", "memory_gib", "requested_model", "node_count",
-                "worker_nodes_per_cluster", "worker_node_count",
-                "worker_requested_model", "worker_vcpu", "worker_memory_gib",
+                "vcpu",
+                "memory_gib",
+                "requested_model",
+                "node_count",
+                "worker_nodes_per_cluster",
+                "worker_node_count",
+                "worker_requested_model",
+                "worker_vcpu",
+                "worker_memory_gib",
                 "worker_system_disk_gib",
+                "total_worker_system_disk_gib",
             ):
                 item.requirements.pop(field, None)
+                path = f"requirements.{field}"
+                item.field_sources.pop(path, None)
+                item.field_evidence.pop(path, None)
+                item.locked_fields = [entry for entry in item.locked_fields if entry != path]
+        if duplicate_worker_ids:
+            parsed.services = [
+                candidate
+                for candidate in parsed.services
+                if id(candidate) not in duplicate_worker_ids
+            ]
         parsed.services.extend(additions)
+        ensure_component_keys(parsed)
+        enforce_component_integrity(parsed)
 
     @staticmethod
     def _replace_untrusted_customer_summary(parsed: ParsedIntent) -> None:
@@ -7022,23 +7489,17 @@ class DeepSeekIntentParser:
                 item.region = None
                 item.field_sources["region"] = "customer_region_conflict"
                 item.field_evidence.pop("region", None)
-                item.locked_fields = [
-                    field for field in item.locked_fields if field != "region"
-                ]
+                item.locked_fields = [field for field in item.locked_fields if field != "region"]
                 continue
 
             if global_region is not None:
                 item.region = global_region
                 item.field_sources["region"] = "customer_global_default"
                 item.field_evidence.pop("region", None)
-                item.locked_fields = [
-                    field for field in item.locked_fields if field != "region"
-                ]
+                item.locked_fields = [field for field in item.locked_fields if field != "region"]
 
     @classmethod
-    def _collapse_explicit_auxiliary_duplicates(
-        cls, text: str, parsed: ParsedIntent
-    ) -> None:
+    def _collapse_explicit_auxiliary_duplicates(cls, text: str, parsed: ParsedIntent) -> None:
         """Keep one aggregate row when one customer line is split by region.
 
         A model may expand a single total EBS or transfer line once per source
@@ -7109,9 +7570,7 @@ class DeepSeekIntentParser:
                     re.IGNORECASE,
                 )
             )
-            cpu = paired or bool(
-                re.search(r"\d+(?:\.\d+)?\s*(?:核|vcpu)", source, re.IGNORECASE)
-            )
+            cpu = paired or bool(re.search(r"\d+(?:\.\d+)?\s*(?:核|vcpu)", source, re.IGNORECASE))
             memory = paired or bool(
                 re.search(
                     r"(?:内存|ram)\s*[:：]?\s*(?:约|大约|不低于|至少|为)?\s*"
@@ -7171,11 +7630,7 @@ class DeepSeekIntentParser:
             region = source_regions[0]
         elif source_regions and available_regions:
             region = next(
-                (
-                    candidate
-                    for candidate in source_regions
-                    if candidate in available_regions
-                ),
+                (candidate for candidate in source_regions if candidate in available_regions),
                 available_regions[0],
             )
         elif source_regions:
@@ -7192,9 +7647,7 @@ class DeepSeekIntentParser:
             ):
                 item.region = region
                 item.field_sources["region"] = "inherited_quote_region"
-                item.locked_fields = [
-                    field for field in item.locked_fields if field != "region"
-                ]
+                item.locked_fields = [field for field in item.locked_fields if field != "region"]
         regional = [
             item
             for item in parsed.services
@@ -7233,9 +7686,7 @@ class DeepSeekIntentParser:
             item.region = None
             item.field_sources.pop("region", None)
             item.field_evidence.pop("region", None)
-            item.locked_fields = [
-                field for field in item.locked_fields if field != "region"
-            ]
+            item.locked_fields = [field for field in item.locked_fields if field != "region"]
         if not invalid_items:
             return
 

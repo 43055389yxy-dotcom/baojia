@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ConfigurationOptionPicker, type ConfigurationChoice } from "./components/configuration-option-picker";
 
 type Health = { status: string; awsAccount?: string; calculatorReady?: boolean; aiProvider?: string; pricingMode?: string };
@@ -103,6 +103,10 @@ type PreviewCandidate = {
 };
 type PreviewSelection = {
   component_id?: string;
+  component_number?: string | null;
+  parent_component_id?: string | null;
+  parent_component_number?: string | null;
+  parent_display_name?: string | null;
   service: string;
   display_name: string;
   region?: string;
@@ -120,12 +124,29 @@ type PreviewSelection = {
 };
 type ConfirmationItem = {
   question: string;
+  answer_key?: string | null;
   options: ConfigurationChoice[];
   component_id?: string | null;
   service?: string | null;
-  selection_mode?: "buttons" | "catalog";
+  selection_mode?: "text" | "buttons" | "catalog";
+};
+
+function confirmationAnswerKey(item: ConfirmationItem): string {
+  return item.answer_key ?? item.question;
+}
+type SalesRegionOption = { code: string; label: string };
+type SalesRegionPreflight = {
+  detected_regions: string[];
+  selected_region?: string | null;
+  requires_confirmation: boolean;
+  options: SalesRegionOption[];
 };
 type Selection = {
+  component_id?: string | null;
+  component_number?: string | null;
+  parent_component_id?: string | null;
+  parent_component_number?: string | null;
+  parent_display_name?: string | null;
   service: string;
   display_name: string;
   region: string;
@@ -135,10 +156,45 @@ type Selection = {
   specifications: Record<string, unknown>;
   rationale: string;
   substitution_notice?: string | null;
+  pricing_status?: "priced" | "reference_only" | "free" | "unpriced";
+  pricing_issue_code?: string | null;
+  pricing_notice?: string | null;
   remarks?: string[];
   reference_rates?: ReferenceRate[];
   usage_lines?: Array<{ key: string; amount: number; group?: string | null }>;
 };
+
+function hierarchyOrdered<T extends {
+  component_id?: string | null;
+  parent_component_id?: string | null;
+}>(items: T[]): Array<{ item: T; originalIndex: number }> {
+  const entries = items.map((item, originalIndex) => ({
+    item,
+    originalIndex,
+    id: item.component_id ?? String(originalIndex),
+  }));
+  const knownIds = new Set(entries.map((entry) => entry.id));
+  const children = new Map<string, typeof entries>();
+  entries.forEach((entry) => {
+    const parentId = entry.item.parent_component_id;
+    if (!parentId || !knownIds.has(parentId) || parentId === entry.id) return;
+    children.set(parentId, [...(children.get(parentId) ?? []), entry]);
+  });
+  const ordered: typeof entries = [];
+  const visited = new Set<string>();
+  const append = (entry: (typeof entries)[number]) => {
+    if (visited.has(entry.id)) return;
+    visited.add(entry.id);
+    ordered.push(entry);
+    (children.get(entry.id) ?? []).forEach(append);
+  };
+  entries
+    .filter((entry) => !entry.item.parent_component_id
+      || !knownIds.has(entry.item.parent_component_id))
+    .forEach(append);
+  entries.forEach(append);
+  return ordered.map(({ item, originalIndex }) => ({ item, originalIndex }));
+}
 type ReferenceRate = {
   description: string;
   unit: string;
@@ -171,6 +227,8 @@ type Quote = {
   source_url?: string | null;
   calculator_details?: string[];
   pricing_scenarios?: PricingScenario[];
+  is_partial?: boolean;
+  incomplete_component_ids?: string[];
 };
 type PricingScenario = {
   label: string;
@@ -182,6 +240,9 @@ type PricingScenario = {
   upfront_cost: number;
   currency: string;
   priced_lines: PricedLine[];
+  component_costs?: Record<string, number>;
+  is_partial?: boolean;
+  incomplete_component_ids?: string[];
 };
 type Job = {
   job_id: string;
@@ -382,7 +443,7 @@ const stageName: Record<string, string> = {
   ai_result: "配置清单",
   intake_start: "需求识别",
   intake_done: "识别完成",
-  component_plan: "并行调度",
+  component_plan: "独立调度",
   component_start: "参数解析",
   component_done: "一致性核验",
   ai_repair: "定向修正",
@@ -413,10 +474,21 @@ function customerFacingNotices(notices: string[] = []) {
   return notices.filter((notice) => !internalMarkers.some((marker) => notice.includes(marker)));
 }
 
-function serviceCost(quote: Quote, index: number) {
-  const prefixes = [`s${index + 1}l`, `az${index + 1}l`];
+function selectionPricingOrdinal(selection: Selection, fallbackIndex: number) {
+  const componentIndex = Number(selection.component_id);
+  return Number.isInteger(componentIndex) && componentIndex >= 0
+    ? componentIndex + 1
+    : fallbackIndex + 1;
+}
+
+function isSelectionPricedLine(key: string, selection: Selection, index: number) {
+  const ordinal = selectionPricingOrdinal(selection, index);
+  return new RegExp(`^(?:s|az)${ordinal}(?:l\\d+|commit)$`).test(key);
+}
+
+function serviceCost(quote: Quote, selection: Selection, index: number) {
   return (quote.priced_lines ?? [])
-    .filter((line) => prefixes.some((prefix) => line.key.startsWith(prefix)))
+    .filter((line) => isSelectionPricedLine(line.key, selection, index))
     .reduce((sum, line) => sum + Number(line.cost || 0), 0);
 }
 
@@ -433,16 +505,26 @@ function quoteScenarios(quote: Quote): PricingScenario[] {
   }];
 }
 
-function scenarioServiceCost(scenario: PricingScenario, index: number) {
-  const prefixes = [
-    `s${index + 1}l`,
-    `s${index + 1}commit`,
-    `az${index + 1}l`,
-    `az${index + 1}commit`,
-  ];
+function scenarioServiceCost(scenario: PricingScenario, selection: Selection, index: number) {
+  const componentId = selection.component_id ?? String(index);
+  if (
+    scenario.component_costs
+    && Object.prototype.hasOwnProperty.call(scenario.component_costs, componentId)
+  ) {
+    return Number(scenario.component_costs[componentId] || 0);
+  }
   return (scenario.priced_lines ?? [])
-    .filter((line) => prefixes.some((prefix) => line.key.startsWith(prefix)))
+    .filter((line) => isSelectionPricedLine(line.key, selection, index))
     .reduce((sum, line) => sum + Number(line.cost || 0), 0);
+}
+
+function scenarioComponentIsIncomplete(
+  scenario: PricingScenario,
+  selection: Selection,
+  index: number,
+) {
+  const componentId = selection.component_id ?? String(index);
+  return Boolean(scenario.incomplete_component_ids?.includes(componentId));
 }
 
 function formatUnitRate(value: number, currency = "USD") {
@@ -468,6 +550,14 @@ function compactReferenceRateText(selection: Selection) {
 
 function quotationRemark(selection: Selection) {
   const remarks: string[] = [];
+  if (selection.pricing_status === "unpriced") {
+    remarks.push(selection.pricing_notice || "当前未取得官方价格，本项未计入合计");
+  }
+  if (selection.parent_component_number) {
+    remarks.push(
+      `由 ${selection.parent_component_number} · ${selection.parent_display_name ?? "父组件"} 衍生`,
+    );
+  }
   const internalMarkers = [
     "客户未指定", "客户未提供", "按最低", "最低官方", "最低计费", "本次按",
     "暂未接入", "适配器", "不计入月费", "仅展示", "系统默认", "官方目录",
@@ -577,9 +667,14 @@ export default function Home() {
   const [previewDraftId, setPreviewDraftId] = useState<string | null>(null);
   const [confirmationToken, setConfirmationToken] = useState<string | null>(null);
   const [salesReview, setSalesReview] = useState<Preview | null>(null);
+  const [salesRegion, setSalesRegion] = useState<string | null>(null);
+  const [salesRegionOptions, setSalesRegionOptions] = useState<SalesRegionOption[]>([]);
+  const [salesRegionPromptOpen, setSalesRegionPromptOpen] = useState(false);
+  const [salesRegionChecking, setSalesRegionChecking] = useState(false);
   const [receivedCustomerAnswers, setReceivedCustomerAnswers] = useState<Record<string, string>>({});
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const confirmationTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const confirmationPollInFlight = useRef(false);
   const confirmationRecoveryStarted = useRef(false);
   const quoteRecoveryStarted = useRef(false);
   const lateConfirmationTokenStarted = useRef<string | null>(null);
@@ -634,6 +729,8 @@ export default function Home() {
     } catch {
       window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
     }
+  // Recovery runs once on mount; pollConfirmation is intentionally read from the current component closure.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -666,7 +763,37 @@ export default function Home() {
     } catch {
       window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY);
     }
+  // Recovery runs once on mount; poll is intentionally read from the current component closure.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!confirmationToken || !previewDraftId) return;
+    const checkConfirmation = () => {
+      if (document.visibilityState === "hidden" || workflowPhase.current === "quote") return;
+      void pollConfirmation(
+        confirmationToken,
+        previewDraftId,
+        requirement,
+        cloudProvider,
+      );
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") checkConfirmation();
+    };
+    checkConfirmation();
+    const interval = window.setInterval(checkConfirmation, 2200);
+    window.addEventListener("focus", checkConfirmation);
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", checkConfirmation);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  // The poller reads the current workflow through refs and is intentionally
+  // restarted only when the persisted confirmation context changes.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [confirmationToken, previewDraftId, requirement, cloudProvider]);
 
   const running = job?.status === "queued" || job?.status === "running";
   const latest = useMemo(() => job?.events.at(-1), [job]);
@@ -702,13 +829,48 @@ export default function Home() {
         order: previous?.order ?? order,
       });
     }
-    const rows = [...channels.values()].sort((a, b) => a.order - b.order);
+    const statePriority: Record<ActivityChannel["state"], number> = {
+      repair: 0,
+      running: 1,
+      done: 2,
+    };
+    const rows = [...channels.values()].sort((a, b) => {
+      const priorityDifference = statePriority[a.state] - statePriority[b.state];
+      return priorityDifference || a.order - b.order;
+    });
     return {
       total,
       completed: officialDone.size || templateDone.size,
       channels: rows,
     };
   }, [job?.events]);
+  const channelNodes = useRef(new Map<string, HTMLDivElement>());
+  const previousChannelPositions = useRef(new Map<string, DOMRect>());
+  const channelLayoutSignature = liveComponentActivity.channels
+    .map((channel) => `${channel.id}:${channel.state}`)
+    .join("|");
+  useLayoutEffect(() => {
+    const nextPositions = new Map<string, DOMRect>();
+    channelNodes.current.forEach((node, id) => nextPositions.set(id, node.getBoundingClientRect()));
+    if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      nextPositions.forEach((nextPosition, id) => {
+        const previousPosition = previousChannelPositions.current.get(id);
+        const node = channelNodes.current.get(id);
+        if (!previousPosition || !node) return;
+        const deltaX = previousPosition.left - nextPosition.left;
+        const deltaY = previousPosition.top - nextPosition.top;
+        if (Math.abs(deltaX) < 1 && Math.abs(deltaY) < 1) return;
+        node.animate(
+          [
+            { transform: `translate(${deltaX}px, ${deltaY}px)`, zIndex: 3 },
+            { transform: "translate(0, 0)", zIndex: 3 },
+          ],
+          { duration: 720, easing: "cubic-bezier(.2,.78,.25,1)", fill: "none" },
+        );
+      });
+    }
+    previousChannelPositions.current = nextPositions;
+  }, [channelLayoutSignature]);
   const confirmationText =
     typeof job?.error?.details?.confirmation_text === "string"
       ? job.error.details.confirmation_text
@@ -780,6 +942,8 @@ export default function Home() {
       () => pollConfirmation(token, draftId, requirement, cloudProvider),
       250,
     );
+  // A late confirmation starts once per token; including pollConfirmation would restart this effect every render.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [job?.status, job?.error, confirmationItems, confirmationText, requirement, cloudProvider]);
 
   useEffect(() => {
@@ -918,12 +1082,13 @@ export default function Home() {
     customerRequest: string,
     provider: CloudProvider,
   ) {
-    if (workflowPhase.current === "quote") return;
+    if (workflowPhase.current === "quote" || confirmationPollInFlight.current) return;
+    confirmationPollInFlight.current = true;
     try {
       const response = await fetch(`${API_BASE}/api/confirmation-sessions/${token}`, {
         cache: "no-store",
       });
-      if (!response.ok) return;
+      if (!response.ok) throw new Error("无法读取客户确认状态");
       const session = await response.json() as {
         status: string;
         cloud_provider?: CloudProvider;
@@ -975,6 +1140,8 @@ export default function Home() {
         () => pollConfirmation(token, draftId, customerRequest, provider),
         5000,
       );
+    } finally {
+      confirmationPollInFlight.current = false;
     }
   }
 
@@ -1237,6 +1404,7 @@ export default function Home() {
     confirmationResponses: Record<string, string> = {},
     stopForSalesReview = false,
     provider: CloudProvider = cloudProvider,
+    salesRegionOverride?: string,
   ) {
     if (workflowPhase.current === "quote") return;
     workflowPhase.current = "preview";
@@ -1256,6 +1424,7 @@ export default function Home() {
         customer_request: requestText,
         draft_id: draftId,
         confirmation_responses: confirmationResponses,
+        sales_region: provider === "aws" ? (salesRegionOverride ?? salesRegion) : null,
         pricing_mode: pricingMode ?? "on_demand",
         reserved_term_years: pricingMode ? reservedTermYears[0] : null,
         reserved_term_options: pricingMode ? reservedTermYears : null,
@@ -1327,7 +1496,7 @@ export default function Home() {
   }
 
   async function submitRequirement() {
-    if (running || requirement.trim().length < 3) return;
+    if (running || salesRegionChecking || requirement.trim().length < 3) return;
     workflowPhase.current = "idle";
     setConfirmationReply("");
     setConfirmationToken(null);
@@ -1336,7 +1505,41 @@ export default function Home() {
     setReceivedCustomerAnswers({});
     window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
     window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY);
-    await runPreflight(requirement);
+    if (cloudProvider !== "aws") {
+      await runPreflight(requirement);
+      return;
+    }
+    setSalesRegionChecking(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/quotes/region-preflight`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ customer_request: requirement }),
+      });
+      const result = await response.json() as SalesRegionPreflight & { message?: string };
+      if (!response.ok) throw new Error(result.message ?? "地区识别失败");
+      if (result.requires_confirmation) {
+        setSalesRegionOptions(result.options);
+        setSalesRegionPromptOpen(true);
+        return;
+      }
+      const detectedRegion = result.selected_region ?? null;
+      setSalesRegion(detectedRegion);
+      await runPreflight(requirement, undefined, {}, false, "aws", detectedRegion ?? undefined);
+    } catch (error) {
+      setJob({
+        job_id: "region-preflight-error",
+        kind: "preview",
+        status: "failed",
+        events: [],
+        error: {
+          code: "region_preflight_unavailable",
+          message: readableRequestError(error, "地区识别服务暂时不可用。"),
+        },
+      });
+    } finally {
+      setSalesRegionChecking(false);
+    }
   }
 
   async function submitConfirmationReply() {
@@ -1348,7 +1551,7 @@ export default function Home() {
     const responses = confirmationItems.length
       ? Object.fromEntries(
           confirmationItems.map((item, index) => [
-            item.question,
+            confirmationAnswerKey(item),
             confirmationAnswers[index].trim(),
           ]),
         )
@@ -1373,6 +1576,7 @@ export default function Home() {
       workbook.creator = "AstraQuote";
       workbook.created = new Date();
       const scenarios = quoteScenarios(quote);
+      const orderedSelections = hierarchyOrdered(quote.selections);
 
       const summary = workbook.addWorksheet("报价单", {
         views: [{ state: "frozen", ySplit: 1 }],
@@ -1392,19 +1596,25 @@ export default function Home() {
         cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
         cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF0D7C72" } };
       });
-      quote.selections.forEach((selection, index) => {
-        const isReferenceOnly = Boolean(selection.reference_rates?.length)
-          && scenarios.every((scenario) => scenarioServiceCost(scenario, index) === 0);
+      orderedSelections.forEach(({ item: selection, originalIndex: index }, displayIndex) => {
+        const isUnpriced = selection.pricing_status === "unpriced";
+        const isReferenceOnly = !isUnpriced && (
+          selection.pricing_status === "reference_only" || Boolean(selection.reference_rates?.length)
+        )
+          && scenarios.every((scenario) => scenarioServiceCost(scenario, selection, index) === 0);
         const row = summary.addRow([
-          index + 1,
-          serviceDisplayName(selection),
+          selection.component_number ?? index + 1,
+          `${selection.parent_component_id ? "↳ " : ""}${serviceDisplayName(selection)}`,
           selection.region,
           selection.model,
           selection.quantity ?? 1,
           compactSpecifications(selection),
           ...scenarios.map((scenario) => {
-            const cost = scenarioServiceCost(scenario, index);
-            return isReferenceOnly && cost === 0 ? null : cost;
+            const cost = scenarioServiceCost(scenario, selection, index);
+            return (isUnpriced || isReferenceOnly
+              || scenarioComponentIsIncomplete(scenario, selection, index)) && cost === 0
+              ? null
+              : cost;
           }),
           compactReferenceRateText(selection) || "-",
           quotationRemark(selection),
@@ -1413,11 +1623,11 @@ export default function Home() {
           row.getCell(7 + scenarioIndex).numFmt = "$#,##0.00";
         });
         row.alignment = { vertical: "top", wrapText: true };
-        if (index % 2 === 1) row.eachCell((cell) => {
+        if (displayIndex % 2 === 1) row.eachCell((cell) => {
           cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF1F6F2" } };
         });
       });
-      const totalRow = summary.addRow(["", "合计", "", "", "", "", ...scenarios.map((scenario) => scenario.total_cost), "", ""]);
+      const totalRow = summary.addRow(["", quote.is_partial ? "已核价小计（报价不完整）" : "合计", "", "", "", "", ...scenarios.map((scenario) => scenario.total_cost), "", ""]);
       totalRow.font = { bold: true };
       scenarios.forEach((_, scenarioIndex) => {
         const cell = totalRow.getCell(7 + scenarioIndex);
@@ -1431,7 +1641,7 @@ export default function Home() {
           upfrontRow.getCell(7 + scenarioIndex).numFmt = "$#,##0.00";
         });
       }
-      summary.autoFilter = { from: `A${headerRowNumber}`, to: `${lastColumn}${Math.max(headerRowNumber, headerRowNumber + quote.selections.length)}` };
+      summary.autoFilter = { from: `A${headerRowNumber}`, to: `${lastColumn}${Math.max(headerRowNumber, headerRowNumber + orderedSelections.length)}` };
       const tableLastRow = summary.rowCount;
       for (let rowNumber = headerRowNumber; rowNumber <= tableLastRow; rowNumber += 1) {
         const row = summary.getRow(rowNumber);
@@ -1523,8 +1733,11 @@ export default function Home() {
           window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY);
           setJob(null);
           setSalesReview(null);
+          setSalesRegion(null);
+          setSalesRegionOptions([]);
+          setSalesRegionPromptOpen(false);
         }}>AWS 报价</button>
-        <button type="button" className={cloudProvider === "azure" ? "selected" : ""} onClick={() => { workflowPhase.current = "idle"; window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY); setCloudProvider("azure"); setPricingMode(null); setAzurePricingMode("pay_as_you_go"); setAzureTermYears(1); setAzurePaymentOption("monthly"); setJob(null); setSalesReview(null); }}>Microsoft Azure 报价</button>
+        <button type="button" className={cloudProvider === "azure" ? "selected" : ""} onClick={() => { workflowPhase.current = "idle"; window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY); setCloudProvider("azure"); setPricingMode(null); setAzurePricingMode("pay_as_you_go"); setAzureTermYears(1); setAzurePaymentOption("monthly"); setJob(null); setSalesReview(null); setSalesRegion(null); setSalesRegionOptions([]); setSalesRegionPromptOpen(false); }}>Microsoft Azure 报价</button>
       </nav>}
 
       <nav className="quote-steps" aria-label="报价步骤">
@@ -1549,6 +1762,7 @@ export default function Home() {
             value={requirement}
             onChange={(event) => {
               setRequirement(event.target.value);
+              setSalesRegion(null);
             }}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey) {
@@ -1689,6 +1903,53 @@ export default function Home() {
       </section>
       )}
 
+      {salesRegionPromptOpen && (
+        <div className="sales-region-modal-backdrop" role="presentation">
+          <section
+            className="sales-region-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="sales-region-modal-title"
+          >
+            <small>销售确认 · 第一步</small>
+            <h2 id="sales-region-modal-title">请选择客户部署地区</h2>
+            <p>客户需求中没有识别到地区。地区确认后，系统才会开始整理组件并生成客户链接。</p>
+            <div className="sales-region-option-grid">
+              {salesRegionOptions.map((option) => (
+                <button
+                  type="button"
+                  className={salesRegion === option.code ? "selected" : ""}
+                  key={option.code}
+                  onClick={() => setSalesRegion(option.code)}
+                >
+                  <strong>{option.label}</strong>
+                  <span>{option.code}</span>
+                </button>
+              ))}
+            </div>
+            <div className="sales-region-modal-actions">
+              <button type="button" className="secondary" onClick={() => {
+                setSalesRegionPromptOpen(false);
+                setSalesRegion(null);
+              }}>返回修改需求</button>
+              <button type="button" className="primary" disabled={!salesRegion} onClick={() => {
+                const confirmedRegion = salesRegion;
+                if (!confirmedRegion) return;
+                setSalesRegionPromptOpen(false);
+                void runPreflight(
+                  requirement,
+                  undefined,
+                  {},
+                  false,
+                  "aws",
+                  confirmedRegion,
+                );
+              }}>确认地区并开始整理</button>
+            </div>
+          </section>
+        </div>
+      )}
+
       {salesReview && (
         <section className="sales-review-card">
           {salesReview.confirmation_token && (
@@ -1740,16 +2001,28 @@ export default function Home() {
             </div>
           )}
           <div className="component-review-grid">
-            {(salesReview.selections ?? []).map((selection, index) => {
+            {(salesReview.selections ?? []).map((selection, originalIndex) => {
               const questions = (salesReview.confirmation_items ?? []).filter((item) => questionMatchesSelection(item, selection));
               const state = questions.length > 0 || selection.requires_confirmation
                 ? "customer_issue"
                 : selection.status ?? "ready";
+              return { selection, originalIndex, questions, state };
+            }).sort((left, right) => {
+              const priority = (state: string) => state === "customer_issue"
+                ? 0
+                : state === "technical_issue" || state === "unsupported"
+                  ? 1
+                  : 2;
+              if (left.selection.parent_component_id === right.selection.component_id) return 1;
+              if (right.selection.parent_component_id === left.selection.component_id) return -1;
+              return priority(left.state) - priority(right.state)
+                || left.originalIndex - right.originalIndex;
+            }).map(({ selection, originalIndex, questions, state }) => {
               return (
-                <article className={`component-review-card ${state}`} key={`${selection.component_id ?? index}-${selection.service}`}>
+                <article className={`component-review-card ${state} ${selection.parent_component_id ? "derived-component" : ""}`} key={`${selection.component_id ?? originalIndex}-${selection.service}`}>
                   <header>
-                    <span>{String(index + 1).padStart(2, "0")}</span>
-                    <div><small>{selection.region ?? "未指定区域"}</small><h3>{serviceDisplayName(selection)}</h3></div>
+                    <span>{selection.component_number ?? String(originalIndex + 1).padStart(2, "0")}</span>
+                    <div><small>{selection.parent_component_number ? `隶属于 ${selection.parent_component_number} · ${selection.parent_display_name ?? "父组件"}` : selection.region ?? "未指定区域"}</small><h3>{serviceDisplayName(selection)}</h3></div>
                     <b>{state === "ready" ? "可报价" : state === "customer_issue" ? "需客户确认" : state === "unsupported" ? "已识别" : "系统检查"}</b>
                   </header>
                   <div className="component-model">
@@ -1796,7 +2069,7 @@ export default function Home() {
               ]);
             }}>确认配置并报价</button>}
             {salesReview.confirmation_text && !salesReview.confirmation_token && <button type="button" className="primary" disabled={confirmationAnswers.some((answer) => !answer.trim())} onClick={() => {
-              const answers = Object.fromEntries((salesReview.confirmation_items ?? []).map((item, index) => [item.question, confirmationAnswers[index]]));
+              const answers = Object.fromEntries((salesReview.confirmation_items ?? []).map((item, index) => [confirmationAnswerKey(item), confirmationAnswers[index]]));
               setSalesReview(null);
               void runPreflight(requirement, salesReview.draft_id, answers, true);
             }}>提交确认并继续</button>}
@@ -1845,11 +2118,18 @@ export default function Home() {
             <div className="ai-channel-section">
               <div className="ai-channel-summary">
                 <span>组件处理通道</span>
-                <b>{liveComponentActivity.total || liveComponentActivity.channels.length} 路并行 · {liveComponentActivity.completed}/{liveComponentActivity.total || "-"}</b>
+                <b>{liveComponentActivity.total || liveComponentActivity.channels.length} 个独立组件 · {liveComponentActivity.completed}/{liveComponentActivity.total || "-"}</b>
               </div>
               <div className="ai-channel-grid">
                 {liveComponentActivity.channels.map((channel, index) => (
-                  <div className={`ai-channel ${channel.state}`} key={channel.id}>
+                  <div
+                    className={`ai-channel ${channel.state}`}
+                    key={channel.id}
+                    ref={(node) => {
+                      if (node) channelNodes.current.set(channel.id, node);
+                      else channelNodes.current.delete(channel.id);
+                    }}
+                  >
                     <header><span>通道 {index + 1}</span><i /></header>
                     <strong>{channel.name}</strong>
                     <div className="ai-channel-log" aria-hidden="true">
@@ -1927,7 +2207,7 @@ export default function Home() {
                       onChange={(selected) => setConfirmationAnswers((current) => current.map((answer, answerIndex) => answerIndex === index ? selected : answer))}
                     />
                   )}
-                  {item.options.length === 0 && <input
+                  {item.selection_mode === "text" && item.options.length === 0 && <input
                     id={`confirmation-reply-${index}`}
                     value={confirmationAnswers[index] ?? ""}
                     onChange={(event) => setConfirmationAnswers((current) => current.map((answer, answerIndex) => answerIndex === index ? event.target.value : answer))}
@@ -1939,6 +2219,10 @@ export default function Home() {
                     }}
                     placeholder="填写该问题的客户回复"
                   />}
+                  {item.selection_mode !== "text" && item.options.length === 0 && <div
+                    className="configuration-picker-empty"
+                    role="alert"
+                  >官方可选项尚未加载完成，系统已阻止手动填写，请刷新后重试。</div>}
                 </div>
               ))}
               <div className="reply-hint">每项分别填写，系统会自动编号对应</div>
@@ -2014,7 +2298,7 @@ export default function Home() {
       {job?.status === "completed" && job.result && (
         <section className="result">
           <div className="result-top">
-            <div><p className="kicker">{cloudProvider === "aws" ? "AWS OFFICIAL ESTIMATE" : "MICROSOFT AZURE RETAIL ESTIMATE"} · {job.result.quote_id}</p><h2>官方报价已完成</h2><p>{job.result.customer_summary}</p></div>
+            <div><p className="kicker">{cloudProvider === "aws" ? "AWS OFFICIAL ESTIMATE" : "MICROSOFT AZURE RETAIL ESTIMATE"} · {job.result.quote_id}</p><h2>{job.result.is_partial ? "部分组件报价待处理" : "官方报价已完成"}</h2><p>{job.result.customer_summary}</p></div>
             <div className="result-summary-actions">
               <div className="scenario-totals">
                 {quoteScenarios(job.result).map((scenario) => (
@@ -2033,6 +2317,16 @@ export default function Home() {
               </div>
             </div>
           </div>
+          {job.result.is_partial && (
+            <div className="partial-quote-warning" role="alert">
+              <strong>当前金额只是已核价组件的小计，不能作为完整预算</strong>
+              <span>{job.result.selections
+                .filter((selection, index) => (job.result?.incomplete_component_ids ?? [])
+                  .includes(selection.component_id ?? String(index)))
+                .map((selection) => serviceDisplayName(selection))
+                .join("、")} 尚未取得完整官方价格，系统没有猜价，也没有把它们计入合计。</span>
+            </div>
+          )}
           {customerFacingNotices(job.result.notices).length > 0 && (
             <div className="result-notices">
               <strong>报价说明</strong>
@@ -2041,24 +2335,25 @@ export default function Home() {
           )}
           <div className="quote-table-wrap">
             <table className="quote-table">
-              <thead><tr><th>#</th><th>AWS 服务</th><th>区域</th><th>型号 / 方案</th><th>配置</th>{quoteScenarios(job.result).map((scenario) => <th key={scenario.label}>{scenario.label}<small>月均成本</small></th>)}<th>未提供用量参考单价</th></tr></thead>
+              <thead><tr><th>#</th><th>AWS 服务</th><th>区域</th><th>型号 / 方案</th><th>配置</th>{quoteScenarios(job.result).map((scenario) => <th key={scenario.label}>{scenario.label}<small>月均成本</small></th>)}<th>缺少用量时的官方单价</th></tr></thead>
               <tbody>
-                {job.result.selections.map((selection, index) => (
-                  <tr key={`${selection.region}-${index}`}>
-                    <td>{String(index + 1).padStart(2, "0")}</td>
-                    <td><strong>{serviceDisplayName(selection)}</strong><span className="verified-inline">{selection.reference_rates?.length && serviceCost(job.result!, index) === 0 ? `${cloudProvider === "aws" ? "AWS" : "Azure"} 官方单价 ✓` : `${cloudProvider === "aws" ? "AWS" : "Azure"} 已核价 ✓`}</span></td>
+                {hierarchyOrdered(job.result.selections).map(({ item: selection, originalIndex: index }) => (
+                  <tr className={`${selection.parent_component_id ? "quote-child-row " : ""}${selection.pricing_status === "unpriced" ? "quote-unpriced-row" : ""}`.trim()} key={`${selection.region}-${index}`}>
+                    <td>{selection.component_number ?? String(index + 1).padStart(2, "0")}</td>
+                    <td><strong>{selection.parent_component_id ? "↳ " : ""}{serviceDisplayName(selection)}</strong>{selection.parent_component_number && <small className="component-parent-label">由 {selection.parent_component_number} · {selection.parent_display_name ?? "父组件"} 衍生</small>}<span className={`verified-inline ${selection.pricing_status === "unpriced" ? "unpriced" : ""}`}>{selection.pricing_status === "unpriced" ? "报价异常 · 未计入" : selection.pricing_status === "free" ? `${cloudProvider === "aws" ? "AWS" : "Azure"} 官方免费项 ✓` : (selection.pricing_status === "reference_only" || selection.reference_rates?.length) && serviceCost(job.result!, selection, index) === 0 ? "缺少月用量 · 仅展示单价" : `${cloudProvider === "aws" ? "AWS" : "Azure"} 已核价 ✓`}</span></td>
                     <td>{selection.region}</td>
                     <td><strong>{selection.model}</strong><small>{selection.architecture}</small></td>
                     <td className="quote-specifications">{compactSpecifications(selection) || "-"}</td>
                     {quoteScenarios(job.result!).map((scenario) => {
-                      const cost = scenarioServiceCost(scenario, index);
-                      return <td className="row-cost" key={scenario.label}>{cost > 0 ? formatMoney(cost, scenario.currency) : (selection.reference_rates?.length ? "未计入" : formatMoney(0, scenario.currency))}</td>;
+                      const cost = scenarioServiceCost(scenario, selection, index);
+                      const scenarioIncomplete = scenarioComponentIsIncomplete(scenario, selection, index);
+                      return <td className="row-cost" key={scenario.label}>{selection.pricing_status === "unpriced" || scenarioIncomplete ? "报价异常" : cost > 0 ? formatMoney(cost, scenario.currency) : ((selection.pricing_status === "reference_only" || selection.reference_rates?.length) ? "缺少用量" : formatMoney(0, scenario.currency))}</td>;
                     })}
                     <td className="reference-rate">{referenceRateText(selection) || "-"}</td>
                   </tr>
                 ))}
               </tbody>
-              <tfoot><tr><td colSpan={5}>官方月均成本合计</td>{quoteScenarios(job.result).map((scenario) => <td key={scenario.label}>{formatMoney(scenario.total_cost, scenario.currency)}{scenario.upfront_cost > 0 && <small>预付 {formatMoney(scenario.upfront_cost, scenario.currency)}</small>}</td>)}<td>参考单价不计入合计</td></tr></tfoot>
+              <tfoot><tr><td colSpan={5}>{job.result.is_partial ? "当前已核价组件月均小计" : "官方月均成本合计"}</td>{quoteScenarios(job.result).map((scenario) => <td key={scenario.label}>{formatMoney(scenario.total_cost, scenario.currency)}{scenario.upfront_cost > 0 && <small>预付 {formatMoney(scenario.upfront_cost, scenario.currency)}</small>}</td>)}<td>参考单价未加入小计</td></tr></tfoot>
             </table>
           </div>
           <div className="result-conversation">

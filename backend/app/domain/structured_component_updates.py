@@ -28,6 +28,7 @@ CATALOG_COMPATIBILITY_FIELDS = {
     "architecture",
     "tenancy",
     "engine",
+    "engine_version",
     "deployment",
     "storage_class",
     "storage_type",
@@ -78,9 +79,10 @@ def apply_component_update(
         path = f"requirements.{field}"
         if value is None or value == "":
             revised.requirements.pop(field, None)
-            revised.field_sources.pop(path, None)
-            revised.field_evidence.pop(path, None)
-            revised.locked_fields = [entry for entry in revised.locked_fields if entry != path]
+            revised.field_sources[path] = "customer_confirmation_removed"
+            revised.field_evidence[path] = "客户在配置表中明确删除"
+            revised.locked_fields = sorted(set(revised.locked_fields) | {path})
+            changed_paths.append(path)
             continue
         revised.requirements[field] = value
         changed_paths.append(path)
@@ -108,13 +110,16 @@ def apply_component_update(
         "reference_lcu_unit_only",
         "system_default_assumption",
         "_quote_skip_reason",
+        "_quote_skip_code",
+        "_quote_skip_category",
     ):
         revised.requirements.pop(field, None)
 
     locked = set(revised.locked_fields)
     for path in changed_paths:
-        revised.field_sources[path] = "customer_confirmation"
-        revised.field_evidence[path] = "客户在配置表中直接编辑"
+        if revised.field_sources.get(path) != "customer_confirmation_removed":
+            revised.field_sources[path] = "customer_confirmation"
+            revised.field_evidence[path] = "客户在配置表中直接编辑"
         locked.add(path)
     revised.locked_fields = sorted(locked)
     if changed_paths:
