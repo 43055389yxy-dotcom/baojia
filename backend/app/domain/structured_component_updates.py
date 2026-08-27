@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from app.domain.customer_facts import record_customer_fact_metadata
 from app.domain.models import ServiceRequirement
-
 
 SHAPE_FIELDS = {
     "vcpu",
@@ -24,6 +24,7 @@ SHAPE_FIELDS = {
 CATALOG_COMPATIBILITY_FIELDS = {
     *SHAPE_FIELDS,
     "requested_model",
+    "requested_sku",
     "operating_system",
     "architecture",
     "tenancy",
@@ -68,7 +69,14 @@ def apply_component_update(
     requirements = update.get("requirements", {})
     if not isinstance(requirements, dict):
         raise ValueError("组件参数格式不正确")
-    explicitly_selected_model = "requested_model" in requirements
+    explicitly_selected_model = any(
+        requirements.get(field) not in {None, ""}
+        for field in ("requested_model", "requested_sku")
+    )
+    if SHAPE_FIELDS.intersection(requirements):
+        # A later direct shape edit supersedes an earlier choice that replaced
+        # the original CPU/memory sentence with a catalog model.
+        revised.field_sources.pop("_customer_shape_replaced_by_model", None)
     catalog_compatibility_changed = (
         "region" in update
         or any(field in requirements for field in CATALOG_COMPATIBILITY_FIELDS)
@@ -85,6 +93,12 @@ def apply_component_update(
             changed_paths.append(path)
             continue
         revised.requirements[field] = value
+        record_customer_fact_metadata(
+            revised,
+            field,
+            "客户在配置表中直接编辑",
+            policy="exact",
+        )
         changed_paths.append(path)
 
     # Any catalog-compatibility edit must be matched again. Keeping the old
@@ -92,10 +106,12 @@ def apply_component_update(
     # information or reach the final quote with no billable product.
     if catalog_compatibility_changed and not explicitly_selected_model:
         revised.requirements.pop("requested_model", None)
+        revised.requirements.pop("requested_sku", None)
         revised.requirements.pop("_review_selected_model", None)
         revised.requirements.pop("_review_selected_specifications", None)
         for path in (
             "requirements.requested_model",
+            "requirements.requested_sku",
             "requirements._review_selected_model",
             "requirements._review_selected_specifications",
         ):

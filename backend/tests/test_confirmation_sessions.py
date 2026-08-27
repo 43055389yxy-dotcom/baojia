@@ -60,6 +60,50 @@ def test_confirmation_session_round_trip(tmp_path: Path) -> None:
     assert completed.status == "completed"
 
 
+def test_recoverable_old_system_mapping_is_not_presented_as_customer_work(
+    tmp_path: Path,
+) -> None:
+    store = ConfirmationSessionStore(tmp_path / "recoverable-mapping.sqlite3")
+    intent = ParsedIntent(
+        customer_summary="Step Functions",
+        services=[
+            ServiceRequirement(
+                service="step_functions",
+                calculator_service_name="AWS Step Functions",
+                region="ap-east-1",
+                requirements={
+                    "workflow_type": "Standard",
+                    "state_transitions": 12_000_000,
+                    "_quote_skip_reason": (
+                        "AWS Step Functions 尚未建立安全的官方报价映射，"
+                        "本次暂不计入总价。"
+                    ),
+                    "_quote_skip_code": "service_region_not_supported",
+                    "_quote_skip_category": "unsupported",
+                },
+            )
+        ],
+    )
+
+    token = store.create_or_replace(
+        draft_id="recover-step-functions",
+        customer_request="AWS Step Functions Standard，每月1200万次状态转换",
+        customer_summary="Step Functions",
+        intent=intent,
+        confirmation_text="请确认",
+        items=[],
+    )
+    store.prepare_configuration_review(
+        draft_id="recover-step-functions",
+        intent=intent,
+    )
+    session = store.get(token)
+
+    assert session is not None
+    assert session.configuration_items[0].pricing_status == "unpriced"
+    assert session.configuration_items[0].pricing_notice is None
+
+
 def test_saved_eks_worker_quantity_is_reconciled_before_customer_display(
     tmp_path: Path,
 ) -> None:

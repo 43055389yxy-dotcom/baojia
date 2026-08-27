@@ -41,13 +41,13 @@ SERVICE_TEMPLATE_FIELDS: dict[str, tuple[str, ...]] = {
         "cluster_members",
     ),
     "elasticache": (
-        "requested_model", "engine", "engine_version", "memory_gib", "shards",
+        "requested_model", "engine", "memory_gib", "shards",
         "replicas_per_shard", "node_count", "cluster_mode", "data_tiering",
         "backup_retention_days", "purchase_option", "reserved_term_years",
         "payment_option", "utilization_percent",
     ),
     "memorydb": (
-        "requested_model", "engine", "engine_version", "memory_gib",
+        "requested_model", "engine", "memory_gib",
         "node_count", "shards", "replicas_per_shard", "snapshot_retention_days",
         "data_transfer_in_gib", "data_transfer_out_gib",
     ),
@@ -62,7 +62,9 @@ SERVICE_TEMPLATE_FIELDS: dict[str, tuple[str, ...]] = {
         "storage_gib", "storage_class", "put_copy_post_list_requests",
         "get_select_requests", "data_retrieval_gib", "data_transfer_out_gib",
     ),
-    "cloudfront": ("data_transfer_out_gib", "https_requests", "price_class"),
+    "cloudfront": (
+        "data_transfer_out_gib", "https_requests", "traffic_geography", "price_class",
+    ),
     "route53": ("hosted_zones", "dns_queries", "health_checks"),
     "waf": ("web_acls", "rules", "requests", "protected_resource"),
     "sqs": ("requests", "queue_type", "payload_size_kib"),
@@ -95,17 +97,20 @@ SERVICE_TEMPLATE_FIELDS: dict[str, tuple[str, ...]] = {
         "memory_gib", "total_storage_gib", "data_transfer_in_gib",
         "data_transfer_out_gib",
     ),
-    "apigateway": ("api_type", "requests", "request_size_mb", "data_transfer_out_gib"),
+    "apigateway": (
+        "api_type", "requests", "messages", "connection_minutes",
+        "request_size_mb", "data_transfer_out_gib",
+    ),
     "scheduler": ("scheduled_invocations", "schedules"),
     "opensearch": (
         "requested_model", "data_nodes", "vcpu", "memory_gib",
         "storage_gib_per_node", "volume_type", "master_nodes",
-        "dedicated_master", "multi_az", "warm_node_count", "engine_version",
+        "dedicated_master", "multi_az", "warm_node_count",
         "total_storage_gib", "data_transfer_out_gib",
     ),
     "documentdb": (
         "requested_model", "instance_count", "vcpu", "memory_gib",
-        "storage_gib", "io_requests", "backup_storage_gib", "engine_version",
+        "storage_gib", "io_requests", "backup_storage_gib",
     ),
     "nat_gateway": ("gateway_count", "hours_per_month", "data_processed_gib"),
     "secrets_manager": ("secret_count", "api_calls", "rotation_enabled"),
@@ -137,8 +142,8 @@ SERVICE_TEMPLATE_FIELDS: dict[str, tuple[str, ...]] = {
         "provisioned_throughput_mibps", "lifecycle_policy",
     ),
     "fsx": (
-        "file_system_type", "storage_gib", "throughput_mbps", "iops",
-        "backup_storage_gib",
+        "file_system_type", "storage_gib", "throughput_mbps",
+        "throughput_mbps_per_tib", "iops", "backup_storage_gib",
     ),
     "sns": ("requests", "deliveries", "delivery_type", "data_transfer_out_gib"),
     "kinesis": (
@@ -206,15 +211,36 @@ SERVICE_ALIASES = {
     "wafv2": "waf",
     "awswafv2": "waf",
     "aurora": "rds",
+    "cloud_front": "cloudfront",
+    "quick_sight": "quicksight",
 }
 
 
 GENERIC_TEMPLATE_FIELDS = (
     "requested_model", "vcpu", "memory_gib", "storage_gib", "quantity_detail",
-    "hours_per_month", "requests", "data_transfer_out_gib", "purpose",
+    "instance_count", "writer_nodes", "reader_nodes",
+    "user_count", "hours_per_user_per_day", "hours_per_month",
+    "system_disk_gib", "user_volume_gib",
+    "requests", "data_transfer_out_gib", "purpose",
 )
 
 COMMON_TEMPLATE_FIELDS = ("system_default_assumption",)
+
+# Customer prose is preserved verbatim in ``source_text``.  These normalized
+# fields are useful deployment context, but they do not change the AWS product
+# price selected by this application.  Keep them out of the pricing contract
+# so an operational compatibility check can never block or mutate a quote.
+# Database versions deliberately are not listed: RDS Extended Support can add
+# a real charge, so RDS engine_version remains a pricing field.
+NON_PRICING_CONTEXT_FIELDS: dict[str, frozenset[str]] = {
+    "ec2": frozenset({"operating_system_version", "business_type", "purpose"}),
+    "elasticache": frozenset({"engine_version"}),
+    "memorydb": frozenset({"engine_version"}),
+    "opensearch": frozenset({"engine_version"}),
+    "documentdb": frozenset({"engine_version"}),
+    "waf": frozenset({"protected_resource"}),
+    "backup": frozenset({"protected_service"}),
+}
 
 # Safe defaults are values that do not change which product the customer is
 # buying.  Every known template participates in this registry, even when its
@@ -256,7 +282,10 @@ BILLING_DIMENSION_FIELDS = {
     "snapshot_changed_gib", "snapshot_storage_gib", "state_transitions",
     "storage_gib", "storage_gib_per_broker", "storage_iops",
     "storage_throughput_mbps", "experiment_hours",
-    "total_storage_gib", "write_request_units",
+    "total_storage_gib", "user_count", "hours_per_user_per_day",
+    "messages", "connection_minutes", "throughput_mbps_per_tib",
+    "deployment_updates",
+    "user_volume_gib", "write_request_units",
 }
 
 
@@ -276,6 +305,15 @@ def safe_requirement_defaults(service: str) -> dict[str, Any]:
     """Return system-owned defaults that may never override customer input."""
 
     return dict(SERVICE_SAFE_DEFAULTS.get(normalized_service_key(service), {}))
+
+
+def strip_non_pricing_context_fields(
+    service: str, requirements: dict[str, Any]
+) -> dict[str, Any]:
+    """Project a component onto the fields allowed to influence its price."""
+
+    ignored = NON_PRICING_CONTEXT_FIELDS.get(normalized_service_key(service), frozenset())
+    return {field: value for field, value in requirements.items() if field not in ignored}
 
 
 def billing_dimension_fields(service: str) -> tuple[str, ...]:

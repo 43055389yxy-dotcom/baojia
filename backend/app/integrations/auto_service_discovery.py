@@ -15,7 +15,7 @@ from app.integrations.aws_product_registry import AwsProductRegistry
 
 PROFILE_TTL_SECONDS = 10 * 24 * 60 * 60
 FAILED_RETRY_SECONDS = 6 * 60 * 60
-PROFILE_SCHEMA_VERSION = 2
+PROFILE_SCHEMA_VERSION = 7
 
 
 def canonical_service_name(value: str) -> str:
@@ -66,7 +66,48 @@ def _dimension_field(dimension: dict[str, Any]) -> tuple[str | None, str | None]
             return "input_tokens", "输入 Token 数量"
         return None, None
 
-    if any(token in unit for token in ("request", "api call", "message", "event")):
+    # Preserve the customer-facing quantity behind uncommon AWS units.  These
+    # rules are based on official units/operations, not service names, so a
+    # newly added product receives the same protection automatically.
+    if "flow run" in unit or "flow run" in text or "executeflow" in text:
+        return "flow_runs", "流程运行次数"
+    if "bucket" in unit:
+        return "bucket_count", "存储桶数量"
+    if "object-day" in unit or "object day" in unit:
+        return "object_count", "对象数量"
+    if "onpremupdates" in unit or (
+        "on-premises instance" in text and "update" in text
+    ):
+        return "deployment_updates", "本地服务器更新次数"
+    if "session" in unit and "reader" in text:
+        return "session_capacity", "读者会话次数"
+    if "user" in unit:
+        # Several QuickSight rows use the broad User unit even though some
+        # rows are free trials or optional Amazon Q add-ons. Those are not
+        # complete author subscriptions and must not be offered as cheaper
+        # alternatives to the real paid author plans.
+        if any(token in text for token in ("free trial", "free tier", "free promo")):
+            return None, None
+        if "q author" in text and "add-on" in text:
+            return None, None
+        if "author" in text or re.search(
+            r"qs-user-(?:enterprise|standard)-(?:annual|month)(?:\s|$)", text
+        ):
+            return "author_users", "作者数量"
+        if "reader" in text:
+            return "reader_users", "读者数量"
+
+    # Distinct official units must stay distinct all the way to pricing.  The
+    # old catch-all mapping collapsed API Gateway WebSocket messages into
+    # generic requests and left connection minutes unnamed, so the extraction
+    # allow-list later discarded both customer values.
+    if "message" in unit or "message" in text:
+        return "messages", "消息数量"
+    if "minute" in unit and any(
+        token in text for token in ("connection", "websocket", "apigatewayminute")
+    ):
+        return "connection_minutes", "连接时长（分钟）"
+    if any(token in unit for token in ("request", "api call", "event")):
         return "requests", "请求数量"
 
     if any(token in unit for token in ("gb-month", "gb-mo", "gib-month")):
@@ -76,10 +117,22 @@ def _dimension_field(dimension: dict[str, Any]) -> tuple[str | None, str | None]
             return "managed_storage_gib", "托管存储（GiB/月）"
         return "storage_gib", "存储容量（GiB/月）"
 
-    if unit in {"gb", "gbyte", "gigabyte", "gigabytes", "gib"}:
+    if unit in {"gb", "gbyte", "gigabyte", "gigabytes", "gib"} or (
+        "byte" in unit
+        and any(token in text for token in ("process", "processed", "ingest"))
+    ):
         if any(token in text for token in ("transfer", "egress", "data out", "outbound")):
             return "data_transfer_out_gib", "出站流量（GiB）"
-        if any(token in text for token in ("scan", "scanned")):
+        if any(
+            token in text
+            for token in (
+                "scan",
+                "scanned",
+                "sensitive data discovery",
+                "sensitivedatadiscovery",
+                "classification",
+            )
+        ):
             return "data_scanned_gib", "扫描数据量（GiB）"
         if any(token in text for token in ("process", "processed", "ingest")):
             return "data_processed_gib", "处理数据量（GiB）"
@@ -91,6 +144,8 @@ def _dimension_field(dimension: dict[str, Any]) -> tuple[str | None, str | None]
 
     if any(token in unit for token in ("dpu-hour", "dpu hour")):
         return "dpu_hours", "DPU 小时"
+    if any(token in unit for token in ("mibps", "mbps")):
+        return "throughput_mbps", "吞吐能力（MiB/s）"
     if any(token in unit for token in ("hour", "hrs")):
         return "hours_per_month", "运行时长（小时/月）"
     if any(token in unit for token in ("quantity", "unit")):
@@ -190,6 +245,13 @@ class AutoServiceDiscovery:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         return connection
+
+    def resolve_official_product(self, *labels: str) -> dict[str, Any] | None:
+        """Return an exact provider-owned identity before any AI fallback."""
+
+        if self.product_registry is None:
+            return None
+        return self.product_registry.resolve_product(*labels)
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -455,7 +517,11 @@ class AutoServiceDiscovery:
             "fields": _dimension_fields(safe_dimensions),
             "field_bindings": _dimension_bindings(safe_dimensions),
             "attribute_names": sorted(attribute_names)[:80],
-            "dimensions": safe_dimensions[:120],
+            # Every selectable binding must keep its exact price row. The old
+            # 120-row slice retained the long instance list but silently cut
+            # later storage, backup and user rows; the confirmation page could
+            # then offer a choice that final pricing no longer knew about.
+            "dimensions": safe_dimensions,
             "status": "verified",
             "updated_at": time.time(),
         }
@@ -592,6 +658,19 @@ class AutoServiceDiscovery:
         payload["updated_at"] = now
         key = self._profile_key(str(profile["service_key"]), profile.get("region"))
         with self._lock, self._connect() as connection:
+            previous = connection.execute(
+                "SELECT status FROM auto_service_profiles WHERE profile_key = ?",
+                (key,),
+            ).fetchone()
+            # A failed refresh is diagnostic information, not a publishable
+            # catalog version.  Keep the last verified snapshot available;
+            # only a newly verified profile may replace it atomically.
+            if (
+                status != "verified"
+                and previous is not None
+                and str(previous["status"]) == "verified"
+            ):
+                return
             connection.execute(
                 """
                 INSERT OR REPLACE INTO auto_service_profiles (

@@ -188,12 +188,19 @@ def test_product_registry_creates_one_independent_row_per_offer(tmp_path: Path) 
         "profile_status": {"identity_ready": 2},
     }
 
+    # Official identity lookup is independent of workload-specific adapters.
+    # CamelCase names and acronyms must remain human-resolvable instead of
+    # degrading into keys such as ``e_c2`` or ``m_q``.
+    example = registry.resolve_product("Amazon Example")
+    assert example is not None
+    assert example["service_code"] == "AmazonExample"
+    assert example["service_key"] == "example"
+
     assert registry.sync_region_availability(workers=2) == {
         "checked": 2,
         "updated": 2,
         "failed": 0,
     }
-
     registry.update_profile(
         "AmazonExample",
         {
@@ -235,3 +242,34 @@ def test_product_registry_creates_one_independent_row_per_offer(tmp_path: Path) 
         "updated": 0,
         "failed": 0,
     }
+
+
+def test_product_registry_accepts_official_marketing_version_suffix(tmp_path: Path) -> None:
+    def fetch(url: str) -> dict:
+        if url.endswith("/offers/v1.0/aws/index.json"):
+            return {
+                "publicationDate": "2026-08-26T00:00:00Z",
+                "offers": {
+                    "AmazonAppStream": {
+                        "offerCode": "AmazonAppStream",
+                        "currentVersionUrl": "/appstream/current/index.json",
+                    }
+                },
+            }
+        if url.endswith("/appstream/current/index.json"):
+            return {"products": {}, "terms": {}}
+        raise AssertionError(f"unexpected fixture URL: {url}")
+
+    registry = AwsProductRegistry(
+        PublicAwsPriceCatalog(fetch),
+        tmp_path / "appstream-products.sqlite3",
+    )
+    registry.sync()
+
+    resolved = registry.resolve_product("Amazon AppStream 2.0")
+
+    assert resolved is not None
+    assert resolved["service_code"] == "AmazonAppStream"
+    # The safe normalization is deliberately terminal-version-only. A
+    # different product phrase must not become a fuzzy prefix match.
+    assert registry.resolve_product("Amazon AppStream 2.0 Connector") is None

@@ -315,9 +315,11 @@ class Ec2Plugin(ServicePlugin):
         # telling the customer that the shape does not exist. Ask for a
         # replacement only when the requested shape itself is unavailable.
         customer_must_select = bool(requirement.field_sources.get("_customer_select_configuration"))
-        requires_confirmation = customer_must_select or bool(
-            not requested_model and exact is None and len(options) > 1 and not exact_shape_exists
-        )
+        # Catalog sizing is deterministic: choose the cheapest official model
+        # that does not under-provision the customer's CPU/memory. The only
+        # remaining picker is an explicit architecture workflow (for example
+        # a newly derived self-hosted child whose machine size was never given).
+        requires_confirmation = customer_must_select
         confirmation_reason = None
         if customer_must_select:
             confirmation_reason = (

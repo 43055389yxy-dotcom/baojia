@@ -18,6 +18,7 @@ type Props = {
   requireMachineCount?: boolean;
   initialMachineCount?: number;
   className?: string;
+  placeholder?: string;
 };
 
 function numericSpecification(option: ConfigurationChoice, keys: string[]): number | null {
@@ -42,6 +43,7 @@ export function ConfigurationOptionPicker({
   requireMachineCount = false,
   initialMachineCount = 1,
   className = "",
+  placeholder,
 }: Props) {
   const [vcpu, setVcpu] = useState("");
   const [memory, setMemory] = useState("");
@@ -167,7 +169,7 @@ export function ConfigurationOptionPicker({
         <label className="configuration-picker-result">
           {hasProcessorFilter && <span>官方型号</span>}
           <select className="configuration-picker-select" aria-label="选择可用配置" value={filtered.some(({ option }) => option.value === selectedValue) ? selectedValue : ""} onChange={(event) => emitSelection(event.target.value)}>
-            <option value="">请选择当前区域支持的{hasProcessorFilter ? "型号" : "选项"}</option>
+            <option value="">{placeholder ?? `请选择当前区域支持的${hasProcessorFilter ? "型号" : "选项"}`}</option>
             {filtered.map(({ option }) => <option value={option.value} key={option.value}>{option.label}</option>)}
           </select>
         </label>

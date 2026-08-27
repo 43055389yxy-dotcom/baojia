@@ -40,6 +40,16 @@ REQUIREMENT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
         "root_volume_gib",
         "disk_size_gib",
     ),
+    "user_volume_gib": (
+        "user_disk_gib",
+        "user_disk_size_gib",
+        "user_volume_size_gib",
+    ),
+    "hours_per_user_per_day": (
+        "daily_hours_per_user",
+        "user_hours_per_day",
+        "hours_per_user_day",
+    ),
     "storage_gib": (
         "storage_size_gib",
         "storage_gb",
@@ -252,7 +262,8 @@ _MODEL_PATTERNS: dict[str, re.Pattern[str]] = {
 
 _NUMERIC_REQUIREMENT_FIELDS = {
     "vcpu", "memory_gib", "memory_mb", "ephemeral_storage_mb",
-    "system_disk_gib", "total_system_disk_gib", "total_worker_system_disk_gib",
+    "system_disk_gib", "user_volume_gib", "total_system_disk_gib",
+    "total_worker_system_disk_gib", "hours_per_user_per_day",
     "storage_gib", "total_storage_gib", "storage_gib_per_node",
     "storage_gib_per_broker", "storage_iops", "storage_throughput_mbps",
     "ebs_iops", "ebs_throughput_mbps", "hours_per_month", "broker_hours",
@@ -270,12 +281,15 @@ _NUMERIC_REQUIREMENT_FIELDS = {
     "utilization_percent", "snapshot_changed_gib", "backup_storage_gib",
     "warm_storage_gib", "cold_storage_gib", "restore_gib",
     "provisioned_throughput_mibps", "throughput_mbps", "rpu", "dpu_hours",
+    "throughput_mbps_per_tib", "connection_minutes",
     "crawler_dpu_hours", "interactive_session_dpu_hours",
     "master_vcpu", "master_memory_gib", "master_storage_gib_per_node",
     "core_vcpu", "core_memory_gib", "core_storage_gib_per_node",
     "task_vcpu", "task_memory_gib", "task_storage_gib_per_node",
     "managed_storage_gib", "snapshot_storage_gib", "provisioned_dpu_hours",
-    "resource_count",
+    "resource_count", "flow_runs", "bucket_count", "object_count",
+    "deployment_updates", "author_users", "reader_users", "session_capacity",
+    "spice_gib",
 }
 
 
@@ -291,6 +305,9 @@ _INTEGER_REQUIREMENT_FIELDS = {
     "outbound_messages", "inbound_messages", "image_scans", "queue_count",
     "event_buses", "namespaces", "service_instances", "nodes",
     "master_nodes", "core_nodes", "task_nodes", "provisioned_throughput_units",
+    "user_count",
+    "messages", "flow_runs", "bucket_count", "object_count",
+    "deployment_updates", "author_users", "reader_users", "session_capacity",
 }
 
 

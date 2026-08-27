@@ -150,19 +150,42 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
                     is_default=False,
                 )
             )
+        eligible_options = [
+            option
+            for option in options
+            if (
+                min_vcpu is None
+                or float(option.specifications.get("vCPU") or 0) >= min_vcpu
+            )
+            and (
+                min_memory is None
+                or float(option.specifications.get("memoryGiB") or 0) >= min_memory
+            )
+        ]
+        if eligible_options:
+            options = eligible_options
+        options.sort(
+            key=lambda option: (
+                option.monthly_catalog_cost is None,
+                option.monthly_catalog_cost
+                if option.monthly_catalog_cost is not None
+                else float("inf"),
+                option.model,
+            )
+        )
+        selected = options[0]
+        selected.is_default = True
         return PreviewSelection(
             component_id="component",
             service=self.kind,
             display_name=self.display_name,
             region=region,
             requested_model=None,
-            selected_model=None,
-            selection_reason="客户未指定节点型号，等待从部署区域的官方可用型号中选择。",
+            selected_model=selected.model,
+            selection_reason="已自动选择满足客户规格下限的最低价官方节点型号。",
             candidates=options,
-            requires_confirmation=True,
-            confirmation_reason=(
-                "请选择 OpenSearch 节点型号；列表仅展示当前部署区域可用的官方型号。"
-            ),
+            requires_confirmation=False,
+            confirmation_reason=None,
         )
 
     def select(self, requirement: ServiceRequirement, default_region: str) -> SelectedResource:

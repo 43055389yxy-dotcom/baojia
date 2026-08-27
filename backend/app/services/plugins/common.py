@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.core.errors import ManualConfirmationRequired
-from app.domain.requirement_fields import canonicalize_requirement_fields
+from app.domain.customer_facts import scoped_amount
 from app.domain.models import (
     PreviewSelection,
     ReferenceRate,
@@ -12,6 +13,7 @@ from app.domain.models import (
     ServiceRequirement,
     UsageLine,
 )
+from app.domain.requirement_fields import canonicalize_requirement_fields
 from app.integrations.aws import PricingCatalog
 from app.services.plugins.base import ServicePlugin, required_float
 
@@ -61,6 +63,62 @@ def _reference(product: dict[str, Any], *, description: str) -> ReferenceRate:
         usage_type=usage_type,
         operation=operation,
     )
+
+
+def _s3_request_product(
+    catalog: PricingCatalog,
+    *,
+    region: str,
+    group: str,
+    tier: int,
+    context: str,
+) -> dict[str, Any]:
+    """Resolve an ordinary object API meter inside an official S3 group.
+
+    AWS now publishes S3 Metadata ``Annotation Requests`` in the same Tier 1
+    and Tier 2 groups as ordinary PUT/GET requests.  The group is therefore a
+    discovery boundary, not a unique billing identity.  Match the customer's
+    action to the official usage type/description first, then retain the
+    fail-closed uniqueness check for genuinely ambiguous results.
+    """
+
+    expected_usage = re.compile(
+        rf"requests(?:-(?:sia|zia))?-tier{tier}$",
+        re.IGNORECASE,
+    )
+
+    def matches(product: dict[str, Any]) -> bool:
+        attributes = PricingCatalog.attributes(product)
+        usage_type = str(
+            attributes.get("usagetype") or attributes.get("usageType") or ""
+        ).strip()
+        description = str(attributes.get("groupDescription") or "").strip()
+        searchable = f"{usage_type} {description}".casefold()
+        if "annotation" in searchable or not expected_usage.search(usage_type):
+            return False
+        # Official descriptions add the storage tier suffix for IA classes,
+        # but the billed action at the beginning remains stable.
+        if description:
+            lowered = description.casefold()
+            if tier == 1 and not ("put" in lowered and "list" in lowered):
+                return False
+            if tier == 2 and "get" not in lowered:
+                return False
+        return True
+
+    products = catalog.products(
+        "AmazonS3", {"regionCode": region, "group": group}, max_pages=3
+    )
+    candidates = [product for product in products if matches(product)]
+    if not candidates:
+        products = catalog.products(
+            "AmazonS3",
+            {"regionCode": region, "group": group},
+            max_pages=3,
+            refresh=True,
+        )
+        candidates = [product for product in products if matches(product)]
+    return PricingCatalog.require_unique(candidates, context=context)
 
 
 def _normalize_s3_storage_class(value: object) -> str:
@@ -147,7 +205,7 @@ class S3Plugin(ServicePlugin):
             f"{display_tier} 存储 ({region})",
         )
         attrs = PricingCatalog.attributes(product)
-        line = (
+        storage_line = (
             _line(product, key="s3", amount=storage_gib, group="s3")
             if storage_gib is not None
             else None
@@ -157,6 +215,44 @@ class S3Plugin(ServicePlugin):
             if storage_gib is None
             else []
         )
+        lines = [storage_line] if storage_line else []
+        request_dimensions = {
+            "standard": ("S3-API-Tier1", "S3-API-Tier2"),
+            "standard_ia": ("S3-API-SIA-Tier1", "S3-API-SIA-Tier2"),
+            "one_zone_ia": ("S3-API-ZIA-Tier1", "S3-API-ZIA-Tier2"),
+        }
+        for field, key, group, tier in (
+            (
+                "put_copy_post_list_requests",
+                "s3put",
+                request_dimensions[storage_class][0],
+                1,
+            ),
+            (
+                "get_select_requests",
+                "s3get",
+                request_dimensions[storage_class][1],
+                2,
+            ),
+        ):
+            amount = required_float(requested, field)
+            if amount is None:
+                continue
+            request_product = _s3_request_product(
+                self.catalog,
+                region=region,
+                group=group,
+                tier=tier,
+                context=f"{display_tier} {field} ({region})",
+            )
+            lines.append(
+                _line(
+                    request_product,
+                    key=key,
+                    amount=scoped_amount(requirement, field, amount),
+                    group="s3",
+                )
+            )
         return SelectedResource(
             service=self.kind,
             display_name=self.display_name,
@@ -167,11 +263,28 @@ class S3Plugin(ServicePlugin):
                 if storage_gib is not None
                 else "未提供容量，仅展示官方单位参考价"
             ),
-            specifications={"storageClass": display_tier, **({"storageGiB": storage_gib} if storage_gib is not None else {})},
+            specifications={
+                "storageClass": display_tier,
+                **({"storageGiB": storage_gib} if storage_gib is not None else {}),
+                **(
+                    {"putCopyPostListRequests": requested["put_copy_post_list_requests"]}
+                    if requested.get("put_copy_post_list_requests") is not None
+                    else {}
+                ),
+                **(
+                    {"getSelectRequests": requested["get_select_requests"]}
+                    if requested.get("get_select_requests") is not None
+                    else {}
+                ),
+            },
             official_product={
                 "sku": product["product"]["sku"],
-                "usageType": (line.usage_type if line else reference_rates[0].usage_type),
-                "operation": (line.operation if line else reference_rates[0].operation),
+                "usageType": (
+                    storage_line.usage_type if storage_line else reference_rates[0].usage_type
+                ),
+                "operation": (
+                    storage_line.operation if storage_line else reference_rates[0].operation
+                ),
                 "regionCode": attrs.get("regionCode"),
             },
             rationale=f"使用 AWS 官方 {display_tier} GB-Month 计费维度。",
@@ -180,7 +293,7 @@ class S3Plugin(ServicePlugin):
                 if storage_gib is None
                 else None
             ),
-            usage_lines=([line] if line else []),
+            usage_lines=lines,
             reference_rates=reference_rates,
         )
 
@@ -303,7 +416,14 @@ class CloudFrontPlugin(ServicePlugin):
     def select(self, requirement: ServiceRequirement, default_region: str) -> SelectedResource:
         requested = canonicalize_requirement_fields(requirement.requirements, service="cloudfront")
         transfer_gib = required_float(requested, "data_transfer_out_gib")
-        geography, prefix = self._geography(requirement.region or default_region)
+        raw_geography = str(requested.get("traffic_geography") or "").strip()
+        if not raw_geography:
+            raise ManualConfirmationRequired(
+                "CloudFront 的公网下行和 HTTPS 请求价格取决于访问者流量地区，客户尚未指定。请从下方选择主要访问者流量地区。",
+                code="cloudfront_traffic_geography_required",
+                field="traffic_geography",
+            )
+        geography, prefix = self._geography(raw_geography)
         transfer = _one_product(
             self.catalog,
             "AmazonCloudFront",
@@ -372,16 +492,23 @@ class CloudFrontPlugin(ServicePlugin):
         return None
 
     @staticmethod
-    def _geography(region: str) -> tuple[str, str]:
-        normalized = region.lower()
-        if normalized.startswith("eu-"):
+    def _geography(value: str) -> tuple[str, str]:
+        normalized = value.strip().casefold()
+        if normalized in {"europe", "欧洲"}:
             return "Europe", "EU"
-        if normalized.startswith("us-"):
+        if normalized in {"united states", "us", "美国"}:
             return "United States", "US"
-        if normalized.startswith("ca-"):
+        if normalized in {"canada", "加拿大"}:
             return "Canada", "CA"
-        if normalized.startswith("ap-northeast-1"):
+        if normalized in {"japan", "日本"}:
             return "Japan", "JP"
-        if normalized.startswith("ap-southeast-2"):
+        if normalized in {"australia", "澳大利亚"}:
             return "Australia", "AU"
-        return "Asia Pacific", "AP"
+        if normalized in {"asia pacific", "ap", "亚太", "亚太地区"}:
+            return "Asia Pacific", "AP"
+        raise ManualConfirmationRequired(
+            "CloudFront 流量地区不在当前官方选项中，请重新选择。",
+            code="cloudfront_traffic_geography_invalid",
+            field="traffic_geography",
+            supplied=value,
+        )

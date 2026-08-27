@@ -4,6 +4,7 @@ from typing import Any
 
 from app.integrations.aws_product_registry import AwsProductRegistry
 from app.integrations.service_templates import SERVICE_TEMPLATE_FIELDS
+from app.integrations.aws_supported_services import CURATED_SERVICE_OFFER_CODES
 
 
 class AwsAdaptationAudit:
@@ -68,6 +69,19 @@ class AwsAdaptationAudit:
             )
         ]
         official_count = len(official)
+        official_codes = {str(product["service_code"]) for product in official}
+        curated_services = set(SERVICE_TEMPLATE_FIELDS)
+        declared_services = set(CURATED_SERVICE_OFFER_CODES)
+        missing_template_bindings = sorted(curated_services - declared_services)
+        stale_offer_bindings = sorted(
+            f"{service} -> {offer_code}"
+            for service, offer_code in CURATED_SERVICE_OFFER_CODES.items()
+            if service in curated_services and offer_code not in official_codes
+        )
+        extra_template_bindings = sorted(declared_services - curated_services)
+        verified_template_bindings = len(curated_services) - len(
+            missing_template_bindings
+        ) - len(stale_offer_bindings)
 
         def stage(
             number: int,
@@ -90,6 +104,9 @@ class AwsAdaptationAudit:
                 "strictly_isolated": len(isolated),
                 "policy_ready": len(policy_ready),
                 "curated_component_templates": len(SERVICE_TEMPLATE_FIELDS),
+                "verified_template_offer_bindings": verified_template_bindings,
+                "missing_template_offer_bindings": len(missing_template_bindings),
+                "stale_template_offer_bindings": len(stale_offer_bindings),
                 "materialized_dynamic_profiles": len(profile_ready),
                 "dynamic_profiles_pending_first_use": max(
                     official_count - len(profile_ready) - len(needs_review), 0
@@ -111,8 +128,13 @@ class AwsAdaptationAudit:
                 stage(
                     2,
                     "产品别名与唯一归属",
-                    "ready",
-                    "每个官方产品有独立 service_code、service_key 和别名集合。",
+                    (
+                        "ready"
+                        if not missing_template_bindings and not stale_offer_bindings
+                        else "needs_review"
+                    ),
+                    f"{verified_template_bindings}/{len(curated_services)} 个常用组件已绑定到"
+                    "当前 AWS 官方 Offer Code；共享报价目录也有独立归属。",
                 ),
                 stage(
                     3,
@@ -177,4 +199,7 @@ class AwsAdaptationAudit:
                 ),
             ],
             "needs_review_service_codes": needs_review,
+            "missing_template_offer_bindings": missing_template_bindings,
+            "stale_template_offer_bindings": stale_offer_bindings,
+            "extra_template_offer_bindings": extra_template_bindings,
         }

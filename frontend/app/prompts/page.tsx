@@ -100,7 +100,7 @@ export default function PromptLibraryPage() {
           <span>A</span><strong>AstraQuote</strong>
         </Link>
         <div className="product-title"><strong>提示词管理</strong><span>开发调试</span></div>
-        <Link className="prompt-nav-link" href="/">返回报价</Link>
+        <Link className="prompt-nav-link global-requote-button" href="/">重新报价</Link>
       </header>
 
       <section className="prompt-page-title">

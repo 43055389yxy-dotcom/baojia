@@ -103,13 +103,6 @@ class RdsPlugin(ServicePlugin):
             min_vcpu=min_vcpu,
             min_memory=min_memory,
         )
-        exact_shape_exists = bool(
-            min_vcpu is not None
-            and min_memory is not None
-            and any(
-                item["vcpu"] == min_vcpu and item["memory_gib"] == min_memory for item in eligible
-            )
-        )
         if requested_model:
             exact = next((item for item in eligible if item["model"] == requested_model), None)
             if exact:
@@ -197,15 +190,12 @@ class RdsPlugin(ServicePlugin):
         )
         default.is_default = True
         options = [default, *(option for option in options if option.model != default.model)]
-        # CPU/memory without a model means "choose for me". The adapter already
-        # ranks non-underprovisioned official products by monthly price, so a
-        # non-exact shape must not be sent back to the customer.
-        requires_confirmation = bool(
-            not requested_model and len(options) > 1 and not exact_shape_exists
-        )
-        if requires_confirmation:
-            for option in options:
-                option.is_default = False
+        # CPU/memory are lower bounds, not a request to make the customer pick
+        # an AWS catalog row. ``default`` is always from the non-underprovisioned
+        # eligible set and is already price-ranked. A missing exact shape is
+        # therefore resolved automatically instead of generating a false
+        # "AWS has no matching configuration" question.
+        requires_confirmation = False
         return PreviewSelection(
             component_id="component",
             service=self.kind,
@@ -220,11 +210,7 @@ class RdsPlugin(ServicePlugin):
             ),
             candidates=options,
             requires_confirmation=requires_confirmation,
-            confirmation_reason=(
-                "AWS 可订购的数据库规格与客户要求不是完全匹配，请确认推荐配置。"
-                if requires_confirmation
-                else None
-            ),
+            confirmation_reason=None,
         )
 
     def select(self, requirement: ServiceRequirement, default_region: str) -> SelectedResource:
@@ -341,12 +327,14 @@ class RdsPlugin(ServicePlugin):
             "multi_az_cluster": "RDS Multi-AZ DB cluster；使用 AWS 对应集群计费维度",
         }[deployment]
         if _is_aurora_engine(engine):
-            customer_deployment = _text(requested.get("deployment")) or "single_az"
+            customer_deployment = _text(requested.get("deployment"))
             availability = (
-                "高可用" if customer_deployment in {"multi_az", "multi_az_cluster"} else "单可用区"
+                "客户指定高可用；"
+                if customer_deployment in {"multi_az", "multi_az_cluster"}
+                else ""
             )
             architecture = (
-                f"Aurora {availability}集群；{requirement.quantity} 套集群，"
+                f"Aurora 集群；{availability}{requirement.quantity} 套集群，"
                 f"每套 {cluster_members} 个数据库实例；"
                 "实例成员按 Aurora 官方实例计费维度处理"
             )
@@ -363,14 +351,18 @@ class RdsPlugin(ServicePlugin):
             specifications={
                 "engine": attrs.get("databaseEngine"),
                 "engineVersion": requested.get("engine_version"),
-                "deploymentOption": attrs.get("deploymentOption"),
+                "deploymentOption": (
+                    _text(requested.get("deployment"))
+                    if _is_aurora_engine(engine)
+                    else attrs.get("deploymentOption")
+                ),
                 "vCPU": selected["vcpu"],
                 "memoryGiB": selected["memory_gib"],
                 "storageType": storage_type_used,
                 "storageGiB": storage_gib,
                 **(
                     {
-                        "customerDeployment": _text(requested.get("deployment")) or "single_az",
+                        "billingDeploymentOption": attrs.get("deploymentOption"),
                         "clusterMembers": cluster_members,
                     }
                     if _is_aurora_engine(engine)

@@ -343,6 +343,90 @@ class ApiGatewayPlugin(_NoConfirmationPlugin):
         region = requirement.region or default_region
         requested = requirement.requirements
         api_type = str(requested.get("api_type") or "http").strip().casefold()
+        is_websocket = api_type in {"websocket", "web_socket", "websocket_api"}
+        if is_websocket:
+            products = self.catalog.products(
+                "AmazonApiGateway",
+                {"regionCode": region, "operation": "ApiGatewayWebSocket"},
+                max_pages=3,
+            )
+            message_product = PricingCatalog.require_unique(
+                [
+                    product
+                    for product in products
+                    if "message" in str(
+                        PricingCatalog.on_demand_unit_rate(product)[1]
+                        if PricingCatalog.on_demand_unit_rate(product)
+                        else ""
+                    ).casefold()
+                ],
+                context=f"API Gateway WebSocket 消息 ({region})",
+            )
+            minute_product = PricingCatalog.require_unique(
+                [
+                    product
+                    for product in products
+                    if "minute" in str(
+                        PricingCatalog.on_demand_unit_rate(product)[1]
+                        if PricingCatalog.on_demand_unit_rate(product)
+                        else ""
+                    ).casefold()
+                ],
+                context=f"API Gateway WebSocket 连接分钟 ({region})",
+            )
+            messages = required_float(requested, "messages")
+            connection_minutes = required_float(requested, "connection_minutes")
+            lines = []
+            references = []
+            if messages is not None:
+                lines.append(_usage(message_product, "apigwmsg", messages, "api-gateway"))
+            else:
+                references.append(_reference(message_product, "WebSocket 消息单价"))
+            if connection_minutes is not None:
+                lines.append(
+                    _usage(
+                        minute_product,
+                        "apigwmin",
+                        connection_minutes,
+                        "api-gateway",
+                    )
+                )
+            else:
+                references.append(_reference(minute_product, "WebSocket 连接分钟单价"))
+            missing = []
+            if messages is None:
+                missing.append("消息数")
+            if connection_minutes is None:
+                missing.append("连接分钟")
+            return SelectedResource(
+                service=self.kind,
+                display_name=self.display_name,
+                region=region,
+                model="WebSocket API",
+                architecture=(
+                    f"每月 {messages:g} 条消息 · {connection_minutes:g} 连接分钟"
+                    if messages is not None and connection_minutes is not None
+                    else "WebSocket 官方计费维度"
+                ),
+                specifications={
+                    "apiType": "WebSocket",
+                    **({"messages": messages} if messages is not None else {}),
+                    **(
+                        {"connectionMinutes": connection_minutes}
+                        if connection_minutes is not None
+                        else {}
+                    ),
+                },
+                official_product={"source": "AWS Price List", "regionCode": region},
+                rationale="使用 API Gateway WebSocket 官方消息与连接分钟两个独立计费维度。",
+                substitution_notice=(
+                    f"客户未提供{'、'.join(missing)}；缺少部分仅展示官方单位价，不计入月费合计。"
+                    if missing
+                    else None
+                ),
+                usage_lines=lines,
+                reference_rates=references,
+            )
         is_rest = api_type in {"rest", "rest_api", "restapi"}
         operation = "ApiGatewayRequest" if is_rest else "ApiGatewayHttpApi"
         products = self.catalog.products(

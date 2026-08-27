@@ -63,30 +63,19 @@ class RedisPlugin(ServicePlugin):
             for index, item in enumerate(candidates)
         ]
         selected = options[default_index]
-        exact_shape_exists = bool(
-            min_memory is not None
-            and any(
-                option.specifications.get("memoryGiB") == min_memory
-                and (min_vcpu is None or option.specifications.get("vCPU") == min_vcpu)
-                for option in options
-            )
-        )
         # A requested model can also come from the customer's answer to the
         # lower/upper choice. Once that exact official model is available, the
         # choice is resolved even when its memory is not numerically identical
         # to the original approximate request.
-        # A free-form capacity such as 16 GiB is a customer-visible choice, not
-        # an official ElastiCache node size.  Do not silently turn it into a
-        # larger (and more expensive) node at the pricing stage.  Surface the
-        # adjacent official sizes during configuration review instead.  Once
-        # the customer selects an official model, that model is authoritative
-        # and this question is resolved.
+        # A free-form capacity is a lower bound. Automatically keep the
+        # smallest official node that satisfies it; never ask the customer to
+        # choose between a cheaper under-sized node and a valid node.
         requires_confirmation = bool(
-            not requested_model and len(options) > 1 and not exact_shape_exists
+            not requested_model
+            and min_memory is None
+            and min_vcpu is None
+            and len(options) > 1
         )
-        # A lower/upper sizing question is a real customer decision.  Do not
-        # preselect either answer or persist a provisional model as if the
-        # customer had already confirmed it.
         if requires_confirmation:
             for option in options:
                 option.is_default = False
@@ -235,7 +224,6 @@ class RedisPlugin(ServicePlugin):
                 code="unsupported_cache_engine",
             )
         api_engine = "valkey" if engine == "valkey" else "redis"
-        self._validate_engine(region, api_engine, requested.get("engine_version"))
 
         requested_model = _text(requested.get("requested_model"))
         purchase_option = _text(requested.get("purchase_option")) or "on_demand"
@@ -362,14 +350,19 @@ class RedisPlugin(ServicePlugin):
 
     def _validate_engine(self, region: str, engine: str, version: object) -> None:
         kwargs: dict[str, Any] = {"Engine": engine}
-        if version_text := _text(version):
-            kwargs["EngineVersion"] = version_text
+        version_text = _text(version)
+        # Customer requirements commonly use a version family such as
+        # ``Redis 7.x``.  ElastiCache's API only accepts concrete versions in
+        # EngineVersion, so sending ``7.x`` literally produces an empty result
+        # even when Redis 7 is available in the region.  Query the regional
+        # version catalog once and apply the customer's family/exact constraint
+        # locally instead.
         try:
             response = ReadOnlyAwsQueryExecutor(self.clients).execute(
                 service="elasticache",
                 operation="describe_cache_engine_versions",
                 region=region,
-                parameters={**kwargs, "MaxRecords": 20},
+                parameters={**kwargs, "MaxRecords": 100},
                 paginate=False,
             )
         except ManualConfirmationRequired as exc:
@@ -382,11 +375,45 @@ class RedisPlugin(ServicePlugin):
             for page in response.get("pages", [response])
             for version in page.get("CacheEngineVersions", [])
         ]
-        if not versions:
-            raise ManualConfirmationRequired(
-                f"ElastiCache {engine} 或指定版本在 {region} 不受支持",
-                code="unsupported_cache_engine_or_region",
+        available_versions = list(
+            dict.fromkeys(
+                value
+                for item in versions
+                if (value := _text(item.get("EngineVersion")))
             )
+        )
+        matches = [
+            candidate
+            for candidate in available_versions
+            if not version_text or _engine_version_matches(version_text, candidate)
+        ]
+        if not matches:
+            raise ManualConfirmationRequired(
+                (
+                    f"您指定的 {engine.title()} {version_text} 在 {region} 不受支持"
+                    if version_text
+                    else f"ElastiCache {engine} 在 {region} 不受支持"
+                ),
+                code="unsupported_cache_engine_or_region",
+                engine=engine,
+                requested_version=version_text,
+                region=region,
+                supported_engine_versions=available_versions,
+            )
+
+
+def _engine_version_matches(requested: str, available: str) -> bool:
+    """Match a customer version constraint against one official version."""
+
+    wanted = requested.strip().casefold()
+    candidate = available.strip().casefold()
+    wildcard = re.fullmatch(r"(\d+(?:\.\d+)*)\.(?:x|\*)", wanted)
+    if wildcard:
+        prefix = wildcard.group(1)
+        return candidate == prefix or candidate.startswith(f"{prefix}.")
+    if re.fullmatch(r"\d+", wanted):
+        return candidate == wanted or candidate.startswith(f"{wanted}.")
+    return candidate == wanted or candidate.startswith(f"{wanted}.")
 
 
 def _cache_candidates(products: list[dict[str, Any]], api_engine: str) -> list[dict[str, Any]]:

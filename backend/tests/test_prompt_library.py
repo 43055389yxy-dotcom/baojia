@@ -6,6 +6,7 @@ from app.integrations.prompt_library import (
     SERVICE_KEYWORDS,
     SERVICE_PROMPTS,
     build_component_extraction_prompt,
+    build_inventory_prompt,
     build_intake_prompt,
     build_service_prompt,
     build_system_prompt,
@@ -42,6 +43,18 @@ def test_component_extraction_loads_exactly_its_own_full_service_prompt() -> Non
     assert "deployment 只能" not in ec2
     assert "db.t3.large 只能是" in rds
     assert "additional_ebs_volumes" not in rds
+
+
+def test_requirement_cleaning_prompt_declares_split_extract_and_reconcile_stages() -> None:
+    inventory = build_inventory_prompt()
+    component = build_component_extraction_prompt(
+        "lambda", "AWS Lambda：1024MB，800ms，每月调用2000万次"
+    )
+
+    assert "第 1 步" in inventory
+    assert "只提取会改变 AWS 价格的字段" in inventory
+    assert "计价字段逐项对账" in inventory
+    assert "第 2、3 步" in component
 
 
 def test_quicksight_component_uses_native_independent_template_prompt() -> None:

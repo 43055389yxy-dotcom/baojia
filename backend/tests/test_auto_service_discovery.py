@@ -7,6 +7,7 @@ from app.integrations.auto_service_discovery import (
     PROFILE_TTL_SECONDS,
     PROFILE_SCHEMA_VERSION,
     AutoServiceDiscovery,
+    _dimension_field,
 )
 from app.services.plugins.generic_official import GenericOfficialPlugin
 
@@ -141,6 +142,38 @@ def test_unknown_service_builds_and_reuses_verified_official_profile(tmp_path: P
     # read is served from the persistent discovery cache.
     assert catalog.product_calls == 2
     assert discovery.list_profiles()[0]["service_key"] == "appflow"
+
+
+def test_failed_refresh_never_overwrites_last_verified_profile(tmp_path: Path) -> None:
+    discovery = AutoServiceDiscovery(
+        AppFlowCatalog(),  # type: ignore[arg-type]
+        tmp_path / "auto-profiles.sqlite3",
+    )
+    verified = discovery.ensure_profile(
+        service_key="appflow",
+        display_name="Amazon AppFlow",
+        region="ap-southeast-1",
+    )
+    assert verified is not None and verified["status"] == "verified"
+
+    discovery._save(
+        {
+            "profile_schema_version": PROFILE_SCHEMA_VERSION,
+            "service_key": "appflow",
+            "display_name": "Amazon AppFlow",
+            "service_code": "AmazonAppFlow",
+            "region": "ap-southeast-1",
+            "fields": [],
+            "dimensions": [],
+        },
+        status="failed",
+        error_code="temporary_catalog_failure",
+    )
+
+    cached = discovery.get_profile("appflow", "ap-southeast-1")
+    assert cached is not None
+    assert cached["status"] == "verified"
+    assert cached["field_bindings"]
 
 
 def test_stale_profile_is_refreshed_from_official_catalog(tmp_path: Path) -> None:
@@ -289,7 +322,7 @@ def test_unknown_official_unit_gets_guarded_field_and_can_be_priced(
         for binding in profile["field_bindings"]
         if binding["usage_type"] == "APS1-FlowExecution"
     )
-    assert field.startswith("official_usage_")
+    assert field == "flow_runs"
 
     plugin = GenericOfficialPlugin(
         None,  # type: ignore[arg-type]
@@ -308,6 +341,69 @@ def test_unknown_official_unit_gets_guarded_field_and_can_be_priced(
 
     assert selected.usage_lines[0].usage_type == "APS1-FlowExecution"
     assert selected.usage_lines[0].amount == 12
+
+
+def test_uncommon_official_units_get_stable_customer_fields() -> None:
+    assert _dimension_field(
+        {
+            "unit": "Processing-Bytes",
+            "operation": "DataProcessing",
+            "description": "GB of data processed",
+        }
+    ) == ("data_processed_gib", "处理数据量（GiB）")
+    assert _dimension_field(
+        {
+            "unit": "Bucket-days",
+            "description": "S3 Bucket analyzed daily",
+        }
+    ) == ("bucket_count", "存储桶数量")
+    assert _dimension_field(
+        {
+            "unit": "GB",
+            "description": "Sensitive Data Discovery",
+        }
+    ) == ("data_scanned_gib", "扫描数据量（GiB）")
+
+
+def test_role_session_and_on_premise_units_keep_separate_billable_fields() -> None:
+    assert _dimension_field(
+        {
+            "unit": "OnPremUpdates",
+            "description": "Deployment update to an on-premises instance",
+        }
+    ) == ("deployment_updates", "本地服务器更新次数")
+    assert _dimension_field(
+        {
+            "unit": "User-Month",
+            "description": "QuickSight Enterprise author subscription",
+        }
+    ) == ("author_users", "作者数量")
+    assert _dimension_field(
+        {
+            "unit": "User-Month",
+            "description": "QuickSight Enterprise reader subscription",
+        }
+    ) == ("reader_users", "读者数量")
+    assert _dimension_field(
+        {
+            "unit": "Session",
+            "description": "QuickSight reader session",
+        }
+    ) == ("session_capacity", "读者会话次数")
+    assert _dimension_field(
+        {
+            "unit": "User",
+            "usage_type": "QS-User-Enterprise-Month",
+            "description": "QuickSight Enterprise Edition User",
+        }
+    ) == ("author_users", "作者数量")
+    assert _dimension_field(
+        {
+            "unit": "Users",
+            "usage_type": "QS-User-Enterprise-Month-Q",
+            "description": "QuickSight Q Author $10 Monthly Add-on Fee",
+        }
+    ) == (None, None)
 
 
 def test_unknown_service_can_quote_explicit_usage_without_custom_adapter(tmp_path: Path) -> None:
@@ -366,3 +462,48 @@ def test_unknown_service_without_usage_exposes_reference_unit_only(tmp_path: Pat
     assert selected.usage_lines == []
     assert selected.reference_rates[0].service_code == "AmazonAppFlow"
     assert selected.reference_rates[0].unit_price == 0.02
+
+
+def test_discovery_profile_never_drops_price_rows_behind_selectable_bindings(
+    tmp_path: Path,
+) -> None:
+    products = []
+    for index in range(125):
+        product = json.loads(json.dumps(appflow_product()))
+        product["product"]["sku"] = f"appflow-{index}"
+        product["product"]["attributes"]["usagetype"] = f"APS1-DataProcessed-{index}"
+        products.append(product)
+
+    class LargeCatalog(AppFlowCatalog):
+        def products(
+            self,
+            service_code: str,
+            filters: dict[str, str],
+            *,
+            max_pages: int = 20,
+            refresh: bool = False,
+        ) -> list[dict]:
+            assert service_code == "AmazonAppFlow"
+            return products
+
+    discovery = AutoServiceDiscovery(
+        LargeCatalog(),  # type: ignore[arg-type]
+        tmp_path / "auto-profiles.sqlite3",
+    )
+    profile = discovery.ensure_profile(
+        service_key="appflow",
+        display_name="Amazon AppFlow",
+        region="ap-southeast-1",
+    )
+
+    assert profile is not None
+    assert len(profile["dimensions"]) == 125
+    dimension_identities = {
+        (item["usage_type"], item["operation"], item["unit"])
+        for item in profile["dimensions"]
+    }
+    assert all(
+        (binding["usage_type"], binding["operation"], binding["unit"])
+        in dimension_identities
+        for binding in profile["field_bindings"]
+    )

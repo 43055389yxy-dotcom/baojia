@@ -4,6 +4,7 @@ import logging
 from typing import Any, Callable
 
 from app.core.errors import ManualConfirmationRequired
+from app.domain.customer_facts import field_scope, scoped_amount
 from app.domain.models import (
     PreviewSelection,
     ReferenceRate,
@@ -14,7 +15,6 @@ from app.domain.models import (
 )
 from app.integrations.aws import PricingCatalog
 from app.services.plugins.base import ServicePlugin, required_float
-
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +187,22 @@ class WafPlugin(_MinimumAssumptionPlugin):
         web_acls = required_float(requirement.requirements, "web_acls") or 1.0
         rules = required_float(requirement.requirements, "rules") or 1.0
         requests = required_float(requirement.requirements, "requests")
+        billed_rules = scoped_amount(
+            requirement,
+            "rules",
+            rules,
+            resource_count=web_acls,
+        )
+        billed_requests = (
+            scoped_amount(
+                requirement,
+                "requests",
+                requests,
+                resource_count=web_acls,
+            )
+            if requests is not None
+            else None
+        )
         acl = _one_matching(
             self.catalog,
             "awswaf",
@@ -210,10 +226,10 @@ class WafPlugin(_MinimumAssumptionPlugin):
         )
         lines = [
             _usage(acl, key="wafacl", amount=web_acls, group="waf"),
-            _usage(rule, key="wafrule", amount=rules, group="waf"),
+            _usage(rule, key="wafrule", amount=billed_rules, group="waf"),
         ]
-        if requests is not None:
-            lines.append(_usage(request, key="wafreq", amount=requests, group="waf"))
+        if billed_requests is not None:
+            lines.append(_usage(request, key="wafreq", amount=billed_requests, group="waf"))
         reference_rates = (
             [_reference(request, description="AWS WAF 请求单价")]
             if requests is None
@@ -224,8 +240,31 @@ class WafPlugin(_MinimumAssumptionPlugin):
             display_name=self.display_name,
             region=region,
             model="WAF Basic Protection",
-            architecture=f"{web_acls:g} 个 Web ACL · {rules:g} 条规则",
-            specifications={"webACLs": web_acls, "rules": rules, **({"requests": requests} if requests is not None else {})},
+            architecture=(
+                f"{web_acls:g} 个 Web ACL · 每个 {rules:g} 条规则"
+                if field_scope(requirement, "rules") == "per_resource"
+                else f"{web_acls:g} 个 Web ACL · {rules:g} 条规则"
+            ),
+            specifications={
+                "webACLs": web_acls,
+                "rules": billed_rules,
+                **(
+                    {"rulesPerWebACL": rules}
+                    if field_scope(requirement, "rules") == "per_resource"
+                    else {}
+                ),
+                **(
+                    {"requests": billed_requests}
+                    if billed_requests is not None
+                    else {}
+                ),
+                **(
+                    {"requestsPerWebACL": requests}
+                    if requests is not None
+                    and field_scope(requirement, "requests") == "per_resource"
+                    else {}
+                ),
+            },
             official_product={"source": "AWS Price List", "regionCode": region},
             rationale="基础防护按 Web ACL、规则和请求三个官方计费维度提交 BCM。",
             substitution_notice=(

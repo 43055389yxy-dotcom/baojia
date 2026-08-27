@@ -86,6 +86,24 @@ _SERVICE_ALIASES = {
 
 _NUMBERED_HEADING = re.compile(r"^\s*(\d{1,2})\s*(?:[、，,.．。)）]|[-:]\s+)\s*(\S.*)$")
 
+_NON_PRICING_METADATA_LINE = re.compile(
+    r"^\s*(?:客户(?:名称)?|公司(?:名称)?|联系人|联系电话|手机|邮箱|电子邮件|"
+    r"项目名称|项目背景|项目说明|业务背景|需求说明|备注|补充说明|"
+    r"交付时间|上线时间|销售(?:人员)?|负责人|地址|用途|使用场景)\s*[:：]",
+    re.IGNORECASE,
+)
+_PRICING_FACT_MARKER = re.compile(
+    r"(?:\bstandard_[a-z0-9_-]+\b|\b(?:p|e|s|m)\d{1,2}(?:\s+(?:lrs|zrs))?\b|"
+    r"\b(?:basic|standard|premium|enterprise)\s+[a-z]?\d+\b|"
+    r"\d+(?:\.\d+)?\s*(?:v?cpu|核|gib|gb|tb|tib|mb|小时|hours?|hrs?|"
+    r"台|套|个|节点|次|请求|iops|mbps|天|年|月)|"
+    r"区域|地区|region|linux|windows|ubuntu|rhel|red\s*hat|suse|"
+    r"sku|型号|规格|数量|容量|存储|磁盘|内存|处理器|流量|带宽|"
+    r"运行时长|服务层级|性能层级|计费|预留|节省计划|spot|按量|"
+    r"高可用|副本|分片|冗余|保留|license|许可)",
+    re.IGNORECASE,
+)
+
 _AZURE_NUMBERED_IDENTITIES: tuple[tuple[str, str, str], ...] = (
     ("azure_postgresql", "Azure Database for PostgreSQL", r"postgres(?:ql)?"),
     ("azure_mysql", "Azure Database for MySQL", r"\bmysql\b"),
@@ -188,6 +206,31 @@ def split_numbered_components(text: str) -> list[str]:
     return components
 
 
+def azure_pricing_relevant_source(text: str) -> str:
+    """Remove explicit sales metadata while conserving every pricing fact.
+
+    The original text is persisted separately for audit. This conservative
+    pass only removes lines whose labels are known non-billing metadata and
+    which contain no region, SKU, quantity, shape, usage or purchase signal.
+    The fixed per-service template performs the remaining structural cleanup.
+    """
+
+    kept: list[str] = []
+    seen: set[str] = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if _NON_PRICING_METADATA_LINE.match(line) and not _PRICING_FACT_MARKER.search(line):
+            continue
+        normalized = "".join(line.split()).casefold()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        kept.append(line)
+    return "\n".join(kept) or text.strip()
+
+
 class AzureIntentParser:
     """Two-pass Azure intake: inventory first, then one isolated AI call per component."""
 
@@ -200,7 +243,7 @@ class AzureIntentParser:
     ):
         self._gateway = gateway
         self._component_cache = component_cache
-        self._cache_model_name = f"azure|{model_name}|component-template-v2"
+        self._cache_model_name = f"azure|{model_name}|component-template-v3-price-cleaning"
         self._auto_discovery = auto_discovery
 
     async def parse(self, text: str, reporter: AzureReporter | None = None) -> ParsedIntent:
@@ -231,6 +274,10 @@ class AzureIntentParser:
                 "未识别到可报价的 Microsoft Azure 组件",
                 code="azure_no_services",
             )
+        for component in components:
+            original = component.original_source_text or component.source_text
+            component.original_source_text = original
+            component.source_text = azure_pricing_relevant_source(original)
         if reporter:
             await reporter(
                 "component_plan",
@@ -265,6 +312,7 @@ class AzureIntentParser:
                         parsed.calculator_service_name or "Microsoft Azure",
                     )
                     parsed.source_text = component.source_text
+                    parsed.original_source_text = component.original_source_text
                     self._reconcile_explicit_sku(parsed)
                 else:
                     async with semaphore:
@@ -358,12 +406,19 @@ class AzureIntentParser:
                 f"{component.calculator_service_name or component.service}｜正在重新识别",
             )
         revised = await self._component(
-            component.model_copy(deep=True, update={"source_text": source})
+            component.model_copy(
+                deep=True,
+                update={
+                    "source_text": azure_pricing_relevant_source(source),
+                    "original_source_text": source,
+                },
+            )
         )
         revised.service = component.service
         revised.product_identity = component.product_identity
         revised.calculator_service_name = component.calculator_service_name
-        revised.source_text = source
+        revised.source_text = azure_pricing_relevant_source(source)
+        revised.original_source_text = source
         return revised
 
     async def _inventory(self, text: str) -> list[ServiceRequirement]:
@@ -436,6 +491,9 @@ class AzureIntentParser:
 这是一个完全隔离的单组件识别任务。只能读取当前组件原文，不得增加其他组件。
 service 必须是稳定 Azure 标识；不得输出 AWS 字段。客户明确写出的 SKU 原样放入
 requirements.requested_sku；没有写 SKU 时不得编造。区域使用 armRegionName。
+先执行价格字段清洗：联系人、公司、项目背景、交付说明、备注和用途描述不得进入
+结构化报价字段；SKU/型号、区域、数量、vCPU、内存、操作系统、容量、性能层级、
+流量、请求量、运行时长和购买方式均会影响选型或价格，必须完整保留。
 只能填写固定模板中存在的字段，原文没有的字段保持 null。
 返回严格 JSON：
 {{"component":{json.dumps(template, ensure_ascii=False)}}}
@@ -473,6 +531,9 @@ requirements.requested_sku；没有写 SKU 时不得编造。区域使用 armReg
                     service, str(value.get("calculator_service_name") or "Microsoft Azure")
                 )
                 value["source_text"] = component.source_text
+                value["original_source_text"] = (
+                    component.original_source_text or component.source_text
+                )
                 value["query_action"] = None
                 # AI fixed templates use null for absent customer facts; the
                 # execution model uses concrete safe defaults for these fields.
@@ -531,7 +592,7 @@ requirements.requested_sku；没有写 SKU 时不得编造。区域使用 armReg
     def _reconcile_explicit_sku(component: ServiceRequirement) -> None:
         """Preserve literal Azure SKUs exactly as the AWS literal guards do."""
 
-        source = component.source_text
+        source = component.original_source_text or component.source_text
         pattern = None
         if component.service == "azure_vm":
             pattern = r"\bStandard_[A-Za-z0-9_]+\b"

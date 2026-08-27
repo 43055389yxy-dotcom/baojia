@@ -5,6 +5,7 @@ from typing import Any
 
 from app.core.errors import ManualConfirmationRequired
 from app.integrations.azure_catalog import AzureOfficialCatalog
+from app.integrations.azure_product_registry import AzureProductRegistry
 
 
 def _service_candidates(service_key: str, display_name: str) -> list[str]:
@@ -37,8 +38,13 @@ def _profile_fields(profile: dict[str, Any]) -> list[str]:
 class AzureAutoServiceDiscovery:
     """Build non-executable Azure component profiles from public retail metadata."""
 
-    def __init__(self, catalog: AzureOfficialCatalog):
+    def __init__(
+        self,
+        catalog: AzureOfficialCatalog,
+        product_registry: AzureProductRegistry | None = None,
+    ):
         self._catalog = catalog
+        self._product_registry = product_registry
         self._used_profiles: set[tuple[str, str, str]] = set()
 
     async def ensure_profile(
@@ -50,7 +56,20 @@ class AzureAutoServiceDiscovery:
         force_refresh: bool = False,
     ) -> dict[str, Any]:
         target_region = region or "southeastasia"
-        for service_name in _service_candidates(service_key, display_name):
+        candidates: list[str] = []
+        if self._product_registry is not None:
+            registered = self._product_registry.resolve_product(
+                service_key,
+                display_name,
+            )
+            if registered is not None:
+                official_name = str(registered.get("service_name") or "").strip()
+                if official_name:
+                    candidates.append(official_name)
+        for candidate in _service_candidates(service_key, display_name):
+            if candidate.casefold() not in {item.casefold() for item in candidates}:
+                candidates.append(candidate)
+        for service_name in candidates:
             profile = await self._catalog.sync_service_profile(
                 service_name=service_name,
                 region=target_region,
@@ -69,7 +88,37 @@ class AzureAutoServiceDiscovery:
             }
             result["prompt_text"] = self._profile_prompt(result)
             self._used_profiles.add((service_key, display_name, target_region))
+            if self._product_registry is not None:
+                self._product_registry.update_profile(result)
             return result
+        region_mismatches: list[tuple[str, list[str]]] = []
+        for service_name in candidates:
+            supported_regions = await self._catalog.service_regions(
+                service_name,
+                force_refresh=force_refresh,
+            )
+            if supported_regions and target_region not in supported_regions:
+                region_mismatches.append((service_name, supported_regions))
+        if region_mismatches:
+            service_name, supported_regions = min(
+                region_mismatches,
+                key=lambda item: len(item[1]),
+            )
+            if self._product_registry is not None:
+                self._product_registry.register_identity(
+                    service_key=service_key,
+                    display_name=display_name,
+                    service_name=service_name,
+                    regions=supported_regions,
+                )
+            raise ManualConfirmationRequired(
+                f"{display_name} 在当前 Azure 区域不可用，请选择 Microsoft 官方支持区域。",
+                code="azure_service_region_not_supported",
+                service=service_key,
+                service_name=service_name,
+                requested_region=target_region,
+                supported_regions=supported_regions,
+            )
         raise ManualConfirmationRequired(
             "Microsoft 官方零售目录暂时无法唯一匹配这个 Azure 新组件",
             code="azure_auto_discovery_service_not_found",
@@ -93,6 +142,25 @@ class AzureAutoServiceDiscovery:
             except Exception:
                 failed += 1
         return {"refreshed": refreshed, "failed": failed}
+
+    async def refresh_registered_profiles(self) -> dict[str, int]:
+        """Refresh persisted dynamic profiles after process restarts."""
+
+        if self._product_registry is None:
+            return await self.refresh_used_profiles()
+        for product in self._product_registry.list_products():
+            template = product.get("field_template") or {}
+            region = str(template.get("region") or "").strip()
+            if not region:
+                continue
+            self._used_profiles.add(
+                (
+                    str(product["service_key"]),
+                    str(product["display_name"]),
+                    region,
+                )
+            )
+        return await self.refresh_used_profiles()
 
     @staticmethod
     def _profile_prompt(profile: dict[str, Any]) -> str:

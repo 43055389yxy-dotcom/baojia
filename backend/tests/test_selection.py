@@ -631,7 +631,8 @@ def test_ec2_replacement_picker_keeps_smaller_official_shapes(
         "ap-southeast-1",
     )
 
-    assert preview.requires_confirmation is True
+    assert preview.requires_confirmation is False
+    assert preview.selected_model in {"m7g.2xlarge", "m7i.2xlarge"}
     assert {option.specifications["vCPU"] for option in preview.candidates} == {
         2.0,
         4.0,
@@ -964,7 +965,7 @@ def test_redis_preview_without_model_or_capacity_requires_catalog_choice(
     ]
 
 
-def test_redis_shape_without_exact_official_size_requires_customer_choice(
+def test_redis_shape_without_exact_official_size_uses_non_underprovisioned_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plugin = RedisPlugin(None, None)  # type: ignore[arg-type]
@@ -984,11 +985,9 @@ def test_redis_shape_without_exact_official_size_requires_customer_choice(
         "ap-southeast-1",
     )
 
-    assert preview.selected_model is None
-    assert preview.requires_confirmation is True
-    assert all(option.is_default is False for option in preview.candidates)
-    assert "客户需要 Redis 每节点约 8G" in (preview.confirmation_reason or "")
-    assert "当前区域支持的配置" in (preview.confirmation_reason or "")
+    assert preview.selected_model == "cache.r6g.large"
+    assert preview.requires_confirmation is False
+    assert preview.confirmation_reason is None
 
 
 def test_redis_exact_memory_with_multiple_models_does_not_ask_again(

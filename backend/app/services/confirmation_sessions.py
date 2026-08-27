@@ -9,9 +9,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
 
-from app.domain.customer_configuration import preserve_customer_configuration
 from app.domain.component_hierarchy import component_hierarchy
 from app.domain.component_integrity import ensure_component_keys
+from app.domain.customer_configuration import preserve_customer_configuration
 from app.domain.models import (
     ConfigurationReviewItem,
     ConfirmationItem,
@@ -23,6 +23,7 @@ from app.domain.pricing_issues import (
     PricingIssueCategory,
     classify_persisted_pricing_issue,
     legacy_pricing_issue_message,
+    should_retry_persisted_pricing_issue,
 )
 from app.integrations.service_templates import billing_dimension_fields
 
@@ -107,11 +108,28 @@ class ConfirmationSessionStore:
         reason = str(requirements.get("_quote_skip_reason") or "")
         if not reason:
             return None
+        category = cls._pricing_issue_category(item)
+        retryable = category is not None and should_retry_persisted_pricing_issue(
+            reason=reason,
+            category=category,
+            code=str(requirements.get("_quote_skip_code") or ""),
+            service=str(getattr(item, "service", "")),
+            requirements=requirements,
+        )
+        # Catalog refreshes, transient lookups and system configuration are
+        # sales-side operational details. They must never leak into a customer
+        # confirmation page. A new link is publication-gated before reaching
+        # this point; returning None also protects already-issued legacy links.
+        if retryable or category in {
+            "catalog_mapping",
+            "system_configuration",
+            "unsupported",
+        }:
+            return None
         if requirements.get("_quote_skip_category") or requirements.get(
             "_quote_skip_code"
         ):
             return reason
-        category = cls._pricing_issue_category(item)
         if category is None:
             return reason
         return legacy_pricing_issue_message(
@@ -234,7 +252,10 @@ class ConfirmationSessionStore:
                     customer_summary,
                     intent.model_dump_json(),
                     confirmation_text,
-                    json.dumps([item.model_dump(mode="json") for item in items], ensure_ascii=False),
+                    json.dumps(
+                        [item.model_dump(mode="json") for item in items],
+                        ensure_ascii=False,
+                    ),
                     now,
                     json.dumps(asked_questions, ensure_ascii=False),
                     quote_request.model_dump_json() if quote_request is not None else "{}",
@@ -274,7 +295,25 @@ class ConfirmationSessionStore:
             # they are displayed or edited.
             from app.integrations.deepseek import DeepSeekIntentParser
 
+            numbered_blocks = DeepSeekIntentParser._numbered_requirement_blocks(
+                str(row["customer_request"])
+            )
+            top_level_components = [
+                item for item in intent.services if not item.derived_from_service
+            ]
+            if len(numbered_blocks) > len(top_level_components):
+                # Upgrade older drafts created when identical numbered rows
+                # were collapsed. The original request remains the source of
+                # truth, so each missing sales boundary can be restored without
+                # asking the customer to enter the same server again.
+                DeepSeekIntentParser._reconcile_explicit_component_inventory(
+                    str(row["customer_request"]), intent
+                )
+                DeepSeekIntentParser._reconcile_explicit_regions(
+                    str(row["customer_request"]), intent
+                )
             preserve_customer_configuration(intent)
+            DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
             DeepSeekIntentParser._split_eks_worker_nodes(intent)
             self._normalize_review_group_quantities(intent)
             normalized_intent_json = intent.model_dump_json()
@@ -472,15 +511,21 @@ class ConfirmationSessionStore:
             for item in json.loads(str(row["items_json"]))
             if isinstance(item, dict) and item.get("question")
         ]
+        visible_question_counts: dict[str, int] = {}
+        for item in items:
+            question = str(item["question"])
+            visible_question_counts[question] = visible_question_counts.get(question, 0) + 1
         # New pages submit the opaque answer_key. Continue accepting the old
-        # question-text key for confirmation links created before this change.
+        # question-text key when that visible question is unique. Duplicate
+        # visible questions must use their per-component key to avoid answers
+        # leaking from one component into another.
         cleaned: dict[str, str] = {}
         missing = 0
         for item in items:
             question = str(item["question"])
             answer_key = str(item.get("answer_key") or question)
             raw_answer = answers.get(answer_key)
-            if raw_answer is None and answer_key == question:
+            if raw_answer is None and visible_question_counts.get(question) == 1:
                 raw_answer = answers.get(question)
             answer = str(raw_answer or "").strip()
             if not answer:
@@ -529,7 +574,8 @@ class ConfirmationSessionStore:
                 """
                 UPDATE confirmation_sessions
                 SET status = 'completed'
-                WHERE draft_id = ? AND status IN ('submitted', 'reviewing', 'processing', 'approved')
+                WHERE draft_id = ?
+                  AND status IN ('submitted', 'reviewing', 'processing', 'approved')
                 """,
                 (draft_id,),
             )
@@ -640,6 +686,7 @@ class ConfirmationSessionStore:
             from app.integrations.deepseek import DeepSeekIntentParser
 
             preserve_customer_configuration(intent)
+            DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
             DeepSeekIntentParser._split_eks_worker_nodes(intent)
             with self._lock, self._connect() as connection:
                 connection.execute(
@@ -729,7 +776,8 @@ class ConfirmationSessionStore:
     def restore_draft(self, draft_id: str) -> tuple[str, ParsedIntent] | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT customer_request, intent_json FROM confirmation_sessions WHERE draft_id = ?",
+                "SELECT customer_request, intent_json "
+                "FROM confirmation_sessions WHERE draft_id = ?",
                 (draft_id,),
             ).fetchone()
         if row is None:
@@ -739,6 +787,7 @@ class ConfirmationSessionStore:
             from app.integrations.deepseek import DeepSeekIntentParser
 
             preserve_customer_configuration(intent)
+            DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
             DeepSeekIntentParser._split_eks_worker_nodes(intent)
         return str(row["customer_request"]), intent
 

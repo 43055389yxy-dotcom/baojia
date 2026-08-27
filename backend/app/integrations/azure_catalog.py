@@ -9,6 +9,7 @@ import httpx
 
 from app.core.config import Settings
 from app.core.errors import QuoteError
+from app.integrations.azure_bulk_cache import AzureBulkRetailCache
 from app.integrations.azure_cache import PersistentAzureCache
 
 RETAIL_ENDPOINT = "https://prices.azure.com/api/retail/prices"
@@ -21,12 +22,18 @@ class AzureOfficialCatalog:
         self,
         settings: Settings,
         persistent_cache: PersistentAzureCache | None = None,
+        bulk_cache: AzureBulkRetailCache | None = None,
     ):
         self._settings = settings
         self._persistent = persistent_cache or PersistentAzureCache()
+        self._bulk = bulk_cache
         self._retail_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._sku_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._token: tuple[float, str] | None = None
+
+    @property
+    def account_configured(self) -> bool:
+        return self._settings.azure_account_configured
 
     async def retail_items(
         self,
@@ -44,8 +51,31 @@ class AzureOfficialCatalog:
         filter_text = " and ".join(filters)
         cache_key = filter_text.casefold()
         cached = self._retail_cache.get(cache_key)
-        if not force_refresh and cached and cached[0] > time.monotonic():
+        # An empty result cached before the complete bulk snapshot was
+        # published must never hide rows that now exist locally. Non-empty
+        # results remain safe to reuse; empty results are rechecked against the
+        # atomic snapshot whenever it is available.
+        bulk_ready = self._bulk is not None and self._bulk.is_ready()
+        if (
+            not force_refresh
+            and cached
+            and cached[0] > time.monotonic()
+            and (bool(cached[1]) or not bulk_ready)
+        ):
             return [dict(item) for item in cached[1]]
+        if not force_refresh and self._bulk is not None:
+            bulk_rows = await asyncio.to_thread(
+                self._bulk.retail_items,
+                service_name=service_name,
+                region=region,
+                arm_sku_name=arm_sku_name,
+            )
+            if bulk_rows is not None:
+                self._retail_cache[cache_key] = (
+                    time.monotonic() + 3600,
+                    bulk_rows,
+                )
+                return [dict(item) for item in bulk_rows]
         persistent_key = self._persistent.key("retail-v1", filter_text)
         persistent = await asyncio.to_thread(self._persistent.get, persistent_key)
         if not force_refresh and isinstance(persistent, list):
@@ -187,10 +217,60 @@ class AzureOfficialCatalog:
         )
         return profile
 
+    async def service_regions(
+        self,
+        service_name: str,
+        *,
+        force_refresh: bool = False,
+    ) -> list[str]:
+        """Return regions that actually contain retail rows for one Azure service."""
+
+        key = self._persistent.key("service-regions-v1", service_name)
+        if not force_refresh:
+            # A published complete snapshot is authoritative. Older per-service
+            # caches may have been created from a partial query.
+            if self._bulk is not None:
+                bulk_regions = await asyncio.to_thread(
+                    self._bulk.service_regions,
+                    service_name,
+                )
+                if bulk_regions is not None:
+                    return bulk_regions
+            cached = await asyncio.to_thread(self._persistent.get, key)
+            if isinstance(cached, list):
+                return sorted({str(item) for item in cached if str(item).strip()})
+        rows = await self.retail_items(
+            service_name=service_name,
+            region=None,
+            force_refresh=force_refresh,
+        )
+        regions = sorted(
+            {
+                str(row.get("armRegionName") or "").strip()
+                for row in rows
+                if str(row.get("armRegionName") or "").strip()
+                and str(row.get("armRegionName") or "").casefold() != "global"
+            }
+        )
+        await asyncio.to_thread(
+            self._persistent.set,
+            key,
+            regions,
+            ttl_seconds=24 * 60 * 60,
+        )
+        return regions
+
     async def available_regions(self) -> list[dict[str, str]]:
         """Return current public Azure regions with retail VM availability."""
 
         key = self._persistent.key("available-regions-v1", "commercial-cloud")
+        if self._bulk is not None:
+            bulk_options = await asyncio.to_thread(
+                self._bulk.service_region_options,
+                "Virtual Machines",
+            )
+            if bulk_options is not None:
+                return bulk_options
         cached = await asyncio.to_thread(self._persistent.get, key)
         if isinstance(cached, list):
             return [dict(item) for item in cached if isinstance(item, dict)]
@@ -222,11 +302,7 @@ class AzureOfficialCatalog:
     ) -> dict[str, Any]:
         def values(field: str, limit: int = 200) -> list[str]:
             return sorted(
-                {
-                    str(row.get(field)).strip()
-                    for row in rows
-                    if str(row.get(field) or "").strip()
-                }
+                {str(row.get(field)).strip() for row in rows if str(row.get(field) or "").strip()}
             )[:limit]
 
         return {

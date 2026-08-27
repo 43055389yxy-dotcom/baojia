@@ -42,9 +42,7 @@ def test_structured_storage_edit_clears_old_reference_default() -> None:
         },
     )
 
-    revised = apply_component_update(
-        original, {"requirements": {"storage_gib": 20480}}
-    )
+    revised = apply_component_update(original, {"requirements": {"storage_gib": 20480}})
 
     assert revised.requirements["storage_gib"] == 20480
     assert "reference_unit_only" not in revised.requirements
@@ -64,9 +62,7 @@ def test_structured_edit_only_changes_targeted_fields() -> None:
         },
     )
 
-    revised = apply_component_update(
-        original, {"requirements": {"storage_gib": 10240}}
-    )
+    revised = apply_component_update(original, {"requirements": {"storage_gib": 10240}})
 
     assert revised.region == original.region
     assert revised.quantity == original.quantity
@@ -86,9 +82,7 @@ def test_rds_engine_version_edit_reselects_model_and_stays_customer_confirmed() 
         },
     )
 
-    revised = apply_component_update(
-        original, {"requirements": {"engine_version": "8.4.11"}}
-    )
+    revised = apply_component_update(original, {"requirements": {"engine_version": "8.4.11"}})
 
     assert revised.requirements["engine_version"] == "8.4.11"
     assert "requested_model" not in revised.requirements
@@ -113,9 +107,7 @@ def test_catalog_compatibility_edit_clears_stale_model_for_every_service() -> No
             },
         )
 
-        revised = apply_component_update(
-            original, {"requirements": {field: value}}
-        )
+        revised = apply_component_update(original, {"requirements": {field: value}})
 
         assert "requested_model" not in revised.requirements
         assert "_review_selected_model" not in revised.requirements
@@ -138,6 +130,32 @@ def test_region_edit_clears_model_selected_in_another_region() -> None:
     assert revised.region == "ap-northeast-1"
     assert "requested_model" not in revised.requirements
     assert "_review_selected_model" not in revised.requirements
+
+
+def test_azure_shape_edit_clears_stale_sku_but_explicit_sku_is_preserved() -> None:
+    original = ServiceRequirement(
+        service="azure_vm",
+        region="southeastasia",
+        requirements={
+            "requested_sku": "Standard_D4s_v5",
+            "vcpu": 4,
+            "memory_gib": 16,
+            "_review_selected_model": "Standard_D4s_v5",
+        },
+    )
+
+    reshaped = apply_component_update(
+        original,
+        {"requirements": {"vcpu": 8, "memory_gib": 32}},
+    )
+    selected = apply_component_update(
+        original,
+        {"requirements": {"requested_sku": "Standard_E8s_v5"}},
+    )
+
+    assert "requested_sku" not in reshaped.requirements
+    assert "_review_selected_model" not in reshaped.requirements
+    assert selected.requirements["requested_sku"] == "Standard_E8s_v5"
 
 
 def test_customer_value_survives_ai_revision_even_if_ai_reuses_authoritative_source() -> None:

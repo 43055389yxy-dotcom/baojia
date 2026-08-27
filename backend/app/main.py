@@ -32,9 +32,12 @@ from app.integrations.auto_service_discovery import AutoServiceDiscovery
 from app.integrations.aws import AwsClients, PricingCatalog, RegionResolver
 from app.integrations.aws_adaptation_audit import AwsAdaptationAudit
 from app.integrations.aws_product_registry import AwsProductRegistry
+from app.integrations.azure_adaptation_audit import AzureAdaptationAudit
 from app.integrations.azure_auto_service_discovery import AzureAutoServiceDiscovery
+from app.integrations.azure_bulk_cache import AzureBulkRetailCache
 from app.integrations.azure_catalog import AzureOfficialCatalog
 from app.integrations.azure_intent import AzureIntentParser
+from app.integrations.azure_product_registry import AzureProductRegistry
 from app.integrations.azure_prompt_library import (
     azure_prompt_library_payload,
     update_azure_prompt_text,
@@ -45,7 +48,7 @@ from app.integrations.component_result_cache import ValidatedComponentResultCach
 from app.integrations.deepseek import DeepSeekIntentParser
 from app.integrations.ec2_calculator_capabilities import EC2_CALCULATOR_CAPABILITIES
 from app.integrations.prompt_library import prompt_library_payload, update_prompt_text
-from app.services.azure_plugins import AzurePluginRegistry
+from app.services.azure_plugins import AZURE_RETAIL_SERVICE_NAMES, AzurePluginRegistry
 from app.services.azure_quote_service import AzureQuoteService
 from app.services.bcm_estimator import BcmWorkloadEstimator
 from app.services.confirmation_sessions import ConfirmationSessionStore
@@ -132,8 +135,14 @@ quote_service = QuoteService(
     GenericOfficialPlugin(clients, catalog, auto_service_discovery),
 )
 quote_jobs = QuoteJobManager(quote_service, "AWS", "aws")
-azure_catalog = AzureOfficialCatalog(settings)
-azure_auto_service_discovery = AzureAutoServiceDiscovery(azure_catalog)
+azure_bulk_cache = AzureBulkRetailCache()
+azure_catalog = AzureOfficialCatalog(settings, bulk_cache=azure_bulk_cache)
+azure_product_registry = AzureProductRegistry()
+azure_adaptation_audit = AzureAdaptationAudit(azure_product_registry)
+azure_auto_service_discovery = AzureAutoServiceDiscovery(
+    azure_catalog,
+    azure_product_registry,
+)
 azure_component_cache = ValidatedComponentResultCache(
     Path(__file__).resolve().parents[1]
     / ".cache"
@@ -146,12 +155,20 @@ azure_quote_service = AzureQuoteService(
         settings.ai_model,
         azure_auto_service_discovery,
     ),
-    AzurePluginRegistry(azure_catalog, azure_auto_service_discovery),
+    AzurePluginRegistry(
+        azure_catalog,
+        azure_auto_service_discovery,
+        azure_product_registry,
+    ),
     azure_confirmation_sessions,
     settings.ai_display_name,
 )
 azure_quote_jobs = QuoteJobManager(azure_quote_service, "Microsoft Azure", "azure")
-azure_catalog_warmer = AzureCatalogWarmer(azure_catalog)
+azure_catalog_warmer = AzureCatalogWarmer(
+    azure_catalog,
+    azure_product_registry,
+    AZURE_RETAIL_SERVICE_NAMES,
+)
 # Keep background prewarming on separate boto3 clients. This prevents its
 # adaptive retry state and HTTP connection pool from delaying foreground quotes.
 warmup_clients = AwsClients.from_settings(settings)
@@ -213,6 +230,28 @@ async def warm_common_aws_catalogs() -> None:
 
     asyncio.create_task(delayed_azure_warmup())
 
+    async def maintain_complete_azure_catalog() -> None:
+        await asyncio.sleep(5)
+        while True:
+            try:
+                snapshot = await azure_bulk_cache.sync()
+                registry_result = await asyncio.to_thread(
+                    azure_product_registry.sync_official_services,
+                    azure_bulk_cache.services(),
+                )
+                logger.info(
+                    "Azure complete retail snapshot: snapshot=%s registry=%s",
+                    snapshot,
+                    registry_result,
+                )
+            except Exception:
+                logger.exception("Azure complete retail snapshot synchronization failed")
+            await asyncio.sleep(6 * 60 * 60)
+
+    app.state.azure_bulk_sync_task = asyncio.create_task(
+        maintain_complete_azure_catalog()
+    )
+
     async def maintain_official_field_profiles() -> None:
         # Scan periodically, but only refresh rows older than ten days (or
         # failed rows whose shorter retry window has elapsed). Quoting remains
@@ -226,7 +265,9 @@ async def warm_common_aws_catalogs() -> None:
                 if result["refreshed"] or result["failed"]:
                     logger.info("Official field profile maintenance: %s", result)
                 await azure_catalog_warmer.warm(refresh_profiles=True)
-                dynamic_result = await azure_auto_service_discovery.refresh_used_profiles()
+                dynamic_result = (
+                    await azure_auto_service_discovery.refresh_registered_profiles()
+                )
                 logger.info(
                     "Azure official field profile maintenance: fixed=%s dynamic=%s",
                     azure_catalog_warmer.status.as_dict(),
@@ -243,8 +284,13 @@ async def warm_common_aws_catalogs() -> None:
 
 @app.on_event("shutdown")
 async def stop_official_field_profile_maintenance() -> None:
-    task = getattr(app.state, "official_field_maintenance_task", None)
-    if task is not None:
+    tasks = [
+        getattr(app.state, "official_field_maintenance_task", None),
+        getattr(app.state, "azure_bulk_sync_task", None),
+    ]
+    for task in tasks:
+        if task is None:
+            continue
         task.cancel()
         try:
             await task
@@ -342,6 +388,23 @@ async def get_aws_product_registry(details: bool = False) -> dict[str, Any]:
     return payload
 
 
+@app.get("/api/azure-product-registry")
+async def get_azure_product_registry(details: bool = False) -> dict[str, Any]:
+    """Expose the Azure-only adaptation registry without touching AWS data."""
+
+    payload: dict[str, Any] = {
+        "coverage": azure_product_registry.coverage(),
+        "adaptationAudit": azure_adaptation_audit.report(),
+        "catalogSource": "Microsoft Azure Retail Prices",
+        "componentIsolation": "region-only inheritance",
+        "providerBoundary": "azure-only; AWS data access forbidden",
+        "bulkCatalog": azure_bulk_cache.status(),
+    }
+    if details:
+        payload["products"] = azure_product_registry.list_products()
+    return payload
+
+
 class PromptUpdate(BaseModel):
     content: str = Field(min_length=1, max_length=50000)
 
@@ -373,7 +436,11 @@ async def update_prompt_library_item(key: str, request: PromptUpdate, provider: 
 async def cache_status() -> dict[str, object]:
     return {
         "aws": catalog_warmer.status.as_dict(),
-        "azure": azure_catalog_warmer.status.as_dict(),
+        "azure": {
+            **azure_catalog_warmer.status.as_dict(),
+            "productRegistry": azure_product_registry.coverage(),
+            "bulkCatalog": azure_bulk_cache.status(),
+        },
     }
 
 
@@ -448,7 +515,7 @@ AWS_SALES_REGION_PRIORITY = (
 )
 
 
-def _sales_region_options() -> list[dict[str, str]]:
+def _aws_sales_region_options() -> list[dict[str, str]]:
     official = DeepSeekIntentParser.official_aws_region_labels()
     return [
         {
@@ -484,17 +551,44 @@ async def sales_region_preflight(
     """Resolve AWS regions before starting AI/component catalog work."""
 
     result = await quote_service.identify_sales_region(request.customer_request)
+    official_regions = set(DeepSeekIntentParser.official_aws_region_labels())
     detected = [
         str(region)
         for region in result.get("regions", [])
-        if isinstance(region, str)
+        if isinstance(region, str) and str(region) in official_regions
     ]
     requires_confirmation = bool(result.get("requires_confirmation")) or not detected
     return SalesRegionPreflightResponse(
         detected_regions=detected,
         selected_region=detected[0] if len(detected) == 1 else None,
         requires_confirmation=requires_confirmation,
-        options=_sales_region_options() if requires_confirmation else [],
+        options=_aws_sales_region_options() if requires_confirmation else [],
+    )
+
+
+@app.post(
+    "/api/azure/quotes/region-preflight",
+    response_model=SalesRegionPreflightResponse,
+)
+async def azure_sales_region_preflight(
+    request: SalesRegionPreflightRequest,
+) -> SalesRegionPreflightResponse:
+    """Resolve the Azure-wide region before any component AI or pricing work."""
+
+    result = await azure_quote_service.identify_sales_region(request.customer_request)
+    detected = [str(region) for region in result.get("regions", []) if isinstance(region, str)]
+    requires_confirmation = bool(result.get("requires_confirmation")) or len(detected) != 1
+    raw_options = result.get("options", [])
+    options = [
+        {"code": str(code), "label": str(label)}
+        for code, label in raw_options
+        if str(code).strip() and str(label).strip()
+    ]
+    return SalesRegionPreflightResponse(
+        detected_regions=detected,
+        selected_region=detected[0] if len(detected) == 1 else None,
+        requires_confirmation=requires_confirmation,
+        options=options if requires_confirmation else [],
     )
 
 
@@ -527,13 +621,20 @@ async def get_confirmation_session(token: str) -> ConfirmationSessionResponse | 
         if hydrated.confirmation_items != session.confirmation_items:
             store.replace_pending_confirmation_items(token, hydrated.confirmation_items)
             session = hydrated
-    if store.cloud_provider == "aws":
-        reprocess_request = store.begin_configuration_reprocessing(token)
-        if reprocess_request is not None:
+    elif store.cloud_provider == "azure" and session.status == "pending":
+        polished = azure_quote_service.professionalize_confirmation_session(session)
+        if polished.confirmation_items != session.confirmation_items:
+            store.replace_pending_confirmation_items(token, polished.confirmation_items)
+        session = polished
+    reprocess_request = store.begin_configuration_reprocessing(token)
+    if reprocess_request is not None:
+        if store.cloud_provider == "azure":
+            azure_quote_jobs.start_preview(reprocess_request)
+        else:
             quote_jobs.start_preview(reprocess_request)
-            refreshed = store.get(token)
-            if refreshed is not None:
-                session = refreshed
+        refreshed = store.get(token)
+        if refreshed is not None:
+            session = refreshed
     return session
 
 
@@ -585,6 +686,34 @@ async def get_aws_configuration_field_options(
     }
 
 
+class AzureConfigurationOptionsRequest(BaseModel):
+    service: str = Field(min_length=2, max_length=120, pattern=r"^[a-z0-9_\-]+$")
+    region: str = Field(min_length=2, max_length=64)
+    requirements: dict[str, Any] = Field(default_factory=dict)
+
+
+@app.post("/api/azure/configuration-field-options")
+async def get_azure_configuration_field_options(
+    request: AzureConfigurationOptionsRequest,
+) -> dict[str, Any]:
+    """Return provider-isolated Azure choices from the local official snapshot."""
+
+    requirement = ServiceRequirement(
+        service=request.service,
+        region=request.region,
+        requirements=request.requirements,
+    )
+    try:
+        payload = await asyncio.wait_for(
+            azure_quote_service.configuration_field_options(requirement),
+            timeout=10,
+        )
+    except Exception:
+        logger.exception("Could not load Azure configuration field options")
+        return {"options": {}, "shapes": [], "source": "unavailable"}
+    return payload if isinstance(payload, dict) else {"options": {}, "shapes": []}
+
+
 @app.post(
     "/api/confirmation-sessions/{token}",
     response_model=ConfirmationSessionResponse,
@@ -601,13 +730,15 @@ async def submit_confirmation_session(
         return JSONResponse(status_code=422, content={"message": str(exc)})
     if session is None:
         return JSONResponse(status_code=404, content={"message": "确认单不存在或已失效"})
-    if store.cloud_provider == "aws":
-        reprocess_request = store.begin_configuration_reprocessing(token)
-        if reprocess_request is not None:
+    reprocess_request = store.begin_configuration_reprocessing(token)
+    if reprocess_request is not None:
+        if store.cloud_provider == "azure":
+            azure_quote_jobs.start_preview(reprocess_request)
+        else:
             quote_jobs.start_preview(reprocess_request)
-            refreshed = store.get(token)
-            if refreshed is not None:
-                session = refreshed
+        refreshed = store.get(token)
+        if refreshed is not None:
+            session = refreshed
     return session
 
 
@@ -651,13 +782,15 @@ async def submit_configuration_feedback(
         return JSONResponse(status_code=409, content={"message": str(exc)})
     if session is None:
         return JSONResponse(status_code=404, content={"message": "确认单不存在或已失效"})
-    if store.cloud_provider == "aws":
-        reprocess_request = store.begin_configuration_reprocessing(token)
-        if reprocess_request is not None:
+    reprocess_request = store.begin_configuration_reprocessing(token)
+    if reprocess_request is not None:
+        if store.cloud_provider == "azure":
+            azure_quote_jobs.start_preview(reprocess_request)
+        else:
             quote_jobs.start_preview(reprocess_request)
-            refreshed = store.get(token)
-            if refreshed is not None:
-                session = refreshed
+        refreshed = store.get(token)
+        if refreshed is not None:
+            session = refreshed
     return session
 
 

@@ -16,7 +16,12 @@ PRODUCT_REGISTRY_SCHEMA_VERSION = 2
 
 
 def _service_key(service_code: str) -> str:
-    value = re.sub(r"(?<!^)(?=[A-Z])", "_", service_code).casefold()
+    # Split a CamelCase service code without splitting every letter in an
+    # acronym.  The old expression turned AmazonEC2 into ``e_c2`` and
+    # AmazonMQ into ``m_q``; that made the complete official catalog unusable
+    # as an identity source for customer-facing names.
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", service_code)
+    value = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", value).casefold()
     value = re.sub(r"[^a-z0-9]+", "_", value).strip("_")
     for prefix in ("amazon_", "aws_"):
         if value.startswith(prefix):
@@ -25,7 +30,8 @@ def _service_key(service_code: str) -> str:
 
 
 def _aliases(service_code: str) -> list[str]:
-    spaced = re.sub(r"(?<!^)(?=[A-Z])", " ", service_code).strip()
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", service_code)
+    spaced = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", spaced).strip()
     stripped = re.sub(r"^(Amazon|AWS)\s*", "", spaced, flags=re.IGNORECASE).strip()
     values = {
         service_code,
@@ -39,6 +45,30 @@ def _aliases(service_code: str) -> list[str]:
 
 def _canonical(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.casefold())
+
+
+def _identity_targets(value: str) -> set[str]:
+    """Return exact, identity-safe variants of one customer product label.
+
+    AWS sometimes keeps a marketing version in the public product name while
+    the Price List service code omits it (``Amazon AppStream 2.0`` versus
+    ``AmazonAppStream``).  Removing only a terminal numeric version preserves
+    exact product matching without introducing fuzzy or substring guesses.
+    """
+
+    compact = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not compact:
+        return set()
+    variants = {_canonical(compact)}
+    without_terminal_version = re.sub(
+        r"(?:\s+|[-_])v?\d+(?:\.\d+)*(?:\s*)$",
+        "",
+        compact,
+        flags=re.IGNORECASE,
+    ).strip()
+    if without_terminal_version and without_terminal_version != compact:
+        variants.add(_canonical(without_terminal_version))
+    return {variant for variant in variants if variant}
 
 
 class AwsProductRegistry:
@@ -108,6 +138,33 @@ class AwsProductRegistry:
                 connection.execute(
                     "ALTER TABLE aws_product_registry ADD COLUMN "
                     "policy_json TEXT NOT NULL DEFAULT '{}'"
+                )
+            # Repair identities created by older releases in place.  This is
+            # metadata-only and does not touch offers, prices or customer
+            # sessions.  It lets the local catalog immediately recognize all
+            # existing official services without waiting for a network sync.
+            rows = connection.execute(
+                "SELECT service_code, aliases_json FROM aws_product_registry"
+            ).fetchall()
+            for row in rows:
+                service_code = str(row["service_code"])
+                try:
+                    aliases = {
+                        str(value)
+                        for value in json.loads(str(row["aliases_json"]))
+                        if str(value).strip()
+                    }
+                except (TypeError, json.JSONDecodeError):
+                    aliases = set()
+                aliases.update(_aliases(service_code))
+                connection.execute(
+                    "UPDATE aws_product_registry SET service_key = ?, aliases_json = ? "
+                    "WHERE service_code = ?",
+                    (
+                        _service_key(service_code),
+                        json.dumps(sorted(aliases), ensure_ascii=False),
+                        service_code,
+                    ),
                 )
 
     def sync(self, *, refresh: bool = False) -> dict[str, Any]:
@@ -382,20 +439,38 @@ class AwsProductRegistry:
             )
         return result
 
-    def resolve_service_code(self, *labels: str) -> str | None:
-        targets = {_canonical(label) for label in labels if _canonical(label)}
+    def resolve_product(self, *labels: str) -> dict[str, Any] | None:
+        """Resolve one exact official product identity from customer labels.
+
+        This deliberately performs identity matching only.  It never guesses
+        a product by price, capacity or a fuzzy nearest name, so a third-party
+        workload cannot be silently converted into an unrelated AWS service.
+        """
+
+        targets = {
+            target
+            for label in labels
+            for target in _identity_targets(label)
+        }
         if not targets:
             return None
-        matches: set[str] = set()
+        matches: list[dict[str, Any]] = []
         for product in self.list_products():
+            if str(product.get("identity_status") or "") != "official":
+                continue
             identities = {
                 _canonical(str(product["service_code"])),
                 _canonical(str(product["service_key"])),
+                _canonical(str(product["display_name"])),
                 *(_canonical(str(alias)) for alias in product["aliases"]),
             }
             if identities & targets:
-                matches.add(str(product["service_code"]))
-        return next(iter(matches)) if len(matches) == 1 else None
+                matches.append(product)
+        return matches[0] if len(matches) == 1 else None
+
+    def resolve_service_code(self, *labels: str) -> str | None:
+        product = self.resolve_product(*labels)
+        return str(product["service_code"]) if product is not None else None
 
     def coverage(self) -> dict[str, Any]:
         products = self.list_products()

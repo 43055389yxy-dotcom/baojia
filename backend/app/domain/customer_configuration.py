@@ -7,6 +7,7 @@ from app.domain.component_integrity import (
     enforce_component_integrity,
     ensure_component_keys,
 )
+from app.domain.customer_facts import explicit_requested_model, record_customer_fact_metadata
 from app.domain.models import ParsedIntent, ServiceRequirement
 from app.integrations.service_templates import requirement_fields
 
@@ -74,6 +75,43 @@ _FSX_TYPE_NAMES = {
 }
 
 
+def aurora_cluster_member_count(source: str) -> tuple[int, str] | None:
+    """Read an Aurora member count without mistaking per-node CPU for topology.
+
+    A bare expression such as ``节点8`` is unsafe because it also occurs in
+    ``单节点8核``. Cluster size is accepted only when the wording states a
+    count/total, puts the number before the resource noun, or gives a primary
+    plus reader topology. Every cleanup layer shares this parser.
+    """
+
+    text = str(source or "")
+    explicit_patterns = (
+        r"(?:数据库实例|实例|节点)(?:数量|数|总数)\s*[:：]?\s*(\d+)",
+        r"(?:共|总共|合计)\s*(\d+)\s*(?:个|台)?\s*(?:数据库实例|实例|节点)",
+        r"(?<![\w.])(\d+)\s*(?:个|台)\s*(?:数据库实例|实例|数据库节点|节点)",
+    )
+    for pattern in explicit_patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            return max(int(match.group(1)), 1), match.group(0)
+
+    primary = re.search(
+        r"(?<![\w.])(\d+)\s*(?:个|台)?\s*(?:主|写|writer)(?:节点|实例|库|node)?",
+        text,
+        re.I,
+    )
+    readers = re.search(
+        r"(?<![\w.])(\d+)\s*(?:个|台)?\s*(?:只读|读|从|reader)(?:节点|实例|副本|库|node)?",
+        text,
+        re.I,
+    )
+    if primary and readers:
+        start = min(primary.start(), readers.start())
+        end = max(primary.end(), readers.end())
+        return max(int(primary.group(1)) + int(readers.group(1)), 1), text[start:end]
+    return None
+
+
 def _normalized(value: object) -> str:
     return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
 
@@ -103,10 +141,24 @@ def _set_customer_product_field(
         "system_cheapest_official_match",
     }:
         return
+    changed = field not in requirement.requirements or requirement.requirements.get(field) != value
     requirement.requirements[field] = value
     requirement.field_sources[path] = "customer_text"
     requirement.field_evidence[path] = evidence
     requirement.locked_fields = sorted(set(requirement.locked_fields) | {path})
+    record_customer_fact_metadata(requirement, field, evidence)
+    if changed:
+        # Official-review selections are derived from the previous pricing
+        # contract. If a literal customer fact was newly recovered or repaired,
+        # every cached candidate/model/specification is stale and must be
+        # rebuilt before pricing. This is field-agnostic and therefore protects
+        # EC2 models, WAF usage, storage, request counts and future services in
+        # exactly the same way.
+        for internal_field in tuple(requirement.requirements):
+            if internal_field.startswith("_review_") or internal_field.startswith(
+                "_quote_skip_"
+            ):
+                requirement.requirements.pop(internal_field, None)
 
 
 def _set_customer_scalar_field(
@@ -201,6 +253,14 @@ def preserve_customer_configuration(intent: ParsedIntent) -> None:
         folded = source.casefold()
         source_heading = re.split(r"[：:]", _without_sales_number(source), maxsplit=1)[0]
 
+        # A literal AWS model is a customer-owned pricing fact. Recover it for
+        # both fresh parses and old persisted drafts before any catalog choice
+        # can substitute a merely shape-compatible product.
+        model_fact = explicit_requested_model(item.service, source)
+        if model_fact:
+            model, evidence = model_fact
+            _set_customer_product_field(item, "requested_model", model, evidence)
+
         # A composite heading is a declaration of two independent products.
         # ``Public-VPC`` in the explanation is only the network they protect;
         # it must not turn the whole WAF + ALB row into a VPC.  This also
@@ -228,7 +288,6 @@ def preserve_customer_configuration(intent: ParsedIntent) -> None:
                 }:
                     item.requirements.pop(field, None)
             _set_customer_product_field(item, "web_acls", item.quantity, "WAF 数量")
-            _set_customer_product_field(item, "rules", item.quantity, "WAF 基础规则")
 
         # ``数量`` is the customer's component count. It is independent from
         # product-specific dimensions such as RDS cluster members and must not
@@ -251,9 +310,55 @@ def preserve_customer_configuration(intent: ParsedIntent) -> None:
                 _set_customer_product_field(
                     item, "web_acls", explicit_quantity, quantity_match.group(0).strip()
                 )
-                if item.requirements.get("rules") in {None, 1}:
+
+        if service_key in {"waf", "awswaf"}:
+            # Quantity, rules per ACL and requests per ACL are three different
+            # billable dimensions. Parse each punctuation-delimited clause so
+            # the number 2 in ``数量2`` can never become ``规则2`` and the
+            # ``每个 Web ACL`` scope survives through pricing.
+            clauses = [
+                clause.strip()
+                for clause in re.split(r"[，,；;\n]", source)
+                if clause.strip()
+            ]
+            for clause in clauses:
+                acl_match = re.search(
+                    r"(?<![a-z0-9.])(\d+)\s*(?:个|套)?\s*web\s*acls?(?![a-z])",
+                    clause,
+                    re.I,
+                )
+                if acl_match and not re.search(r"每|单", clause[: acl_match.start() + 1]):
+                    count = max(int(acl_match.group(1)), 1)
+                    _set_customer_scalar_field(item, "quantity", count, clause)
+                    _set_customer_product_field(item, "web_acls", count, clause)
+
+                rule_match = re.search(
+                    r"(?:配置|包含|设置|有)?\s*(\d+)\s*(?:条|个)?\s*规则",
+                    clause,
+                    re.I,
+                )
+                if rule_match:
                     _set_customer_product_field(
-                        item, "rules", explicit_quantity, quantity_match.group(0).strip()
+                        item, "rules", int(rule_match.group(1)), clause
+                    )
+
+                if "请求" not in clause:
+                    continue
+                request_match = re.search(
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次|个)?\s*请求",
+                    clause,
+                    re.I,
+                )
+                if request_match:
+                    multiplier = {"万": 10_000, "亿": 100_000_000}.get(
+                        request_match.group(2), 1
+                    )
+                    requests = float(request_match.group(1).replace(",", "")) * multiplier
+                    _set_customer_product_field(
+                        item,
+                        "requests",
+                        int(requests) if requests.is_integer() else requests,
+                        clause,
                     )
 
         # Preserve licensed Linux distributions. Pricing Red Hat Enterprise
@@ -272,7 +377,7 @@ def preserve_customer_configuration(intent: ParsedIntent) -> None:
             disk_match = re.search(
                 r"\d+(?:\.\d+)?\s*(?:核|c|vcpu)\s*"
                 r"\d+(?:\.\d+)?\s*(?:gib|gb|g)\s*[/＋+]\s*"
-                r"(\d+(?:\.\d+)?)\s*(gib|gb|g|tib|tb|t)\b",
+                r"(\d+(?:\.\d+)?)\s*(gib|gb|g|tib|tb|t)(?![a-z])",
                 source,
                 re.I,
             )
@@ -432,6 +537,19 @@ def preserve_customer_configuration(intent: ParsedIntent) -> None:
                 marker in folded for marker in ("redis", "valkey", "memcached")
             ):
                 _set_customer_product_field(item, "engine", engine, engine)
+            version_match = re.search(
+                r"(?:redis|valkey|memcached)(?:\s*兼容)?(?:\s*版本)?\s*"
+                r"[:：]?\s*(\d+(?:\.\d+|\.x){0,3})",
+                source,
+                re.I,
+            )
+            if version_match:
+                _set_customer_product_field(
+                    item,
+                    "engine_version",
+                    version_match.group(1),
+                    version_match.group(0),
+                )
             _set_product_identity(item, identity, display)
             continue
 
@@ -577,7 +695,9 @@ def preserve_customer_configuration(intent: ParsedIntent) -> None:
                         model_match.group(1),
                     )
                 version_match = re.search(
-                    r"(?:mysql|postgres(?:ql)?|mariadb)\s*(\d+(?:\.\d+){1,3}(?:[-.][a-z0-9.]+)?)",
+                    r"(?:mysql|postgres(?:ql)?|mariadb)(?:\s*兼容)?(?:\s*数据库)?"
+                    r"(?:\s*版本)?\s*[:：]?\s*"
+                    r"(\d+(?:\.\d+|\.x){0,3}(?:[-.][a-z0-9.]+)?)",
                     source,
                     re.I,
                 )
@@ -637,6 +757,19 @@ def preserve_customer_configuration(intent: ParsedIntent) -> None:
         _set_product_identity(item, aurora_engine, display_name)
         requirements["aurora_cluster"] = True
         source = item.source_text or ""
+        version_match = re.search(
+            r"(?:mysql|postgres(?:ql)?)(?:\s*兼容)?(?:\s*数据库)?(?:\s*版本)?\s*"
+            r"[:：]?\s*(\d+(?:\.\d+|\.x){0,3})",
+            source,
+            re.I,
+        )
+        if version_match:
+            _set_customer_product_field(
+                item,
+                "engine_version",
+                version_match.group(1),
+                version_match.group(0),
+            )
         high_availability = bool(
             re.search(r"主备|高可用|multi[ -]?az|一主(?:一|两|二|三|\d+)读", source, re.I)
         )
@@ -647,15 +780,11 @@ def preserve_customer_configuration(intent: ParsedIntent) -> None:
         elif explicitly_single:
             requirements["deployment"] = "single_az"
 
-        member_match = re.search(
-            r"(?:节点(?:数量)?|数据库实例(?:数量)?|实例(?:数量)?)\s*[:：]?\s*(\d+)",
-            source,
-            re.I,
-        )
-        if member_match:
-            members = max(int(member_match.group(1)), 1)
+        member_fact = aurora_cluster_member_count(source)
+        if member_fact:
+            members, member_evidence = member_fact
             requirements["cluster_members"] = members
-            item.field_evidence.setdefault("requirements.cluster_members", member_match.group(0))
+            item.field_evidence.setdefault("requirements.cluster_members", member_evidence)
             item.field_sources["requirements.cluster_members"] = "customer_text"
             item.locked_fields = sorted(set(item.locked_fields) | {"requirements.cluster_members"})
         elif high_availability and not requirements.get("cluster_members"):
@@ -801,6 +930,11 @@ def preserve_customer_configuration(intent: ParsedIntent) -> None:
                 for index, existing in enumerate(deduplicated)
                 if customer_product_identity(existing) == identity
                 and _without_sales_number(existing.source_text).casefold() == canonical_source
+                and not (
+                    existing.component_key
+                    and item.component_key
+                    and existing.component_key != item.component_key
+                )
                 and (
                     existing.source_text.strip() == item.source_text.strip()
                     or bool(re.match(r"^\s*\d{1,3}\s*[、,，.．。:：;；\-—]", existing.source_text))

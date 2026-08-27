@@ -155,4 +155,20 @@ def should_retry_persisted_pricing_issue(
         service=service,
         requirements=requirements,
     )
-    return resolved in {"retryable", "compatibility", "catalog_mapping"}
+    if resolved in {
+        "retryable",
+        "compatibility",
+        "catalog_mapping",
+        "system_configuration",
+    }:
+        return True
+    # A previously valid AWS product can be persisted as unsupported when a
+    # stale marketing-name alias points at a non-existent ServiceCode, or when
+    # the local regional catalog was incomplete.  Re-check those structured
+    # failures against the current official registry instead of permanently
+    # freezing the old conclusion.  A genuinely unknown service with no such
+    # structured evidence remains non-retryable.
+    return resolved == "unsupported" and code.casefold() in {
+        "generic_service_code_not_found",
+        "service_region_not_supported",
+    }

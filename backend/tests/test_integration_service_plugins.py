@@ -420,6 +420,47 @@ def test_api_gateway_uses_official_request_dimension(api_type: str, operation: s
     assert selected.usage_lines[0].operation == operation
 
 
+def test_api_gateway_websocket_quotes_messages_and_connection_minutes() -> None:
+    message = product(
+        "AmazonApiGateway",
+        "APS1-ApiGatewayMessage",
+        "ApiGatewayWebSocket",
+        0.000001,
+        "Messages",
+        location="Asia Pacific (Singapore)",
+    )
+    minute = product(
+        "AmazonApiGateway",
+        "APS1-ApiGatewayMinute",
+        "ApiGatewayWebSocket",
+        0.00000025,
+        "minutes",
+        location="Asia Pacific (Singapore)",
+    )
+    plugin = ApiGatewayPlugin(  # type: ignore[arg-type]
+        None, FakeCatalog({"AmazonApiGateway": [message, minute]})
+    )
+
+    selected = plugin.select(
+        ServiceRequirement(
+            service="apigateway",
+            region="ap-southeast-1",
+            requirements={
+                "api_type": "websocket",
+                "messages": 60_000_000,
+                "connection_minutes": 15_000_000,
+            },
+        ),
+        "ap-southeast-1",
+    )
+
+    assert selected.model == "WebSocket API"
+    assert {line.operation for line in selected.usage_lines} == {"ApiGatewayWebSocket"}
+    assert {line.amount for line in selected.usage_lines} == {60_000_000, 15_000_000}
+    assert selected.specifications["messages"] == 60_000_000
+    assert selected.specifications["connectionMinutes"] == 15_000_000
+
+
 def test_scheduler_without_usage_returns_reference_rate_not_customer_question() -> None:
     scheduler = product(
         "AWSEvents",
@@ -485,9 +526,9 @@ def test_opensearch_quotes_nodes_and_storage_per_node() -> None:
         ),
         "ap-southeast-1",
     )
-    assert preview.selected_model is None
-    assert preview.requires_confirmation is True
-    assert preview.confirmation_reason is not None
+    assert preview.selected_model == "m7g.xlarge.search"
+    assert preview.requires_confirmation is False
+    assert preview.confirmation_reason is None
 
 
 def test_opensearch_accepts_ai_data_node_field_aliases() -> None:
@@ -565,12 +606,9 @@ def test_opensearch_nonstandard_shape_auto_selects_non_underprovisioned_option()
         "ap-southeast-1",
     )
 
-    assert preview.requires_confirmation is True
-    assert preview.selected_model is None
-    assert [option.model for option in preview.candidates] == [
-        "m7g.xlarge.search",
-        "m7g.large.search",
-    ]
+    assert preview.requires_confirmation is False
+    assert preview.selected_model == "m7g.xlarge.search"
+    assert [option.model for option in preview.candidates] == ["m7g.xlarge.search"]
 
 
 def test_opensearch_unavailable_model_auto_selects_cheapest_same_shape() -> None:

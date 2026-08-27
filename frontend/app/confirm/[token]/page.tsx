@@ -29,7 +29,10 @@ function confirmationComplete(item: Item, answer?: string): boolean {
 function isRegionConfirmation(item: Item): boolean {
   const question = item.question.trim();
   return question.includes("区域") && (
-    question.includes("部署在哪")
+    question.includes("Azure 部署区域")
+    || question.includes("支持该服务的 Azure 区域")
+    || question.includes("的部署区域")
+    || question.includes("部署在哪")
     || question.includes("哪个 AWS 区域")
     || question.includes("请选择区域")
     || question.includes("未指定区域")
@@ -47,7 +50,7 @@ type ConfigurationItem = {
   quantity: number;
   selected_model?: string | null;
   official_specifications?: Record<string, unknown>;
-  available_shapes?: Array<{ vcpu: number; memory_gib: number }>;
+  available_shapes?: Array<{ model?: string; vcpu: number; memory_gib: number }>;
   available_options?: Record<string, EditableValue[]>;
   available_billing_fields?: string[];
   available_billing_labels?: Record<string, string>;
@@ -115,6 +118,7 @@ const FIELD_LABELS: Record<string, string> = {
   total_worker_system_disk_gib: "工作节点系统盘总容量", storage_gib: "单项存储容量",
   total_storage_gib: "总存储容量", storage_gib_per_node: "每节点存储",
   storage_gib_per_broker: "每个 Broker 存储", engine: "数据库或缓存引擎", engine_version: "引擎版本",
+  operating_system_version: "操作系统版本", traffic_geography: "访问者流量地区",
   deployment: "部署方式", cluster_members: "数据库实例数", broker_count: "Broker 节点数", data_nodes: "数据节点数",
   master_nodes: "主节点数", master_requested_model: "主节点型号",
   master_vcpu: "主节点处理器", master_memory_gib: "主节点内存",
@@ -147,7 +151,11 @@ const FIELD_LABELS: Record<string, string> = {
   public_subnets: "公有子网数量", private_subnets: "私有子网数量", availability_zones: "可用区数量",
   data_transfer_out_gib: "每月出站流量", data_processed_gib: "每月处理数据量",
   data_transfer_in_gib: "每月入站流量",
-  requests: "每月请求量", https_requests: "每月 HTTPS 请求量", listeners: "监听器数量",
+  requests: "每月请求量", memory_mb: "函数内存", duration_ms: "平均执行时长",
+  flow_runs: "每月流程运行次数", bucket_count: "存储桶数量", object_count: "对象数量",
+  messages: "每月消息数", connection_minutes: "每月连接分钟",
+  throughput_mbps_per_tib: "每 TiB 吞吐量（MB/s/TiB）",
+  https_requests: "每月 HTTPS 请求量", listeners: "监听器数量",
   storage_iops: "存储 IOPS", storage_throughput_mbps: "存储吞吐量",
   backup_retention_days: "备份保留天数", read_replica_count: "只读副本数",
   detailed_monitoring: "详细监控", performance_insights: "性能分析",
@@ -163,6 +171,9 @@ const FIELD_LABELS: Record<string, string> = {
   active_series: "活跃指标序列", samples_ingested: "写入样本数",
   query_samples_processed: "查询处理样本数", collector_hours: "采集器运行小时",
   backup_storage_gib: "备份存储量", restore_gib: "恢复数据量",
+  deployment_updates: "本地服务器更新次数", author_users: "作者数量",
+  reader_users: "读者数量", session_capacity: "读者会话次数",
+  spice_gib: "SPICE 容量",
   accelerators: "加速器数量", broker_hours: "Broker 运行小时",
   scheduled_invocations: "计划调用次数", schedules: "计划数量",
   io_requests: "I/O 请求量", api_calls: "每月服务发现 API 调用量",
@@ -175,26 +186,45 @@ const FIELD_LABELS: Record<string, string> = {
   state_transitions: "状态转换次数", duration_gb_seconds: "执行时长（GB-秒）",
   input_tokens: "输入 Token 数", output_tokens: "输出 Token 数", images: "图片数量",
   data_in_gib: "每月写入数据量", data_out_gib: "每月读取数据量",
+  capacity_mode: "容量模式", put_payload_units: "写入计费单位数",
   read_request_units: "读请求单位", write_request_units: "写请求单位",
 };
 
 const AWS_SERVICE_EDIT_FIELDS: Record<string, string[]> = {
-  ec2: ["vcpu", "memory_gib", "system_disk_gib", "operating_system", "architecture", "purpose"],
+  ec2: ["vcpu", "memory_gib", "system_disk_gib", "operating_system", "operating_system_version", "architecture", "purpose"],
   rds: ["engine", "engine_version", "vcpu", "memory_gib", "storage_gib", "deployment", "storage_type", "backup_retention_days", "read_replica_count"],
   elasticache: ["engine", "vcpu", "memory_gib", "node_count", "shards", "replicas_per_shard", "deployment"],
   s3: ["storage_gib", "storage_class"],
   msk: ["broker_count", "vcpu", "memory_gib", "storage_gib_per_broker", "cluster_type"],
   opensearch: ["data_nodes", "vcpu", "memory_gib", "storage_gib_per_node", "dedicated_master", "master_nodes"],
   eks: ["support_tier"],
-  cloudfront: [],
+  cloudfront: ["traffic_geography"],
   waf: ["web_acls", "rules"],
   elb: ["load_balancer_type", "listeners"],
   apigateway: ["api_type"],
+  fsx: ["file_system_type", "storage_gib", "throughput_mbps_per_tib"],
   nat_gateway: ["gateway_count"],
   ebs: ["storage_gib", "volume_type", "storage_iops", "storage_throughput_mbps"],
   route53: [],
   global_accelerator: [],
   cloudwatch: ["log_ingestion_gib"],
+};
+
+const AZURE_SERVICE_EDIT_FIELDS: Record<string, string[]> = {
+  azure_vm: ["requested_sku", "vcpu", "memory_gib", "operating_system"],
+  managed_disks: ["requested_sku", "disk_type", "disk_size_gib", "storage_gib", "iops", "throughput_mbps"],
+  azure_sql: ["requested_sku", "service_tier", "compute_model", "vcore", "memory_gib", "storage_gib", "high_availability", "license_model"],
+  azure_postgresql: ["requested_sku", "service_tier", "compute_model", "vcore", "memory_gib", "storage_gib", "high_availability", "backup_retention_days"],
+  azure_mysql: ["requested_sku", "service_tier", "compute_model", "vcore", "memory_gib", "storage_gib", "high_availability", "backup_retention_days"],
+  azure_cache: ["requested_sku", "service_tier", "capacity", "memory_gib", "replicas", "shards"],
+  blob_storage: ["requested_sku", "access_tier", "redundancy", "storage_gib", "write_operations", "read_operations", "data_retrieval_gib"],
+  load_balancer: ["requested_sku", "load_balancer_type", "rules", "data_processed_gib"],
+  application_gateway: ["requested_sku", "service_tier", "capacity_units", "data_processed_gib"],
+  front_door: ["requested_sku", "service_tier", "data_transfer_out_gib", "requests"],
+  bandwidth: ["data_transfer_out_gib", "source_region", "destination_zone"],
+  aks: ["service_tier", "cluster_count", "worker_requested_sku", "worker_node_count", "worker_vcpu", "worker_memory_gib", "worker_system_disk_gib"],
+  monitor: ["log_ingestion_gib", "retention_days", "custom_metrics", "alerts"],
+  api_management: ["requested_sku", "service_tier", "units", "requests", "data_transfer_out_gib"],
 };
 
 // Optional billing dimensions are service contracts, not a universal menu.
@@ -223,7 +253,8 @@ const AWS_SERVICE_OPTIONAL_USAGE_FIELDS: Record<string, string[]> = {
   data_transfer: ["data_transfer_out_gib"],
   global_accelerator: ["data_transfer_out_gib"],
   msk: ["broker_hours", "storage_gib_per_broker", "data_transfer_in_gib", "data_transfer_out_gib"],
-  apigateway: ["requests", "data_transfer_out_gib"],
+  apigateway: ["requests", "messages", "connection_minutes", "data_transfer_out_gib"],
+  fsx: ["storage_gib", "throughput_mbps_per_tib", "iops", "backup_storage_gib"],
   scheduler: ["scheduled_invocations", "schedules"],
   opensearch: ["total_storage_gib", "data_transfer_out_gib"],
   documentdb: ["storage_gib", "io_requests", "backup_storage_gib"],
@@ -231,7 +262,7 @@ const AWS_SERVICE_OPTIONAL_USAGE_FIELDS: Record<string, string[]> = {
   secrets_manager: ["secret_count", "api_calls"],
   dms: ["hours_per_month", "storage_gib", "data_processed_gib"],
   kms: ["key_count", "requests"],
-  lambda: ["requests"],
+  lambda: ["memory_mb", "duration_ms", "requests"],
   dynamodb: ["read_request_units", "write_request_units", "storage_gib", "backup_storage_gib", "restore_gib"],
   efs: ["storage_gib"],
   fsx: ["storage_gib", "backup_storage_gib"],
@@ -260,6 +291,7 @@ const SELECT_FIELD_OPTIONS: Record<string, string[]> = {
   business_type: ["general_purpose", "compute_optimized", "memory_optimized", "storage_optimized", "accelerated_computing"],
   cluster_mode: ["disabled", "enabled"],
   deployment_type: ["single_instance", "multi_instance", "serverless"],
+  traffic_geography: ["Asia Pacific", "United States", "Europe", "Japan", "Australia", "Canada"],
 };
 
 const AWS_SERVICE_SELECT_OPTIONS: Record<string, Record<string, string[]>> = {
@@ -318,9 +350,14 @@ const OFFICIAL_OPTION_ALIASES: Record<string, string> = {
   websocket: "websocket",
 };
 
-function configuredFieldOptions(item: ConfigurationItem, field: string): EditableValue[] {
-  const serviceOptions = AWS_SERVICE_SELECT_OPTIONS[item.service]?.[field] ?? [];
-  const commonOptions = SELECT_FIELD_OPTIONS[field] ?? [];
+function configuredFieldOptions(
+  item: ConfigurationItem,
+  field: string,
+  isAzure = false,
+): EditableValue[] {
+  // Azure reuses the editor mechanism only; option data stays provider-specific.
+  const serviceOptions = isAzure ? [] : (AWS_SERVICE_SELECT_OPTIONS[item.service]?.[field] ?? []);
+  const commonOptions = isAzure ? [] : (SELECT_FIELD_OPTIONS[field] ?? []);
   const discoveredOptions = (item.available_options?.[field] ?? [])
     .filter((option) => option !== null)
     .map((option) => typeof option === "string"
@@ -337,8 +374,12 @@ function uniqueNumericOptions(values: number[]): number[] {
   return Array.from(new Set(values.filter(Number.isFinite))).sort((left, right) => left - right);
 }
 
-function availableShapes(item: ConfigurationItem, draft: ComponentDraft) {
-  const shapes = (item.available_shapes ?? []).filter(
+function availableShapes(
+  item: ConfigurationItem,
+  draft: ComponentDraft,
+  liveShapes: Array<{ model?: string; vcpu: number; memory_gib: number }> = [],
+) {
+  const shapes = [...(item.available_shapes ?? []), ...liveShapes].filter(
     (shape) => Number.isFinite(shape.vcpu) && Number.isFinite(shape.memory_gib),
   );
   const currentVcpu = draft.requirements.vcpu;
@@ -365,7 +406,9 @@ function buildComponentDraft(item: ConfigurationItem, isAzure = false): Componen
       requirements[key] = value as EditableValue;
     }
   });
-  if (item.selected_model) requirements.requested_model = item.selected_model;
+  if (item.selected_model) {
+    requirements[isAzure ? "requested_sku" : "requested_model"] = item.selected_model;
+  }
   // Old S3 confirmation rows can already display "Standard" from the
   // selected plan while lacking the equivalent editable requirement. Carry
   // that official selection into the editor so it never opens on a misleading
@@ -394,7 +437,9 @@ function editableRequirementFields(
   additional: string[] = [],
   isAzure = false,
 ): string[] {
-  const known = AWS_SERVICE_EDIT_FIELDS[item.service] ?? [];
+  const known = isAzure
+    ? (AZURE_SERVICE_EDIT_FIELDS[item.service] ?? [])
+    : (AWS_SERVICE_EDIT_FIELDS[item.service] ?? []);
   const existing = Object.keys(draft.requirements).filter(
     (key) => !HIDDEN_CONFIGURATION_FIELDS.has(key)
       && !key.startsWith("_")
@@ -531,8 +576,10 @@ const NUMERIC_CONFIGURATION_FIELDS = new Set([
   "configuration_retrievals", "targets_receiving_configuration", "events", "event_buses",
   "schema_discovery_events", "pipes_requests", "state_transitions", "duration_gb_seconds",
   "input_tokens", "output_tokens", "images", "data_in_gib", "data_out_gib",
+  "put_payload_units",
   "read_request_units", "write_request_units", "control_plane_hours",
-  "experiment_hours",
+  "experiment_hours", "memory_mb", "duration_ms", "flow_runs", "bucket_count", "object_count",
+  "messages", "connection_minutes", "throughput_mbps_per_tib",
 ]);
 
 function formatConfigurationValue(key: string, value: unknown): string {
@@ -546,12 +593,16 @@ function formatConfigurationValue(key: string, value: unknown): string {
   }
   if (
     typeof value === "number"
-    && key.includes("storage_gib")
+    && (key.endsWith("_gib") || key.includes("_gib_"))
     && value >= 1024
     && Number.isInteger(value / 1024)
   ) return `${value / 1024} TB`;
   const suffix = key.endsWith("_gib") || key.endsWith("_gib_per_node")
     ? " GiB"
+    : key === "memory_mb"
+      ? " MB"
+      : key === "duration_ms"
+        ? " ms"
     : key.endsWith("_percent")
       ? "%"
       : key.endsWith("_hours") || key === "hours_per_month"
@@ -575,15 +626,14 @@ function configurationText(
     ? requirements.replicas_per_shard
     : null;
   const entries = Object.entries(displayedRequirements).filter(
-    ([key, value]) => key in FIELD_LABELS
-      && !HIDDEN_CONFIGURATION_FIELDS.has(key)
+    ([key, value]) => !HIDDEN_CONFIGURATION_FIELDS.has(key)
       && !(service === "elasticache" && ["shards", "replicas_per_shard"].includes(key))
       && value !== null
       && value !== ""
       && (!NUMERIC_CONFIGURATION_FIELDS.has(key) || typeof value === "number"),
   );
   const descriptions = entries.map(
-    ([key, value]) => `${FIELD_LABELS[key]}：${formatConfigurationValue(key, value)}`,
+    ([key, value]) => `${FIELD_LABELS[key] ?? editableFieldLabel(key)}：${formatConfigurationValue(key, value)}`,
   );
   if (redisShards !== null && redisReplicas !== null) {
     descriptions.push(`主节点：${redisShards}`);
@@ -717,16 +767,26 @@ function isTechnicalPricingIssue(item: ConfigurationItem): boolean {
   );
 }
 
+function isSystemPricingIssue(item: ConfigurationItem): boolean {
+  if (item.pricing_status === "ready") return false;
+  return isTechnicalPricingIssue(item) || [
+    "compatibility",
+    "catalog_mapping",
+    "system_configuration",
+    "unsupported",
+  ].includes(item.pricing_issue_category ?? "");
+}
+
 function pricingNoticeClass(item: ConfigurationItem): string {
   if (isTechnicalPricingIssue(item)) return "technical-pricing-notice";
   if (item.pricing_issue_category === "compatibility") return "compatibility-pricing-notice";
+  if (isSystemPricingIssue(item)) return "technical-pricing-notice";
   return "customer-pricing-notice";
 }
 
 function requiresCustomerConfiguration(item: ConfigurationItem): boolean {
   return item.pricing_status !== "ready"
-    && !isTechnicalPricingIssue(item)
-    && !["compatibility", "catalog_mapping"].includes(item.pricing_issue_category ?? "");
+    && !isSystemPricingIssue(item);
 }
 
 export default function CustomerConfirmationPage() {
@@ -746,7 +806,11 @@ export default function CustomerConfirmationPage() {
   const [additionalFieldChoice, setAdditionalFieldChoice] = useState<Record<string, string>>({});
   const [fieldUnits, setFieldUnits] = useState<Record<string, "gib" | "tib">>({});
   const [liveFieldOptions, setLiveFieldOptions] = useState<Record<string, EditableValue[]>>({});
-  const [loadedOfficialOptionComponents, setLoadedOfficialOptionComponents] = useState<string[]>([]);
+  const [liveAvailableShapes, setLiveAvailableShapes] = useState<Record<string, Array<{
+    model?: string;
+    vcpu: number;
+    memory_gib: number;
+  }>>>({});
   const [editingComponents, setEditingComponents] = useState<Record<string, boolean>>({});
   const [pendingEditorSwitch, setPendingEditorSwitch] = useState<{
     fromId: string;
@@ -790,9 +854,6 @@ export default function CustomerConfirmationPage() {
     || additionFeedback.trim().length > 0;
   const customerBlockingItems = (session?.configuration_items ?? []).filter(
     requiresCustomerConfiguration,
-  );
-  const hasTechnicalPricingIssues = (session?.configuration_items ?? []).some(
-    isTechnicalPricingIssue,
   );
   const isConfigurationRefreshActive = (
     refreshingComponentIds.length > 0 || addingConfigurationInProgress
@@ -840,72 +901,91 @@ export default function CustomerConfirmationPage() {
     const componentId = item.component_id;
     const isClosing = editingComponents[componentId] === true;
     if (isClosing) {
-      if (!isAzureConfirmation && componentUpdates[componentId]) {
+      if (componentUpdates[componentId]) {
         setPendingEditorSwitch({ fromId: componentId, toId: null });
         return;
       }
       setEditingComponents((current) => ({ ...current, [componentId]: false }));
-      if (!isAzureConfirmation) discardComponentDraft(componentId);
+      discardComponentDraft(componentId);
       setPendingEditorSwitch(null);
       return;
     }
 
     // AWS structured edits are local drafts. Moving to another component is
     // allowed only after the customer chooses whether to keep real changes.
-    if (!isAzureConfirmation) {
-      const openId = Object.entries(editingComponents).find(
-        ([candidateId, isOpen]) => isOpen && candidateId !== componentId,
-      )?.[0];
-      if (openId && componentUpdates[openId]) {
-        setPendingEditorSwitch({ fromId: openId, toId: componentId });
-        return;
-      }
-      if (openId) discardComponentDraft(openId);
-      setEditingComponents({ [componentId]: true });
-    } else {
-      setEditingComponents((current) => ({ ...current, [componentId]: true }));
+    const openId = Object.entries(editingComponents).find(
+      ([candidateId, isOpen]) => isOpen && candidateId !== componentId,
+    )?.[0];
+    if (openId && componentUpdates[openId]) {
+      setPendingEditorSwitch({ fromId: openId, toId: componentId });
+      return;
     }
+    if (openId) discardComponentDraft(openId);
+    setEditingComponents({ [componentId]: true });
     setComponentDrafts((current) => ({
       ...current,
       [componentId]: buildComponentDraft(item, isAzureConfirmation),
     }));
-    if (!isAzureConfirmation) {
-      void loadOfficialFieldOptions(item);
-    }
+    void loadOfficialFieldOptions(item);
   }
 
-  async function loadOfficialFieldOptions(item: ConfigurationItem) {
-    const region = item.region?.trim();
+  async function loadOfficialFieldOptions(
+    item: ConfigurationItem,
+    regionOverride?: string,
+    requirementsOverride?: Record<string, EditableValue>,
+  ) {
+    const region = (regionOverride ?? item.region)?.trim();
     if (!region) return;
-    if (loadedOfficialOptionComponents.includes(item.component_id)) return;
+    if (regionOverride && regionOverride !== item.region) {
+      setLiveFieldOptions((existing) => Object.fromEntries(
+        Object.entries(existing).filter(([key]) => (
+          !key.startsWith(`${item.component_id}:`)
+          || key === `${item.component_id}:region`
+        )),
+      ));
+      setLiveAvailableShapes((existing) => ({
+        ...existing,
+        [item.component_id]: [],
+      }));
+    }
     try {
-      const response = await fetch(`${API_BASE}/api/aws/configuration-field-options`, {
+      const provider = session?.cloud_provider === "azure" ? "azure" : "aws";
+      const response = await fetch(`${API_BASE}/api/${provider}/configuration-field-options`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           service: item.service,
           region,
-          requirements: item.requirements,
+          requirements: requirementsOverride ?? item.requirements,
         }),
         cache: "no-store",
       });
       if (!response.ok) return;
-      const payload = await response.json() as Record<string, EditableValue[]>;
+      const rawPayload = await response.json() as {
+        options?: Record<string, EditableValue[]>;
+        shapes?: Array<{ model?: string; vcpu: number; memory_gib: number }>;
+      } | Record<string, EditableValue[]>;
+      const payload = "options" in rawPayload
+        ? (rawPayload.options ?? {})
+        : rawPayload as Record<string, EditableValue[]>;
       setLiveFieldOptions((existing) => ({
-        ...existing,
+        ...Object.fromEntries(
+          Object.entries(existing).filter(([key]) => !key.startsWith(`${item.component_id}:`)),
+        ),
         ...Object.fromEntries(
           Object.entries(payload)
             .filter(([, values]) => Array.isArray(values) && values.length > 0)
             .map(([field, values]) => [`${item.component_id}:${field}`, values]),
         ),
       }));
+      if ("shapes" in rawPayload && Array.isArray(rawPayload.shapes)) {
+        setLiveAvailableShapes((existing) => ({
+          ...existing,
+          [item.component_id]: rawPayload.shapes ?? [],
+        }));
+      }
     } catch {
-      // Existing editable controls remain available if AWS is offline.
-    } finally {
-      setLoadedOfficialOptionComponents((existing) => Array.from(new Set([
-        ...existing,
-        item.component_id,
-      ])));
+      // Existing provider-specific controls remain available while the local lookup retries.
     }
   }
 
@@ -1509,6 +1589,7 @@ export default function CustomerConfirmationPage() {
               className="customer-options"
               options={item.options}
               value={answers[answerKey]}
+              placeholder={isRegionConfirmation(item) ? "请选择 Azure 部署区域" : "请选择配置选项"}
               catalog={item.selection_mode === "catalog" || item.options.some((option) => Boolean(option.model))}
               requireMachineCount={/自建/.test(item.question) && item.options.some((option) => Boolean(option.model))}
               initialMachineCount={session.configuration_items.find(
@@ -1614,8 +1695,14 @@ export default function CustomerConfirmationPage() {
             )}
             {isSessionReviewing && reviewSeconds >= 15 && (
               <div className="customer-ai-retry-notice" role="alert">
-                <strong>{isAzureConfirmation || addingConfigurationInProgress ? "AI 响应较慢，正在自动重试" : "官方规格校验较慢，正在自动重试"}</strong>
-                <span>{isAzureConfirmation || addingConfigurationInProgress ? "系统正在切换备用 AI，您的修改已经保存，不需要重复填写。" : "您的字段修改已经保存，不需要重复填写。"}</span>
+                <strong>{addingConfigurationInProgress
+                  ? "正在检查新加的配置"
+                  : isAzureConfirmation
+                    ? "正在继续处理您的修改"
+                    : "正在检查您刚修改的配置"}</strong>
+                <span>{addingConfigurationInProgress
+                  ? "这里只处理新加的内容，原来的配置不会重新运行。"
+                  : "您填写的内容已经保存，不需要重复提交。"}</span>
               </div>
             )}
             <div className="customer-configuration-toolbar">
@@ -1663,7 +1750,9 @@ export default function CustomerConfirmationPage() {
                     const availableOptionalFields = (
                       item.available_billing_fields?.length
                         ? item.available_billing_fields
-                        : (AWS_SERVICE_OPTIONAL_USAGE_FIELDS[item.service] ?? [])
+                        : (isAzureConfirmation
+                          ? []
+                          : (AWS_SERVICE_OPTIONAL_USAGE_FIELDS[item.service] ?? []))
                     ).filter(
                       (field) => !editableFields.includes(field),
                     );
@@ -1693,7 +1782,7 @@ export default function CustomerConfirmationPage() {
                                 <small className="configuration-comparison-label">生成配置</small>
                                 <span>{sharedRegion && !isGlobalService(item) ? "" : `${displayRegion(item)} · `}{displayPlan(item)} · {displayQuantity(item)}</span>
                                 <small>{configurationText(item.requirements, item.service, item.official_specifications)}</small>
-                                {item.pricing_status !== "ready" && <small className={pricingNoticeClass(item)}>
+                                {item.pricing_status !== "ready" && !isSystemPricingIssue(item) && <small className={pricingNoticeClass(item)}>
                                   {item.pricing_notice ?? "此配置尚未完成官方核验。"}
                                 </small>}
                               </div>
@@ -1718,7 +1807,7 @@ export default function CustomerConfirmationPage() {
                                   if (!isDeleted) {
                                     setEditingComponents((current) => ({ ...current, [item.component_id]: false }));
                                     setPendingEditorSwitch(null);
-                                    if (!isAzureConfirmation) discardComponentDraft(item.component_id);
+                                    discardComponentDraft(item.component_id);
                                   }
                                 }}
                               >{isDeleted ? "撤销" : "删除"}</button>
@@ -1735,27 +1824,7 @@ export default function CustomerConfirmationPage() {
                           <tr className="review-feedback-row">
                             <td colSpan={4}>
                               <div className="customer-component-feedback-box">
-                                {isAzureConfirmation ? <>
-                                  <label htmlFor={`component-feedback-${item.component_id}`}><strong>{displayServiceName(item)}</strong>：请说明要修改的字段和新值</label>
-                                  <div className="customer-component-feedback-input">
-                                  <textarea
-                                    id={`component-feedback-${item.component_id}`}
-                                    value={feedback}
-                                    onChange={(event) => setComponentFeedback((current) => ({
-                                      ...current,
-                                      [item.component_id]: event.target.value,
-                                    }))}
-                                    placeholder="例如：数量改为 3，存储改为 500GB。"
-                                    rows={2}
-                                  />
-                                  <button
-                                    type="button"
-                                    className={isRefreshing ? "is-refreshing" : ""}
-                                    disabled={!feedback.trim() || isSubmittingComponent || isQueuedComponent || isRefreshing}
-                                    onClick={() => void submitConfigurationFeedback(item.component_id)}
-                                  >{isRefreshing ? "更新中…" : isSubmittingComponent ? "提交中…" : isQueuedComponent ? "等待提交" : failedComponentIds.includes(item.component_id) ? "重新尝试" : "提交本项"}</button>
-                                  </div>
-                                </> : <>
+                                <>
                                   <div className="customer-structured-editor-heading">
                                     <strong>直接修改 {displayServiceName(item)} 的配置</strong>
                                     <span>{item.service === "eks"
@@ -1779,11 +1848,36 @@ export default function CustomerConfirmationPage() {
                                       <span>区域</span>
                                       <select
                                         value={draft.region}
-                                        onChange={(event) => updateComponentField(item, "region", "region", event.target.value)}
+                                        onChange={(event) => {
+                                          const nextRegion = event.target.value;
+                                          updateComponentField(item, "region", "region", nextRegion);
+                                          if (isAzureConfirmation) {
+                                            updateComponentField(
+                                              item,
+                                              "requirements",
+                                              "requested_sku",
+                                              null,
+                                            );
+                                          }
+                                          void loadOfficialFieldOptions(
+                                            item,
+                                            nextRegion,
+                                            draft.requirements,
+                                          );
+                                        }}
                                       >
-                                        {Object.entries(REGION_LABELS)
-                                          .filter(([region]) => region !== "global" && region.includes("-"))
-                                          .map(([region, label]) => <option key={region} value={region}>{label}</option>)}
+                                        {Array.from(new Set([
+                                          draft.region,
+                                          ...(liveFieldOptions[`${item.component_id}:region`] ?? [])
+                                            .map(String),
+                                          ...(isAzureConfirmation
+                                            ? []
+                                            : Object.keys(REGION_LABELS).filter(
+                                                (region) => region !== "global" && region.includes("-"),
+                                              )),
+                                        ].filter(Boolean))).map((region) => <option key={region} value={region}>
+                                          {REGION_LABELS[region] ?? region}
+                                        </option>)}
                                       </select>
                                     </label>}
                                     {editableFields.map((field) => {
@@ -1793,7 +1887,7 @@ export default function CustomerConfirmationPage() {
                                       const isCpu = field === "vcpu" || field.endsWith("_vcpu");
                                       const isMemory = field === "memory_gib" || field.endsWith("_memory_gib");
                                       let selectOptions = [
-                                        ...configuredFieldOptions(item, field),
+                                        ...configuredFieldOptions(item, field, isAzureConfirmation),
                                         ...(liveFieldOptions[`${item.component_id}:${field}`] ?? []),
                                       ].filter((option, optionIndex, allOptions) => allOptions.findIndex(
                                         (candidate) => String(candidate).toLowerCase()
@@ -1830,7 +1924,11 @@ export default function CustomerConfirmationPage() {
                                       const unitKey = `${item.component_id}:${field}`;
                                       const selectedUnit = fieldUnits[unitKey]
                                         ?? (typeof value === "number" && value >= 1024 ? "tib" : "gib");
-                                      const shapes = availableShapes(item, draft);
+                                      const shapes = availableShapes(
+                                        item,
+                                        draft,
+                                        liveAvailableShapes[item.component_id] ?? [],
+                                      );
                                       const pairedCpuField = pairedShapeField(field, "cpu");
                                       const selectedCpu = isCpu
                                         ? value
@@ -1875,6 +1973,11 @@ export default function CustomerConfirmationPage() {
                                             updateComponentField(
                                               item, "requirements", field, nextValue,
                                             );
+                                            if (isAzureConfirmation && (isCpu || isMemory)) {
+                                              updateComponentField(
+                                                item, "requirements", "requested_sku", null,
+                                              );
+                                            }
                                             if (isCpu) {
                                               const memoryField = pairedShapeField(field, "memory");
                                               const currentMemory = draft.requirements[memoryField];
@@ -1915,6 +2018,25 @@ export default function CustomerConfirmationPage() {
                                             updateComponentField(
                                               item, "requirements", field, nextValue,
                                             );
+                                            if (isAzureConfirmation && field === "requested_sku") {
+                                              const selectedShape = (
+                                                liveAvailableShapes[item.component_id] ?? []
+                                              ).find((shape) => shape.model === String(nextValue));
+                                              if (selectedShape) {
+                                                updateComponentField(
+                                                  item,
+                                                  "requirements",
+                                                  "vcpu",
+                                                  selectedShape.vcpu,
+                                                );
+                                                updateComponentField(
+                                                  item,
+                                                  "requirements",
+                                                  "memory_gib",
+                                                  selectedShape.memory_gib,
+                                                );
+                                              }
+                                            }
                                             if (
                                               field === "operating_system"
                                               && String(nextValue).toLowerCase().includes("windows")
@@ -1971,7 +2093,12 @@ export default function CustomerConfirmationPage() {
                                             <option value="gib">GiB</option>
                                             <option value="tib">TiB</option>
                                           </select>
-                                        </div> : <input
+                                        </div> : isAzureConfirmation && !isNumeric
+                                          ? <div className="customer-fixed-field-value">
+                                              {value === "" ? "等待官方可选项" : String(value)}
+                                              <small>该字段不支持手动填写，系统仅接受 Microsoft 官方选项</small>
+                                            </div>
+                                          : <input
                                           type={isNumeric ? "number" : "text"}
                                           min={isNumeric ? "0" : undefined}
                                           step={isNumeric ? "any" : undefined}
@@ -2080,7 +2207,7 @@ export default function CustomerConfirmationPage() {
                                       </div>
                                     </div>
                                   )}
-                                </>}
+                                </>
                               </div>
                             </td>
                           </tr>
@@ -2099,8 +2226,8 @@ export default function CustomerConfirmationPage() {
                   disabled={submitting}
                   onClick={() => void submitConfigurationFeedback()}
                 >{submitting
-                    ? (isAzureConfirmation || additionFeedback.trim() ? "正在重新识别…" : "正在保存…")
-                    : (isAzureConfirmation || additionFeedback.trim() ? "重新识别配置" : "保存全部修改")}</button>
+                    ? (additionFeedback.trim() ? "正在重新识别…" : "正在保存…")
+                    : (additionFeedback.trim() ? "重新识别配置" : "保存全部修改")}</button>
               ) : (
                 <button
                   className="customer-submit"
@@ -2111,9 +2238,7 @@ export default function CustomerConfirmationPage() {
                     ? "正在确认…"
                     : customerBlockingItems.length > 0
                       ? `请先修改 ${customerBlockingItems.length} 项不可用配置`
-                      : hasTechnicalPricingIssues
-                        ? "确认配置并自动重试报价"
-                        : "最终确认并开始报价"}</button>
+                      : "最终确认并开始报价"}</button>
               )}
             </div>
             {hasPendingConfigurationChanges && (
@@ -2127,8 +2252,8 @@ export default function CustomerConfirmationPage() {
           <div className="customer-question-page">
             <div className="customer-confirm-title customer-question-heading">
               <small>{addingConfigurationInProgress ? "新增配置 · 补充信息" : "配置校验 · 需要确认"}</small>
-              <h1>{addingConfigurationInProgress ? "请补充新增配置信息" : "请一次确认全部问题"}</h1>
-              <p>所有待确认项都集中在本页，填写完成后统一提交。</p>
+              <h1>{addingConfigurationInProgress ? "请补充新增配置信息" : "请确认以下配置选项"}</h1>
+              <p>为确保报价准确，请根据实际业务需求完成以下配置选择，并统一提交。</p>
             </div>
             {isSessionReviewing && <div className="configuration-refresh-status customer-inline-review" role="status">
               <i />
@@ -2140,7 +2265,7 @@ export default function CustomerConfirmationPage() {
             </div>
             <div className="customer-question-footer">
               {error && <p className="customer-submit-error">{error}</p>}
-              <button className="customer-submit" type="button" disabled={submitting || isSessionReviewing || session.confirmation_items.some((item) => !confirmationComplete(item, answers[confirmationAnswerKey(item)]))} onClick={() => void submit()}>{submitting || isSessionReviewing ? "正在处理…" : addingConfigurationInProgress ? "确认并继续添加" : "全部填写完成，统一提交"}</button>
+              <button className="customer-submit" type="button" disabled={submitting || isSessionReviewing || session.confirmation_items.some((item) => !confirmationComplete(item, answers[confirmationAnswerKey(item)]))} onClick={() => void submit()}>{submitting || isSessionReviewing ? "正在处理…" : addingConfigurationInProgress ? "确认并继续添加" : "确认配置并提交"}</button>
             </div>
           </div>
         ) : session ? (

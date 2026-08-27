@@ -4,6 +4,8 @@ import asyncio
 from dataclasses import dataclass, field
 
 from app.integrations.azure_catalog import AzureOfficialCatalog
+from app.integrations.azure_product_registry import AzureProductRegistry
+from app.integrations.azure_service_templates import azure_requirement_fields
 
 AZURE_WARM_REGIONS = (
     "southeastasia",
@@ -43,26 +45,50 @@ class AzureWarmupStatus:
 
 
 class AzureCatalogWarmer:
-    def __init__(self, catalog: AzureOfficialCatalog):
+    def __init__(
+        self,
+        catalog: AzureOfficialCatalog,
+        product_registry: AzureProductRegistry | None = None,
+        service_names: dict[str, str] | None = None,
+    ):
         self._catalog = catalog
+        self._product_registry = product_registry
+        self._service_names = dict(service_names or {})
         self.status = AzureWarmupStatus()
 
     async def warm(self, *, refresh_profiles: bool = False) -> None:
         self.status = AzureWarmupStatus(state="running")
         semaphore = asyncio.Semaphore(3)
 
-        async def warm_one(service: str, region: str) -> None:
+        async def warm_one(
+            service: str,
+            region: str,
+            service_key: str | None = None,
+        ) -> None:
             async with semaphore:
                 try:
                     await self._catalog.retail_items(
                         service_name=service,
                         region=region,
                     )
-                    await self._catalog.sync_service_profile(
+                    profile = await self._catalog.sync_service_profile(
                         service_name=service,
                         region=region,
                         force_refresh=refresh_profiles,
                     )
+                    if (
+                        self._product_registry is not None
+                        and service_key is not None
+                        and int(profile.get("row_count") or 0) > 0
+                    ):
+                        profile.update(
+                            {
+                                "service_key": service_key,
+                                "display_name": service_key.replace("_", " ").title(),
+                                "fields": list(azure_requirement_fields(service_key)),
+                            }
+                        )
+                        self._product_registry.update_profile(profile)
                     self.status.completed += 1
                     self.status.profiles += 1
                 except Exception as exc:
@@ -76,12 +102,15 @@ class AzureCatalogWarmer:
             except Exception as exc:
                 self.status.errors.append(f"regions: {type(exc).__name__}")
 
-        await asyncio.gather(
-            warm_regions(),
-            *(
-                warm_one(service, region)
-                for region in AZURE_WARM_REGIONS
-                for service in AZURE_WARM_SERVICES
-            )
-        )
+        primary_targets = [
+            warm_one(service_name, "southeastasia", service_key)
+            for service_key, service_name in self._service_names.items()
+        ]
+        hot_targets = [
+            warm_one(service, region)
+            for region in AZURE_WARM_REGIONS
+            for service in AZURE_WARM_SERVICES
+            if region != "southeastasia"
+        ]
+        await asyncio.gather(warm_regions(), *primary_targets, *hot_targets)
         self.status.state = "ready" if self.status.failed == 0 else "ready_with_warnings"

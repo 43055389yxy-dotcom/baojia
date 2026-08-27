@@ -18,6 +18,8 @@ from app.domain.models import (
 from app.integrations.azure_auto_service_discovery import AzureAutoServiceDiscovery
 from app.integrations.azure_catalog import AzureOfficialCatalog
 from app.integrations.azure_intent import AZURE_SERVICE_NAMES, canonical_azure_service
+from app.integrations.azure_product_registry import AzureProductRegistry
+from app.integrations.azure_service_templates import azure_requirement_fields
 
 AZURE_RETAIL_SERVICE_NAMES: dict[str, str] = {
     "azure_vm": "Virtual Machines",
@@ -84,6 +86,91 @@ AZURE_REGION_FALLBACK: tuple[tuple[str, str], ...] = (
     ("westus3", "美国西部 3"),
 )
 
+AZURE_REGION_BILINGUAL_NAMES: dict[str, tuple[str, str]] = {
+    "attatlanta1": ("AT&T 亚特兰大 1", "ATT Atlanta 1"),
+    "attdallas1": ("AT&T 达拉斯 1", "ATT Dallas 1"),
+    "attdetroit1": ("AT&T 底特律 1", "ATT Detroit 1"),
+    "attnewyork1": ("AT&T 纽约 1", "ATT New York 1"),
+    "australiacentral": ("澳大利亚中部", "Australia Central"),
+    "australiacentral2": ("澳大利亚中部 2", "Australia Central 2"),
+    "australiaeast": ("澳大利亚东部", "Australia East"),
+    "australiasoutheast": ("澳大利亚东南部", "Australia Southeast"),
+    "austriaeast": ("奥地利东部", "Austria East"),
+    "belgiumcentral": ("比利时中部", "Belgium Central"),
+    "brazilsouth": ("巴西南部", "Brazil South"),
+    "brazilsoutheast": ("巴西东南部", "Brazil Southeast"),
+    "canadacentral": ("加拿大中部", "Canada Central"),
+    "canadaeast": ("加拿大东部", "Canada East"),
+    "centralindia": ("印度中部", "Central India"),
+    "centralus": ("美国中部", "Central US"),
+    "chilecentral": ("智利中部", "Chile Central"),
+    "denmarkeast": ("丹麦东部", "Denmark East"),
+    "eastasia": ("东亚（香港）", "East Asia"),
+    "eastus": ("美国东部", "East US"),
+    "eastus2": ("美国东部 2", "East US 2"),
+    "eastus3": ("美国东部 3", "East US 3"),
+    "francecentral": ("法国中部", "France Central"),
+    "francesouth": ("法国南部", "France South"),
+    "germanynorth": ("德国北部", "Germany North"),
+    "germanywestcentral": ("德国中西部", "Germany West Central"),
+    "indiasouthcentral": ("印度中南部", "India South Central"),
+    "indonesiacentral": ("印度尼西亚中部", "Indonesia Central"),
+    "israelcentral": ("以色列中部", "Israel Central"),
+    "israelnorthwest": ("以色列西北部", "Israel Northwest"),
+    "italynorth": ("意大利北部", "Italy North"),
+    "japaneast": ("日本东部（东京）", "Japan East"),
+    "japanwest": ("日本西部（大阪）", "Japan West"),
+    "jioindiacentral": ("Jio 印度中部", "Jio India Central"),
+    "jioindiawest": ("Jio 印度西部", "Jio India West"),
+    "koreacentral": ("韩国中部（首尔）", "Korea Central"),
+    "koreasouth": ("韩国南部", "Korea South"),
+    "malaysiawest": ("马来西亚西部", "Malaysia West"),
+    "mexicocentral": ("墨西哥中部", "Mexico Central"),
+    "newzealandnorth": ("新西兰北部", "New Zealand North"),
+    "northcentralus": ("美国中北部", "North Central US"),
+    "northeurope": ("北欧（爱尔兰）", "North Europe"),
+    "norwayeast": ("挪威东部", "Norway East"),
+    "norwaywest": ("挪威西部", "Norway West"),
+    "polandcentral": ("波兰中部", "Poland Central"),
+    "portland": ("波特兰", "Portland"),
+    "qatarcentral": ("卡塔尔中部", "Qatar Central"),
+    "sgxsingapore1": ("SGX 新加坡 1", "SGX Singapore 1"),
+    "southafricanorth": ("南非北部", "South Africa North"),
+    "southafricawest": ("南非西部", "South Africa West"),
+    "southcentralus": ("美国中南部", "South Central US"),
+    "southcentralus2": ("美国中南部 2", "South Central US 2"),
+    "southeastasia": ("东南亚（新加坡）", "Southeast Asia"),
+    "southeastus": ("美国东南部", "Southeast US"),
+    "southindia": ("印度南部", "South India"),
+    "southwestus": ("美国西南部", "Southwest US"),
+    "spaincentral": ("西班牙中部", "Spain Central"),
+    "swedencentral": ("瑞典中部", "Sweden Central"),
+    "swedensouth": ("瑞典南部", "Sweden South"),
+    "switzerlandnorth": ("瑞士北部", "Switzerland North"),
+    "switzerlandwest": ("瑞士西部", "Switzerland West"),
+    "uaecentral": ("阿联酋中部", "UAE Central"),
+    "uaenorth": ("阿联酋北部", "UAE North"),
+    "uksouth": ("英国南部（伦敦）", "UK South"),
+    "ukwest": ("英国西部", "UK West"),
+    "usgovarizona": ("美国政府云亚利桑那", "US Gov Arizona"),
+    "usgoviowa": ("美国政府云爱荷华", "US Gov Iowa"),
+    "usgovtexas": ("美国政府云得克萨斯", "US Gov Texas"),
+    "usgovvirginia": ("美国政府云弗吉尼亚", "US Gov Virginia"),
+    "westcentralus": ("美国中西部", "West Central US"),
+    "westeurope": ("西欧（荷兰）", "West Europe"),
+    "westindia": ("印度西部", "West India"),
+    "westus": ("美国西部", "West US"),
+    "westus2": ("美国西部 2", "West US 2"),
+    "westus3": ("美国西部 3", "West US 3"),
+}
+
+
+def azure_region_bilingual_label(code: str, official_label: str) -> str:
+    names = AZURE_REGION_BILINGUAL_NAMES.get(code.casefold())
+    if names is not None:
+        return f"{names[0]} / {names[1]}"
+    return f"Azure 地区 / {official_label or code}"
+
 
 @dataclass(slots=True)
 class AzureComponentQuote:
@@ -119,15 +206,13 @@ class AzureRetailPlugin:
         *,
         retail_service_name: str | None = None,
         display_name: str | None = None,
+        product_registry: AzureProductRegistry | None = None,
     ):
         self.service = service
-        self.display_name = display_name or AZURE_SERVICE_NAMES.get(
-            service, "Microsoft Azure"
-        )
-        self.retail_service_name = retail_service_name or AZURE_RETAIL_SERVICE_NAMES[
-            service
-        ]
+        self.display_name = display_name or AZURE_SERVICE_NAMES.get(service, "Microsoft Azure")
+        self.retail_service_name = retail_service_name or AZURE_RETAIL_SERVICE_NAMES[service]
         self._catalog = catalog
+        self._product_registry = product_registry
 
     async def preview(
         self,
@@ -153,11 +238,22 @@ class AzureRetailPlugin:
             )
         requested_sku = self._requested_sku(requirement)
         catalog_region = None if self.service in {"front_door", "load_balancer"} else region
+        # Match the proven AWS order: before model or meter matching, verify
+        # that this service itself exists in the selected region. A mismatch
+        # is a customer-resolvable compatibility choice, not a cache failure.
+        if catalog_region:
+            region_preview = await self._region_unavailable_preview(
+                requirement,
+                component_id,
+            )
+            if region_preview is not None:
+                return region_preview
         rows = await self._catalog.retail_items(
             service_name=self.retail_service_name,
             region=catalog_region,
             arm_sku_name=(requested_sku if self.service == "azure_vm" else None),
         )
+        self._record_profile(region or "global", rows)
         if self.service == "azure_vm" and requested_sku and not rows:
             rows = await self._catalog.retail_items(
                 service_name=self.retail_service_name,
@@ -243,6 +339,7 @@ class AzureRetailPlugin:
             region=catalog_region,
             arm_sku_name=(effective_sku if self.service == "azure_vm" else None),
         )
+        self._record_profile(region or "global", rows)
         eligible = self._eligible_rows(requirement, request, rows)
         if effective_sku:
             exact = [row for row in eligible if _fold(_rate_model(row)) == _fold(effective_sku)]
@@ -326,6 +423,160 @@ class AzureRetailPlugin:
         )
         return AzureComponentQuote(selection, priced_lines, upfront)
 
+    async def configuration_field_options(
+        self,
+        requirement: ServiceRequirement,
+    ) -> dict[str, Any]:
+        """Build finite edit choices from the current local Microsoft snapshot."""
+
+        region = requirement.region or "southeastasia"
+        catalog_region = None if self.service in {"front_door"} else region
+        rows = await self._catalog.retail_items(
+            service_name=self.retail_service_name,
+            region=catalog_region,
+        )
+        regions = await self._catalog.service_regions(self.retail_service_name)
+
+        def unique(field: str) -> list[str]:
+            return sorted(
+                {
+                    str(row.get(field) or "").strip()
+                    for row in rows
+                    if str(row.get(field) or "").strip()
+                },
+                key=str.casefold,
+            )
+
+        models = sorted(
+            {_rate_model(row) for row in rows if _rate_model(row)},
+            key=str.casefold,
+        )
+        options: dict[str, list[Any]] = {
+            "region": regions,
+            "requested_sku": models,
+            "service_tier": unique("skuName"),
+            "usage_unit": unique("unitOfMeasure"),
+            "price_type": unique("type"),
+            "reservation_term": unique("reservationTerm"),
+        }
+        product_text = " ".join(unique("productName")).casefold()
+        operating_systems = []
+        if "windows" in product_text:
+            operating_systems.append("windows")
+        if self.service == "azure_vm" and any(
+            "windows" not in str(row.get("productName") or "").casefold() for row in rows
+        ):
+            operating_systems.append("linux")
+        if operating_systems:
+            options["operating_system"] = operating_systems
+
+        shapes: list[dict[str, Any]] = []
+        if self.service == "azure_vm":
+            resource_skus = await self._catalog.compute_skus(region)
+            if resource_skus:
+                priced_models = set(models)
+                for sku in resource_skus:
+                    model = str(sku.get("name") or "").strip()
+                    if not model or model not in priced_models:
+                        continue
+                    restrictions = sku.get("restrictions") or []
+                    if restrictions:
+                        continue
+                    capabilities = {
+                        str(item.get("name")): str(item.get("value"))
+                        for item in sku.get("capabilities") or []
+                        if isinstance(item, dict)
+                    }
+                    try:
+                        vcpu = float(capabilities["vCPUs"])
+                        memory = float(capabilities["MemoryGB"])
+                    except (KeyError, ValueError):
+                        continue
+                    shapes.append({"model": model, "vcpu": vcpu, "memory_gib": memory})
+            else:
+                for model in models:
+                    shape = self._shape_from_standard_vm_sku(model)
+                    if shape is not None:
+                        shapes.append(
+                            {
+                                "model": model,
+                                "vcpu": shape["vCPU"],
+                                "memory_gib": shape["memoryGiB"],
+                            }
+                        )
+            # A VM model selector must never contain a meter label that only
+            # looks like a deployable SKU. It must also stay paired with an
+            # official or conservatively decoded CPU/memory shape.
+            options["requested_sku"] = sorted(
+                {str(shape["model"]) for shape in shapes},
+                key=str.casefold,
+            )
+        return {
+            "options": {field: values for field, values in options.items() if values},
+            "shapes": shapes,
+            "source": (
+                "Azure Resource SKUs + local Retail Prices snapshot"
+                if shapes and getattr(self._catalog, "account_configured", False)
+                else "local Azure Retail Prices snapshot"
+            ),
+        }
+
+    async def _region_unavailable_preview(
+        self,
+        requirement: ServiceRequirement,
+        component_id: str,
+    ) -> PreviewSelection | None:
+        supported = await self._catalog.service_regions(self.retail_service_name)
+        if not supported or str(requirement.region) in supported:
+            return None
+        if self._product_registry is not None:
+            self._product_registry.register_identity(
+                service_key=self.service,
+                display_name=self.display_name,
+                service_name=self.retail_service_name,
+                regions=supported,
+            )
+        labels = dict(AZURE_REGION_FALLBACK)
+        candidates = [
+            CandidateOption(
+                model=region,
+                family=azure_region_bilingual_label(
+                    region,
+                    labels.get(region, region),
+                ),
+                specifications={"region": region},
+                rationale="Microsoft 官方零售目录中存在该服务计费项的区域。",
+            )
+            for region in supported
+        ]
+        message = (
+            f"{self.display_name} 在当前 Azure 区域不可用，请从下方 Microsoft 官方支持区域中选择。"
+        )
+        return self._confirmation_preview(requirement, component_id, message).model_copy(
+            update={
+                "candidates": candidates,
+                "issue_code": "azure_service_region_not_supported",
+                "issue_category": "compatibility",
+            }
+        )
+
+    def _record_profile(self, region: str, rows: list[dict[str, Any]]) -> None:
+        if self._product_registry is None or not rows:
+            return
+        profile = AzureOfficialCatalog._profile_from_rows(
+            self.retail_service_name,
+            region,
+            rows,
+        )
+        profile.update(
+            {
+                "service_key": self.service,
+                "display_name": self.display_name,
+                "fields": list(azure_requirement_fields(self.service)),
+            }
+        )
+        self._product_registry.update_profile(profile)
+
     async def _preview_vm_by_shape(
         self,
         requirement: ServiceRequirement,
@@ -392,9 +643,9 @@ class AzureRetailPlugin:
                     "Microsoft 官方 SKU 中选择。"
                 )
             )
-            return self._confirmation_preview(
-                requirement, component_id, message
-            ).model_copy(update={"candidates": public_candidates})
+            return self._confirmation_preview(requirement, component_id, message).model_copy(
+                update={"candidates": public_candidates}
+            )
         capabilities: dict[str, dict[str, float]] = {}
         exact_models: set[str] = set()
         for sku in sku_rows:
@@ -486,23 +737,24 @@ class AzureRetailPlugin:
         def distance(candidate: CandidateOption) -> tuple[float, float, str]:
             vcpu = float(candidate.specifications.get("vCPU") or 0)
             memory = float(candidate.specifications.get("memoryGiB") or 0)
-            score = (
-                abs(vcpu - requested_vcpu) / max(requested_vcpu, 1)
-                + abs(memory - requested_memory) / max(requested_memory, 1)
-            )
+            score = abs(vcpu - requested_vcpu) / max(requested_vcpu, 1) + abs(
+                memory - requested_memory
+            ) / max(requested_memory, 1)
             return score, candidate.monthly_catalog_cost or float("inf"), candidate.model
 
         return sorted(shaped, key=distance)[:12] or candidates[:12]
 
     @staticmethod
     def _shape_from_standard_vm_sku(model: str) -> dict[str, float] | None:
-        """Decode mainstream D/E/F SKU names; unknown families stay untrusted."""
+        """Decode modern D/E/F v3+ names; legacy/unknown families stay untrusted."""
 
         match = re.match(
-            r"^Standard_([DEFdef])(\d+)(?:-(\d+))?[A-Za-z0-9_]*$",
+            r"^Standard_([DEFdef])(\d+)(?:-(\d+))?[A-Za-z0-9]*_v(\d+)$",
             model,
         )
         if match is None:
+            return None
+        if int(match.group(4)) < 3:
             return None
         family = match.group(1).upper()
         full_vcpu = float(match.group(2))
@@ -621,11 +873,7 @@ class AzureRetailPlugin:
             vcore = requirements.get("vcore")
             if isinstance(vcore, (int, float)):
                 expected = f"{float(vcore):g} vcore"
-                exact = [
-                    row
-                    for row in result
-                    if _fold(row.get("skuName")) == expected
-                ]
+                exact = [row for row in result if _fold(row.get("skuName")) == expected]
                 if exact:
                     result = exact
         if self.service == "monitor" and requirements.get("log_ingestion_gib") is not None:
@@ -800,15 +1048,15 @@ class AzureGenericRetailPlugin:
         service: str,
         catalog: AzureOfficialCatalog,
         auto_discovery: AzureAutoServiceDiscovery,
+        product_registry: AzureProductRegistry | None = None,
     ):
         self.service = service
         self.display_name = service.replace("_", " ").title()
         self._catalog = catalog
         self._auto_discovery = auto_discovery
+        self._product_registry = product_registry
 
-    async def _delegate(
-        self, requirement: ServiceRequirement
-    ) -> AzureRetailPlugin:
+    async def _delegate(self, requirement: ServiceRequirement) -> AzureRetailPlugin:
         display_name = requirement.calculator_service_name or self.display_name
         profile = await self._auto_discovery.ensure_profile(
             service_key=self.service,
@@ -820,6 +1068,7 @@ class AzureGenericRetailPlugin:
             self._catalog,
             retail_service_name=str(profile["service_name"]),
             display_name=display_name,
+            product_registry=self._product_registry,
         )
 
     async def preview(
@@ -828,7 +1077,32 @@ class AzureGenericRetailPlugin:
         request: QuoteRequest,
         component_id: str,
     ) -> PreviewSelection:
-        delegate = await self._delegate(requirement)
+        try:
+            delegate = await self._delegate(requirement)
+        except ManualConfirmationRequired as exc:
+            if exc.code != "azure_service_region_not_supported":
+                raise
+            labels = dict(AZURE_REGION_FALLBACK)
+            candidates = [
+                CandidateOption(
+                    model=str(region),
+                    family=labels.get(str(region), str(region)),
+                    specifications={"region": str(region)},
+                    rationale="Microsoft 官方零售目录中存在该服务计费项的区域。",
+                )
+                for region in exc.details.get("supported_regions", [])
+            ]
+            return self._confirmation_preview(
+                requirement,
+                component_id,
+                exc.message,
+            ).model_copy(
+                update={
+                    "candidates": candidates,
+                    "issue_code": exc.code,
+                    "issue_category": "compatibility",
+                }
+            )
         selection = await delegate.preview(requirement, request, component_id)
         requested_sku = delegate._requested_sku(requirement)
         if (
@@ -856,11 +1130,7 @@ class AzureGenericRetailPlugin:
                         "status": "ready",
                     }
                 )
-        if (
-            not requested_sku
-            and selection.status == "ready"
-            and len(selection.candidates) > 1
-        ):
+        if not requested_sku and selection.status == "ready" and len(selection.candidates) > 1:
             return selection.model_copy(
                 update={
                     "selected_model": None,
@@ -883,6 +1153,13 @@ class AzureGenericRetailPlugin:
     ) -> AzureComponentQuote:
         delegate = await self._delegate(requirement)
         return await delegate.quote(requirement, request, component_index)
+
+    async def configuration_field_options(
+        self,
+        requirement: ServiceRequirement,
+    ) -> dict[str, Any]:
+        delegate = await self._delegate(requirement)
+        return await delegate.configuration_field_options(requirement)
 
     def _confirmation_preview(
         self,
@@ -911,11 +1188,20 @@ class AzurePluginRegistry:
         self,
         catalog: AzureOfficialCatalog,
         auto_discovery: AzureAutoServiceDiscovery | None = None,
+        product_registry: AzureProductRegistry | None = None,
     ):
         self._catalog = catalog
         self._auto_discovery = auto_discovery
+        self._product_registry = product_registry
+        if product_registry is not None:
+            product_registry.bootstrap(AZURE_RETAIL_SERVICE_NAMES, AZURE_SERVICE_NAMES)
         self._plugins: dict[str, AzureRetailPlugin | AzureGenericRetailPlugin] = {
-            service: AzureRetailPlugin(service, catalog) for service in AZURE_RETAIL_SERVICE_NAMES
+            service: AzureRetailPlugin(
+                service,
+                catalog,
+                product_registry=product_registry,
+            )
+            for service in AZURE_RETAIL_SERVICE_NAMES
         }
 
     def get(self, service: str) -> AzureRetailPlugin | AzureGenericRetailPlugin:
@@ -928,12 +1214,12 @@ class AzurePluginRegistry:
                     key,
                     self._catalog,
                     self._auto_discovery,
+                    self._product_registry,
                 )
                 self._plugins[key] = plugin
                 return plugin
             raise ManualConfirmationRequired(
-                f"暂时无法识别 Microsoft Azure 服务“{service}”的官方产品类型，"
-                "该组件本次不计价。",
+                f"暂时无法识别 Microsoft Azure 服务“{service}”的官方产品类型，该组件本次不计价。",
                 code="azure_unsupported_service",
                 service=service,
             ) from exc
@@ -945,10 +1231,29 @@ class AzurePluginRegistry:
                 timeout=6,
             )
         except Exception:
-            return list(AZURE_REGION_FALLBACK)
+            return [
+                (code, azure_region_bilingual_label(code, label))
+                for code, label in AZURE_REGION_FALLBACK
+            ]
         options = [
-            (str(item.get("code") or ""), str(item.get("label") or ""))
+            (
+                str(item.get("code") or ""),
+                azure_region_bilingual_label(
+                    str(item.get("code") or ""),
+                    str(item.get("label") or ""),
+                ),
+            )
             for item in regions
             if item.get("code") and item.get("label")
         ]
-        return options or list(AZURE_REGION_FALLBACK)
+        return options or [
+            (code, azure_region_bilingual_label(code, label))
+            for code, label in AZURE_REGION_FALLBACK
+        ]
+
+    async def configuration_field_options(
+        self,
+        requirement: ServiceRequirement,
+    ) -> dict[str, Any]:
+        plugin = self.get(requirement.service)
+        return await plugin.configuration_field_options(requirement)

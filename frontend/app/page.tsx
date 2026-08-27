@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { ConfigurationOptionPicker, type ConfigurationChoice } from "./components/configuration-option-picker";
 
 type Health = { status: string; awsAccount?: string; calculatorReady?: boolean; aiProvider?: string; pricingMode?: string };
@@ -12,6 +13,13 @@ type ActivityChannel = {
   history: string[];
   state: "running" | "repair" | "done";
   order: number;
+  updatedAt: string;
+};
+type ComponentRetryStatus = {
+  componentIds: number[];
+  attempt: number;
+  remainingSeconds: number;
+  phase: "waiting" | "running";
 };
 
 function serviceActivityLogs(name: string): string[] {
@@ -66,9 +74,9 @@ function activityLogStream(channel: ActivityChannel): string[] {
     ...pricingLogs,
     `${channel.name} 数据边界已锁定`,
     ...channel.history,
-    "官方计费维度校验通过",
-    "验证结果已写入只读缓存",
-    `${channel.name} 完整性校验通过`,
+    "持续轮询本组件最新状态",
+    "等待下一条真实处理记录",
+    `${channel.name} 处理通道保持运行`,
   ];
 }
 type QuoteError = { code: string; message: string; details?: Record<string, unknown> };
@@ -79,6 +87,8 @@ type Preview = {
   confirmation_text?: string | null;
   confirmation_items?: ConfirmationItem[];
   configuration_review_required?: boolean;
+  sales_validation_required?: boolean;
+  sales_validation_message?: string | null;
   notices?: string[];
   selections?: PreviewSelection[];
   execution_trace?: { stage: string; message: string; status?: string }[];
@@ -260,6 +270,27 @@ type CloudProvider = "aws" | "azure";
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "/api/backend";
 const CONFIRMATION_CONTEXT_KEY = "astraquote.pending-confirmation.v1";
 const QUOTE_JOB_CONTEXT_KEY = "astraquote.pending-quote.v1";
+const SALES_REGION_CONTEXT_KEYS: Record<CloudProvider, string> = {
+  aws: "astraquote.aws.current-sales-region.v2",
+  azure: "astraquote.azure.current-sales-region.v2",
+};
+
+function readSalesRegionContext(provider: CloudProvider): string | null {
+  return window.sessionStorage.getItem(SALES_REGION_CONTEXT_KEYS[provider]);
+}
+
+function writeSalesRegionContext(provider: CloudProvider, region: string) {
+  window.sessionStorage.setItem(SALES_REGION_CONTEXT_KEYS[provider], region);
+}
+
+function clearSalesRegionContext(provider: CloudProvider) {
+  window.sessionStorage.removeItem(SALES_REGION_CONTEXT_KEYS[provider]);
+}
+
+function clearAllSalesRegionContexts() {
+  clearSalesRegionContext("aws");
+  clearSalesRegionContext("azure");
+}
 
 type PendingConfirmationContext = {
   token: string;
@@ -326,7 +357,11 @@ const specificationNames: Record<string, string> = {
   shards: "分片", replicasPerShard: "每分片副本", totalNodes: "节点", quantity: "数量",
   dataTransferOutGiB: "公网下行", processedBytesGiB: "处理流量",
   systemDiskGiB: "系统盘", volumeType: "磁盘类型",
-  hostedZones: "域名托管区", webACLs: "Web ACL", rules: "规则", requests: "每月请求量",
+  hostedZones: "域名托管区", webACLs: "Web ACL", rules: "规则总数", requests: "每月请求总量",
+  messages: "每月消息数", connectionMinutes: "每月连接分钟",
+  throughputMbpsPerTiB: "每 TiB 吞吐量",
+  rulesPerWebACL: "每个 ACL 规则", requestsPerWebACL: "每个 ACL 每月请求",
+  memory_mb: "函数内存", duration_ms: "平均执行时长",
   queueType: "队列类型", outboundMessages: "出站邮件", logIngestionGiB: "日志写入",
   customMetrics: "自定义指标",
   vcpu: "vCPU", memory_gib: "内存", operating_system: "系统", system_disk_gib: "系统盘",
@@ -361,7 +396,15 @@ function formatPreviewValue(key: string, value: unknown): string {
   if (typeof value === "string" && normalizedValues[value.toLowerCase()]) {
     return normalizedValues[value.toLowerCase()];
   }
-  const suffix = key.toLowerCase().includes("gib") ? " GiB" : key === "utilization_percent" ? "%" : "";
+  const suffix = key.toLowerCase().includes("gib")
+    ? " GiB"
+    : key === "memory_mb"
+      ? " MB"
+      : key === "duration_ms"
+        ? " ms"
+        : key === "utilization_percent"
+          ? "%"
+          : "";
   return `${String(value)}${suffix}`;
 }
 
@@ -635,7 +678,11 @@ function compactSpecifications(selection: Selection) {
       const numericValue = typeof value === "number" ? value.toLocaleString("zh-CN") : String(value);
       const suffix = key.toLowerCase().includes("gib")
         ? " GiB"
-        : key === "requests"
+        : key === "memory_mb"
+          ? " MB"
+          : key === "duration_ms"
+            ? " ms"
+        : key === "requests" || key === "requestsPerWebACL"
           ? " 次/月"
           : "";
       return `${specificationNames[key] ?? key}: ${numericValue}${suffix}`;
@@ -650,6 +697,7 @@ export default function Home() {
   const [job, setJob] = useState<Job | null>(null);
   const [copied, setCopied] = useState(false);
   const [customerLinkModalOpen, setCustomerLinkModalOpen] = useState(false);
+  const [portalReady, setPortalReady] = useState(false);
   const [confirmationReply, setConfirmationReply] = useState("");
   const [confirmationAnswers, setConfirmationAnswers] = useState<string[]>([]);
   const [logExpanded, setLogExpanded] = useState(false);
@@ -671,6 +719,7 @@ export default function Home() {
   const [salesRegionOptions, setSalesRegionOptions] = useState<SalesRegionOption[]>([]);
   const [salesRegionPromptOpen, setSalesRegionPromptOpen] = useState(false);
   const [salesRegionChecking, setSalesRegionChecking] = useState(false);
+  const [componentRetryStatus, setComponentRetryStatus] = useState<ComponentRetryStatus | null>(null);
   const [receivedCustomerAnswers, setReceivedCustomerAnswers] = useState<Record<string, string>>({});
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const confirmationTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -680,6 +729,9 @@ export default function Home() {
   const lateConfirmationTokenStarted = useRef<string | null>(null);
   const previewPollFailures = useRef<Map<string, number>>(new Map());
   const previewRestartedJobs = useRef<Set<string>>(new Set());
+  const componentRetryAttempts = useRef<Map<string, number>>(new Map());
+  const componentRetryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const openedCustomerLinkVersion = useRef<string | null>(null);
   // Async preview, customer-confirmation polling and official pricing can all
   // finish out of order. Keep the workflow monotonic so an older response can
   // never replace a newer official-pricing screen.
@@ -688,11 +740,34 @@ export default function Home() {
   const requirementInput = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
-    fetch(`${API_BASE}/api/health`)
-      .then((response) => response.json())
-      .then(setHealth)
-      .catch(() => setHealth({ status: "offline" }));
+    setPortalReady(true);
+  }, []);
+
+  useEffect(() => {
+    const savedRegion = readSalesRegionContext(cloudProvider);
+    setSalesRegion(savedRegion);
+  }, [cloudProvider]);
+
+  useEffect(() => {
+    let active = true;
+    const checkHealth = () => {
+      fetch(`${API_BASE}/api/health`, { cache: "no-store" })
+        .then((response) => {
+          if (!response.ok) throw new Error("health check failed");
+          return response.json();
+        })
+        .then((payload) => {
+          if (active) setHealth(payload);
+        })
+        .catch(() => {
+          if (active) setHealth({ status: "offline" });
+        });
+    };
+    checkHealth();
+    const healthTimer = window.setInterval(checkHealth, 5000);
     return () => {
+      active = false;
+      window.clearInterval(healthTimer);
       if (timer.current) clearTimeout(timer.current);
       if (confirmationTimer.current) clearTimeout(confirmationTimer.current);
     };
@@ -796,6 +871,7 @@ export default function Home() {
   }, [confirmationToken, previewDraftId, requirement, cloudProvider]);
 
   const running = job?.status === "queued" || job?.status === "running";
+  const retryActivityVisible = Boolean(componentRetryStatus);
   const latest = useMemo(() => job?.events.at(-1), [job]);
   const liveComponentActivity = useMemo(() => {
     const channels = new Map<string, ActivityChannel>();
@@ -827,6 +903,7 @@ export default function Home() {
         history: history.slice(-10),
         state,
         order: previous?.order ?? order,
+        updatedAt: event.time,
       });
     }
     const statePriority: Record<ActivityChannel["state"], number> = {
@@ -845,6 +922,18 @@ export default function Home() {
     };
   }, [job?.events]);
   const channelNodes = useRef(new Map<string, HTMLDivElement>());
+  const retryingChannelIds = new Set(
+    (salesReview?.selections ?? []).flatMap((selection, index) => {
+      const componentId = Number(selection.component_id);
+      return componentRetryStatus?.componentIds.includes(componentId)
+        ? [String(index + 1)]
+        : [];
+    }),
+  );
+  const visibleCompletedComponents = Math.max(
+    0,
+    liveComponentActivity.completed - retryingChannelIds.size,
+  );
   const previousChannelPositions = useRef(new Map<string, DOMRect>());
   const channelLayoutSignature = liveComponentActivity.channels
     .map((channel) => `${channel.id}:${channel.state}`)
@@ -947,25 +1036,99 @@ export default function Home() {
   }, [job?.status, job?.error, confirmationItems, confirmationText, requirement, cloudProvider]);
 
   useEffect(() => {
-    if (!running) return;
+    if (!running && !retryActivityVisible) return;
     const interval = window.setInterval(() => setElapsedSeconds((value) => value + 1), 1000);
     return () => window.clearInterval(interval);
-  }, [running]);
+  }, [running, retryActivityVisible]);
 
   useEffect(() => {
-    if (!running) return;
+    if (!running && !retryActivityVisible) return;
     const interval = window.setInterval(
       () => setActivityLogTick((value) => value + 1),
       520,
     );
     return () => window.clearInterval(interval);
-  }, [running]);
+  }, [running, retryActivityVisible]);
 
   useEffect(() => {
-    if (!salesReview?.confirmation_token) return;
+    if (!salesReview?.confirmation_token || salesReview.sales_validation_required) return;
+    const linkMode = salesReview.configuration_review_required ? "configuration" : "questions";
+    const linkVersion = `${salesReview.confirmation_token}:${linkMode}`;
+    if (openedCustomerLinkVersion.current === linkVersion) return;
+    openedCustomerLinkVersion.current = linkVersion;
     setCopied(false);
     setCustomerLinkModalOpen(true);
-  }, [salesReview?.confirmation_token]);
+  }, [
+    salesReview?.confirmation_token,
+    salesReview?.configuration_review_required,
+    salesReview?.sales_validation_required,
+  ]);
+
+  useEffect(() => {
+    if (componentRetryTimer.current) {
+      clearTimeout(componentRetryTimer.current);
+      componentRetryTimer.current = null;
+    }
+    if (
+      !salesReview?.sales_validation_required
+      || salesReview.confirmation_token
+      || running
+      || cloudProvider !== "aws"
+    ) {
+      if (!running) setComponentRetryStatus(null);
+      return;
+    }
+    const failedComponentIds = (salesReview.selections ?? [])
+      .filter((selection) => ["technical_issue", "unsupported"].includes(selection.status ?? ""))
+      .map((selection) => Number(selection.component_id))
+      .filter((componentId) => Number.isInteger(componentId) && componentId >= 0);
+    if (!failedComponentIds.length) {
+      setComponentRetryStatus(null);
+      return;
+    }
+    const retryKey = `${salesReview.draft_id}:${failedComponentIds.join(",")}`;
+    const attempt = componentRetryAttempts.current.get(retryKey) ?? 0;
+    const delays = [1500, 4000, 10000, 30000, 60000, 120000];
+    const delay = delays[Math.min(attempt, delays.length - 1)];
+    setComponentRetryStatus({
+      componentIds: failedComponentIds,
+      attempt: attempt + 1,
+      remainingSeconds: Math.max(1, Math.ceil(delay / 1000)),
+      phase: "waiting",
+    });
+    const countdown = window.setInterval(() => {
+      setComponentRetryStatus((current) => current ? {
+        ...current,
+        remainingSeconds: Math.max(0, current.remainingSeconds - 1),
+      } : null);
+    }, 1000);
+    componentRetryTimer.current = setTimeout(() => {
+      componentRetryAttempts.current.set(retryKey, attempt + 1);
+      setComponentRetryStatus({
+        componentIds: failedComponentIds,
+        attempt: attempt + 1,
+        remainingSeconds: 0,
+        phase: "running",
+      });
+      void runPreflight(
+        requirement,
+        salesReview.draft_id,
+        {},
+        false,
+        cloudProvider,
+        undefined,
+        failedComponentIds,
+      );
+    }, delay);
+    return () => {
+      window.clearInterval(countdown);
+      if (componentRetryTimer.current) clearTimeout(componentRetryTimer.current);
+      componentRetryTimer.current = null;
+    };
+  // The retry is intentionally driven only by the persisted preview snapshot;
+  // runPreflight is a function declaration and must not restart this timer on render.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [salesReview, running, cloudProvider, requirement]);
 
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -1017,6 +1180,7 @@ export default function Home() {
     prefixEvents: JobEvent[] = [],
     provider: CloudProvider = cloudProvider,
   ) {
+    const currentSalesRegion = salesRegion ?? readSalesRegionContext(provider);
     workflowPhase.current = "quote";
     if (timer.current) clearTimeout(timer.current);
     if (confirmationTimer.current) clearTimeout(confirmationTimer.current);
@@ -1036,6 +1200,7 @@ export default function Home() {
           cloud_provider: provider,
           customer_request: requestText,
           draft_id: draftId,
+          sales_region: currentSalesRegion,
           pricing_mode: pricingMode ?? "on_demand",
           reserved_term_years: pricingMode ? reservedTermYears[0] : null,
           reserved_term_options: pricingMode ? reservedTermYears : null,
@@ -1059,6 +1224,7 @@ export default function Home() {
           customerRequest: requestText,
           cloudProvider: provider,
           draftId: draftId ?? null,
+          salesRegion: currentSalesRegion,
         }),
       );
       await poll(payload.job_id, prefixEvents);
@@ -1305,6 +1471,7 @@ export default function Home() {
     confirmationResponses: Record<string, string>,
     stopForSalesReview: boolean,
     provider: CloudProvider,
+    retryComponentIds: number[] = [],
   ) {
     if (workflowPhase.current === "quote") return;
     try {
@@ -1320,10 +1487,12 @@ export default function Home() {
         previewPollFailures.current.delete(jobId);
         await runPreflight(
           requestText,
-          undefined,
+          draftId,
           confirmationResponses,
           stopForSalesReview,
           provider,
+          undefined,
+          retryComponentIds,
         );
         return;
       }
@@ -1345,6 +1514,7 @@ export default function Home() {
             confirmationResponses,
             stopForSalesReview,
             provider,
+            retryComponentIds,
           ),
           700,
         );
@@ -1380,6 +1550,7 @@ export default function Home() {
             confirmationResponses,
             stopForSalesReview,
             provider,
+            retryComponentIds,
           ),
           Math.min(5000, 1000 + failures * 500),
         );
@@ -1405,6 +1576,7 @@ export default function Home() {
     stopForSalesReview = false,
     provider: CloudProvider = cloudProvider,
     salesRegionOverride?: string,
+    retryComponentIds: number[] = [],
   ) {
     if (workflowPhase.current === "quote") return;
     workflowPhase.current = "preview";
@@ -1419,12 +1591,16 @@ export default function Home() {
       ],
     });
     try {
+      const currentSalesRegion = salesRegionOverride
+        ?? salesRegion
+        ?? readSalesRegionContext(provider);
       const requestPayload = {
         cloud_provider: provider,
         customer_request: requestText,
         draft_id: draftId,
         confirmation_responses: confirmationResponses,
-        sales_region: provider === "aws" ? (salesRegionOverride ?? salesRegion) : null,
+        retry_component_ids: retryComponentIds,
+        sales_region: currentSalesRegion,
         pricing_mode: pricingMode ?? "on_demand",
         reserved_term_years: pricingMode ? reservedTermYears[0] : null,
         reserved_term_options: pricingMode ? reservedTermYears : null,
@@ -1473,6 +1649,7 @@ export default function Home() {
           confirmationResponses,
           stopForSalesReview,
           provider,
+          retryComponentIds,
         );
         return;
       }
@@ -1505,13 +1682,15 @@ export default function Home() {
     setReceivedCustomerAnswers({});
     window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
     window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY);
-    if (cloudProvider !== "aws") {
-      await runPreflight(requirement);
-      return;
-    }
+    clearSalesRegionContext(cloudProvider);
+    setSalesRegion(null);
+    const provider = cloudProvider;
     setSalesRegionChecking(true);
     try {
-      const response = await fetch(`${API_BASE}/api/quotes/region-preflight`, {
+      const endpoint = provider === "azure"
+        ? "/api/azure/quotes/region-preflight"
+        : "/api/quotes/region-preflight";
+      const response = await fetch(`${API_BASE}${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ customer_request: requirement }),
@@ -1525,7 +1704,10 @@ export default function Home() {
       }
       const detectedRegion = result.selected_region ?? null;
       setSalesRegion(detectedRegion);
-      await runPreflight(requirement, undefined, {}, false, "aws", detectedRegion ?? undefined);
+      if (detectedRegion) {
+        writeSalesRegionContext(provider, detectedRegion);
+      }
+      await runPreflight(requirement, undefined, {}, false, provider, detectedRegion ?? undefined);
     } catch (error) {
       setJob({
         job_id: "region-preflight-error",
@@ -1696,9 +1878,11 @@ export default function Home() {
     setPreviewDraftId(null);
     setConfirmationToken(null);
     setSalesReview(null);
+    setSalesRegion(null);
     setReceivedCustomerAnswers({});
     window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
     window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY);
+    clearAllSalesRegionContexts();
     window.scrollTo({ top: 0, behavior: "smooth" });
     window.setTimeout(() => requirementInput.current?.focus(), 350);
   }
@@ -1711,13 +1895,14 @@ export default function Home() {
           <strong>AstraQuote</strong>
         </a>
         <div className="header-actions">
+          <button className="global-requote-button" type="button" onClick={returnToHome}>重新报价</button>
           <div className={`health ${health?.status === "ok" ? "online" : ""}`}>
             <i />
             {health?.status === "ok"
               ? cloudProvider === "aws" ? `AWS ${health.awsAccount}` : "Azure Retail Prices · 公开接口"
               : health
-                ? "系统已启动 · AWS 待连接"
-                : "服务连接中"}
+                ? "后台连接中断 · 正在重连"
+                : "正在连接服务"}
           </div>
         </div>
       </header>
@@ -1731,13 +1916,14 @@ export default function Home() {
           setReservedTermYears([1, 3]);
           setPaymentOption("all_upfront");
           window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY);
+          clearAllSalesRegionContexts();
           setJob(null);
           setSalesReview(null);
           setSalesRegion(null);
           setSalesRegionOptions([]);
           setSalesRegionPromptOpen(false);
         }}>AWS 报价</button>
-        <button type="button" className={cloudProvider === "azure" ? "selected" : ""} onClick={() => { workflowPhase.current = "idle"; window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY); setCloudProvider("azure"); setPricingMode(null); setAzurePricingMode("pay_as_you_go"); setAzureTermYears(1); setAzurePaymentOption("monthly"); setJob(null); setSalesReview(null); setSalesRegion(null); setSalesRegionOptions([]); setSalesRegionPromptOpen(false); }}>Microsoft Azure 报价</button>
+        <button type="button" className={cloudProvider === "azure" ? "selected" : ""} onClick={() => { workflowPhase.current = "idle"; window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY); clearAllSalesRegionContexts(); setCloudProvider("azure"); setPricingMode(null); setAzurePricingMode("pay_as_you_go"); setAzureTermYears(1); setAzurePaymentOption("monthly"); setJob(null); setSalesReview(null); setSalesRegion(null); setSalesRegionOptions([]); setSalesRegionPromptOpen(false); }}>Microsoft Azure 报价</button>
       </nav>}
 
       <nav className="quote-steps" aria-label="报价步骤">
@@ -1763,6 +1949,7 @@ export default function Home() {
             onChange={(event) => {
               setRequirement(event.target.value);
               setSalesRegion(null);
+              clearSalesRegionContext(cloudProvider);
             }}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey) {
@@ -1899,11 +2086,20 @@ export default function Home() {
             )}
             <div className="azure-pricing-note"><strong>Microsoft 官方公开价</strong><span>不包含 EA/MCA/CSP 协议折扣、税费和抵扣</span></div>
           </fieldset>}
+          <div className="form-actions">
+            <button
+              type="submit"
+              className="primary"
+              disabled={running || salesRegionChecking || requirement.trim().length < 3}
+            >
+              {running || salesRegionChecking ? <><i className="spinner" aria-hidden="true" />正在提交</> : <>提交并生成配置 <span aria-hidden="true">→</span></>}
+            </button>
+          </div>
         </form>
       </section>
       )}
 
-      {salesRegionPromptOpen && (
+      {portalReady && salesRegionPromptOpen && createPortal((
         <div className="sales-region-modal-backdrop" role="presentation">
           <section
             className="sales-region-modal"
@@ -1912,15 +2108,18 @@ export default function Home() {
             aria-labelledby="sales-region-modal-title"
           >
             <small>销售确认 · 第一步</small>
-            <h2 id="sales-region-modal-title">请选择客户部署地区</h2>
-            <p>客户需求中没有识别到地区。地区确认后，系统才会开始整理组件并生成客户链接。</p>
+            <h2 id="sales-region-modal-title">请由销售确认客户部署地区</h2>
+            <p>这是组件识别和生成客户链接之前的销售内部步骤。客户未填写可用 {cloudProvider === "aws" ? "AWS" : "Microsoft Azure"} 地区，或填写的地点无法对应到真实官方区域时，请销售从当前官方列表确认；系统不会擅自替换，也不会把地区问题发给客户。</p>
             <div className="sales-region-option-grid">
               {salesRegionOptions.map((option) => (
                 <button
                   type="button"
                   className={salesRegion === option.code ? "selected" : ""}
                   key={option.code}
-                  onClick={() => setSalesRegion(option.code)}
+                  onClick={() => {
+                    setSalesRegion(option.code);
+                    writeSalesRegionContext(cloudProvider, option.code);
+                  }}
                 >
                   <strong>{option.label}</strong>
                   <span>{option.code}</span>
@@ -1931,6 +2130,7 @@ export default function Home() {
               <button type="button" className="secondary" onClick={() => {
                 setSalesRegionPromptOpen(false);
                 setSalesRegion(null);
+                clearSalesRegionContext(cloudProvider);
               }}>返回修改需求</button>
               <button type="button" className="primary" disabled={!salesRegion} onClick={() => {
                 const confirmedRegion = salesRegion;
@@ -1941,14 +2141,14 @@ export default function Home() {
                   undefined,
                   {},
                   false,
-                  "aws",
+                  cloudProvider,
                   confirmedRegion,
                 );
-              }}>确认地区并开始整理</button>
+              }}>销售确认地区并开始整理</button>
             </div>
           </section>
         </div>
-      )}
+      ), document.body)}
 
       {salesReview && (
         <section className="sales-review-card">
@@ -2000,30 +2200,44 @@ export default function Home() {
               </div>
             </div>
           )}
+          {salesReview.sales_validation_required && (
+            <div className="customer-answer-received sales-internal-validation" role="status">
+              <strong>系统正在自动完成组件核验</strong>
+              <p>{salesReview.sales_validation_message ?? "仅重新处理未通过的组件，已通过组件不会重复运行。"}</p>
+            </div>
+          )}
           <div className="component-review-grid">
-            {(salesReview.selections ?? []).map((selection, originalIndex) => {
+            {hierarchyOrdered(salesReview.selections ?? []).map(({ item: selection, originalIndex }) => {
               const questions = (salesReview.confirmation_items ?? []).filter((item) => questionMatchesSelection(item, selection));
               const state = questions.length > 0 || selection.requires_confirmation
                 ? "customer_issue"
                 : selection.status ?? "ready";
-              return { selection, originalIndex, questions, state };
-            }).sort((left, right) => {
-              const priority = (state: string) => state === "customer_issue"
-                ? 0
-                : state === "technical_issue" || state === "unsupported"
-                  ? 1
-                  : 2;
-              if (left.selection.parent_component_id === right.selection.component_id) return 1;
-              if (right.selection.parent_component_id === left.selection.component_id) return -1;
-              return priority(left.state) - priority(right.state)
-                || left.originalIndex - right.originalIndex;
-            }).map(({ selection, originalIndex, questions, state }) => {
+              const activity = liveComponentActivity.channels.find(
+                (channel) => channel.id === String(originalIndex + 1),
+              );
+              const numericComponentId = Number(selection.component_id);
+              const retryingThisComponent = Boolean(
+                componentRetryStatus
+                && Number.isInteger(numericComponentId)
+                && componentRetryStatus.componentIds.includes(numericComponentId),
+              );
+              const systemManaged = ["technical_issue", "unsupported"].includes(state);
+              const currentProcessingMessage = componentRetryStatus?.phase === "waiting" && retryingThisComponent
+                ? `本轮尚未通过，${componentRetryStatus.remainingSeconds} 秒后开始第 ${componentRetryStatus.attempt} 次重试`
+                : retryingThisComponent
+                  ? `第 ${componentRetryStatus?.attempt ?? 1} 次重试中：先检查本地缓存，必要时同步官方目录`
+                  : activity?.state === "done" && systemManaged
+                    ? "本轮查询已结束，但组件尚未通过安全报价检查"
+                    : activity?.message ?? "等待组件级自动核验任务";
+              const processingHistory = (activity?.history ?? [])
+                .filter((message) => !/核验完成|报价计算完成|停止运行/.test(message))
+                .slice(-3);
               return (
                 <article className={`component-review-card ${state} ${selection.parent_component_id ? "derived-component" : ""}`} key={`${selection.component_id ?? originalIndex}-${selection.service}`}>
                   <header>
                     <span>{selection.component_number ?? String(originalIndex + 1).padStart(2, "0")}</span>
                     <div><small>{selection.parent_component_number ? `隶属于 ${selection.parent_component_number} · ${selection.parent_display_name ?? "父组件"}` : selection.region ?? "未指定区域"}</small><h3>{serviceDisplayName(selection)}</h3></div>
-                    <b>{state === "ready" ? "可报价" : state === "customer_issue" ? "需客户确认" : state === "unsupported" ? "已识别" : "系统检查"}</b>
+                    <b>{state === "ready" ? "可报价" : state === "customer_issue" ? "需客户确认" : retryingThisComponent ? componentRetryStatus?.phase === "waiting" ? "等待重试" : "处理中" : state === "unsupported" ? "已识别" : "待处理"}</b>
                   </header>
                   <div className="component-model">
                     {selection.requested_model || selection.selected_model || `由 ${cloudProvider === "aws" ? "AWS" : "Azure"} 规格匹配`}
@@ -2034,50 +2248,42 @@ export default function Home() {
                   {selection.source_text && <details><summary>查看客户原话</summary><p>{selection.source_text}</p></details>}
                   {(questions.length > 0 || selection.issue_message) && (
                     <div className="component-issue">
-                      {questions.length > 0 ? questions.map((item) => <p key={item.question}>{item.question}</p>) : <p>{selection.issue_message}</p>}
+                      {questions.length > 0
+                        ? questions.map((item) => <p key={item.question}>{item.question}</p>)
+                        : <p>{selection.issue_message}</p>}
                     </div>
                   )}
-                  {state === "unsupported" && <p className="component-note">客户需求已保留。该项尚未核价，不需要客户回答，也不影响其他组件。</p>}
+                  {systemManaged && retryingThisComponent && (
+                    <div className="component-processing-log" role="status" aria-live="polite">
+                      <div><i className="active" aria-hidden="true" /><strong>处理记录</strong></div>
+                      <p>{currentProcessingMessage}</p>
+                      {processingHistory.length > 0 && (
+                        <ol>
+                          {processingHistory.map((message, index) => (
+                            <li key={`${message}-${index}`}>{message}</li>
+                          ))}
+                        </ol>
+                      )}
+                      <small>{activity ? `最近更新 ${activity.updatedAt}` : "已进入处理队列"}</small>
+                    </div>
+                  )}
                 </article>
               );
             })}
           </div>
-          {salesReview.confirmation_text && !salesReview.confirmation_token && (
-            <div className="confirmation-list inline-review-confirmation">
-              {(salesReview.confirmation_items ?? []).map((item, index) => (
-                <div className="confirmation-item" key={`${index}-${item.question}`}>
-                  <label htmlFor={`review-confirmation-${index}`}><b>{index + 1}</b><span>{item.question}</span></label>
-                  <input
-                    id={`review-confirmation-${index}`}
-                    value={confirmationAnswers[index] ?? ""}
-                    onChange={(event) => setConfirmationAnswers((current) => current.map((answer, answerIndex) => answerIndex === index ? event.target.value : answer))}
-                    placeholder="填写客户确认结果"
-                  />
-                </div>
-              ))}
-            </div>
-          )}
           <div className="sales-review-actions">
             <button type="button" className="secondary" onClick={() => { workflowPhase.current = "idle"; setSalesReview(null); setJob(null); reviseRequirement(); }}>返回修改</button>
-            {!salesReview.confirmation_text && !salesReview.configuration_review_required && <button type="button" className="primary" onClick={() => {
-              const draftId = salesReview.draft_id;
-              setSalesReview(null);
-              setReceivedCustomerAnswers({});
-              window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
-              void startQuote(requirement, draftId, [
-                { stage: "customer", message: "完整配置已确认，开始官方报价", time: "刚刚" },
-              ]);
-            }}>确认配置并报价</button>}
-            {salesReview.confirmation_text && !salesReview.confirmation_token && <button type="button" className="primary" disabled={confirmationAnswers.some((answer) => !answer.trim())} onClick={() => {
-              const answers = Object.fromEntries((salesReview.confirmation_items ?? []).map((item, index) => [confirmationAnswerKey(item), confirmationAnswers[index]]));
-              setSalesReview(null);
-              void runPreflight(requirement, salesReview.draft_id, answers, true);
-            }}>提交确认并继续</button>}
+            {salesReview.confirmation_token && !salesReview.sales_validation_required && (
+              <button type="button" className="primary" onClick={() => {
+                setCopied(false);
+                setCustomerLinkModalOpen(true);
+              }}>获取客户确认链接</button>
+            )}
           </div>
         </section>
       )}
 
-      {salesReview?.confirmation_token && customerLinkModalOpen && (
+      {portalReady && salesReview?.confirmation_token && customerLinkModalOpen && createPortal((
         <div className="customer-link-modal-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget) setCustomerLinkModalOpen(false);
         }}>
@@ -2100,45 +2306,49 @@ export default function Home() {
             <footer><i /> 等待客户提交确认结果</footer>
           </section>
         </div>
-      )}
+      ), document.body)}
 
-      {running && (
-        <section className={`workbench ${running ? "running" : ""}`} aria-live="polite">
+      {!salesReview && (running || componentRetryStatus) && (
+        <section className="workbench running" aria-live="polite">
           <div className="workbench-head">
-            <div><p className="kicker">报价处理进度</p><h2>{checking ? "正在核验配置" : "正在生成报价"}</h2></div>
+            <div><p className="kicker">报价处理进度</p><h2>{componentRetryStatus ? "正在持续修复未通过组件" : checking ? "正在核验配置" : "正在生成报价"}</h2></div>
             <div className="workbench-actions">
               <button type="button" className="log-toggle" onClick={() => setLogExpanded((value) => !value)}>
                 {logExpanded ? "收起记录" : "展开记录"}
               </button>
-              <span className="status-pill">处理中</span>
+              <span className="status-pill">{componentRetryStatus?.phase === "waiting" ? `${componentRetryStatus.remainingSeconds} 秒后继续` : "处理中"}</span>
             </div>
           </div>
-          {running && <div className="current-step"><i /><span>{latest?.message ?? "正在准备官方报价"}</span><b>{elapsedSeconds}s</b></div>}
+          {(running || componentRetryStatus) && <div className="current-step"><i /><span>{componentRetryStatus?.phase === "waiting" ? `未通过组件将在 ${componentRetryStatus.remainingSeconds} 秒后继续核验` : latest?.message ?? "正在准备组件级官方核验"}</span><b>{elapsedSeconds}s</b></div>}
           {liveComponentActivity.channels.length > 0 && (
             <div className="ai-channel-section">
               <div className="ai-channel-summary">
                 <span>组件处理通道</span>
-                <b>{liveComponentActivity.total || liveComponentActivity.channels.length} 个独立组件 · {liveComponentActivity.completed}/{liveComponentActivity.total || "-"}</b>
+                <b>{liveComponentActivity.total || liveComponentActivity.channels.length} 个独立组件 · {visibleCompletedComponents}/{liveComponentActivity.total || "-"}</b>
               </div>
               <div className="ai-channel-grid">
-                {liveComponentActivity.channels.map((channel, index) => (
-                  <div
-                    className={`ai-channel ${channel.state}`}
-                    key={channel.id}
-                    ref={(node) => {
-                      if (node) channelNodes.current.set(channel.id, node);
-                      else channelNodes.current.delete(channel.id);
-                    }}
-                  >
-                    <header><span>通道 {index + 1}</span><i /></header>
-                    <strong>{channel.name}</strong>
-                    <div className="ai-channel-log" aria-hidden="true">
-                      <div
-                        className="ai-channel-log-group"
-                      >
-                        {(() => {
-                          const stream = activityLogStream(channel);
-                          const end = channel.state === "done"
+                {liveComponentActivity.channels.map((channel, index) => {
+                  const visibleChannel: ActivityChannel = retryingChannelIds.has(channel.id)
+                    ? { ...channel, state: "running" }
+                    : channel;
+                  return (
+                    <div
+                      className={`ai-channel ${visibleChannel.state}`}
+                      key={visibleChannel.id}
+                      ref={(node) => {
+                        if (node) channelNodes.current.set(visibleChannel.id, node);
+                        else channelNodes.current.delete(visibleChannel.id);
+                      }}
+                    >
+                      <header><span>通道 {index + 1}</span><i /></header>
+                      <strong>{visibleChannel.name}</strong>
+                      <div className="ai-channel-log" aria-hidden="true">
+                        <div
+                          className="ai-channel-log-group"
+                        >
+                          {(() => {
+                          const stream = activityLogStream(visibleChannel);
+                          const end = visibleChannel.state === "done"
                             ? stream.length - 1
                             : (activityLogTick + index * 2) % stream.length;
                           return Array.from({ length: Math.min(5, stream.length) }, (_, row) => {
@@ -2146,7 +2356,7 @@ export default function Home() {
                             return (
                               <p
                                 className={row === 0 ? "log-row-exiting" : row === 4 ? "log-row-new" : ""}
-                                key={`${channel.id}-${messageIndex}-${stream[messageIndex]}`}
+                                key={`${visibleChannel.id}-${messageIndex}-${stream[messageIndex]}`}
                                 style={{ top: `${(row - 1) * 19}px` }}
                               >
                                 <span>{String(messageIndex + 1).padStart(2, "0")}</span>
@@ -2154,11 +2364,12 @@ export default function Home() {
                               </p>
                             );
                           });
-                        })()}
+                          })()}
+                        </div>
                       </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}

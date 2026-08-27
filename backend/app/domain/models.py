@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -94,6 +95,14 @@ class ServiceRequirement(BaseModel):
     # overwriting customer-written or customer-confirmed facts.
     field_sources: dict[str, str] = Field(default_factory=dict)
     locked_fields: list[str] = Field(default_factory=list)
+    # Pricing semantics live outside ``requirements`` so they cannot leak into
+    # AWS adapters or the customer-facing configuration table.
+    field_match_policies: dict[str, Literal["exact", "approximate", "minimum"]] = Field(
+        default_factory=dict
+    )
+    field_scopes: dict[
+        str, Literal["component_total", "aggregate", "per_resource", "per_node"]
+    ] = Field(default_factory=dict)
 
 
 class ParsedIntent(BaseModel):
@@ -110,13 +119,15 @@ class QuoteRequest(BaseModel):
     selected_models: dict[str, str] = Field(default_factory=dict)
     draft_id: str | None = Field(default=None, min_length=12, max_length=12)
     confirmation_responses: dict[str, str] = Field(default_factory=dict)
-    # Sales confirms the quote-wide AWS deployment region before the slower
-    # component/catalog pass begins. Explicit component regions in customer
-    # text still take priority; this value fills only unresolved components.
-    sales_region: str | None = Field(
-        default=None,
-        pattern=r"^(?:af|ap|ca|cn|eu|il|me|mx|sa|us)(?:-gov)?-[a-z0-9-]+-\d$",
-    )
+    # Internal revalidation is component-scoped.  A retry must never send
+    # already validated rows back through their catalog adapters, because one
+    # transient failure should not invalidate or slow down the whole quote.
+    retry_component_ids: list[int] = Field(default_factory=list, max_length=25)
+    # Sales confirms the quote-wide provider region before the slower
+    # component/catalog pass begins. The value is provider-scoped and is
+    # validated below, so an AWS region can never enter an Azure request (or
+    # vice versa). Explicit component regions still take priority.
+    sales_region: str | None = Field(default=None, max_length=40)
     pricing_mode: Literal[
         "on_demand", "standard_reserved", "convertible_reserved"
     ] = "on_demand"
@@ -133,6 +144,15 @@ class QuoteRequest(BaseModel):
 
     @model_validator(mode="after")
     def normalize_sales_pricing_choice(self) -> QuoteRequest:
+        if self.sales_region:
+            self.sales_region = self.sales_region.strip().casefold()
+            region_pattern = (
+                r"[a-z][a-z0-9]{2,39}"
+                if self.cloud_provider == "azure"
+                else r"(?:af|ap|ca|cn|eu|il|me|mx|sa|us)(?:-gov)?-[a-z0-9-]+-\d"
+            )
+            if re.fullmatch(region_pattern, self.sales_region) is None:
+                raise ValueError(f"{self.cloud_provider.upper()} 销售地区格式不正确")
         if self.cloud_provider == "azure":
             if self.azure_pricing_mode in {"reservation", "savings_plan"}:
                 self.azure_term_years = self.azure_term_years or 1
@@ -310,6 +330,8 @@ class QuotePreviewResponse(BaseModel):
     confirmation_items: list[ConfirmationItem] = Field(default_factory=list)
     confirmation_token: str | None = None
     configuration_review_required: bool = False
+    sales_validation_required: bool = False
+    sales_validation_message: str | None = None
     execution_trace: list[ExecutionEvent] = Field(default_factory=list)
     expert_review: ExpertReview | None = None
 
