@@ -1226,8 +1226,7 @@ async def test_quantity_edit_rebuilds_any_component_from_latest_confirmed_model(
         "requested_model": model,
         "memory_gib": 999,
     }
-    if service != "elasticache":
-        old_requirements["vcpu"] = 99
+    old_requirements["vcpu"] = 99
 
     class QuantityGateway:
         async def complete_json(self, **_: object) -> dict[str, object]:
@@ -1268,10 +1267,7 @@ async def test_quantity_edit_rebuilds_any_component_from_latest_confirmed_model(
 
     assert revised.quantity == 2
     assert revised.requirements["requested_model"] == model
-    if service == "elasticache":
-        assert "vcpu" not in revised.requirements
-    else:
-        assert revised.requirements["vcpu"] == official_vcpu
+    assert revised.requirements["vcpu"] == official_vcpu
     assert revised.requirements["memory_gib"] == official_memory
 
 
@@ -1526,7 +1522,7 @@ async def test_invalid_ai_structure_is_repaired_once() -> None:
 
     # Invalid intake gets one repair, then one validated component extraction.
     assert gateway.calls == 3
-    assert parsed.services[0].quantity == 2
+    assert parsed.services[0].quantity == 1
 
 
 @pytest.mark.asyncio
@@ -1543,7 +1539,7 @@ async def test_missing_ai_summary_uses_customer_text_after_component_cleanup() -
     assert gateway.calls == 2
     assert (
         parsed.customer_summary
-        == "已识别 1 项 AWS 配置；区域：待确认；Amazon ElastiCache for Redis × 2。"
+        == "已识别 1 项 AWS 配置；区域：待确认；Amazon ElastiCache for Redis × 1。"
     )
 
 
@@ -6175,6 +6171,121 @@ def test_capacity_recovery_uses_canonical_service_identity_for_all_aliases() -> 
     for item, (_, expected) in zip(parsed.services, cases, strict=True):
         for field, value in expected.items():
             assert item.requirements[field] == value
+
+
+def test_broker_cpu_cannot_overwrite_literal_broker_count() -> None:
+    source = "Kafka：每个Broker 8核CPU、16GB内存、2TB磁盘，共3个Broker。"
+    parsed = ParsedIntent(
+        customer_summary="Kafka",
+        services=[
+            ServiceRequirement(
+                service="msk",
+                quantity=3,
+                source_text=source,
+                requirements={"broker_count": 8, "vcpu": 8, "memory_gib": 16},
+            )
+        ],
+    )
+
+    DeepSeekIntentParser._reconcile_explicit_capacities(source, parsed)
+    DeepSeekIntentParser._reconcile_repeated_unit_storage(parsed)
+    DeepSeekIntentParser._normalize_cluster_group_quantities(parsed)
+
+    component = parsed.services[0]
+    assert component.quantity == 1
+    assert component.requirements["broker_count"] == 3
+    assert component.requirements["storage_gib_per_broker"] == 2048
+    assert component.requirements["total_storage_gib"] == 6144
+
+
+def test_mysql_primary_replica_keeps_member_count_without_double_pricing_quantity() -> None:
+    source = (
+        "MySQL：每个数据库节点16核CPU、64GB内存、2TB磁盘，"
+        "共2个节点，采用1主1从。"
+    )
+    parsed = ParsedIntent(
+        customer_summary="MySQL",
+        services=[
+            ServiceRequirement(
+                service="rds",
+                quantity=2,
+                source_text=source,
+                requirements={"engine": "mysql", "vcpu": 16, "memory_gib": 64},
+            )
+        ],
+    )
+
+    DeepSeekIntentParser._reconcile_explicit_capacities(source, parsed)
+    DeepSeekIntentParser._normalize_database_group_quantity(parsed)
+    DeepSeekIntentParser._sanitize_parsed_requirements(parsed)
+
+    component = parsed.services[0]
+    assert component.quantity == 1
+    assert component.requirements["deployment"] == "multi_az"
+    assert component.requirements["instance_count"] == 2
+    DeepSeekIntentParser._validate_numeric_evidence_value(
+        component,
+        path="quantity",
+        snippet="共2个节点，采用1主1从",
+    )
+    assert DeepSeekIntentParser._deterministic_component_audit_issues(
+        ServiceRequirement(service="rds", source_text=source), component
+    ) == []
+
+
+def test_self_hosted_service_switch_preserves_per_node_disk_and_count() -> None:
+    source = "Flink：每个节点24核CPU、64GB内存、500GB磁盘，共3个节点。"
+    parsed = ParsedIntent(
+        customer_summary="Flink",
+        services=[
+            ServiceRequirement(
+                service="flink",
+                calculator_service_name="Flink",
+                source_text=source,
+                requirements={"storage_gib": 500},
+            )
+        ],
+    )
+
+    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, source)
+    DeepSeekIntentParser._sanitize_parsed_requirements(parsed)
+
+    component = parsed.services[0]
+    assert component.service == "ec2"
+    assert component.quantity == 3
+    assert component.requirements["vcpu"] == 24
+    assert component.requirements["memory_gib"] == 64
+    assert component.requirements["system_disk_gib"] == 500
+    assert "storage_gib" not in component.requirements
+
+
+def test_redis_keeps_cpu_node_count_and_source_storage_separate_from_memory() -> None:
+    source = "Redis：每个节点16核CPU、64GB内存、500GB存储，共3个节点。"
+    parsed = ParsedIntent(
+        customer_summary="Redis",
+        services=[
+            ServiceRequirement(
+                service="elasticache",
+                source_text=source,
+                requirements={"engine": "redis", "memory_gib": 500},
+            )
+        ],
+    )
+
+    DeepSeekIntentParser._reconcile_explicit_capacities(source, parsed)
+    DeepSeekIntentParser._reconcile_explicit_service_architecture(source, parsed)
+    DeepSeekIntentParser._normalize_cluster_group_quantities(parsed)
+    DeepSeekIntentParser._sanitize_parsed_requirements(parsed)
+
+    component = parsed.services[0]
+    assert component.quantity == 1
+    assert component.requirements["vcpu"] == 16
+    assert component.requirements["memory_gib"] == 64
+    assert component.requirements["node_count"] == 3
+    assert component.requirements["shards"] == 1
+    assert component.requirements["replicas_per_shard"] == 2
+    assert component.requirements["source_storage_gib_per_node"] == 500
+    assert "requirements.node_count" in component.locked_fields
 
 
 def test_cleaned_component_source_never_falls_back_to_full_quote() -> None:

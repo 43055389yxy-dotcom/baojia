@@ -62,6 +62,7 @@ class BcmWorkloadEstimator:
         self._estimate_ids = list(settings.bcm_workload_estimate_ids)
         self._account_id: str | None = None
         self._owned_estimate_ids: set[str] = set()
+        self._exhausted_estimate_ids: set[str] = set()
         self._lock = threading.Lock()
 
     def quote(self, lines: list[UsageLine]) -> BcmQuoteResult:
@@ -76,24 +77,65 @@ class BcmWorkloadEstimator:
 
         with self._lock:
             pooled = bool(self._estimate_ids)
+            if pooled:
+                quota_error: ManualConfirmationRequired | None = None
+                for estimate_id in self._estimate_ids:
+                    if estimate_id in self._exhausted_estimate_ids:
+                        continue
+                    self._verify_owned(estimate_id)
+                    self._clear_usage(estimate_id)
+                    captured: BcmQuoteResult | None = None
+                    try:
+                        self._create_usage(estimate_id, lines)
+                        captured = self._wait_for_result(estimate_id, lines)
+                    except ManualConfirmationRequired as exc:
+                        if self._is_exhausted_estimate_error(exc):
+                            self._exhausted_estimate_ids.add(estimate_id)
+                            quota_error = exc
+                            logger.warning(
+                                "AWS BCM estimate modification quota exhausted; rotating pool: %s",
+                                estimate_id,
+                            )
+                            continue
+                        raise
+                    finally:
+                        # Every configured estimate is private to this app. Keep
+                        # no per-quote history even when one pool slot is full.
+                        self._clear_usage(estimate_id)
+                    if captured is not None:
+                        return captured
+                if quota_error is not None:
+                    raise ManualConfirmationRequired(
+                        "AWS BCM 可复用报价槽位均已达到修改次数上限",
+                        code="bcm_estimate_pool_exhausted",
+                        exhausted_estimate_ids=sorted(self._exhausted_estimate_ids),
+                    ) from quota_error
+                raise ManualConfirmationRequired(
+                    "没有可用的 AWS BCM 报价槽位",
+                    code="bcm_estimate_pool_unavailable",
+                )
+
             estimate_id = self._ensure_estimate()
             self._verify_owned(estimate_id)
-            if pooled:
-                self._clear_usage(estimate_id)
-            captured: BcmQuoteResult | None = None
+            captured = None
             try:
                 self._create_usage(estimate_id, lines)
                 captured = self._wait_for_result(estimate_id, lines)
             finally:
-                # Keep no per-quote history. A configured pool is emptied and
-                # reused; an automatically created temporary estimate is deleted.
-                if pooled:
-                    self._clear_usage(estimate_id)
-                else:
-                    self._delete_estimate(estimate_id)
+                # An automatically created estimate is temporary and must not
+                # consume one of the account's retained estimate slots.
+                self._delete_estimate(estimate_id)
             if captured is None:  # pragma: no cover - defensive guard
                 raise ManualConfirmationRequired("BCM 未返回报价结果")
             return captured
+
+    @staticmethod
+    def _is_exhausted_estimate_error(error: ManualConfirmationRequired) -> bool:
+        return (
+            error.code == "bcm_usage_create_failed"
+            and error.details.get("aws_error_code") == "ServiceQuotaExceededException"
+            and "usage modifications" in str(error.details.get("aws_error_message") or "").lower()
+        )
 
     def readiness(self) -> dict[str, Any]:
         try:
@@ -279,9 +321,28 @@ class BcmWorkloadEstimator:
                 clientToken=uuid.uuid4().hex,
             )
         except (ClientError, BotoCoreError) as exc:
+            error_code = (
+                str(exc.response.get("Error", {}).get("Code") or "")
+                if isinstance(exc, ClientError)
+                else type(exc).__name__
+            )
+            error_message = (
+                str(exc.response.get("Error", {}).get("Message") or "")
+                if isinstance(exc, ClientError)
+                else str(exc)
+            )
+            logger.warning(
+                "AWS BCM rejected workload usage creation: code=%s message=%s estimate=%s",
+                error_code,
+                error_message,
+                estimate_id,
+            )
             raise ManualConfirmationRequired(
                 "AWS BCM 拒绝了计费行，禁止改用本地单价",
                 code="bcm_usage_create_failed",
+                aws_error_code=error_code,
+                aws_error_message=error_message,
+                estimate_id=estimate_id,
             ) from exc
         if response.get("errors"):
             raise ManualConfirmationRequired(

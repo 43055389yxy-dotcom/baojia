@@ -2033,7 +2033,7 @@ async def test_missing_region_precedes_redis_size_question() -> None:
     assert len(preview.selections) == 1
     assert preview.selections[0].status == "customer_issue"
     assert preview.selections[0].requires_confirmation is True
-    assert preview.selections[0].quantity == 2
+    assert preview.selections[0].quantity == 1
     assert preview.confirmation_text is not None
     assert "部署在哪个 AWS 区域" in preview.confirmation_text
     assert "每节点大概需要 1G、4G 还是 8G 内存" not in preview.confirmation_text

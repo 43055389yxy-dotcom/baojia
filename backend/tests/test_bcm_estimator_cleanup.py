@@ -97,6 +97,57 @@ def test_configured_pool_is_cleared_and_never_deleted(monkeypatch) -> None:
     assert bcm.deleted == []
 
 
+def test_exhausted_pool_estimate_rotates_to_next_configured_slot(monkeypatch) -> None:
+    bcm = FakeBcm()
+    clients = AwsClients(session=object(), pricing=None, bcm=bcm, ssm=None)  # type: ignore[arg-type]
+    estimator = BcmWorkloadEstimator(
+        clients,
+        Settings(bcm_workload_estimate_ids=["full-estimate", "ready-estimate"]),
+    )
+    cleared: list[str] = []
+    create_calls: list[str] = []
+    monkeypatch.setattr(estimator, "_verify_owned", lambda _: None)
+    monkeypatch.setattr(estimator, "_clear_usage", lambda estimate_id: cleared.append(estimate_id))
+
+    def create_usage(estimate_id: str, _: list[UsageLine]) -> None:
+        create_calls.append(estimate_id)
+        if estimate_id == "full-estimate":
+            raise ManualConfirmationRequired(
+                "AWS BCM 拒绝了计费行，禁止改用本地单价",
+                code="bcm_usage_create_failed",
+                aws_error_code="ServiceQuotaExceededException",
+                aws_error_message=(
+                    "The limit for usage modifications for this workload estimate "
+                    "has been exceeded. Create a new estimate to make additional changes."
+                ),
+            )
+
+    monkeypatch.setattr(estimator, "_create_usage", create_usage)
+    monkeypatch.setattr(estimator, "_wait_for_result", lambda estimate_id, _: _result(estimate_id))
+
+    result = estimator.quote(
+        [
+            UsageLine(
+                key="line1",
+                service_code="AmazonEC2",
+                usage_type="BoxUsage:test",
+                operation="RunInstances",
+                amount=1,
+            )
+        ]
+    )
+
+    assert result.estimate_id == "ready-estimate"
+    assert create_calls == ["full-estimate", "ready-estimate"]
+    assert cleared == [
+        "full-estimate",
+        "full-estimate",
+        "ready-estimate",
+        "ready-estimate",
+    ]
+    assert estimator._exhausted_estimate_ids == {"full-estimate"}
+
+
 def test_owned_pool_tag_is_verified_once_per_running_estimator() -> None:
     class TaggedBcm(FakeBcm):
         def __init__(self) -> None:

@@ -1934,6 +1934,8 @@ class DeepSeekIntentParser:
             isolated,
             extra_fields=extra_fields,
         )
+        cls._normalize_database_group_quantity(isolated)
+        cls._normalize_cluster_group_quantities(isolated)
 
     @classmethod
     def reconcile_customer_pricing_facts(cls, intent: ParsedIntent) -> None:
@@ -2196,6 +2198,8 @@ class DeepSeekIntentParser:
         cls._reconcile_explicit_engines(source, isolated)
         cls._reconcile_explicit_service_architecture(source, isolated)
         cls._reconcile_explicit_capacities(source, isolated)
+        cls._normalize_database_group_quantity(isolated)
+        cls._normalize_cluster_group_quantities(isolated)
         expected = isolated.services[0]
 
         def value_at(component: ServiceRequirement, path: str) -> object:
@@ -2308,7 +2312,7 @@ class DeepSeekIntentParser:
             if category == "quantity":
                 return path == "quantity"
             if category == "role_count":
-                return any(
+                return path == "quantity" or any(
                     marker in field
                     for marker in (
                         "count", "node", "shard", "replica", "rule", "user",
@@ -3119,6 +3123,30 @@ class DeepSeekIntentParser:
                 r"(\d+(?:\.\d+)?)\s*(?:gib|gb|g)\s*(?:内存|ram)",
             ]
         elif field == "quantity":
+            service = DeepSeekIntentParser._service_key(component.service)
+            source = component.source_text or snippet
+            internal_topology_fields = {
+                "msk": ("broker_count",),
+                "mq": ("broker_count",),
+                "opensearch": ("data_nodes", "master_nodes", "warm_node_count"),
+                "eks": ("worker_node_count", "worker_nodes_per_cluster"),
+                "documentdb": ("instance_count",),
+                "rds": ("instance_count", "cluster_members", "read_replica_count"),
+            }
+            has_internal_count = any(
+                component.requirements.get(name) not in (None, "")
+                for name in internal_topology_fields.get(service, ())
+            )
+            explicit_deployment_count = re.search(
+                r"(?:部署|集群)(?:数量|数|总数)\s*[:：]?\s*\d+|"
+                r"\d+\s*(?:套|个)\s*(?:独立)?(?:部署|集群)",
+                source,
+                re.I,
+            )
+            if has_internal_count and explicit_deployment_count is None:
+                # This evidence describes members inside one deployment.  It
+                # must not be compared to the top-level deployment quantity.
+                return
             patterns = [
                 r"(?:数量|实例数量|部署数量)\s*[:：]\s*(\d+)",
                 r"(?:数量|实例数量|部署数量)\s*(\d+)",
@@ -5120,10 +5148,93 @@ class DeepSeekIntentParser:
             item.service = "ec2"
             item.calculator_service_name = f"Amazon EC2（自建 {product}）"
             item.requirements.setdefault("operating_system", "linux")
+            apply_self_hosted_dimensions(item, source)
             item.field_sources.pop("_pending_architecture_decision", None)
             item.field_sources["_architecture_decision"] = "customer_text"
             item.field_sources["_third_party_product"] = product
             item.field_evidence["_architecture_decision"] = source[:240]
+
+        def apply_self_hosted_dimensions(
+            item: ServiceRequirement, source: str
+        ) -> None:
+            """Move literal node facts across the third-party -> EC2 boundary.
+
+            The component AI first extracts an unknown product with the generic
+            contract and this method later changes it to EC2.  Previously that
+            service switch kept CPU/RAM but silently dropped generic storage
+            and node counts.  Re-read only unambiguous literals from this
+            component so every current and future self-hosted product follows
+            the same lossless boundary.
+            """
+
+            def to_gib(value: str, unit: str) -> float:
+                number = float(value)
+                return number * 1024 if unit.casefold() in {"tb", "tib", "t"} else number
+
+            shape_match = re.search(
+                r"(\d+(?:\.\d+)?)\s*(?:核|c(?![a-z])|v\s*cpu|vcpu)"
+                r"[^。；,，\n]{0,16}?(\d+(?:\.\d+)?)\s*"
+                r"(?:gib|gi?b|gb|g)(?:\s*内存)?",
+                source,
+                re.I,
+            )
+            if shape_match:
+                for field, value in (
+                    ("vcpu", float(shape_match.group(1))),
+                    ("memory_gib", float(shape_match.group(2))),
+                ):
+                    item.requirements[field] = value
+                    path = f"requirements.{field}"
+                    item.field_sources[path] = "customer_text"
+                    item.field_evidence[path] = shape_match.group(0)
+                    item.locked_fields = sorted(set(item.locked_fields) | {path})
+
+            count_match = (
+                re.search(
+                    r"(?:共|合计|总共|需要|部署)?\s*(\d+)\s*"
+                    r"(?:个|台)?\s*(?:节点|机器|服务器|主机)(?!\s*(?:核|vcpu))",
+                    source,
+                    re.I,
+                )
+                or re.search(
+                    r"(?:部署数量|节点数量|服务器数量|机器数量|数量)\s*[:：]?\s*"
+                    r"(\d+)\s*(?:个|台)?",
+                    source,
+                    re.I,
+                )
+            )
+            if count_match:
+                item.quantity = max(int(count_match.group(1)), 1)
+
+            storage_match = (
+                re.search(
+                    r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tib|tb|t)\s*"
+                    r"(?:/\s*(?:节点|台|机器|服务器))?\s*(?:磁盘|硬盘|存储)",
+                    source,
+                    re.I,
+                )
+                or re.search(
+                    r"(?:每(?:个)?节点[^。；,，\n]{0,18}?)?"
+                    r"(?:磁盘|硬盘|存储(?:容量)?)\s*[:：]?\s*"
+                    r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tib|tb|t)",
+                    source,
+                    re.I,
+                )
+            )
+            generic_storage = item.requirements.pop("storage_gib", None)
+            if storage_match:
+                storage = to_gib(storage_match.group(1), storage_match.group(2))
+                item.requirements["system_disk_gib"] = storage
+                evidence = storage_match.group(0)
+                item.field_sources["requirements.system_disk_gib"] = "customer_text"
+                item.field_evidence["requirements.system_disk_gib"] = evidence
+                item.locked_fields = sorted(
+                    set(item.locked_fields) | {"requirements.system_disk_gib"}
+                )
+            elif isinstance(generic_storage, (int, float)) and not isinstance(
+                generic_storage, bool
+            ):
+                item.requirements["system_disk_gib"] = generic_storage
 
         def remove_architecture_question(product: str) -> None:
             parsed.ambiguities = [
@@ -5199,6 +5310,7 @@ class DeepSeekIntentParser:
             item.service = "ec2"
             item.calculator_service_name = f"Amazon EC2（自建 {product}）"
             item.requirements.setdefault("operating_system", "linux")
+            apply_self_hosted_dimensions(item, source)
             node_match = re.search(
                 r"(?:部署数量|节点数量|数量)\s*[：:]?\s*(\d+)\s*(?:个)?\s*节点",
                 source,
@@ -5216,6 +5328,7 @@ class DeepSeekIntentParser:
             item.service = "ec2"
             item.calculator_service_name = "Amazon EC2（自建 Nacos）"
             item.requirements.setdefault("operating_system", "linux")
+            apply_self_hosted_dimensions(item, source)
             item.field_sources["_pending_architecture_decision"] = "system_policy"
             node_match = re.search(
                 r"(?:部署数量|节点数量|数量)\s*[：:]?\s*(\d+)\s*(?:个)?\s*节点",
@@ -5283,6 +5396,7 @@ class DeepSeekIntentParser:
                 continue
             item.calculator_service_name = f"Amazon EC2（自建 {product}）"
             item.requirements.setdefault("operating_system", "linux")
+            apply_self_hosted_dimensions(item, source)
             item.field_sources.setdefault("_pending_architecture_decision", "system_policy")
             quantity = max(int(item.quantity or 1), 1)
             details = [f"{quantity} 个节点"]
@@ -5966,7 +6080,11 @@ class DeepSeekIntentParser:
                     requirements["replicas_per_shard"] = replicas
                     requirements["node_count"] = shards * (1 + replicas)
                 elif "分片" not in source:
-                    node_match = re.search(r"(?:[×x*]\s*)?(\d+)\s*节点", source, re.I)
+                    node_match = re.search(
+                        r"(?:[×x*]\s*)?(\d+)\s*(?:个)?\s*节点",
+                        source,
+                        re.I,
+                    )
                     if node_match:
                         total_nodes = max(int(node_match.group(1)), 1)
                         requirements["shards"] = 1
@@ -6081,18 +6199,30 @@ class DeepSeekIntentParser:
 
     @classmethod
     def _normalize_redis_group_quantity(cls, parsed: ParsedIntent) -> None:
-        """Do not multiply an explicitly stated node count by the same topology again."""
+        """Keep Redis deployment count and total billable nodes in separate fields."""
 
         for item in parsed.services:
             if cls._service_key(item.service) != "elasticache":
                 continue
             shards = int(item.requirements.get("shards") or 1)
             replicas = int(item.requirements.get("replicas_per_shard") or 0)
-            topology_nodes = shards * (1 + replicas)
+            nodes_per_group = shards * (1 + replicas)
             source = item.source_text or ""
             is_group_count = bool(re.search(r"\d+\s*(?:套|组|个集群)", source, re.I))
-            if not is_group_count and item.quantity == topology_nodes and topology_nodes > 1:
+            if is_group_count:
+                # ``quantity`` is the number of independent replication
+                # groups; ``node_count`` is always the total billable fleet.
+                item.requirements["node_count"] = item.quantity * nodes_per_group
+                continue
+            declared_nodes = int(item.requirements.get("node_count") or 0)
+            if declared_nodes > 0 and item.quantity == declared_nodes:
                 item.quantity = 1
+            elif item.quantity == nodes_per_group and nodes_per_group > 1:
+                item.quantity = 1
+            if declared_nodes > 0:
+                item.requirements["node_count"] = declared_nodes
+            else:
+                item.requirements["node_count"] = item.quantity * nodes_per_group
 
     @classmethod
     def _normalize_cluster_group_quantities(cls, parsed: ParsedIntent) -> None:
@@ -6105,6 +6235,12 @@ class DeepSeekIntentParser:
         before pricing, so no component can multiply an internal count into a
         second copy of the complete service.
         """
+
+        # ElastiCache's plugin treats ``quantity`` as replication-group count
+        # and multiplies it by shards and replicas. Enforce that boundary at
+        # this shared entry point as well: a literal "共 3 个节点" must become
+        # one group with three internal nodes, never three groups of three.
+        cls._normalize_redis_group_quantity(parsed)
 
         chinese_counts = {
             "一": 1,
@@ -6123,10 +6259,7 @@ class DeepSeekIntentParser:
             "msk": ("broker_count",),
             "mq": ("broker_count",),
             "opensearch": ("data_nodes", "master_nodes", "warm_node_count"),
-            # ElastiCache's existing adapter intentionally prices ``quantity``
-            # as cache nodes. Its shards/replicas contract is normalized by
-            # the dedicated Redis topology guard instead of this deployment
-            # multiplier guard.
+            # ElastiCache is normalized by the dedicated Redis guard above.
             "eks": ("worker_node_count", "worker_nodes_per_cluster"),
             "documentdb": ("instance_count",),
             "rds": ("cluster_members", "read_replica_count"),
@@ -6149,7 +6282,7 @@ class DeepSeekIntentParser:
                 # draft/pricing boundary so a model's generic ``quantity`` or
                 # the two-Broker minimum default cannot overwrite it.
                 broker_match = re.search(
-                    r"(?:broker(?:节点)?(?:数量)?|节点数量)\s*[:：]?\s*"
+                    r"(?:broker(?:节点)?(?:数量|数)|节点(?:数量|数))\s*[:：]?\s*"
                     r"([一二两三四五六七八九十]|\d+)|"
                     r"(?:预计|约|大概|共|合计|需要|部署)?\s*"
                     r"([一二两三四五六七八九十]|\d+)\s*(?:个|台)?\s*"
@@ -6207,10 +6340,48 @@ class DeepSeekIntentParser:
             source = item.source_text or ""
             deployment = str(requirements.get("deployment") or "").casefold()
             is_primary_standby = deployment in {"multi_az", "multi-az"} or bool(
-                re.search(r"主备|1\s*主\s*1\s*备|高可用|multi[ -]?az", source, re.I)
+                re.search(
+                    r"主备|主从|1\s*主\s*1\s*(?:备|从)|高可用|multi[ -]?az",
+                    source,
+                    re.I,
+                )
             )
             if not is_primary_standby:
                 continue
+            requirements["deployment"] = "multi_az"
+            deployment_match = re.search(
+                r"1\s*主\s*1\s*(?:备|从)|主备|主从|高可用|multi[ -]?az",
+                source,
+                re.I,
+            )
+            item.field_sources["requirements.deployment"] = "customer_text"
+            item.field_evidence["requirements.deployment"] = (
+                deployment_match.group(0) if deployment_match else source
+            )
+            item.locked_fields = sorted(
+                set(item.locked_fields) | {"requirements.deployment"}
+            )
+            member_count_match = re.search(
+                r"(?:共|合计|总共)?\s*(\d+)\s*(?:个|台)?\s*(?:数据库)?节点",
+                source,
+                re.I,
+            )
+            if member_count_match:
+                requirements["instance_count"] = max(
+                    int(member_count_match.group(1)), 2
+                )
+                member_evidence = member_count_match.group(0)
+            elif re.search(r"1\s*主\s*1\s*(?:备|从)|主备|主从", source, re.I):
+                requirements["instance_count"] = 2
+                member_evidence = deployment_match.group(0) if deployment_match else source
+            else:
+                member_evidence = ""
+            if member_evidence:
+                item.field_sources["requirements.instance_count"] = "customer_text"
+                item.field_evidence["requirements.instance_count"] = member_evidence
+                item.locked_fields = sorted(
+                    set(item.locked_fields) | {"requirements.instance_count"}
+                )
             explicit_deployment_count = re.search(
                 r"(?:数据库|实例|集群)?数量\s*[:：]?\s*(\d+)|"
                 r"(\d+)\s*(?:套|个数据库|个集群)",
@@ -7804,6 +7975,40 @@ class DeepSeekIntentParser:
                     # previously interpreted it as 1 TiB, so absence of an
                     # explicit number + storage unit must clear its guess.
                     requirements.pop("memory_gib", None)
+                storage_match = (
+                    re.search(
+                        r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tib|tb|t)\s*"
+                        r"(?:/\s*(?:节点|台))?\s*(?:磁盘|硬盘|存储)",
+                        source,
+                        re.I,
+                    )
+                    or re.search(
+                        r"(?:磁盘|硬盘|存储(?:容量)?)\s*[:：]?\s*"
+                        r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tib|tb|t)",
+                        source,
+                        re.I,
+                    )
+                )
+                if storage_match:
+                    requirements["source_storage_gib_per_node"] = gib(
+                        storage_match.group(1), storage_match.group(2)
+                    )
+                    lock(
+                        item,
+                        "source_storage_gib_per_node",
+                        storage_match.group(0),
+                    )
+                node_count_match = re.search(
+                    r"(?:共|合计|总共)?\s*(\d+)\s*(?:个|台)?\s*节点",
+                    source,
+                    re.I,
+                )
+                if node_count_match:
+                    node_count = max(int(node_count_match.group(1)), 1)
+                    requirements["node_count"] = node_count
+                    lock(item, "node_count", node_count_match.group(0))
+                    if not re.search(r"主从|主备|\d+\s*主|分片|副本", source, re.I):
+                        item.quantity = node_count
                 if match := re.search(r"(?:[×x*]\s*)?(\d+)\s*分片", source, re.I):
                     requirements["shards"] = int(match.group(1))
             elif service == "s3":
@@ -8084,6 +8289,12 @@ class DeepSeekIntentParser:
                         source,
                     )
                 if value is None:
+                    value = first(
+                        r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tb|tib|t)\s*"
+                        r"(?:/\s*(?:节点|实例))?\s*(?:数据盘|磁盘|硬盘|存储)",
+                        source,
+                    )
+                if value is None:
                     # In an isolated RDS row, a single explicit GB/TB value
                     # after the DB model is the database storage even when a
                     # compact sales list writes only ``+ 100GB``.
@@ -8107,6 +8318,8 @@ class DeepSeekIntentParser:
                                 r"\d+(?:\.\d+)?\s*(?:gib|gi?b|g|tb|tib|t)",
                                 r"(?:gp[23]|io[12])\s*"
                                 r"\d+(?:\.\d+)?\s*(?:gib|gi?b|gb|g|tb|tib|t)",
+                                r"\d+(?:\.\d+)?\s*(?:gib|gi?b|gb|g|tb|tib|t)\s*"
+                                r"(?:/\s*(?:节点|实例))?\s*(?:数据盘|磁盘|硬盘|存储)",
                             )
                             if (match := re.search(pattern, source, re.I))
                         ),

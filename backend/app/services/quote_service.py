@@ -7167,6 +7167,7 @@ class QuoteService:
             "storage_type": "storageType",
             "data_nodes": "dataNodes",
             "storage_gib_per_node": "storageGiBPerNode",
+            "source_storage_gib_per_node": "storageGiBPerNode",
             "broker_count": "brokerCount",
             "storage_gib_per_broker": "storageGiBPerBroker",
             "storage_class": "storageClass",

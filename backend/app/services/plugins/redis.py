@@ -268,7 +268,17 @@ class RedisPlugin(ServicePlugin):
             raise ManualConfirmationRequired(
                 "Redis shards 必须至少为 1", code="invalid_redis_topology"
             )
-        total_nodes = requirement.quantity * shards * (1 + replicas)
+        calculated_nodes = requirement.quantity * shards * (1 + replicas)
+        declared_nodes = required_int(requested, "node_count", calculated_nodes)
+        # ``node_count`` is the normalized total fleet size. It is deliberately
+        # authoritative here so an upstream wording/parser change cannot
+        # multiply the same customer node count a second time. The topology
+        # fields remain available for architecture display and validation.
+        total_nodes = declared_nodes
+        if total_nodes < 1:
+            raise ManualConfirmationRequired(
+                "Redis 节点数量必须至少为 1", code="invalid_redis_topology"
+            )
         amount = total_nodes * requirement.hours_per_month
         monthly_commitment_cost = 0.0
         upfront_commitment_cost = 0.0
