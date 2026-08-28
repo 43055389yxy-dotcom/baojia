@@ -313,3 +313,54 @@ def test_plain_machine_count_cannot_disappear_behind_default_quantity() -> None:
     )
 
     assert any("5台" in issue and "没有进入" in issue for issue in issues)
+
+
+def test_plain_machine_count_uses_managed_component_count_field() -> None:
+    source = "ElasticSearch 这边预计5台，单台16核128G，磁盘4T。"
+    component = ServiceRequirement(
+        service="opensearch",
+        source_text=source,
+        quantity=1,
+    )
+
+    DeepSeekIntentParser._overlay_literal_component_facts(source, component)
+
+    assert component.quantity == 1
+    assert component.requirements["data_nodes"] == 5
+    assert component.field_sources["requirements.data_nodes"] == "customer_text"
+    assert component.field_evidence["requirements.data_nodes"] == "5台"
+
+
+def test_plain_machine_count_uses_top_level_quantity_when_template_has_no_member_count() -> None:
+    source = "应用服务器预计3台，单台16核128G，磁盘1T。"
+    component = ServiceRequirement(
+        service="ec2",
+        source_text=source,
+        quantity=1,
+    )
+
+    DeepSeekIntentParser._overlay_literal_component_facts(source, component)
+
+    assert component.quantity == 3
+    assert component.field_sources["quantity"] == "customer_text"
+    assert component.field_evidence["quantity"] == "3台"
+
+
+def test_default_quantity_is_not_marked_as_customer_text() -> None:
+    original = ServiceRequirement(service="s3", source_text="S3 存储15TB")
+    filled = ServiceRequirement(
+        service="s3",
+        source_text=original.source_text,
+        quantity=1,
+        requirements={"storage_gib": 15360},
+        field_evidence={"requirements.storage_gib": "15TB"},
+    )
+
+    DeepSeekIntentParser._mark_component_field_sources(
+        original,
+        filled,
+        runtime_defaults={},
+    )
+
+    assert filled.field_sources["quantity"] == "system_minimum"
+    assert "quantity" not in filled.locked_fields

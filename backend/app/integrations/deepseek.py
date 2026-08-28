@@ -2054,8 +2054,67 @@ class DeepSeekIntentParser:
             isolated,
             extra_fields=extra_fields,
         )
+        cls._reconcile_plain_resource_counts(isolated, extra_fields=extra_fields)
         cls._normalize_database_group_quantity(isolated)
         cls._normalize_cluster_group_quantities(isolated)
+
+    @classmethod
+    def _reconcile_plain_resource_counts(
+        cls,
+        parsed: ParsedIntent,
+        *,
+        extra_fields: tuple[str, ...] = (),
+    ) -> None:
+        """Bind a plain machine/node count through the component template.
+
+        Sales prose often says only ``预计5台`` or ``3个节点``.  The number is
+        unambiguous, while its destination depends on the selected product:
+        EC2 uses the top-level quantity, whereas managed products expose an
+        internal field such as ``data_nodes`` or ``instance_count``.  Let the
+        active component template choose that destination instead of treating
+        the model's default ``quantity=1`` as customer input.
+        """
+
+        member_count_fields = (
+            "data_nodes",
+            "broker_count",
+            "instance_count",
+            "cluster_members",
+            "node_count",
+            "worker_node_count",
+            "replication_instances",
+            "nodes",
+        )
+        count_pattern = re.compile(
+            r"(?<![\d])(?P<count>\d+)\s*(?:台|个?\s*(?:数据)?节点)"
+            r"(?=\s*(?:[,，。；;]|$|每|单))",
+            re.I,
+        )
+
+        for component in parsed.services:
+            source = component.source_text or ""
+            match = count_pattern.search(source)
+            if match is None:
+                continue
+            count = max(int(match.group("count")), 1)
+            evidence = match.group(0)
+            allowed = allowed_requirement_fields(
+                component.service,
+                extra_fields=extra_fields,
+            )
+            member_field = next(
+                (field for field in member_count_fields if field in allowed),
+                None,
+            )
+            if member_field is None:
+                component.quantity = count
+                path = "quantity"
+            else:
+                component.requirements[member_field] = count
+                path = f"requirements.{member_field}"
+            component.field_sources[path] = "customer_text"
+            component.field_evidence[path] = evidence
+            component.locked_fields = sorted(set(component.locked_fields) | {path})
 
     @classmethod
     def reconcile_customer_pricing_facts(cls, intent: ParsedIntent) -> None:
@@ -3976,11 +4035,26 @@ class DeepSeekIntentParser:
         if filled.region:
             sources.setdefault("region", "customer_text")
             locked.add("region")
-        if filled.field_evidence.get("quantity") == "system_derived":
+        quantity_evidence = filled.field_evidence.get("quantity")
+        if quantity_evidence == "system_derived":
             sources["quantity"] = "system_derived"
-        else:
+            locked.add("quantity")
+        elif quantity_evidence and quantity_evidence not in {
+            "system_minimum",
+            "system_default",
+        }:
             sources.setdefault("quantity", "customer_text")
-        locked.add("quantity")
+            locked.add("quantity")
+        elif sources.get("quantity") in CUSTOMER_OVERRIDE_SOURCES:
+            # A direct sales/customer edit is authoritative even when an old
+            # session predates field-evidence persistence.
+            locked.add("quantity")
+        elif "quantity" not in sources:
+            # Pydantic's default quantity=1 is an implementation fallback, not
+            # something the customer said.  Marking it as customer text hid
+            # omitted counts such as ``预计5台`` from later consistency checks.
+            sources["quantity"] = "system_minimum"
+            locked.discard("quantity")
         for field in filled.requirements:
             path = f"requirements.{field}"
             if field in runtime_defaults and field not in original.requirements:
