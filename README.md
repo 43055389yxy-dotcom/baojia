@@ -42,6 +42,10 @@ Azure 支持 Pay-as-you-go、1/3 年预留、1/3 年 Savings Plan 和 Spot。最
 
 ## 本地启动
 
+macOS 日常开发可直接双击项目根目录的 `start-local.command`。该脚本启动的后端会监视
+`backend/app`，保存 Python 代码后自动重启，因此无需每次手动停止再启动。它只使用当前
+本地工作区代码，不会自动执行 `git pull`，避免覆盖尚未提交的修改。
+
 后端要求 Python 3.11+：
 
 ```bash
