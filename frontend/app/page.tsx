@@ -331,6 +331,10 @@ const serviceNames: Record<string, string> = {
 
 function serviceDisplayName(selection: { service: string; display_name: string }): string {
   if (/\baurora\b/i.test(selection.display_name)) return selection.display_name;
+  if (
+    selection.service === "ec2"
+    && /(?:自建|用于|工作节点|worker\s*nodes?)/i.test(selection.display_name)
+  ) return selection.display_name;
   return serviceNames[selection.service] ?? selection.display_name;
 }
 
@@ -602,6 +606,14 @@ function quotationRemark(selection: Selection) {
   if (selection.parent_component_number) {
     remarks.push(
       `由 ${selection.parent_component_number} · ${selection.parent_display_name ?? "父组件"} 衍生`,
+    );
+  }
+  const selfHostedProduct = selection.service === "ec2"
+    ? selection.display_name.match(/自建\s*([^）)]+)/i)?.[1]?.trim()
+    : undefined;
+  if (selfHostedProduct) {
+    remarks.push(
+      `由“${selfHostedProduct}”部署需求衍生，用于在 Amazon EC2 上运行 ${selfHostedProduct}；这里计算的是所列云服务器与磁盘资源，不是 AWS 托管版服务。`,
     );
   }
   const internalMarkers = [
@@ -2541,6 +2553,19 @@ export default function Home() {
             <p className="kicker">需要检查</p>
             <h2>本次没有生成价格</h2>
             <p>{job.error.message}</p>
+            {Array.isArray(job.error.details?.questions) && job.error.details.questions.length > 0 && (
+              <div className="error-component-list">
+                <strong>需要系统继续处理的问题</strong>
+                <ul>
+                  {(job.error.details.questions as unknown[]).map((question, index) => (
+                    <li key={`${index}-${String(question)}`}>
+                      <b>问题 {index + 1}</b>
+                      <span>{String(question)}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {Array.isArray(job.error.details?.components) && job.error.details.components.length > 0 && (
               <div className="error-component-list">
                 <strong>本次未通过的组件</strong>
@@ -2636,7 +2661,7 @@ export default function Home() {
                 {hierarchyOrdered(job.result.selections).map(({ item: selection, originalIndex: index }) => (
                   <tr className={`${selection.parent_component_id ? "quote-child-row " : ""}${selection.pricing_status === "unpriced" ? "quote-unpriced-row" : ""}`.trim()} key={`${selection.region}-${index}`}>
                     <td>{selection.component_number ?? String(index + 1).padStart(2, "0")}</td>
-                    <td><strong>{selection.parent_component_id ? "↳ " : ""}{serviceDisplayName(selection)}</strong>{selection.parent_component_number && <small className="component-parent-label">由 {selection.parent_component_number} · {selection.parent_display_name ?? "父组件"} 衍生</small>}<span className={`verified-inline ${selection.pricing_status === "unpriced" ? "unpriced" : ""}`}>{selection.pricing_status === "unpriced" ? "报价异常 · 未计入" : selection.pricing_status === "free" ? `${cloudProvider === "aws" ? "AWS" : "Azure"} 官方免费项 ✓` : (selection.pricing_status === "reference_only" || selection.reference_rates?.length) && serviceCost(job.result!, selection, index) === 0 ? "缺少月用量 · 仅展示单价" : `${cloudProvider === "aws" ? "AWS" : "Azure"} 已核价 ✓`}</span></td>
+                    <td><strong>{selection.parent_component_id ? "↳ " : ""}{serviceDisplayName(selection)}</strong>{selection.parent_component_number && <small className="component-parent-label">由 {selection.parent_component_number} · {selection.parent_display_name ?? "父组件"} 衍生</small>}{quotationRemark(selection) !== "-" && <small className="quote-purpose-note">说明：{quotationRemark(selection)}</small>}<span className={`verified-inline ${selection.pricing_status === "unpriced" ? "unpriced" : ""}`}>{selection.pricing_status === "unpriced" ? "报价异常 · 未计入" : selection.pricing_status === "free" ? `${cloudProvider === "aws" ? "AWS" : "Azure"} 官方免费项 ✓` : (selection.pricing_status === "reference_only" || selection.reference_rates?.length) && serviceCost(job.result!, selection, index) === 0 ? "缺少月用量 · 仅展示单价" : `${cloudProvider === "aws" ? "AWS" : "Azure"} 已核价 ✓`}</span></td>
                     <td>{selection.region}</td>
                     <td><strong>{selection.model}</strong><small>{selection.architecture}</small></td>
                     <td className="quote-specifications">{compactSpecifications(selection) || "-"}</td>

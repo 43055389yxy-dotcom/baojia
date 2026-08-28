@@ -316,6 +316,51 @@ def test_same_draft_reuses_link_and_moves_to_configuration_review(tmp_path: Path
     assert approved.status == "approved"
 
 
+def test_legacy_review_never_displays_confirmed_model_with_rejected_shape(
+    tmp_path: Path,
+) -> None:
+    store = ConfirmationSessionStore(tmp_path / "legacy-model-shape.sqlite3")
+    intent = ParsedIntent(
+        customer_summary="MSK",
+        services=[
+            ServiceRequirement(
+                service="msk",
+                region="ap-southeast-1",
+                requirements={
+                    "requested_model": "m7g.xlarge",
+                    "vcpu": 8,
+                    "memory_gib": 16,
+                    "broker_count": 3,
+                },
+                field_sources={
+                    "requirements.requested_model": "customer_confirmation",
+                    "requirements.vcpu": "customer_text",
+                    "requirements.memory_gib": "customer_text",
+                    "_customer_shape_replaced_by_model": "customer_confirmation",
+                },
+            )
+        ],
+    )
+    token = store.create_or_replace(
+        draft_id="legacy-msk-shape",
+        customer_request="Kafka 3个节点，8核16G",
+        customer_summary="MSK",
+        intent=intent,
+        confirmation_text="最终配置",
+        items=[],
+    )
+    store.prepare_configuration_review(draft_id="legacy-msk-shape", intent=intent)
+
+    review = store.get(token)
+
+    assert review is not None
+    requirements = review.configuration_items[0].requirements
+    assert requirements["requested_model"] == "m7g.xlarge"
+    assert requirements["broker_count"] == 3
+    assert "vcpu" not in requirements
+    assert "memory_gib" not in requirements
+
+
 def test_configuration_feedback_reuses_link_and_returns_to_reviewing(tmp_path: Path) -> None:
     store = ConfirmationSessionStore(tmp_path / "sessions.sqlite3")
     intent = ParsedIntent(

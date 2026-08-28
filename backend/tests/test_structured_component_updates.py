@@ -32,6 +32,50 @@ def test_structured_shape_edit_reselects_model_and_locks_customer_fields() -> No
     assert original.requirements["vcpu"] == 4
 
 
+def test_selected_official_model_atomically_replaces_stale_shape_for_all_services() -> None:
+    original = ServiceRequirement(
+        service="msk",
+        region="ap-southeast-1",
+        requirements={
+            "vcpu": 8,
+            "memory_gib": 16,
+            "_review_confirmation_candidates": [
+                {
+                    "model": "m7g.xlarge",
+                    "family": "Amazon MSK Broker",
+                    "specifications": {"vCPU": 4, "memoryGiB": 16},
+                    "rationale": "AWS 官方规格",
+                }
+            ],
+        },
+    )
+
+    revised = apply_component_update(
+        original,
+        {
+            "requirements": {
+                "requested_model": "kafka.m7g.xlarge",
+                # The browser submits the current form as a whole. These are
+                # the old requested values and must not survive the model pick.
+                "vcpu": 8,
+                "memory_gib": 16,
+            }
+        },
+    )
+
+    assert revised.requirements["requested_model"] == "kafka.m7g.xlarge"
+    assert revised.requirements["vcpu"] == 4
+    assert revised.requirements["memory_gib"] == 16
+    assert revised.requirements["_review_selected_model"] == "kafka.m7g.xlarge"
+    assert revised.requirements["_review_selected_specifications"] == {
+        "vCPU": 4,
+        "memoryGiB": 16,
+    }
+    assert revised.field_sources["_customer_shape_replaced_by_model"] == (
+        "customer_confirmation"
+    )
+
+
 def test_structured_storage_edit_clears_old_reference_default() -> None:
     original = ServiceRequirement(
         service="s3",

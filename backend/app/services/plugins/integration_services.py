@@ -176,7 +176,14 @@ class MskPlugin(_NoConfirmationPlugin):
         # not consistently include vCPU/memory attributes.  Enrich those
         # families from the read-only EC2 DescribeInstanceTypes API before
         # applying the customer's shape constraints.
-        if (min_vcpu is not None or min_memory is not None) and product_models:
+        # A selected Broker family and the CPU/memory shown beside it must come
+        # from the same official source.  Previously this lookup ran only when
+        # the customer still had an explicit shape constraint. After the
+        # customer chose a replacement model, that constraint was correctly
+        # removed, but this branch was skipped and presentation fell back to
+        # stale Price List attributes. Always resolve the official EC2 shape
+        # for every MSK Broker model used in pricing.
+        if product_models:
             try:
                 payload = ReadOnlyAwsQueryExecutor(self.clients).execute(
                     service="ec2",

@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     # can be tuned independently.
     component_revision_model: str = "deepseek.v3.2"
     component_revision_timeout_seconds: float = 30.0
+    # The first inventory pass is latency-sensitive. Keep the preferred model,
+    # but hedge to a distinct configured route instead of waiting for one
+    # endpoint to exhaust two long serial timeouts.
+    intake_ai_hedge_delay_seconds: float = 4.0
+    intake_ai_primary_timeout_seconds: float = 16.0
+    intake_ai_recovery_timeout_seconds: float = 14.0
     # Compatibility override for local tests and deployments that previously
     # supplied a single AI_API_KEY instead of a provider-specific key.
     ai_api_key_override: str = Field(

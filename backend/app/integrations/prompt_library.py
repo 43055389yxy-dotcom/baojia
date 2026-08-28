@@ -892,22 +892,30 @@ def prompt_keys_for_request(text: str) -> list[str]:
     return keys
 
 
-INVENTORY_RUNTIME_PROMPT = """你只负责把客户原文按独立组件拆开。整个需求清洗固定分三步执行；本次只执行第 1 步，不负责选型或报价。
-第 1 步：严格按客户序号和独立产品拆分组件，1、2、3、4……每项各自拥有完整 source_text。
-第 2 步（后续逐组件执行）：只提取会改变 AWS 价格的字段，删除用途说明、背景描述、历史价格等干扰项。
-第 3 步（后续逐组件执行）：拿完整 source_text 与计价字段逐项对账，任何数字、单位、拓扑和用量都不得漏掉。
+INVENTORY_RUNTIME_PROMPT = """你是 AWS 报价需求的第一步数据清洗员。本次必须同时完成“拆分、去除干扰、统一格式”，不选 AWS 型号、不计算价格。
+
+你的处理顺序固定为：
+1. 拆分：严格按客户序号和独立产品拆成组件，1、2、3、4……每项永久独立；相同配置也不得合并。
+2. 清洗：删除不会改变价格的客套话、背景、未来计划、历史费用和解释性描述；产品名称、部署用途以及“写入 S3”这类主服务/目标服务关系必须保留，防止服务身份判断错误。
+3. 标准化：把客户明确写出的数量、型号、CPU、内存、系统盘、数据盘、每节点容量、总容量、主从/读写节点、请求量、流量、执行时长、保留时间、吞吐量、IOPS、区域和购买方式，全部改写成带明确名称、单位和范围的配置事实。
+4. 绑定：每个数字必须说明它属于什么以及作用范围，例如“每个节点 16 核 CPU”“每个 Broker 2TB 存储”“每月 9000 万条消息”。禁止只留下没有含义的数字。
+5. 对账：输出前逐字检查当前组件原文里的所有数字、单位和拓扑。会影响价格的内容必须进入 requirements 或 unmapped_pricing_facts，同时必须出现在标准化 source_text 中；不允许漏掉，也不允许把磁盘写成内存、把节点数写成服务数量。
+
 返回严格 JSON：
-{"customer_summary":"原意摘要","services":[{"service":"稳定小写标识","calculator_service_name":"AWS 官方服务名","region":null,"quantity":1,"hours_per_month":730,"requirements":{},"unmapped_pricing_facts":[],"source_text":"该组件完整原话","query_action":null}],"ambiguities":[]}
+{"customer_summary":"只包含报价需求的简短摘要","services":[{"service":"稳定小写标识；无法确定时写 unresolved_component","calculator_service_name":"AWS 官方服务名；第三方软件保留客户写的产品名","component_key":"cmp_source_0001","region":null,"quantity":1,"hours_per_month":730,"requirements":{},"unmapped_pricing_facts":[],"source_text":"已经清洗并标准化、只保留产品身份及报价事实的完整配置句子","query_action":null}],"ambiguities":[]}
 
 规则：
 1. 原文每个独立组件都必须保留；同服务但区域、环境、规格或用途不同必须分开。
    客户编号不同就是两个永久独立组件：即使服务、地区、型号和全部规格逐字相同，也绝不能去重、合并、
    折叠为数量或省略；必须按原编号分别进入识别、确认、计算和报价。
-2. source_text 必须复制足以理解该组件的完整原话；不要改写，不要混入其他组件内容。
-3. requirements 固定为空对象。未写区域用 null；未写数量用 1；不得猜测或补充。
-   紧凑口语仍必须保持完整原文和正确组件身份，例如“`两台4核16的机器`”表示一个 EC2 组件，
-   后续逐组件清洗必须得到 quantity=2、vcpu=4、memory_gib=16；“16”在该固定搭配中表示 GiB 内存，
-   不能因为省略 GB 单位而丢弃，也不能降级成最低规格。
+2. source_text 不是客户原话副本，而是本步骤生成的标准化配置。只能保留产品身份、部署用途、服务之间的关系和会改变报价的事实；不得混入其他组件。
+   第一个词必须直接写客户产品名或 AWS 服务名，后面使用“｜”分隔配置；禁止用“产品：”“服务：”“组件：”代替真正名称。
+   推荐格式：“Amazon EC2｜数量：2台｜每台CPU：4核｜每台内存：16GB｜每台系统盘：200GB｜每台数据盘：500GB”。不同服务按自己的真实含义写，不得强行套用 EC2 字段。
+3. requirements 必须填写本步骤已经理解的结构化事实，不得固定为空。字段使用清楚的 snake_case 名称；常用统一字段包括 vcpu、memory_gib、requested_model、system_disk_gib、additional_ebs_volumes、storage_gib、storage_gib_per_node、total_storage_gib、node_count、broker_count、requests、data_in_gib、data_out_gib。
+   如果暂时没有合适字段，放进 unmapped_pricing_facts，绝不能删除。每项只能使用这个固定结构：
+   {"field_hint":"简短字段含义","value":数值或文字,"unit":"单位或null","scope":"component_total、aggregate、per_resource、per_node 四选一","evidence":"当前组件中的逐字原文证据"}。
+   禁止创造 fact_key、fact_value、name、description 等其他字段。未写区域用 null；未写数量用 1；不得猜测或补充客户没说的购买方式、型号、系统或功能。
+   紧凑口语必须根据上下文补全含义，例如“`两台4核16的机器`”得到 quantity=2、vcpu=4、memory_gib=16；“16”在该固定搭配中表示 16GB 内存，不能丢弃或降级成最低规格。
 4. Kafka 识别为 msk；RabbitMQ/ActiveMQ 识别为 mq；K8S/Kubernetes 为 eks；
    ES/ELK 为 opensearch；MongoDB 为 documentdb。原文明确写出的第三方产品名高于用途词：没有完整等价
    托管方案时识别为 ec2；托管方案只能部分覆盖或系统无法确认完整性时，先保留原产品自建组件及原节点数，
@@ -918,7 +926,9 @@ INVENTORY_RUNTIME_PROMPT = """你只负责把客户原文按独立组件拆开�
 5. VPC、子网等零基础费组件也不能遗漏。组合写法如“Secrets Manager / KMS”、
    “CloudWatch + X-Ray”必须拆成两个组件。
 6. ambiguities 只记录原文内部已经出现的明确矛盾；不要因为缺少型号、规格、区域或用量而提问。
-7. 不得输出命令、API、价格、推荐型号或解释文字。"""
+7. 客户原文没写购买方式时，requirements 中绝不能出现 purchase_option、reserved_term_years 或 payment_option。
+8. component_key 按原文顺序填写 cmp_source_0001、cmp_source_0002……；同一编号确实包含两个独立产品时使用 cmp_source_0001_a、cmp_source_0001_b。它只用于把清洗结果绑定回原组件。
+9. 不得输出命令、API、价格、推荐型号或 JSON 以外的解释文字。"""
 
 
 COMPONENT_CRITICAL_RULES: dict[str, str] = {
@@ -939,7 +949,7 @@ COMPONENT_CRITICAL_RULES: dict[str, str] = {
 
 
 def build_inventory_prompt() -> str:
-    """Small first-pass prompt: inventory only, no product field rules."""
+    """First pass: split, clean and normalize every independent component."""
 
     return INVENTORY_RUNTIME_PROMPT
 
@@ -1030,8 +1040,9 @@ def build_component_extraction_prompt(service_key: str, source_text: str = "") -
     service_rule = _service_rule_with_locked_contract(key)
     variant_key = _variant_prompt_key(service_key, source_text)
     variant_rule = prompt_text(variant_key) if variant_key else ""
-    return f"""你正在执行需求清洗的第 2、3 步，是单个 AWS 组件的固定模板填写器。
-只根据当前组件客户原话填写所给模板，返回填写后的模板对象，不要返回解释文字。
+    return f"""你负责一个已由程序单独拆出的 AWS 报价组件。
+先删除不影响价格的客套话、背景和干扰描述，再把当前组件里会影响价格的事实
+标准化后填入完整模板。只处理这一项，返回填写后的模板对象，不要返回解释文字。
 
 硬规则：
 1. 原文明说才填写；没说的字段必须保持 null。唯一例外是输入中单独标明的“系统最低运行建议”，

@@ -58,6 +58,7 @@ from app.domain.requirement_fields import (
 )
 from app.domain.structured_component_updates import (
     apply_component_update,
+    bind_selected_model_specifications,
     decode_component_update,
 )
 from app.integrations.aws_regions import (
@@ -1520,6 +1521,15 @@ class QuoteService:
                     continue
                 requested_vcpu = intent.services[int(component[0])].requirements.get("vcpu")
                 requested_memory = intent.services[int(component[0])].requirements.get("memory_gib")
+                requested_model = intent.services[int(component[0])].requirements.get(
+                    "requested_model"
+                )
+                # Never replace a named model in the background, and never
+                # manufacture a model when there is no exact customer shape.
+                if requested_model or (
+                    requested_vcpu is None and requested_memory is None
+                ):
+                    continue
                 exact_shape = [
                     candidate
                     for candidate in candidates
@@ -1532,8 +1542,12 @@ class QuoteService:
                         or candidate.specifications.get("memoryGiB") == requested_memory
                     )
                 ]
-                if exact_shape:
-                    candidates = exact_shape
+                # Previously an empty exact-match list fell through to every
+                # candidate and silently chose the cheapest larger machine.
+                # Only a real exact match may be resolved automatically.
+                if not exact_shape:
+                    continue
+                candidates = exact_shape
                 cheapest = min(
                     candidates,
                     key=lambda candidate: (
@@ -2164,6 +2178,28 @@ class QuoteService:
             index = int(numbered.group(1)) - 1
             if 0 <= index < len(intent.services):
                 return index
+
+        # Several independent third-party workloads are ultimately priced as
+        # EC2, but ``ec2`` is only their purchasing vehicle, not their
+        # component identity.  Match the preserved software name first so a
+        # Doris question and a DolphinScheduler question cannot both attach to
+        # the first EC2 row and collapse into one customer decision.
+        identity_matches: list[int] = []
+        for index, service in enumerate(intent.services):
+            third_party = str(service.field_sources.get("_third_party_product") or "").strip()
+            if not third_party and (
+                service.field_sources.get("_pending_architecture_decision")
+                or "自建" in str(service.calculator_service_name or "")
+            ):
+                third_party = cls._third_party_product_name(
+                    service,
+                    service.calculator_service_name or service.service,
+                ).strip()
+            if third_party and third_party.casefold() in folded:
+                identity_matches.append(index)
+        if len(identity_matches) == 1:
+            return identity_matches[0]
+
         aliases = {
             "ec2": ("ec2", "服务器", "实例", "windows", "arm"),
             "rds": ("rds", "数据库", "mysql", "postgresql", "multi-az"),
@@ -2302,15 +2338,53 @@ class QuoteService:
         above all plugins also protects services added in the future.
         """
 
-        if requirement.field_sources.get("_customer_select_configuration"):
-            return selection
         requested = canonicalize_requirement_fields(
             requirement.requirements,
             service=requirement.service,
         )
         requested_model = str(requested.get("requested_model") or "").strip().casefold()
-        if requested_model and str(selection.selected_model or "").casefold() == requested_model:
-            return selection
+        requested_model_source = requirement.field_sources.get(
+            "requirements.requested_model"
+        )
+        # Only an explicit choice from the official catalogue can make a model
+        # authoritative over an earlier descriptive CPU/memory request. A
+        # stale or system-generated model string must still pass the shared
+        # model/specification consistency check below.
+        if (
+            requested_model
+            and QuoteService._models_equivalent(
+                str(selection.selected_model or ""), requested_model
+            )
+            and requested_model_source in {
+                "customer_confirmation",
+                "customer_correction",
+                "sales_confirmation",
+            }
+        ):
+            chosen = next(
+                (
+                    candidate
+                    for candidate in selection.candidates
+                    if QuoteService._models_equivalent(
+                        candidate.model, str(selection.selected_model or "")
+                    )
+                ),
+                None,
+            )
+            if chosen is None:
+                return selection
+            synchronized = dict(requirement.requirements)
+            official_vcpu = chosen.specifications.get("vCPU")
+            official_memory = chosen.specifications.get("memoryGiB")
+            if isinstance(official_vcpu, (int, float)) and not isinstance(
+                official_vcpu, bool
+            ):
+                synchronized["vcpu"] = official_vcpu
+            if isinstance(official_memory, (int, float)) and not isinstance(
+                official_memory, bool
+            ):
+                synchronized["memory_gib"] = official_memory
+            return selection.model_copy(update={"requirements": synchronized})
 
         def positive_number(value: object) -> float | None:
             if isinstance(value, bool):
@@ -3502,6 +3576,22 @@ class QuoteService:
                     selected_model = self._model_from_confirmation_answer(answer)
                     if selected_model:
                         current.requirements["requested_model"] = selected_model
+                        current.field_sources["requirements.requested_model"] = (
+                            "customer_confirmation"
+                        )
+                        current.field_evidence["requirements.requested_model"] = (
+                            "客户从官方可用型号中选择"
+                        )
+                        current.locked_fields = sorted(
+                            set(current.locked_fields)
+                            | {"requirements.requested_model"}
+                        )
+                        record_customer_fact_metadata(
+                            current,
+                            "requested_model",
+                            "客户从官方可用型号中选择",
+                            policy="exact",
+                        )
                         current.field_sources.pop("_customer_select_configuration", None)
                     else:
                         has_customer_shape = all(
@@ -3819,13 +3909,16 @@ class QuoteService:
                         service.field_sources["quantity"] = "customer_confirmation"
                     service.requirements.pop("_review_selected_model", None)
                     service.requirements.pop("_review_selected_specifications", None)
+                    official_shape_bound = bind_selected_model_specifications(
+                        service, selected_model
+                    )
                     # A replacement-model answer is the customer's decision
                     # about an unavailable/non-exact CPU or memory request.
                     # Keeping the old shape as a second hard constraint makes
                     # preflight reject the selected replacement and ask the
                     # same question again.  From this point the official model
                     # is the source of its CPU/memory specification.
-                    if any(
+                    if not official_shape_bound and any(
                         marker in question_folded
                         for marker in (
                             "没有",
@@ -4149,8 +4242,8 @@ class QuoteService:
         )
         return any(affirmative.fullmatch(reply.strip()) for reply in replies)
 
-    @staticmethod
-    def _confirmation_notices(intent: ParsedIntent) -> list[str]:
+    @classmethod
+    def _confirmation_notices(cls, intent: ParsedIntent) -> list[str]:
         # AI may describe every omitted optional field as an ambiguity. Those are
         # system defaults, not customer decisions. Only explicit contradictions
         # or unsupported architecture choices belong on the confirmation page;
@@ -4163,20 +4256,29 @@ class QuoteService:
         regional = [
             item
             for item in intent.services
-            if QuoteService._service_kind(item.service) not in global_services
+            if cls._service_kind(item.service) not in global_services
         ]
         all_regional_services_resolved = bool(regional) and all(item.region for item in regional)
         notices = [
             item.strip()
             for item in intent.ambiguities
             if item.strip()
-            and QuoteService._is_customer_decision_notice(item)
+            and cls._is_customer_decision_notice(item)
             and not (
-                all_regional_services_resolved and QuoteService._is_region_confirmation_notice(item)
+                all_regional_services_resolved and cls._is_region_confirmation_notice(item)
             )
-            and not QuoteService._is_optional_opensearch_role_notice(item)
+            and not cls._is_optional_opensearch_role_notice(item)
         ]
-        return QuoteService._deduplicate_confirmation_notices(notices)
+        component_scopes: dict[str, tuple[str, str]] = {}
+        for notice in notices:
+            component_index = cls._service_index_for_notice(intent, notice)
+            if component_index is None:
+                continue
+            component_scopes[notice] = (
+                str(component_index),
+                intent.services[component_index].service,
+            )
+        return cls._deduplicate_confirmation_notices(notices, component_scopes)
 
     @staticmethod
     def _is_region_confirmation_notice(notice: str) -> bool:
@@ -5158,6 +5260,11 @@ class QuoteService:
                 else {}
             )
             intent = await self._parser.parse(request.customer_request, **parser_arguments)
+            # A fresh final-quote request must honor the region already chosen
+            # on the sales page just like preview does. Previously only the
+            # validation copy received pricing choices, so the same request
+            # could incorrectly ask for region again after preview.
+            self._apply_sales_region(intent, request.sales_region)
             merged_transfer_items = self._merge_transfer_only_ec2_services(intent)
             if reporter:
                 await reporter("ai", f"已整理 {len(intent.services)} 项 AWS 配置")
@@ -6291,24 +6398,43 @@ class QuoteService:
     ) -> bool:
         """Turn an unknown literal third-party product into a real decision.
 
-        AWS/Amazon products with a temporarily missing catalog code remain
-        technical failures.  A named non-AWS product must instead ask whether
-        the customer wants an AWS managed alternative or an EC2 deployment.
+        Product classification owns identity; pricing/catalog lookup does not.
+        A missing service code may expose an already identified third-party
+        workload, but it can never turn a native AWS service into EC2 merely
+        because its internal key does not contain the words AWS or Amazon.
         """
 
         if error.code.casefold() != "generic_service_code_not_found":
             return False
-        identity = " ".join(
-            str(value or "").strip()
-            for value in (
-                display_name,
-                requirement.calculator_service_name,
-                requirement.service,
-            )
-        ).strip()
-        if not identity:
+        if cls._service_kind(requirement.service) is not None:
             return False
-        return not bool(re.search(r"(?:^|\s)(?:aws|amazon)(?:\s|$)", identity, re.I))
+        sources = requirement.field_sources
+        if sources.get("_official_service_code") or sources.get("_managed_product_mapping"):
+            return False
+        if sources.get("_identity_resolution_status") == "failed":
+            return False
+
+        # Pricing is not allowed to classify a product.  Only the intake
+        # identity resolver may mark a component as a named third-party
+        # workload, after official-catalog resolution has missed and the
+        # customer's row contains positive deployment evidence.  The old
+        # compatibility fallback rebuilt a product name from ``display_name``
+        # here; that let a catalog/adapter error reclassify an AWS service such
+        # as S3 as EC2 self-hosting.  Requiring both provenance markers makes
+        # product identity immutable once pricing begins.
+        if sources.get("_identity_resolution_status") != "third_party":
+            return False
+        product = str(sources.get("_third_party_product") or "").strip()
+        if not product:
+            return False
+        if re.search(r"\b(?:aws|amazon)\b", product, re.I):
+            return False
+        # This shared managed-service guard covers S3, RDS, Redis, Kafka and
+        # every other native template identity. It is the decisive safety
+        # boundary for legacy drafts without newer identity metadata.
+        if DeepSeekIntentParser._fully_managed_equivalent(product) is not None:
+            return False
+        return True
 
     @classmethod
     def _recover_third_party_deployment(
@@ -6395,18 +6521,18 @@ class QuoteService:
         """
 
         folded_notice = notice.casefold()
+        # The original workload identity is authoritative.  Do not include
+        # the normalized service key here: after conversion every independent
+        # self-hosted workload is ``ec2``, which makes that token ambiguous and
+        # previously caused later architecture questions to disappear.
         matches: list[str] = []
         for component_id in sorted(pending_component_ids, key=int):
             component = intent.services[int(component_id)]
-            names = {
-                cls._third_party_product_name(
-                    component,
-                    component.calculator_service_name or component.service,
-                ).casefold(),
-                str(component.service or "").strip().casefold(),
-            }
-            names.discard("")
-            if any(name in folded_notice for name in names):
+            product_name = cls._third_party_product_name(
+                component,
+                component.calculator_service_name or component.service,
+            ).strip().casefold()
+            if product_name and product_name in folded_notice:
                 matches.append(component_id)
         if len(matches) == 1:
             return matches[0]
@@ -7559,6 +7685,22 @@ class QuoteService:
                     f"RDS 自动备份保留 {days} 天已保留为部署要求；Calculator 按实际备份"
                     "存储量（GB-month）计费，客户未提供额外备份存储量，因此未添加猜测费用"
                 )
+            if (
+                service.service in {"elasticache", "redis"}
+                and service.requirements.get("source_storage_gib_per_node") is not None
+            ):
+                source_storage = service.requirements["source_storage_gib_per_node"]
+                if isinstance(source_storage, (int, float)):
+                    non_pricing_notices.append(
+                        f"Redis 原环境每节点 {source_storage:g} GiB 存储仅作为迁移容量参考；"
+                        "标准 Amazon ElastiCache 节点不配置同等 EBS 数据盘，"
+                        "本项未作为节点磁盘计费"
+                    )
+                else:
+                    non_pricing_notices.append(
+                        "Redis 原环境存储仅作为迁移容量参考；标准 Amazon ElastiCache "
+                        "节点不配置同等 EBS 数据盘，本项未作为节点磁盘计费"
+                    )
             confirmed_model = self._confirmed_pricing_model(
                 service,
                 request.selected_models.get(str(index)),
@@ -7764,6 +7906,19 @@ class QuoteService:
             notes.append(
                 "本项为 EKS 集群的工作节点计算资源，由 EC2 提供并与对应 EKS 集群配套使用。"
             )
+        elif key == "ec2" and (
+            service.field_sources.get("_third_party_product")
+            or "自建" in str(service.calculator_service_name or "")
+        ):
+            product = QuoteService._third_party_product_name(
+                service,
+                service.calculator_service_name or service.service,
+            ).strip()
+            if product:
+                notes.append(
+                    f"本项由“{product}”部署需求衍生，用于在 Amazon EC2 上运行 {product}；"
+                    "这里计算的是所列云服务器与磁盘资源，不是 AWS 托管版服务。"
+                )
         elif key == "eks":
             has_explicit_workers = bool(
                 re.search(r"(?:工作|worker)?节点(?:数量|规格)|node\s*group", source, re.I)
@@ -7818,7 +7973,6 @@ class QuoteService:
             "storage_type": "storageType",
             "data_nodes": "dataNodes",
             "storage_gib_per_node": "storageGiBPerNode",
-            "source_storage_gib_per_node": "storageGiBPerNode",
             "broker_count": "brokerCount",
             "storage_gib_per_broker": "storageGiBPerBroker",
             "storage_class": "storageClass",
@@ -7846,6 +8000,9 @@ class QuoteService:
             # This is derived from per-machine disk × quantity.  Showing both
             # values made the configuration look duplicated.
             "total_system_disk_gib",
+            # A capacity copied from the customer's previous Redis server is
+            # migration context, not an ElastiCache EBS configuration.
+            "source_storage_gib_per_node",
         }
         complete: dict[str, object] = {}
 
@@ -7923,6 +8080,27 @@ class QuoteService:
         pricing_copy = service.model_copy(deep=True)
         pricing_copy.service = service_key
         pricing_copy.requirements = dict(requirements)
+
+        if (
+            service.field_sources.get("_customer_shape_replaced_by_model")
+            and pricing_copy.requirements.get("requested_model")
+        ):
+            # Compatibility for both current and already-issued drafts: once
+            # the customer chose an official model as the replacement, the old
+            # descriptive CPU/memory sentence is audit history, not a second
+            # pricing constraint.  Let the adapter resolve the selected
+            # model's official shape and prevent restore/ledger code from
+            # bringing the superseded values back into the pricing request.
+            for field in ("vcpu", "memory_gib"):
+                pricing_copy.requirements.pop(field, None)
+                path = f"requirements.{field}"
+                pricing_copy.field_sources.pop(path, None)
+                pricing_copy.field_evidence.pop(path, None)
+                pricing_copy.field_scopes.pop(field, None)
+                pricing_copy.field_match_policies.pop(field, None)
+                pricing_copy.locked_fields = [
+                    entry for entry in pricing_copy.locked_fields if entry != path
+                ]
 
         # Canonicalizing a field value without canonicalizing its evidence
         # produces an invisible customer fact: the adapter sees the value, but

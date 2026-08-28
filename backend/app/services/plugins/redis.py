@@ -342,6 +342,13 @@ class RedisPlugin(ServicePlugin):
                 f"AWS 没有恰好 {min_memory:g} GiB 的 ElastiCache 节点，已直接选择最接近且"
                 f"不低于需求的 {selected['memory_gib']:g} GiB（{selected['model']}）。"
             )
+        source_storage = required_float(requested, "source_storage_gib_per_node")
+        if source_storage is not None:
+            storage_notice = (
+                f"客户原环境的每节点 {source_storage:g} GiB 存储已保留为迁移参考；"
+                "标准 ElastiCache 节点不配置同等 EBS 数据盘，因此没有把它作为节点磁盘计费。"
+            )
+            notice = f"{notice or ''}{storage_notice}"
 
         return SelectedResource(
             service=self.kind,
@@ -366,24 +373,27 @@ class RedisPlugin(ServicePlugin):
             rationale="节点规格来自 AWS 产品目录；节点数按 ElastiCache 分片与副本架构计算。",
             substitution_notice=notice,
             usage_lines=usage_lines,
-            applied_requirement_fields=(
-                [
-                    "quantity",
-                    "hours_per_month",
-                    "requested_model",
-                    "vcpu",
-                    "memory_gib",
-                    "engine",
-                    "shards",
-                    "replicas_per_shard",
-                    "node_count",
-                    "purchase_option",
-                    "reserved_term_years",
-                    "payment_option",
-                ]
-                if purchase_option == "reserved"
-                else []
-            ),
+            applied_requirement_fields=[
+                "source_storage_gib_per_node",
+                *(
+                    [
+                        "quantity",
+                        "hours_per_month",
+                        "requested_model",
+                        "vcpu",
+                        "memory_gib",
+                        "engine",
+                        "shards",
+                        "replicas_per_shard",
+                        "node_count",
+                        "purchase_option",
+                        "reserved_term_years",
+                        "payment_option",
+                    ]
+                    if purchase_option == "reserved"
+                    else []
+                ),
+            ],
             monthly_commitment_cost=monthly_commitment_cost,
             upfront_commitment_cost=upfront_commitment_cost,
         )

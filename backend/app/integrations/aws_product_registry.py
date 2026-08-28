@@ -546,24 +546,46 @@ class AwsProductRegistry:
         This deliberately performs identity matching only.  It never guesses
         a product by price, capacity or a fuzzy nearest name, so a third-party
         workload cannot be silently converted into an unrelated AWS service.
+
+        Provider-owned names and aliases learned from earlier AI classifications
+        are deliberately distinguished in the result.  A learned alias remains
+        useful for candidate retrieval, but callers must validate it again; one
+        historic bad classification must never become an authoritative local
+        catalog fact for every future quote.
         """
 
         targets = {target for label in labels for target in _identity_targets(label)}
         if not targets:
             return None
-        matches: list[dict[str, Any]] = []
+        provider_matches: list[dict[str, Any]] = []
+        learned_matches: list[dict[str, Any]] = []
         for product in self.list_products():
             if str(product.get("identity_status") or "") != "official":
                 continue
-            identities = {
+            provider_aliases = set(_aliases(str(product["service_code"])))
+            provider_identities = {
                 _canonical(str(product["service_code"])),
                 _canonical(str(product["service_key"])),
                 _canonical(str(product["display_name"])),
-                *(_canonical(str(alias)) for alias in product["aliases"]),
+                *(_canonical(str(alias)) for alias in provider_aliases),
             }
-            if identities & targets:
-                matches.append(product)
-        return matches[0] if len(matches) == 1 else None
+            if provider_identities & targets:
+                provider_matches.append(product)
+                continue
+            learned_identities = {
+                _canonical(str(alias))
+                for alias in product["aliases"]
+                if str(alias).strip() and str(alias) not in provider_aliases
+            }
+            if learned_identities & targets:
+                learned_matches.append(product)
+        if len(provider_matches) == 1:
+            return {**provider_matches[0], "identity_match_source": "provider"}
+        if provider_matches:
+            return None
+        if len(learned_matches) == 1:
+            return {**learned_matches[0], "identity_match_source": "learned_alias"}
+        return None
 
     def candidate_products(
         self,

@@ -394,15 +394,19 @@ def test_product_registry_retrieves_renamed_official_candidate_without_auto_sele
     ]
 
     registry.add_alias("AmazonKinesisFirehose", "Amazon Data Firehose")
-    assert registry.resolve_product("Amazon Data Firehose")["service_code"] == (
+    learned = registry.resolve_product("Amazon Data Firehose")
+    assert learned["service_code"] == (
         "AmazonKinesisFirehose"
     )
+    assert learned["identity_match_source"] == "learned_alias"
 
     # A normal official-directory refresh must retain learned marketing names.
     registry.sync()
-    assert registry.resolve_product("Amazon Data Firehose")["service_code"] == (
+    learned_after_sync = registry.resolve_product("Amazon Data Firehose")
+    assert learned_after_sync["service_code"] == (
         "AmazonKinesisFirehose"
     )
+    assert learned_after_sync["identity_match_source"] == "learned_alias"
 
 
 def test_product_registry_can_reuse_learned_non_ascii_customer_wording(
@@ -434,8 +438,11 @@ def test_product_registry_can_reuse_learned_non_ascii_customer_wording(
 
     assert resolved is not None
     assert resolved["service_code"] == "AmazonEFS"
+    assert resolved["identity_match_source"] == "learned_alias"
     registry.sync()
-    assert registry.resolve_product("共享文件存储")["service_code"] == "AmazonEFS"
+    resolved_after_sync = registry.resolve_product("共享文件存储")
+    assert resolved_after_sync["service_code"] == "AmazonEFS"
+    assert resolved_after_sync["identity_match_source"] == "learned_alias"
 
 
 def test_product_registry_keeps_price_list_name_without_marketing_qualifier_as_ai_candidate(

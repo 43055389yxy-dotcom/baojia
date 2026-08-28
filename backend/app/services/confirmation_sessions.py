@@ -82,6 +82,30 @@ class ConfirmationSessionStore:
         return ParsedIntent.model_validate(payload)
 
     @staticmethod
+    def _review_requirements(item: ServiceRequirement) -> dict[str, object]:
+        """Return customer-visible facts without a legacy model/shape hybrid."""
+
+        requirements = {
+            key: value
+            for key, value in item.requirements.items()
+            if not key.startswith("_") and key != "system_default_assumption"
+        }
+        if (
+            item.field_sources.get("_customer_shape_replaced_by_model")
+            and requirements.get("requested_model")
+            and not isinstance(
+                item.requirements.get("_review_selected_specifications"), dict
+            )
+        ):
+            # Older links may contain the replacement model together with the
+            # rejected CPU/memory sentence. Until a fresh official lookup has
+            # populated the selected specifications, omit those superseded
+            # values instead of displaying an impossible combination.
+            requirements.pop("vcpu", None)
+            requirements.pop("memory_gib", None)
+        return requirements
+
+    @staticmethod
     def _pricing_issue_category(item: object) -> PricingIssueCategory | None:
         requirements = getattr(item, "requirements", {})
         reason = str(requirements.get("_quote_skip_reason") or "")
@@ -453,11 +477,7 @@ class ConfirmationSessionStore:
                 pricing_issue_category=(
                     self._pricing_issue_category(item)
                 ),
-                requirements={
-                    key: value
-                    for key, value in item.requirements.items()
-                    if not key.startswith("_") and key != "system_default_assumption"
-                },
+                requirements=self._review_requirements(item),
                 source_text=item.original_source_text or item.source_text,
             )
             for index, item in enumerate(intent.services)

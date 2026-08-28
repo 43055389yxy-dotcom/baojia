@@ -223,6 +223,170 @@ def test_global_catalog_sizing_invariant_asks_before_non_exact_substitution() ->
     assert "不会自动放大、缩小或替换" in str(resolved.confirmation_reason)
 
 
+def test_staged_self_hosted_picker_cannot_bypass_exact_shape_check() -> None:
+    requirement = ServiceRequirement(
+        service="ec2",
+        requirements={"vcpu": 24, "memory_gib": 64},
+        field_sources={
+            "_customer_select_configuration": "customer_confirmation",
+            "requirements.vcpu": "customer_text",
+            "requirements.memory_gib": "customer_text",
+        },
+        field_evidence={
+            "requirements.vcpu": "单节点24核64GB",
+            "requirements.memory_gib": "单节点24核64GB",
+        },
+        locked_fields=["requirements.vcpu", "requirements.memory_gib"],
+    )
+    selection = PreviewSelection(
+        component_id="0",
+        service="ec2",
+        display_name="Amazon EC2（自建 Flink）",
+        region="ap-south-1",
+        selected_model="m6g.8xlarge",
+        candidates=[
+            CandidateOption(
+                model="m6g.8xlarge",
+                family="m6g",
+                specifications={"vCPU": 32, "memoryGiB": 128},
+                rationale="official",
+            )
+        ],
+    )
+
+    resolved = QuoteService._enforce_catalog_sizing_invariant(requirement, selection)
+
+    assert resolved.selected_model is None
+    assert resolved.requires_confirmation is True
+    assert resolved.issue_code == "exact_customer_shape_not_available"
+
+
+def test_customer_confirmed_official_model_overrides_earlier_descriptive_shape() -> None:
+    requirement = ServiceRequirement(
+        service="ec2",
+        requirements={
+            "requested_model": "m6g.8xlarge",
+            "vcpu": 24,
+            "memory_gib": 64,
+        },
+        field_sources={
+            "requirements.requested_model": "customer_confirmation",
+            "requirements.vcpu": "customer_text",
+            "requirements.memory_gib": "customer_text",
+        },
+    )
+    selection = PreviewSelection(
+        component_id="0",
+        service="ec2",
+        display_name="Amazon EC2（自建 Flink）",
+        region="ap-south-1",
+        selected_model="m6g.8xlarge",
+        candidates=[
+            CandidateOption(
+                model="m6g.8xlarge",
+                family="m6g",
+                specifications={"vCPU": 32, "memoryGiB": 128},
+                rationale="customer selected official option",
+            )
+        ],
+    )
+
+    resolved = QuoteService._enforce_catalog_sizing_invariant(requirement, selection)
+
+    assert resolved.selected_model == "m6g.8xlarge"
+    assert resolved.requires_confirmation is False
+    assert resolved.requirements["vcpu"] == 32
+    assert resolved.requirements["memory_gib"] == 128
+
+
+def test_customer_confirmed_msk_model_prefix_uses_same_official_shape() -> None:
+    requirement = ServiceRequirement(
+        service="msk",
+        requirements={
+            "requested_model": "kafka.m7g.xlarge",
+            "vcpu": 8,
+            "memory_gib": 16,
+        },
+        field_sources={
+            "requirements.requested_model": "customer_confirmation",
+            "requirements.vcpu": "customer_text",
+            "requirements.memory_gib": "customer_text",
+        },
+    )
+    selection = PreviewSelection(
+        component_id="0",
+        service="msk",
+        display_name="Amazon MSK",
+        region="ap-southeast-1",
+        selected_model="m7g.xlarge",
+        candidates=[
+            CandidateOption(
+                model="m7g.xlarge",
+                family="Amazon MSK Broker",
+                specifications={"vCPU": 4, "memoryGiB": 16},
+                rationale="AWS official",
+            )
+        ],
+    )
+
+    resolved = QuoteService._enforce_catalog_sizing_invariant(requirement, selection)
+
+    assert resolved.selected_model == "m7g.xlarge"
+    assert resolved.requirements["vcpu"] == 4
+    assert resolved.requirements["memory_gib"] == 16
+
+
+def test_pricing_copy_drops_shape_superseded_by_confirmed_model() -> None:
+    service = ServiceRequirement(
+        service="msk",
+        requirements={
+            "requested_model": "m7g.xlarge",
+            "vcpu": 8,
+            "memory_gib": 16,
+            "broker_count": 3,
+        },
+        field_sources={
+            "requirements.requested_model": "customer_confirmation",
+            "requirements.vcpu": "customer_text",
+            "requirements.memory_gib": "customer_text",
+            "_customer_shape_replaced_by_model": "customer_confirmation",
+        },
+        locked_fields=["requirements.vcpu", "requirements.memory_gib"],
+    )
+
+    pricing_copy = QuoteService._pricing_requirement_copy(
+        service,
+        service_key="msk",
+        requirements=dict(service.requirements),
+    )
+
+    assert pricing_copy.requirements["requested_model"] == "m7g.xlarge"
+    assert pricing_copy.requirements["broker_count"] == 3
+    assert "vcpu" not in pricing_copy.requirements
+    assert "memory_gib" not in pricing_copy.requirements
+    assert "requirements.vcpu" not in pricing_copy.field_sources
+    assert "requirements.memory_gib" not in pricing_copy.locked_fields
+
+
+def test_redis_source_server_storage_never_becomes_elasticache_node_disk() -> None:
+    requirement = ServiceRequirement(
+        service="elasticache",
+        requirements={
+            "memory_gib": 64,
+            "source_storage_gib_per_node": 500,
+        },
+    )
+
+    specifications = QuoteService._complete_selection_specifications(
+        requirement,
+        {"memoryGiB": 52.26},
+    )
+
+    assert specifications["memoryGiB"] == 52.26
+    assert "storageGiBPerNode" not in specifications
+    assert "source_storage_gib_per_node" not in specifications
+
+
 def test_global_catalog_sizing_invariant_honors_approximate_wording_from_source() -> None:
     requirement = ServiceRequirement(
         service="future_cache_plugin",
@@ -2498,6 +2662,71 @@ async def test_second_question_page_is_replaced_by_cheapest_matching_model() -> 
     assert preview.confirmation_text is None
     assert preview.selections[0].selected_model == "cheap.xlarge"
     assert preview.selections[0].selection_reason == "已自动选择满足配置的最低价官方型号"
+
+
+@pytest.mark.asyncio
+async def test_second_question_page_does_not_auto_select_non_exact_larger_model() -> None:
+    class CachedOnlyParser:
+        async def parse(self, _: str) -> ParsedIntent:
+            raise AssertionError("saved draft must be reused")
+
+    class LargerOnlyPlugin(ApiPlugin):
+        def preview(
+            self, requirement: ServiceRequirement, default_region: str
+        ) -> PreviewSelection:
+            return PreviewSelection(
+                component_id="component",
+                service=ServiceKind.EC2,
+                display_name="Amazon EC2（自建 Flink）",
+                region=requirement.region or default_region,
+                candidates=[
+                    CandidateOption(
+                        model="m6g.8xlarge",
+                        family="m6g",
+                        specifications={"vCPU": 32, "memoryGiB": 128},
+                        monthly_catalog_cost=100,
+                        rationale="official",
+                    )
+                ],
+                requires_confirmation=True,
+                confirmation_reason="没有完全一致的官方型号，请选择。",
+            )
+
+    draft_id = "nonexact0001"
+    intent = ParsedIntent(
+        customer_summary="Flink",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                calculator_service_name="Amazon EC2（自建 Flink）",
+                region="ap-south-1",
+                requirements={"vcpu": 24, "memory_gib": 64},
+                field_sources={
+                    "requirements.vcpu": "customer_text",
+                    "requirements.memory_gib": "customer_text",
+                },
+                field_evidence={
+                    "requirements.vcpu": "单节点24核64GB",
+                    "requirements.memory_gib": "单节点24核64GB",
+                },
+            )
+        ],
+    )
+    service = QuoteService(
+        CachedOnlyParser(),  # type: ignore[arg-type]
+        PluginRegistry([LargerOnlyPlugin(ServiceKind.EC2, "fallback")]),
+        FailingEstimator(),  # type: ignore[arg-type]
+    )
+    service._drafts[draft_id] = ("Flink", intent)
+    service._confirmation_rounds[draft_id] = 1
+
+    preview = await service.preview(
+        QuoteRequest(customer_request="Flink", draft_id=draft_id)
+    )
+
+    assert preview.confirmation_items
+    assert preview.selections[0].selected_model is None
+    assert "没有完全一样" in str(preview.selections[0].confirmation_reason)
 
 
 def test_rephrased_shape_question_uses_the_same_confirmation_key() -> None:
@@ -4824,6 +5053,25 @@ def test_dependency_notes_explain_cloudfront_origin_without_adding_cost() -> Non
     ]
 
 
+def test_self_hosted_ec2_note_explains_original_product_and_purpose() -> None:
+    doris = ServiceRequirement(
+        service="ec2",
+        calculator_service_name="Amazon EC2（自建 Doris）",
+        source_text="Doris 预计3台，单台16核128G，磁盘4T。",
+        # The customer-facing purpose must also survive historical drafts that
+        # predate the dedicated metadata field; their contextual display name
+        # is still authoritative.
+        field_sources={},
+    )
+
+    notes = QuoteService._dependency_remarks(doris, [doris])
+
+    assert len(notes) == 1
+    assert "由“Doris”部署需求衍生" in notes[0]
+    assert "用于在 Amazon EC2 上运行 Doris" in notes[0]
+    assert "不是 AWS 托管版服务" in notes[0]
+
+
 def test_missing_rds_deployment_question_has_customer_choices() -> None:
     options = QuoteService._default_confirmation_options(
         "Amazon RDS 数据库未说明部署方式，请选择单可用区还是主备高可用（Multi-AZ）。"
@@ -5476,6 +5724,47 @@ async def test_selected_model_uses_confirmation_component_id_with_multiple_ec2()
 
 
 @pytest.mark.asyncio
+async def test_msk_confirmation_binds_model_and_official_shape_as_one_choice() -> None:
+    question = "您填写的 MSK 是 8 核、16 GB，但没有完全一样的型号，请选择。"
+    intent = ParsedIntent(
+        customer_summary="MSK",
+        services=[
+            ServiceRequirement(
+                service="msk",
+                requirements={
+                    "vcpu": 8,
+                    "memory_gib": 16,
+                    "_review_confirmation_candidates": [
+                        {
+                            "model": "m7g.xlarge",
+                            "family": "Amazon MSK Broker",
+                            "specifications": {"vCPU": 4, "memoryGiB": 16},
+                            "rationale": "AWS 官方规格",
+                        }
+                    ],
+                },
+            )
+        ],
+    )
+    service = QuoteService.__new__(QuoteService)
+
+    await service._apply_confirmation_responses(
+        intent,
+        {question: "选择 m7g.xlarge"},
+        response_components={question: 0},
+    )
+
+    component = intent.services[0]
+    assert component.requirements["requested_model"] == "m7g.xlarge"
+    assert component.requirements["vcpu"] == 4
+    assert component.requirements["memory_gib"] == 16
+    assert component.requirements["_review_selected_specifications"] == {
+        "vCPU": 4,
+        "memoryGiB": 16,
+    }
+
+
+@pytest.mark.asyncio
 async def test_pending_managed_decision_embeds_self_hosted_configuration() -> None:
     question = (
         "您需要 Nacos 的服务发现和配置中心。是继续自建 Nacos（3 个节点），"
@@ -5572,6 +5861,12 @@ async def test_unknown_third_party_product_becomes_architecture_question() -> No
                         calculator_service_name="ClickHouse",
                         region="ap-southeast-1",
                         source_text="ClickHouse：",
+                        # Production identity resolution, rather than pricing,
+                        # owns the third-party classification.
+                        field_sources={
+                            "_identity_resolution_status": "third_party",
+                            "_third_party_product": "ClickHouse",
+                        },
                     )
                 ],
             )
@@ -5609,24 +5904,90 @@ async def test_unknown_third_party_product_becomes_architecture_question() -> No
     assert recovered.field_sources["_pending_architecture_decision"] == "system_policy"
 
 
+def test_generic_catalog_miss_cannot_turn_native_s3_into_self_hosted_ec2() -> None:
+    error = ManualConfirmationRequired(
+        "没有找到官方服务代码",
+        code="generic_service_code_not_found",
+    )
+    native = ServiceRequirement(
+        service="s3",
+        calculator_service_name="Amazon Simple Storage Service (S3)",
+        source_text="S3，容量15T",
+    )
+    legacy_unknown = ServiceRequirement(
+        service="s3_capacity15t",
+        calculator_service_name="S3，容量15T",
+        source_text="S3，容量15T",
+    )
+
+    assert not QuoteService._is_third_party_architecture_catalog_miss(
+        native,
+        native.calculator_service_name or "S3",
+        error,
+    )
+    assert not QuoteService._is_third_party_architecture_catalog_miss(
+        legacy_unknown,
+        legacy_unknown.calculator_service_name or "S3",
+        error,
+    )
+
+
+def test_generic_catalog_miss_keeps_real_third_party_architecture_route() -> None:
+    error = ManualConfirmationRequired(
+        "没有找到官方服务代码",
+        code="generic_service_code_not_found",
+    )
+    component = ServiceRequirement(
+        service="clickhouse",
+        calculator_service_name="ClickHouse",
+        source_text="ClickHouse：3个节点，每节点8核32GB",
+        field_sources={
+            "_identity_resolution_status": "third_party",
+            "_third_party_product": "ClickHouse",
+        },
+    )
+
+    assert QuoteService._is_third_party_architecture_catalog_miss(
+        component,
+        "ClickHouse",
+        error,
+    )
+
+
+def test_pricing_catalog_miss_cannot_classify_an_unresolved_name_as_third_party() -> None:
+    error = ManualConfirmationRequired(
+        "没有找到官方服务代码",
+        code="generic_service_code_not_found",
+    )
+    unresolved = ServiceRequirement(
+        service="some_clean_product_heading",
+        calculator_service_name="Some Clean Product Heading",
+        source_text="Some Clean Product Heading：3个节点，每节点8核32GB",
+    )
+
+    assert not QuoteService._is_third_party_architecture_catalog_miss(
+        unresolved,
+        "Some Clean Product Heading",
+        error,
+    )
+
+
 def test_multiple_architecture_questions_bind_to_their_own_components() -> None:
     intent = ParsedIntent(
         customer_summary="two self-hosted products",
         services=[
             ServiceRequirement(
                 service="ec2",
-                calculator_service_name="Amazon EC2（自建 Apache Kafka）",
+                calculator_service_name="Amazon EC2（自建 Doris）",
                 field_sources={
                     "_pending_architecture_decision": "system_policy",
-                    "_third_party_product": "Apache Kafka",
                 },
             ),
             ServiceRequirement(
-                service="clickhouse",
-                calculator_service_name="Amazon EC2（自建 ClickHouse）",
+                service="ec2",
+                calculator_service_name="Amazon EC2（自建 DolphinScheduler）",
                 field_sources={
                     "_pending_architecture_decision": "system_policy",
-                    "_third_party_product": "ClickHouse",
                 },
             ),
         ],
@@ -5636,7 +5997,7 @@ def test_multiple_architecture_questions_bind_to_their_own_components() -> None:
     assert (
         QuoteService._architecture_notice_component_id(
             intent,
-            "AWS 没有与 Apache Kafka 完全等价的托管服务，采用托管还是自建？",
+            "AWS 没有与 Doris 完全等价的托管服务，采用托管还是自建？",
             pending,
         )
         == "0"
@@ -5644,11 +6005,26 @@ def test_multiple_architecture_questions_bind_to_their_own_components() -> None:
     assert (
         QuoteService._architecture_notice_component_id(
             intent,
-            "AWS 没有与 ClickHouse 完全等价的托管服务，采用托管还是自建？",
+            "AWS 没有与 DolphinScheduler 完全等价的托管服务，采用托管还是自建？",
             pending,
         )
         == "1"
     )
+
+    assert QuoteService._service_index_for_notice(
+        intent,
+        "AWS 没有与 Doris 完全等价的托管服务，采用托管还是在 EC2 自建？",
+    ) == 0
+    assert QuoteService._service_index_for_notice(
+        intent,
+        "AWS 没有与 DolphinScheduler 完全等价的托管服务，采用托管还是在 EC2 自建？",
+    ) == 1
+
+    intent.ambiguities = [
+        "AWS 没有与 Doris 完全等价的托管服务，采用托管还是在 EC2 自建？",
+        "AWS 没有与 DolphinScheduler 完全等价的托管服务，采用托管还是在 EC2 自建？",
+    ]
+    assert QuoteService._confirmation_notices(intent) == intent.ambiguities
 
 
 def test_model_availability_question_waits_until_region_is_selected() -> None:

@@ -18,6 +18,8 @@ type Props = {
   catalog?: boolean;
   requireMachineCount?: boolean;
   initialMachineCount?: number;
+  initialVcpu?: number;
+  initialMemoryGiB?: number;
   className?: string;
   placeholder?: string;
 };
@@ -43,13 +45,36 @@ export function ConfigurationOptionPicker({
   catalog = false,
   requireMachineCount = false,
   initialMachineCount = 1,
+  initialVcpu,
+  initialMemoryGiB,
   className = "",
   placeholder,
 }: Props) {
-  const [vcpu, setVcpu] = useState("");
-  const [memory, setMemory] = useState("");
-  const [machineCount, setMachineCount] = useState(String(Math.max(initialMachineCount, 1)));
   const selectedValue = (value ?? "").replace(/；机器(?:数量|台数)\s*\d+$/, "");
+  const selectedOption = options.find((option) => option.value === selectedValue);
+  const selectedVcpu = selectedOption
+    ? numericSpecification(selectedOption, ["vCPU", "vcpu", "vcpus"])
+    : null;
+  const selectedMemory = selectedOption
+    ? numericSpecification(selectedOption, ["memoryGiB", "memory_gib", "memory"])
+    : null;
+  const selectedMachineCount = Number(
+    (value ?? "").match(/；机器(?:数量|台数)\s*(\d+)$/)?.[1],
+  );
+  const [vcpu, setVcpu] = useState(
+    selectedVcpu !== null ? String(selectedVcpu) : initialVcpu ? String(initialVcpu) : "",
+  );
+  const [memory, setMemory] = useState(
+    selectedMemory !== null
+      ? String(selectedMemory)
+      : initialMemoryGiB ? String(initialMemoryGiB) : "",
+  );
+  const [machineCount, setMachineCount] = useState(String(Math.max(
+    Number.isFinite(selectedMachineCount) && selectedMachineCount > 0
+      ? selectedMachineCount
+      : initialMachineCount,
+    1,
+  )));
   const emitSelection = (optionValue: string, count = machineCount) => {
     if (!optionValue) {
       onChange("");

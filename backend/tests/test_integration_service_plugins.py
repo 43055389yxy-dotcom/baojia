@@ -230,7 +230,9 @@ def test_global_accelerator_uses_source_path_instead_of_global_minimum() -> None
     assert selected.usage_lines[1].usage_type == "AP-AP-OUT-Bytes-Internet"
 
 
-def test_msk_quotes_broker_hours_and_per_broker_storage() -> None:
+def test_msk_quotes_broker_hours_and_per_broker_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     broker = product(
         "AmazonMSK",
         "APS1-Kafka.m7g.large",
@@ -252,6 +254,23 @@ def test_msk_quotes_broker_hours_and_per_broker_storage() -> None:
         location="Asia Pacific (Singapore)",
         group="Storage",
     )
+
+    class FakeExecutor:
+        def __init__(self, _clients: object):
+            pass
+
+        def execute(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "InstanceTypes": [
+                    {
+                        "InstanceType": "m7g.large",
+                        "VCpuInfo": {"DefaultVCpus": 2},
+                        "MemoryInfo": {"SizeInMiB": 8192},
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(integration_services, "ReadOnlyAwsQueryExecutor", FakeExecutor)
     plugin = MskPlugin(None, FakeCatalog({"AmazonMSK": [broker, storage]}))  # type: ignore[arg-type]
     selected = plugin.select(
         ServiceRequirement(
@@ -356,6 +375,69 @@ def test_msk_enriches_missing_price_list_shape_from_ec2(
                 "broker_count": 3,
                 "vcpu": 4,
                 "memory_gib": 16,
+                "storage_gib_per_broker": 1024,
+            },
+        ),
+        "ap-southeast-1",
+    )
+
+    assert selected.model == "m7g.xlarge"
+    assert selected.specifications["vCPU"] == 4
+    assert selected.specifications["memoryGiB"] == 16
+
+
+def test_msk_selected_model_always_uses_ec2_official_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker = product(
+        "AmazonMSK",
+        "APS1-Kafka.m7g.xlarge",
+        "RunBroker",
+        0.5,
+        "hours",
+        location="Asia Pacific (Singapore)",
+        group="Broker",
+        computeFamily="m7g.xlarge",
+        # Reproduce the bad cached/presentation metadata. The selected model's
+        # shape must still come from DescribeInstanceTypes.
+        vcpu="8",
+        memoryGib="16",
+    )
+    storage = product(
+        "AmazonMSK",
+        "APS1-Kafka.Storage.GP2",
+        "RunVolume",
+        0.12,
+        "GB-Mo",
+        location="Asia Pacific (Singapore)",
+        group="Storage",
+    )
+
+    class FakeExecutor:
+        def __init__(self, _clients: object):
+            pass
+
+        def execute(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "InstanceTypes": [
+                    {
+                        "InstanceType": "m7g.xlarge",
+                        "VCpuInfo": {"DefaultVCpus": 4},
+                        "MemoryInfo": {"SizeInMiB": 16384},
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(integration_services, "ReadOnlyAwsQueryExecutor", FakeExecutor)
+    plugin = MskPlugin(object(), FakeCatalog({"AmazonMSK": [broker, storage]}))  # type: ignore[arg-type]
+
+    selected = plugin.select(
+        ServiceRequirement(
+            service="msk",
+            region="ap-southeast-1",
+            requirements={
+                "requested_model": "m7g.xlarge",
+                "broker_count": 3,
                 "storage_gib_per_broker": 1024,
             },
         ),

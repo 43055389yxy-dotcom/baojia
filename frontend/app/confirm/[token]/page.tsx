@@ -26,6 +26,79 @@ function confirmationComplete(item: Item, answer?: string): boolean {
   return !requiresDependentChoice || /；选择\s+[^；]+；机器数量\s+\d+/.test(compact);
 }
 
+function configurationForConfirmation(
+  item: Item,
+  configurations: ConfigurationItem[],
+): ConfigurationItem | undefined {
+  const exact = configurations.find(
+    (configuration) => configuration.component_id === item.component_id,
+  );
+  if (exact) return exact;
+  const zeroBasedIndex = Number(item.component_id);
+  if (!Number.isInteger(zeroBasedIndex) || zeroBasedIndex < 0) return undefined;
+  return configurations.find(
+    (configuration) => String(configuration.component_number) === String(zeroBasedIndex + 1),
+  );
+}
+
+function choiceNumber(choice: ConfigurationChoice, keys: string[]): number | null {
+  for (const key of keys) {
+    const value = choice.specifications?.[key];
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) {
+      return Number(value);
+    }
+  }
+  return null;
+}
+
+function preferredDependentChoice(
+  item: Item,
+  configuration?: ConfigurationItem,
+): ConfigurationChoice | undefined {
+  const options = item.dependent_options ?? [];
+  if (options.length === 0 || !configuration) return undefined;
+  const requestedModel = typeof configuration.requirements.requested_model === "string"
+    ? configuration.requirements.requested_model
+    : configuration.selected_model;
+  const requestedVcpu = Number(configuration.requirements.vcpu);
+  const requestedMemory = Number(configuration.requirements.memory_gib);
+  const hasVcpu = Number.isFinite(requestedVcpu) && requestedVcpu > 0;
+  const hasMemory = Number.isFinite(requestedMemory) && requestedMemory > 0;
+  if (requestedModel) {
+    const modelMatch = options.find((option) => option.model === requestedModel);
+    const modelCpu = modelMatch ? choiceNumber(modelMatch, ["vCPU", "vcpu", "vcpus"]) : null;
+    const modelMemory = modelMatch
+      ? choiceNumber(modelMatch, ["memoryGiB", "memory_gib", "memory"])
+      : null;
+    if (
+      modelMatch
+      && (!hasVcpu || modelCpu === requestedVcpu)
+      && (!hasMemory || modelMemory === requestedMemory)
+    ) return modelMatch;
+  }
+  // Missing customer facts must stay visible for confirmation.  Automatic
+  // selection is safe only when the requested CPU and memory are both known.
+  if (!hasVcpu || !hasMemory) return undefined;
+  // Prefill only a real exact match. When AWS has no exact machine, leave the
+  // picker open so the customer explicitly chooses one official alternative.
+  return options.find((option) => (
+    choiceNumber(option, ["vCPU", "vcpu", "vcpus"]) === requestedVcpu
+    && choiceNumber(option, ["memoryGiB", "memory_gib", "memory"]) === requestedMemory
+  ));
+}
+
+function dependentSelectionValue(
+  item: Item,
+  baseValue: string,
+  configuration?: ConfigurationItem,
+): string {
+  if (!(item.dependent_on_values ?? []).includes(baseValue)) return baseValue;
+  const choice = preferredDependentChoice(item, configuration);
+  if (!choice || !configuration) return baseValue;
+  return `${baseValue}；${choice.value}；机器数量 ${Math.max(configuration.quantity, 1)}`;
+}
+
 function isRegionConfirmation(item: Item): boolean {
   const question = item.question.trim();
   return question.includes("区域") && (
@@ -259,7 +332,7 @@ const FIELD_LABELS: Record<string, string> = {
   rule_evaluations_per_second: "每秒规则检查数", scheme: "访问方式",
   shard_hours: "分片运行小时", snapshot_frequency: "快照频率",
   snapshot_retention_days: "快照保留天数", source_regions: "来源区域",
-  source_storage_gib_per_node: "原节点存储容量",
+  source_storage_gib_per_node: "客户原环境容量（仅迁移参考，不计费）",
   streams_read_requests: "Streams 读取请求量",
   task_count: "任务数量", task_hours: "任务运行小时", tasks: "运行任务数",
   traces_recorded: "记录的追踪数量", traces_retrieved: "查询的追踪数量",
@@ -732,6 +805,10 @@ function displayServiceName(item: ConfigurationItem): string {
     monitor: "Azure Monitor", api_management: "Azure API Management",
   };
   if (/\baurora\b/i.test(item.display_name)) return item.display_name;
+  if (
+    item.service === "ec2"
+    && /(?:自建|用于|工作节点|worker\s*nodes?)/i.test(item.display_name)
+  ) return item.display_name;
   return names[item.service] ?? item.display_name;
 }
 
@@ -749,9 +826,7 @@ function customerQuestionContext(
   question: Item,
   configurations: ConfigurationItem[],
 ): { title: string; source: string } | null {
-  const component = configurations.find(
-    (item) => item.component_id === question.component_id,
-  );
+  const component = configurationForConfirmation(question, configurations);
   if (!component) return null;
   const source = component.source_text?.trim();
   if (!source) {
@@ -1708,6 +1783,10 @@ export default function CustomerConfirmationPage() {
           const answerKey = confirmationAnswerKey(item);
           const answer = answers[answerKey] ?? "";
           const context = customerQuestionContext(item, session.configuration_items);
+          const relatedConfiguration = configurationForConfirmation(
+            item,
+            session.configuration_items,
+          );
           const baseValue = answer.split("；", 1)[0];
           const showDependentConfiguration = (
             item.dependent_on_values ?? []
@@ -1725,10 +1804,12 @@ export default function CustomerConfirmationPage() {
               placeholder={isRegionConfirmation(item) ? "请选择 Azure 部署区域" : "请选择配置选项"}
               catalog={item.selection_mode === "catalog" || item.options.some((option) => Boolean(option.model))}
               requireMachineCount={/自建/.test(item.question) && item.options.some((option) => Boolean(option.model))}
-              initialMachineCount={session.configuration_items.find(
-                (configuration) => configuration.component_id === item.component_id,
-              )?.quantity ?? Number(item.question.match(/当前\s*(\d+)\s*台/)?.[1] ?? 1)}
-              onChange={(selected) => setAnswers((current) => ({ ...current, [answerKey]: selected }))}
+              initialMachineCount={relatedConfiguration?.quantity
+                ?? Number(item.question.match(/当前\s*(\d+)\s*台/)?.[1] ?? 1)}
+              onChange={(selected) => setAnswers((current) => ({
+                ...current,
+                [answerKey]: dependentSelectionValue(item, selected, relatedConfiguration),
+              }))}
             />}
             {showDependentConfiguration && <ConfigurationOptionPicker
               className="customer-options dependent-configuration-picker"
@@ -1736,9 +1817,13 @@ export default function CustomerConfirmationPage() {
               value={answer.includes("；") ? answer.slice(answer.indexOf("；") + 1) : ""}
               catalog
               requireMachineCount
-              initialMachineCount={session.configuration_items.find(
-                (configuration) => configuration.component_id === item.component_id,
-              )?.quantity ?? 1}
+              initialMachineCount={relatedConfiguration?.quantity ?? 1}
+              initialVcpu={typeof relatedConfiguration?.requirements.vcpu === "number"
+                ? relatedConfiguration.requirements.vcpu
+                : undefined}
+              initialMemoryGiB={typeof relatedConfiguration?.requirements.memory_gib === "number"
+                ? relatedConfiguration.requirements.memory_gib
+                : undefined}
               onChange={(selected) => setAnswers((current) => ({
                 ...current,
                 [answerKey]: selected ? `${baseValue}；${selected}` : baseValue,

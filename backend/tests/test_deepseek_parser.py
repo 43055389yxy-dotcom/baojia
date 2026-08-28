@@ -1,4 +1,5 @@
 import asyncio
+import re
 
 import pytest
 
@@ -7,7 +8,7 @@ from app.domain.customer_configuration import (
     aurora_cluster_member_count,
     preserve_customer_configuration,
 )
-from app.domain.models import ParsedIntent, ServiceRequirement
+from app.domain.models import ParsedIntent, ServiceRequirement, UnmappedPricingFact
 from app.integrations.deepseek import (
     DeepSeekIntentParser,
     _component_prompt_cache_model,
@@ -357,6 +358,71 @@ async def test_official_catalog_identity_precedes_closed_ai_service_classifier()
 
 
 @pytest.mark.asyncio
+async def test_comma_delimited_s3_heading_resolves_against_official_directory() -> None:
+    source = (
+        "S3，容量15T，预估费用4608美元，替换OSS，"
+        "用于冷数据存储、Flink快照、业务设备图片"
+    )
+
+    class OfficialDiscovery:
+        @staticmethod
+        def resolve_official_product(*labels: str) -> dict[str, object] | None:
+            assert labels == ("S3",)
+            return {
+                "service_code": "AmazonS3",
+                "service_key": "s3",
+                "display_name": "AmazonS3",
+                "aliases": ["Amazon S3", "S3"],
+            }
+
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        auto_discovery=OfficialDiscovery(),  # type: ignore[arg-type]
+    )
+    component = ServiceRequirement(
+        service="s3_capacity15t_4608_usd",
+        calculator_service_name=source,
+        source_text=source,
+    )
+
+    assert parser._component_product_heading(component) == "S3"
+    assert parser._self_hosted_product_name(component) is None
+
+    await parser._resolve_unknown_component_service(
+        component,
+        semaphore=asyncio.Semaphore(1),
+        reporter=None,
+        component_number=1,
+    )
+
+    assert component.service == "s3"
+    assert component.calculator_service_name == "Amazon Simple Storage Service (S3)"
+    assert component.field_sources["_official_service_code"] == "AmazonS3"
+
+
+def test_reference_quote_money_is_not_an_unmapped_pricing_dimension() -> None:
+    component = ServiceRequirement(
+        service="s3",
+        source_text="S3，容量15T，预估费用4608美元",
+        unmapped_pricing_facts=[
+            UnmappedPricingFact(
+                field_hint="客户预估费用",
+                value=4608,
+                unit="USD",
+                evidence="预估费用4608美元",
+            )
+        ],
+    )
+
+    DeepSeekIntentParser._validate_unmapped_pricing_facts(
+        component,
+        source_text=component.source_text,
+    )
+
+    assert component.unmapped_pricing_facts == []
+
+
+@pytest.mark.asyncio
 async def test_official_offer_code_is_routed_to_existing_dms_adapter() -> None:
     class OfficialDiscovery:
         @staticmethod
@@ -603,6 +669,10 @@ async def test_ai_selects_renamed_main_service_from_official_candidates() -> Non
             assert "目标端" in prompt
             assert "AmazonKinesisFirehose" in prompt
             assert "AmazonS3" in prompt
+            # Existing business-language markers are context for AI, not a
+            # second hard-coded product classifier.
+            assert "对象存储" in prompt
+            assert "不是子串匹配规则" in prompt
             return {
                 "service_code": "AmazonKinesisFirehose",
                 "confidence": "high",
@@ -1251,6 +1321,43 @@ class CapturingWorkloadGateway(MissingSummaryGateway):
         return await super().complete_json(**kwargs)
 
 
+class NumberedCleaningGateway:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.system_prompts: list[str] = []
+
+    async def complete_json(self, **kwargs: object) -> dict[str, object]:
+        self.calls += 1
+        self.system_prompts.append(str(kwargs.get("system_prompt", "")))
+        return {
+            "customer_summary": "应用服务器报价配置",
+            "services": [
+                {
+                    "service": "ec2",
+                    "calculator_service_name": "Amazon EC2",
+                    "component_key": "cmp_source_0001",
+                    "region": None,
+                    "quantity": 3,
+                    "hours_per_month": 730,
+                    "requirements": {
+                        "vcpu": 8,
+                        "memory_gib": 32,
+                        "system_disk_gib": 200,
+                        "additional_ebs_volumes": [
+                            {"size_gib": 500, "volume_type": "gp3", "count_per_instance": 1}
+                        ],
+                    },
+                    "source_text": (
+                        "应用服务器（Amazon EC2）｜数量：3台｜每台CPU：8核｜"
+                        "每台内存：32GB｜每台系统盘：200GB｜每台数据盘：500GB"
+                    ),
+                    "query_action": None,
+                }
+            ],
+            "ambiguities": [],
+        }
+
+
 class ComponentCorrectionGateway:
     def __init__(self) -> None:
         self.user_contents: list[str] = []
@@ -1452,6 +1559,247 @@ def test_failed_product_identity_is_not_rewritten_as_self_hosted_ec2() -> None:
     assert component.service == "unknown_component_search"
     assert component.calculator_service_name == "日志检索"
     assert "自建" not in component.calculator_service_name
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("product", "source", "expected_quantity"),
+    [
+        ("Doris", "Doris 预计3台，单台16核128G，磁盘4T。", 3),
+        (
+            "DolphinScheduler",
+            "DolphinScheduler 预计2个节点，单台16核64G，磁盘1T。",
+            2,
+        ),
+    ],
+)
+async def test_named_third_party_workload_survives_official_catalog_miss(
+    product: str, source: str, expected_quantity: int
+) -> None:
+    class EmptyOfficialDiscovery:
+        @staticmethod
+        def resolve_official_product(*_labels: str) -> None:
+            return None
+
+        @staticmethod
+        def candidate_official_products(
+            *_labels: str, limit: int = 12
+        ) -> list[dict[str, object]]:
+            return []
+
+        @staticmethod
+        def official_products(*, limit: int = 500) -> list[dict[str, object]]:
+            return []
+
+    class UnknownGateway:
+        async def complete_json(self, **_: object) -> dict[str, object]:
+            return {"service": "unknown", "confidence": "low"}
+
+    component = ServiceRequirement(
+        service=f"unknown_component_{product.casefold()}",
+        calculator_service_name=product,
+        source_text=source,
+        requirements={"vcpu": 16, "memory_gib": 128 if product == "Doris" else 64},
+    )
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        auto_discovery=EmptyOfficialDiscovery(),  # type: ignore[arg-type]
+    )
+    parser._gateway = UnknownGateway()  # type: ignore[assignment]
+
+    await parser._resolve_unknown_component_service(
+        component,
+        semaphore=asyncio.Semaphore(1),
+        reporter=None,
+        component_number=1,
+    )
+    parsed = ParsedIntent(customer_summary=product, services=[component])
+    parser._append_third_party_managed_decisions(parsed, source)
+
+    assert component.service == "ec2"
+    assert component.calculator_service_name == f"Amazon EC2（自建 {product}）"
+    assert component.quantity == expected_quantity
+    assert component.field_sources["_identity_resolution_status"] == "third_party"
+    assert component.field_sources["_third_party_product"] == product
+    assert component.field_sources["_pending_architecture_decision"] == "system_policy"
+    assert len(parsed.ambiguities) == 1
+    assert product in parsed.ambiguities[0]
+
+
+def test_generic_capability_heading_is_not_treated_as_named_third_party_product() -> None:
+    component = ServiceRequirement(
+        service="unknown_component_search",
+        calculator_service_name="日志检索",
+        source_text="日志检索：计划部署3个数据节点，单节点8核32GB，单节点存储500GB。",
+        requirements={"vcpu": 8, "memory_gib": 32, "storage_gib": 500},
+    )
+
+    assert DeepSeekIntentParser._route_named_third_party_workload(component) is False
+    assert component.service == "unknown_component_search"
+
+
+@pytest.mark.asyncio
+async def test_learned_ec2_alias_cannot_overwrite_named_software_identity() -> None:
+    class ContaminatedLocalRegistry:
+        @staticmethod
+        def resolve_official_product(*labels: str) -> dict[str, object] | None:
+            assert labels == ("Doris",)
+            return {
+                "service_code": "AmazonEC2",
+                "service_key": "ec2",
+                "display_name": "AmazonEC2",
+                "aliases": ["Amazon EC2", "Doris"],
+                "identity_match_source": "learned_alias",
+            }
+
+    component = ServiceRequirement(
+        service="ec2",
+        calculator_service_name="Doris",
+        source_text="Doris 预计3台，单台16核128G，磁盘4T。",
+        requirements={"vcpu": 16, "memory_gib": 128},
+    )
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        auto_discovery=ContaminatedLocalRegistry(),  # type: ignore[arg-type]
+    )
+
+    await parser._resolve_unknown_component_service(
+        component,
+        semaphore=asyncio.Semaphore(1),
+        reporter=None,
+        component_number=1,
+    )
+
+    assert component.service == "ec2"
+    assert component.calculator_service_name == "Amazon EC2（自建 Doris）"
+    assert component.field_sources["_identity_resolution_status"] == "third_party"
+    assert component.field_sources["_third_party_product"] == "Doris"
+    assert component.field_sources.get("_official_service_code") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("product", "source", "expected_quantity"),
+    [
+        ("Doris", "Doris｜3台｜单台16核128G｜磁盘4T", 3),
+        ("TBMQ/EMQX", "TBMQ/EMQX｜2个节点｜单台16核64G｜磁盘500G", 2),
+        (
+            "DolphinScheduler",
+            "DolphinScheduler｜2个节点｜单台16核64G｜磁盘1T",
+            2,
+        ),
+    ],
+)
+async def test_pipe_cleaned_third_party_name_cannot_reuse_learned_ec2_alias(
+    product: str,
+    source: str,
+    expected_quantity: int,
+) -> None:
+    class ContaminatedLocalRegistry:
+        @staticmethod
+        def resolve_official_product(*labels: str) -> dict[str, object] | None:
+            assert labels == (product,)
+            return {
+                "service_code": "AmazonEC2",
+                "service_key": "ec2",
+                "display_name": "AmazonEC2",
+                "aliases": ["Amazon EC2", product],
+                "identity_match_source": "learned_alias",
+            }
+
+    component = ServiceRequirement(
+        service="unknown_" + re.sub(r"[^a-z0-9]+", "_", product.casefold()).strip("_"),
+        calculator_service_name=product,
+        source_text=source,
+    )
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        auto_discovery=ContaminatedLocalRegistry(),  # type: ignore[arg-type]
+    )
+
+    await parser._resolve_unknown_component_service(
+        component,
+        semaphore=asyncio.Semaphore(1),
+        reporter=None,
+        component_number=1,
+    )
+    parsed = ParsedIntent(customer_summary=product, services=[component])
+    parser._append_third_party_managed_decisions(parsed, f"1、{source}")
+
+    assert component.service == "ec2"
+    assert component.calculator_service_name == f"Amazon EC2（自建 {product}）"
+    assert component.quantity == expected_quantity
+    assert component.requirements["vcpu"] == 16
+    assert component.requirements["memory_gib"] in {64, 128}
+    assert component.field_sources["_pending_architecture_decision"] == "system_policy"
+    assert component.field_sources.get("_official_service_code") is None
+    assert len(parsed.ambiguities) == 1
+    assert product in parsed.ambiguities[0]
+
+
+def test_pipe_cleaned_flink_fixed_nodes_require_managed_or_self_hosted_choice() -> None:
+    source = "Flink｜3个节点｜单台24核64G｜磁盘500G"
+    parsed = DeepSeekIntentParser._intent_from_numbered_blocks(f"1、{source}")
+
+    assert parsed is not None
+    component = parsed.services[0]
+    assert component.service.startswith("flink") or component.service.startswith("unknown")
+    assert DeepSeekIntentParser._route_named_third_party_workload(component) is True
+
+    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, f"1、{source}")
+
+    assert component.service == "ec2"
+    assert component.calculator_service_name == "Amazon EC2（自建 Flink）"
+    assert component.quantity == 3
+    assert component.requirements["vcpu"] == 24
+    assert component.requirements["memory_gib"] == 64
+    assert component.requirements["system_disk_gib"] == 500
+    assert len(parsed.ambiguities) == 1
+    assert "EC2 上自建 Flink" in parsed.ambiguities[0]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_service"),
+    [
+        ("Kafka｜3个Broker节点｜单台8核16G｜磁盘2T", "msk"),
+        ("Redis｜3个节点｜单台16核64G｜存储500G", "elasticache"),
+        ("MySQL｜2个节点｜单台16核64G｜磁盘2T｜主从", "rds"),
+    ],
+)
+def test_pipe_cleaned_managed_products_with_matching_node_contract_stay_managed(
+    source: str,
+    expected_service: str,
+) -> None:
+    parsed = DeepSeekIntentParser._intent_from_numbered_blocks(f"1、{source}")
+
+    assert parsed is not None
+    assert parsed.services[0].service == expected_service
+
+
+def test_component_template_cannot_erase_third_party_workload_identity() -> None:
+    original = ServiceRequirement(
+        service="ec2",
+        calculator_service_name="Amazon EC2（自建 Doris）",
+        source_text="Doris 预计3台，单台16核128G，磁盘4T。",
+        field_sources={
+            "_identity_resolution_status": "third_party",
+            "_third_party_product": "Doris",
+            "_pending_architecture_decision": "system_policy",
+        },
+    )
+    filled = ServiceRequirement(
+        service="ec2",
+        calculator_service_name="Amazon EC2",
+        source_text=original.source_text,
+        field_sources={"_official_service_code": "AmazonEC2"},
+    )
+
+    DeepSeekIntentParser._restore_authoritative_component_fields(original, filled)
+
+    assert filled.calculator_service_name == "Amazon EC2（自建 Doris）"
+    assert filled.field_sources["_third_party_product"] == "Doris"
+    assert filled.field_sources["_pending_architecture_decision"] == "system_policy"
+    assert filled.field_sources.get("_official_service_code") is None
 
 
 @pytest.mark.asyncio
@@ -2328,11 +2676,208 @@ async def test_initial_intake_then_each_component_gets_its_own_prompt() -> None:
     await parser.parse("Redis 一主一从，每节点 8 GiB；S3 对象存储 500GB")
 
     assert gateway.calls >= 5
-    assert "只负责把客户原文按独立组件拆开" in gateway.system_prompts[0]
+    assert "第一步数据清洗员" in gateway.system_prompts[0]
+    assert "拆分、去除干扰、统一格式" in gateway.system_prompts[0]
+    assert "requirements 必须填写" in gateway.system_prompts[0]
     assert "replicas_per_shard" not in gateway.system_prompts[0]
     assert any("replicas_per_shard" in prompt for prompt in gateway.system_prompts[1:])
     assert any("storage_class" in content for content in gateway.user_contents[1:])
     assert not any("结构化结果审核员" in prompt for prompt in gateway.system_prompts[1:])
+
+
+@pytest.mark.asyncio
+async def test_numbered_request_skips_workload_ai_and_keeps_lossless_component_source() -> None:
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid")
+    )
+    gateway = NumberedCleaningGateway()
+    parser._gateway = gateway  # type: ignore[assignment]
+
+    async def keep_first_pass(
+        _original_text: str,
+        intent: ParsedIntent,
+        *,
+        reporter: object | None = None,
+    ) -> ParsedIntent:
+        return intent
+
+    parser._cleanup_components = keep_first_pass  # type: ignore[method-assign]
+    raw = "1、应用服务器：预计部署3台Linux服务器，单台8核32GB，系统盘200GB，数据盘500GB。"
+
+    parsed = await parser.parse(raw)
+
+    assert gateway.calls == 0
+    component = parsed.services[0]
+    assert component.source_text == raw.removeprefix("1、")
+    assert component.original_source_text == raw.removeprefix("1、")
+    assert component.quantity == 3
+    assert component.requirements["system_disk_gib"] == 200
+    assert component.requirements["additional_ebs_volumes"][0]["size_gib"] == 500
+
+
+def test_fast_numbered_path_requires_a_real_sequence_starting_at_one() -> None:
+    assert (
+        DeepSeekIntentParser._intent_from_lossless_sales_numbering(
+            "3、Broker节点\n4核16G"
+        )
+        is None
+    )
+    parsed = DeepSeekIntentParser._intent_from_lossless_sales_numbering(
+        "新加坡地区\n1、Amazon EC2：4核16GB\n2、Amazon S3：10TB"
+    )
+    assert parsed is not None
+    assert len(parsed.services) == 2
+
+
+@pytest.mark.asyncio
+async def test_unusable_numbered_intake_falls_back_without_aborting_quote() -> None:
+    class EmptyInventoryGateway:
+        async def complete_json(self, **_: object) -> dict[str, object]:
+            return {"customer_summary": "", "services": [], "ambiguities": []}
+
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid")
+    )
+    parser._gateway = EmptyInventoryGateway()  # type: ignore[assignment]
+
+    async def keep_inventory(
+        _original_text: str,
+        intent: ParsedIntent,
+        *,
+        reporter: object | None = None,
+    ) -> ParsedIntent:
+        return intent
+
+    parser._cleanup_components = keep_inventory  # type: ignore[method-assign]
+    parsed = await parser.parse(
+        "1、Doris：每节点16核128GB，4TB磁盘，共3节点。\n"
+        "2、DolphinScheduler：每节点16核64GB，1TB磁盘，共2节点。"
+    )
+
+    assert len(parsed.services) == 2
+    assert "Doris" in parsed.services[0].source_text
+    assert "DolphinScheduler" in parsed.services[1].source_text
+
+
+def test_legacy_product_label_is_not_mistaken_for_product_name() -> None:
+    component = ServiceRequirement(
+        service="unknown_component_doris",
+        calculator_service_name="Doris",
+        quantity=3,
+        source_text="产品：Doris；数量：3台；每台CPU：16核；每台内存：128GB",
+        requirements={"vcpu": 16, "memory_gib": 128},
+    )
+    parsed = ParsedIntent(customer_summary="Doris", services=[component])
+
+    DeepSeekIntentParser._normalize_cleaned_source_prefixes(parsed)
+
+    assert component.source_text.startswith("Doris｜")
+    assert DeepSeekIntentParser._self_hosted_product_name(component) == "Doris"
+    assert DeepSeekIntentParser._route_named_third_party_workload(component) is True
+    assert component.calculator_service_name == "Amazon EC2（自建 Doris）"
+
+
+@pytest.mark.parametrize(
+    ("product", "source", "expected_quantity"),
+    [
+        ("Doris", "Doris，3台，单台16核128G，磁盘4T", 3),
+        ("TBMQ/EMQX", "TBMQ/EMQX，2个节点，单台16核64G，磁盘500G", 2),
+        ("DolphinScheduler", "DolphinScheduler，2个节点，单台16核64G，磁盘1T", 2),
+    ],
+)
+def test_comma_cleaned_named_workload_keeps_self_hosted_identity(
+    product: str, source: str, expected_quantity: int
+) -> None:
+    component = ServiceRequirement(
+        service="ec2",
+        calculator_service_name="Amazon EC2",
+        source_text=source,
+        requirements={"vcpu": 16, "memory_gib": 64},
+    )
+    parsed = ParsedIntent(customer_summary=product, services=[component])
+
+    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, f"1、{source}")
+
+    assert component.calculator_service_name == f"Amazon EC2（自建 {product}）"
+    assert component.field_sources["_third_party_product"] == product
+    assert component.quantity == expected_quantity
+    assert any(product in notice and "自建" in notice for notice in parsed.ambiguities)
+
+
+@pytest.mark.parametrize("product", ["Doris", "Flink", "TBMQ/EMQX", "DolphinScheduler"])
+def test_explicit_ec2_self_hosted_row_keeps_the_software_identity(product: str) -> None:
+    source = (
+        f"{product}，Amazon EC2 自建，m6i.4xlarge，16 vCPU，64 GiB，Linux，数量3"
+    )
+    component = ServiceRequirement(
+        service="ec2",
+        calculator_service_name="Amazon EC2 云服务器",
+        quantity=3,
+        source_text=source,
+        requirements={"vcpu": 16, "memory_gib": 64, "operating_system": "linux"},
+    )
+    parsed = ParsedIntent(customer_summary=product, services=[component])
+
+    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, f"1、{source}")
+
+    assert component.service == "ec2"
+    assert component.calculator_service_name == f"Amazon EC2（自建 {product}）"
+    assert component.field_sources["_third_party_product"] == product
+    assert component.field_sources["_pending_architecture_decision"] == "system_policy"
+    assert "_architecture_decision" not in component.field_sources
+    assert len(parsed.ambiguities) == 1
+    assert product in parsed.ambiguities[0]
+    assert "托管" in parsed.ambiguities[0]
+    assert "自建" in parsed.ambiguities[0]
+
+
+def test_sales_self_hosted_plan_rows_all_become_customer_architecture_questions() -> None:
+    source = """1、Doris，Amazon EC2 自建，r6i.4xlarge，16 vCPU，128 GiB，Linux，数量3
+2、Flink，Amazon EC2 自建，c6a.8xlarge，32 vCPU，64 GiB，Linux，数量3
+3、TBMQ/EMQX，Amazon EC2 自建，m6i.4xlarge，16 vCPU，64 GiB，Linux，数量2
+4、应用服务器，Amazon EC2，r6i.4xlarge，16 vCPU，128 GiB，Linux，数量3
+5、DolphinScheduler，Amazon EC2 自建，m6i.4xlarge，16 vCPU，64 GiB，Linux，数量2"""
+    parsed = DeepSeekIntentParser._intent_from_lossless_sales_numbering(source)
+
+    assert parsed is not None
+    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, source)
+
+    assert [item.calculator_service_name for item in parsed.services] == [
+        "Amazon EC2（自建 Doris）",
+        "Amazon EC2（自建 Flink）",
+        "Amazon EC2（自建 TBMQ/EMQX）",
+        "Amazon EC2 云服务器",
+        "Amazon EC2（自建 DolphinScheduler）",
+    ]
+    assert len(parsed.ambiguities) == 4
+    for product in ("Doris", "Flink", "TBMQ/EMQX", "DolphinScheduler"):
+        assert any(
+            product in question and "托管" in question and "自建" in question
+            for question in parsed.ambiguities
+        )
+
+
+def test_component_cleanup_keeps_numbered_owner_and_cannot_duplicate_row() -> None:
+    raw = "Doris，3台，单台16核128G，磁盘4T"
+    original = ServiceRequirement(
+        service="ec2",
+        calculator_service_name="Amazon EC2（自建 Doris）",
+        component_key="cmp_source_0002",
+        quantity=3,
+        source_text="Doris｜数量：3台｜每台CPU：16核｜每台内存：128GB｜每台磁盘：4TB",
+        original_source_text=raw,
+        requirements={"vcpu": 16, "memory_gib": 128},
+        field_sources={"_intake_ai_identity": "ai_cleaning"},
+    )
+    filled = original.model_copy(update={"original_source_text": None})
+
+    DeepSeekIntentParser._restore_authoritative_component_fields(original, filled)
+    parsed = ParsedIntent(customer_summary="Doris", services=[filled])
+    DeepSeekIntentParser._reconcile_explicit_component_inventory(f"2、{raw}", parsed)
+
+    assert filled.original_source_text == raw
+    assert len(parsed.services) == 1
+    assert parsed.services[0].component_key.startswith("cmp_sales_")
 
 
 @pytest.mark.asyncio
@@ -3052,6 +3597,36 @@ def test_native_managed_database_and_cache_names_never_ask_for_self_hosting(
     assert item.service == expected_service
     assert item.requirements["engine"] == expected_engine
     assert "_pending_architecture_decision" not in item.field_sources
+    assert parsed.ambiguities == []
+
+
+def test_generic_application_server_is_plain_ec2_not_a_managed_architecture_question() -> None:
+    source = "1、应用服务器预计3台，单台16核128G，磁盘1T。"
+    parsed = ParsedIntent(
+        customer_summary="应用服务器",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                calculator_service_name="Amazon EC2（自建 应用服务器）",
+                source_text="应用服务器预计3台，单台16核128G，磁盘1T。",
+                field_sources={
+                    "_pending_architecture_decision": "system_policy",
+                    "_third_party_product": "应用服务器",
+                },
+            )
+        ],
+        ambiguities=[
+            "AWS 没有与 应用服务器 完全等价的托管服务。采用托管还是在 EC2 自建？"
+        ],
+    )
+
+    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, source)
+
+    item = parsed.services[0]
+    assert item.service == "ec2"
+    assert item.calculator_service_name == "Amazon EC2 云服务器"
+    assert "_pending_architecture_decision" not in item.field_sources
+    assert "_third_party_product" not in item.field_sources
     assert parsed.ambiguities == []
 
 
