@@ -199,6 +199,16 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
     def select(self, requirement: ServiceRequirement, default_region: str) -> SelectedResource:
         region = requirement.region or default_region
         requested = canonicalize_requirement_fields(requirement.requirements, service="opensearch")
+        purchase_option = str(requested.get("purchase_option") or "on_demand").strip().lower()
+        if purchase_option == "standard_reserved":
+            purchase_option = "reserved"
+        if purchase_option not in {"on_demand", "reserved"}:
+            raise ManualConfirmationRequired(
+                f"OpenSearch 购买方式 {purchase_option!r} 尚不支持官方核价",
+                code="unsupported_purchase_option",
+            )
+        reserved_years = int(requested.get("reserved_term_years") or 1)
+        payment_option = str(requested.get("payment_option") or "no_upfront").strip().lower()
         requested_model = str(requested.get("requested_model") or "").strip().lower()
         min_vcpu = required_float(requested, "vcpu")
         min_memory = required_float(requested, "memory_gib")
@@ -240,9 +250,30 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
                 # One malformed catalog record is not evidence that the whole
                 # AWS catalog or the customer's requirement is invalid.
                 continue
-            rate = PricingCatalog.on_demand_rate(product)
-            if rate is None:
-                continue
+            if purchase_option == "reserved":
+                try:
+                    reserved = PricingCatalog.reserved_price(
+                        product,
+                        years=reserved_years,
+                        payment_option=payment_option,
+                        hours_per_month=requirement.hours_per_month,
+                    )
+                except ManualConfirmationRequired as exc:
+                    if exc.code in {
+                        "reserved_term_not_found",
+                        "reserved_price_dimensions_missing",
+                    }:
+                        continue
+                    raise
+                # Use the exact selected commitment price when comparing
+                # otherwise-compatible models. Choosing by the On-Demand rate
+                # first can select a SKU whose Reserved offer is unavailable
+                # or more expensive for this term/payment combination.
+                rate = reserved.monthly_amortized / requirement.hours_per_month
+            else:
+                rate = PricingCatalog.on_demand_rate(product)
+                if rate is None:
+                    continue
             catalog_shapes.append((rate, model, vcpu, memory, product))
             if normalized_requested and model != normalized_requested:
                 continue
@@ -261,6 +292,19 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
             ]
             substituted = bool(candidates)
         if not candidates:
+            if purchase_option == "reserved" and not catalog_shapes:
+                # The same regional model may be valid on demand but have no
+                # offer for this exact term/payment combination.  This is an
+                # unavailable comparison scenario, not a specification error
+                # and must never be turned into a customer configuration
+                # question.
+                raise ManualConfirmationRequired(
+                    "AWS 官方目录没有返回所选 OpenSearch 预留期限与付款方式的价格",
+                    code="reserved_term_not_found",
+                    years=reserved_years,
+                    payment_option=payment_option,
+                    display_name=self.display_name,
+                )
 
             def distance(
                 item: tuple[float, str, float, float, dict[str, Any]],
@@ -306,22 +350,36 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
         _, model, vcpu, memory, instance_product = min(
             candidates, key=lambda item: (item[0], item[1])
         )
-        lines = [
-            _usage(
+        monthly_commitment_cost = 0.0
+        upfront_commitment_cost = 0.0
+        lines: list[UsageLine] = []
+        if purchase_option == "reserved":
+            reserved = PricingCatalog.reserved_price(
                 instance_product,
-                "osnode",
-                data_nodes * requirement.hours_per_month,
-                "opensearch",
-                source_fields=(
-                    "data_nodes",
-                    "quantity",
-                    "hours_per_month",
-                    "requested_model",
-                    "vcpu",
-                    "memory_gib",
-                ),
+                years=reserved_years,
+                payment_option=payment_option,
+                hours_per_month=requirement.hours_per_month,
             )
-        ]
+            monthly_commitment_cost = reserved.monthly_amortized * data_nodes
+            upfront_commitment_cost = reserved.upfront * data_nodes
+        else:
+            lines.append(
+                _usage(
+                    instance_product,
+                    "osnode",
+                    data_nodes * requirement.hours_per_month,
+                    "opensearch",
+                    source_fields=(
+                        "data_nodes",
+                        "quantity",
+                        "hours_per_month",
+                        "requested_model",
+                        "vcpu",
+                        "memory_gib",
+                        "purchase_option",
+                    ),
+                )
+            )
         references: list[ReferenceRate] = []
         storage_product: dict[str, Any] | None = None
         if storage_gib is not None:
@@ -391,11 +449,44 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
                 "memoryGiB": memory,
                 **({"storageGiBPerNode": storage_gib} if storage_gib is not None else {}),
             },
-            official_product={"source": "AWS Price List", "regionCode": region},
-            rationale="按 OpenSearch 节点小时费和每节点 EBS 存储费提交 BCM。",
+            official_product={
+                "source": "AWS Price List",
+                "regionCode": region,
+                "purchaseOption": purchase_option,
+                **(
+                    {
+                        "reservedTermYears": reserved_years,
+                        "paymentOption": payment_option,
+                    }
+                    if purchase_option == "reserved"
+                    else {}
+                ),
+            },
+            rationale=(
+                "按 OpenSearch 官方预留实例条款核算节点承诺价，EBS 存储继续按官方按需价计费。"
+                if purchase_option == "reserved"
+                else "按 OpenSearch 节点小时费和每节点 EBS 存储费提交 BCM。"
+            ),
             substitution_notice=notice,
             usage_lines=lines,
             reference_rates=references,
+            applied_requirement_fields=(
+                [
+                    "data_nodes",
+                    "quantity",
+                    "hours_per_month",
+                    "requested_model",
+                    "vcpu",
+                    "memory_gib",
+                    "purchase_option",
+                    "reserved_term_years",
+                    "payment_option",
+                ]
+                if purchase_option == "reserved"
+                else []
+            ),
+            monthly_commitment_cost=monthly_commitment_cost,
+            upfront_commitment_cost=upfront_commitment_cost,
         )
 
 

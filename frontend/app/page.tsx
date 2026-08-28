@@ -2647,7 +2647,7 @@ export default function Home() {
                       const pricingBasis = scenario.component_pricing_basis?.[componentId];
                       return <td className="row-cost" key={scenario.label}>
                         {selection.pricing_status === "unpriced" || scenarioIncomplete ? "报价异常" : cost > 0 ? formatMoney(cost, scenario.currency) : ((selection.pricing_status === "reference_only" || selection.reference_rates?.length) ? "缺少用量" : formatMoney(0, scenario.currency))}
-                        {scenario.pricing_mode !== "on_demand" && pricingBasis === "on_demand_fallback" && <small>该服务按需价</small>}
+                        {scenario.pricing_mode !== "on_demand" && pricingBasis === "on_demand_fallback" && <small>无此预留方案 · 仍按需计费</small>}
                         {pricingBasis === "reserved" && <small>官方承诺价</small>}
                       </td>;
                     })}

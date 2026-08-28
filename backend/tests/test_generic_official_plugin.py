@@ -1434,6 +1434,183 @@ def test_memorydb_keeps_redis_engine_and_uses_its_own_reserved_term() -> None:
     assert reserved.upfront_commitment_cost == 4552.397
 
 
+def test_dynamodb_reserved_capacity_uses_official_blocks_and_heavy_utilization() -> None:
+    read = priced_product(
+        "AmazonDynamoDB",
+        "APN1-ReadCapacityUnit-Hrs",
+        "ReadCapacityUnit-Hrs",
+        0.0002,
+        operation="CommittedThroughput",
+        group="DDB-ReadUnits",
+    )
+    write = priced_product(
+        "AmazonDynamoDB",
+        "APN1-WriteCapacityUnit-Hrs",
+        "WriteCapacityUnit-Hrs",
+        0.0004,
+        operation="CommittedThroughput",
+        group="DDB-WriteUnits",
+    )
+    for item, hourly, upfront in (
+        (read, 0.0001, 1.0),
+        (write, 0.0002, 2.0),
+    ):
+        item["terms"]["Reserved"] = {
+            "heavy": {
+                "termAttributes": {
+                    "LeaseContractLength": "1yr",
+                    "PurchaseOption": "Heavy Utilization",
+                    "OfferingClass": "standard",
+                },
+                "priceDimensions": {
+                    "hourly": {
+                        "unit": item["terms"]["OnDemand"]["term"]
+                        ["priceDimensions"]["dimension"]["unit"],
+                        "pricePerUnit": {"USD": str(hourly)},
+                    },
+                    "upfront": {
+                        "unit": "Quantity",
+                        "pricePerUnit": {"USD": str(upfront)},
+                    },
+                },
+            }
+        }
+
+    class DynamoCatalog:
+        @staticmethod
+        def service_codes() -> list[str]:
+            return ["AmazonDynamoDB"]
+
+        @staticmethod
+        def products(
+            service_code: str,
+            filters: dict[str, str],
+            *,
+            max_pages: int = 20,
+        ) -> list[dict]:
+            del max_pages
+            assert service_code == "AmazonDynamoDB"
+            return [
+                item
+                for item in (read, write)
+                if all(
+                    item["product"]["attributes"].get(key) == value
+                    for key, value in filters.items()
+                )
+            ]
+
+    selected = GenericOfficialPlugin(None, DynamoCatalog()).select(  # type: ignore[arg-type]
+        ServiceRequirement(
+            service="dynamodb",
+            calculator_service_name="Amazon DynamoDB",
+            region="ap-northeast-1",
+            hours_per_month=730,
+            requirements={
+                "capacity_mode": "provisioned",
+                "read_request_units": 150,
+                "write_request_units": 20,
+                "purchase_option": "reserved",
+                "reserved_term_years": 1,
+                # DynamoDB has its own Heavy Utilization offer; a global
+                # instance payment choice must not change that official term.
+                "payment_option": "all_upfront",
+            },
+        ),
+        "ap-northeast-1",
+    )
+
+    assert selected.usage_lines == []
+    assert selected.upfront_commitment_cost == pytest.approx(400)
+    assert selected.monthly_commitment_cost == pytest.approx(
+        (0.0001 * 730 + 1 / 12) * 200
+        + (0.0002 * 730 + 2 / 12) * 100
+    )
+    assert selected.specifications["reservedReadCapacityUnits"] == 200
+    assert selected.specifications["reservedWriteCapacityUnits"] == 100
+    assert "Heavy Utilization" in (selected.substitution_notice or "")
+
+
+def test_redshift_reserved_price_multiplies_every_customer_node() -> None:
+    compute = priced_product(
+        "AmazonRedshift",
+        "APN1-Node:ra3.xlplus",
+        "Hrs",
+        1.0,
+        operation="RunComputeNode:0001",
+    )
+    compute["product"]["attributes"].update(
+        {
+            "productFamily": "Compute Instance",
+            "instanceType": "ra3.xlplus",
+            "vcpu": "4",
+            "memory": "32 GiB",
+            "currentGeneration": "Yes",
+        }
+    )
+    compute["terms"]["Reserved"] = {
+        "one-year-no-upfront": {
+            "termAttributes": {
+                "LeaseContractLength": "1yr",
+                "PurchaseOption": "No Upfront",
+                "OfferingClass": "standard",
+            },
+            "priceDimensions": {
+                "hourly": {
+                    "unit": "Hrs",
+                    "pricePerUnit": {"USD": "0.6"},
+                }
+            },
+        }
+    }
+
+    class RedshiftCatalog:
+        @staticmethod
+        def service_codes() -> list[str]:
+            return ["AmazonRedshift"]
+
+        @staticmethod
+        def products(
+            service_code: str,
+            filters: dict[str, str],
+            *,
+            max_pages: int = 20,
+        ) -> list[dict]:
+            del max_pages
+            assert service_code == "AmazonRedshift"
+            return [
+                compute
+                if all(
+                    compute["product"]["attributes"].get(key) == value
+                    for key, value in filters.items()
+                )
+                else None
+            ] if all(
+                compute["product"]["attributes"].get(key) == value
+                for key, value in filters.items()
+            ) else []
+
+    selected = GenericOfficialPlugin(None, RedshiftCatalog()).select(  # type: ignore[arg-type]
+        ServiceRequirement(
+            service="redshift",
+            calculator_service_name="Amazon Redshift",
+            region="ap-northeast-1",
+            quantity=1,
+            hours_per_month=730,
+            requirements={
+                "deployment_type": "provisioned",
+                "requested_model": "ra3.xlplus",
+                "nodes": 4,
+                "purchase_option": "reserved",
+                "reserved_term_years": 1,
+                "payment_option": "no_upfront",
+            },
+        ),
+        "ap-northeast-1",
+    )
+
+    assert selected.monthly_commitment_cost == pytest.approx(0.6 * 730 * 4)
+
+
 def test_memorydb_unavailable_model_uses_cheapest_same_capacity_official_node() -> None:
     replacement = priced_product(
         "AmazonMemoryDB",

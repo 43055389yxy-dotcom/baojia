@@ -282,3 +282,34 @@ def test_internal_fact_mapping_failures_never_become_customer_questions() -> Non
             code="unconsumed_customer_pricing_facts",
         )
     )
+
+
+def test_plain_machine_count_cannot_disappear_behind_default_quantity() -> None:
+    source = "ElasticSearch 这边预计5台，单台16核128G，磁盘4T。"
+    original = ServiceRequirement(
+        service="opensearch",
+        source_text=source,
+    )
+    filled = ServiceRequirement(
+        service="opensearch",
+        source_text=source,
+        quantity=1,
+        requirements={
+            "vcpu": 16,
+            "memory_gib": 128,
+            "storage_gib_per_node": 4096,
+        },
+        field_evidence={
+            "quantity": "预计5台",
+            "requirements.vcpu": "16核",
+            "requirements.memory_gib": "128G",
+            "requirements.storage_gib_per_node": "磁盘4T",
+        },
+    )
+
+    issues = DeepSeekIntentParser._deterministic_component_audit_issues(
+        original,
+        filled,
+    )
+
+    assert any("5台" in issue and "没有进入" in issue for issue in issues)

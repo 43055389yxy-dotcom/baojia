@@ -2531,6 +2531,15 @@ class DeepSeekIntentParser:
             ("duration", re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(ms|毫秒|秒)", re.I)),
             ("role_count", re.compile(r"(\d+)\s*(?:个|台)?\s*(?:worker|工作)?\s*(?:节点|分片|副本|规则|用户)", re.I)),
             (
+                "role_count",
+                re.compile(
+                    r"(?<!单)(?<!每)(\d+)\s*(?:台|个)\s*"
+                    r"(?=(?:实例|机器|服务器|主机|writer|reader|broker|函数|集群|"
+                    r"[,，。；;]|$))",
+                    re.I,
+                ),
+            ),
+            (
                 "endpoint_count",
                 re.compile(r"(\d+)\s*(?:个|台)?\s*(?:防火墙\s*)?(?:endpoint|端点)", re.I),
             ),

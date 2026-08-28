@@ -484,6 +484,11 @@ class PricingCatalog:
             "no_upfront": "No Upfront",
             "partial_upfront": "Partial Upfront",
             "all_upfront": "All Upfront",
+            # DynamoDB reserved provisioned capacity uses one AWS-specific
+            # commercial term instead of the three instance payment choices.
+            # Keeping the translation here still reads the exact official
+            # term; it does not introduce a locally maintained discount.
+            "heavy_utilization": "Heavy Utilization",
         }.get(payment_option)
         if purchase is None:
             raise ManualConfirmationRequired(
@@ -525,7 +530,11 @@ class PricingCatalog:
                 except (TypeError, ValueError):
                     continue
                 unit = str(dimension.get("unit") or "").casefold()
-                if unit in {"hrs", "hour", "hours"}:
+                if (
+                    unit in {"hrs", "hour", "hours"}
+                    or unit.endswith("-hrs")
+                    or unit.endswith("-hours")
+                ):
                     hourly += price
                 elif unit in {"quantity", "unit", "units"}:
                     upfront += price

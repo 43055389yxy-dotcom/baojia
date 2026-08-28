@@ -50,6 +50,42 @@ def product(
     }
 
 
+def add_reserved_term(
+    item: dict[str, Any],
+    *,
+    years: int,
+    payment_option: str,
+    hourly: float = 0,
+    upfront: float = 0,
+) -> None:
+    purchase = {
+        "no_upfront": "No Upfront",
+        "partial_upfront": "Partial Upfront",
+        "all_upfront": "All Upfront",
+    }[payment_option]
+    dimensions: dict[str, object] = {}
+    if hourly:
+        dimensions["hourly"] = {
+            "unit": "Hrs",
+            "pricePerUnit": {"USD": str(hourly)},
+        }
+    if upfront:
+        dimensions["upfront"] = {
+            "unit": "Quantity",
+            "pricePerUnit": {"USD": str(upfront)},
+        }
+    item["terms"].setdefault("Reserved", {})[
+        f"{years}-{payment_option}"
+    ] = {
+        "termAttributes": {
+            "LeaseContractLength": f"{years}yr",
+            "PurchaseOption": purchase,
+            "OfferingClass": "standard",
+        },
+        "priceDimensions": dimensions,
+    }
+
+
 class FakeCatalog:
     def __init__(self, products: dict[str, list[dict[str, Any]]]):
         self._products = products
@@ -529,6 +565,105 @@ def test_opensearch_quotes_nodes_and_storage_per_node() -> None:
     assert preview.selected_model == "m7g.xlarge.search"
     assert preview.requires_confirmation is False
     assert preview.confirmation_reason is None
+
+
+def test_opensearch_uses_exact_one_and_three_year_reserved_terms() -> None:
+    instance = product(
+        "AmazonES", "APS1-ESInstance:m7g.xlarge", "ESDomain", 0.24, "Hrs",
+        location="Asia Pacific (Singapore)",
+        productFamily="Amazon OpenSearch Service Instance",
+        instanceType="m7g.xlarge.search", vcpu="4", memoryGib="16",
+    )
+    add_reserved_term(
+        instance,
+        years=1,
+        payment_option="all_upfront",
+        upfront=1200,
+    )
+    add_reserved_term(
+        instance,
+        years=3,
+        payment_option="all_upfront",
+        upfront=2400,
+    )
+    storage = product(
+        "AmazonES", "APS1-ES:GP3-Storage", "ESDomain", 0.12, "GB-Mo",
+        location="Asia Pacific (Singapore)",
+        productFamily="Amazon OpenSearch Service Volume", storageMedia="GP3",
+    )
+    plugin = OpenSearchPlugin(  # type: ignore[arg-type]
+        None, FakeCatalog({"AmazonES": [instance, storage]})
+    )
+    base = {
+        "service": "opensearch",
+        "region": "ap-southeast-1",
+        "hours_per_month": 730,
+    }
+    requirements = {
+        "requested_model": "m7g.xlarge.search",
+        "data_nodes": 3,
+        "storage_gib_per_node": 500,
+        "purchase_option": "reserved",
+        "payment_option": "all_upfront",
+    }
+
+    one_year = plugin.select(
+        ServiceRequirement(
+            **base,
+            requirements={**requirements, "reserved_term_years": 1},
+        ),
+        "ap-southeast-1",
+    )
+    three_year = plugin.select(
+        ServiceRequirement(
+            **base,
+            requirements={**requirements, "reserved_term_years": 3},
+        ),
+        "ap-southeast-1",
+    )
+
+    assert one_year.monthly_commitment_cost == pytest.approx(300)
+    assert one_year.upfront_commitment_cost == pytest.approx(3600)
+    assert three_year.monthly_commitment_cost == pytest.approx(200)
+    assert three_year.upfront_commitment_cost == pytest.approx(7200)
+    # EBS is not covered by the instance reservation and remains a separate
+    # official monthly usage line in both scenarios.
+    assert [(line.key, line.amount) for line in one_year.usage_lines] == [
+        ("osstore", 1500)
+    ]
+    assert [(line.key, line.amount) for line in three_year.usage_lines] == [
+        ("osstore", 1500)
+    ]
+
+
+def test_opensearch_missing_reserved_offer_is_a_scenario_error_not_customer_question() -> None:
+    instance = product(
+        "AmazonES", "APS1-ESInstance:m7g.xlarge", "ESDomain", 0.24, "Hrs",
+        location="Asia Pacific (Singapore)",
+        productFamily="Amazon OpenSearch Service Instance",
+        instanceType="m7g.xlarge.search", vcpu="4", memoryGib="16",
+    )
+    plugin = OpenSearchPlugin(  # type: ignore[arg-type]
+        None, FakeCatalog({"AmazonES": [instance]})
+    )
+
+    with pytest.raises(ManualConfirmationRequired) as captured:
+        plugin.select(
+            ServiceRequirement(
+                service="opensearch",
+                region="ap-southeast-1",
+                requirements={
+                    "requested_model": "m7g.xlarge.search",
+                    "data_nodes": 3,
+                    "purchase_option": "reserved",
+                    "reserved_term_years": 3,
+                    "payment_option": "all_upfront",
+                },
+            ),
+            "ap-southeast-1",
+        )
+
+    assert captured.value.code == "reserved_term_not_found"
 
 
 def test_opensearch_accepts_ai_data_node_field_aliases() -> None:

@@ -1420,58 +1420,118 @@ class GenericOfficialPlugin:
         display_name = requirement.calculator_service_name or requirement.service
         usage_lines: list[UsageLine] = []
         reference_rates: list[ReferenceRate] = []
-        reserved_compute_rate = None
-        reserved_price = None
+        reserved_rate_identities: set[tuple[str, str, str]] = set()
+        reserved_applied_fields: set[str] = set()
+        reserved_capacity_units: dict[str, int] = {}
+        monthly_commitment_cost = 0.0
+        upfront_commitment_cost = 0.0
         if requirement.requirements.get("purchase_option") == "reserved":
             # Do not keep a service allow-list here.  A managed service supports
             # this exact Reserved offer only when its selected official product
             # exposes a matching Reserved term in the AWS Price List.  This
             # makes new services work automatically and prevents an on-demand
             # rate from being presented as a 1/3-year commitment price.
-            for _, amount, candidate in selected_rates:
-                if amount is None:
-                    continue
-                if not PricingCatalog.attributes(candidate[4]).get("instanceType"):
-                    continue
-                try:
-                    candidate_reserved = PricingCatalog.reserved_price(
-                        candidate[4],
-                        years=int(
-                            requirement.requirements.get("reserved_term_years") or 1
-                        ),
-                        payment_option=str(
-                            requirement.requirements.get("payment_option")
-                            or "no_upfront"
-                        ),
-                    )
-                except ManualConfirmationRequired as exc:
-                    if exc.code in {
-                        "reserved_term_not_found",
-                        "reserved_price_dimensions_missing",
-                    }:
+            if service_stem == "dynamodb" and str(
+                requirement.requirements.get("capacity_mode") or ""
+            ).casefold() in {"provisioned", "预置", "预置容量"}:
+                # DynamoDB does not use No/Partial/All Upfront instance terms.
+                # Its official Reserved Provisioned Capacity is published as
+                # Heavy Utilization and must be bought in blocks of 100 RCU or
+                # WCU. Price exactly those official terms and leave storage or
+                # any excess on-demand dimensions as normal usage lines.
+                for _, amount, candidate in selected_rates:
+                    if amount is None:
                         continue
-                    raise
-                reserved_compute_rate = candidate
-                reserved_price = candidate_reserved
-                break
-        monthly_commitment_cost = 0.0
-        upfront_commitment_cost = 0.0
-        if reserved_compute_rate is not None and reserved_price is not None:
-            reserved_nodes = float(
-                requirement.requirements.get("node_count")
-                or requirement.requirements.get("instance_count")
-                or requirement.requirements.get("broker_count")
-                or requirement.requirements.get("replication_instances")
-                or 1
-            )
-            monthly_commitment_cost = (
-                reserved_price.monthly_amortized
-                * requirement.quantity
-                * reserved_nodes
-            )
-            upfront_commitment_cost = (
-                reserved_price.upfront * requirement.quantity * reserved_nodes
-            )
+                    attrs = PricingCatalog.attributes(candidate[4])
+                    group = str(attrs.get("group") or "")
+                    field = {
+                        "DDB-ReadUnits": "read_request_units",
+                        "DDB-WriteUnits": "write_request_units",
+                    }.get(group)
+                    if field is None or "capacityunit-hrs" not in str(
+                        candidate[2]
+                    ).casefold():
+                        continue
+                    requested_units = float(
+                        requirement.requirements.get(field) or 0
+                    )
+                    if requested_units <= 0:
+                        continue
+                    reserved_units = math.ceil(requested_units / 100) * 100
+                    reserved_capacity_units[field] = reserved_units
+                    try:
+                        reserved = PricingCatalog.reserved_price(
+                            candidate[4],
+                            years=int(
+                                requirement.requirements.get("reserved_term_years")
+                                or 1
+                            ),
+                            payment_option="heavy_utilization",
+                            hours_per_month=requirement.hours_per_month,
+                        )
+                    except ManualConfirmationRequired as exc:
+                        if exc.code in {
+                            "reserved_term_not_found",
+                            "reserved_price_dimensions_missing",
+                        }:
+                            continue
+                        raise
+                    reserved_rate_identities.add(candidate[1:4])
+                    reserved_applied_fields.update(
+                        {
+                            field,
+                            "capacity_mode",
+                            "reserved_term_years",
+                            "purchase_option",
+                        }
+                    )
+                    monthly_commitment_cost += (
+                        reserved.monthly_amortized * reserved_units
+                    )
+                    upfront_commitment_cost += reserved.upfront * reserved_units
+            else:
+                for _, amount, candidate in selected_rates:
+                    if amount is None:
+                        continue
+                    if not PricingCatalog.attributes(candidate[4]).get("instanceType"):
+                        continue
+                    try:
+                        reserved = PricingCatalog.reserved_price(
+                            candidate[4],
+                            years=int(
+                                requirement.requirements.get("reserved_term_years")
+                                or 1
+                            ),
+                            payment_option=str(
+                                requirement.requirements.get("payment_option")
+                                or "no_upfront"
+                            ),
+                        )
+                    except ManualConfirmationRequired as exc:
+                        if exc.code in {
+                            "reserved_term_not_found",
+                            "reserved_price_dimensions_missing",
+                        }:
+                            continue
+                        raise
+                    reserved_nodes = float(
+                        requirement.requirements.get("node_count")
+                        or requirement.requirements.get("nodes")
+                        or requirement.requirements.get("instance_count")
+                        or requirement.requirements.get("broker_count")
+                        or requirement.requirements.get("replication_instances")
+                        or 1
+                    )
+                    reserved_rate_identities.add(candidate[1:4])
+                    monthly_commitment_cost = (
+                        reserved.monthly_amortized
+                        * requirement.quantity
+                        * reserved_nodes
+                    )
+                    upfront_commitment_cost = (
+                        reserved.upfront * requirement.quantity * reserved_nodes
+                    )
+                    break
 
         def source_fields_for_rate(
             candidate: tuple[float, str, str, str, dict[str, object]],
@@ -1513,6 +1573,13 @@ class GenericOfficialPlugin:
                     else:
                         fields.add(field)
             attrs = PricingCatalog.attributes(product)
+            if service_stem == "dynamodb":
+                fields.update(
+                    {
+                        "DDB-ReadUnits": {"read_request_units", "capacity_mode"},
+                        "DDB-WriteUnits": {"write_request_units", "capacity_mode"},
+                    }.get(str(attrs.get("group") or ""), set())
+                )
             if attrs.get("instanceType"):
                 fields.update(
                     {
@@ -1521,6 +1588,7 @@ class GenericOfficialPlugin:
                         "memory_gib",
                         "instance_count",
                         "node_count",
+                        "nodes",
                         "broker_count",
                         "replication_instances",
                         "hours_per_month",
@@ -1532,7 +1600,7 @@ class GenericOfficialPlugin:
         applied_fields: set[str] = set()
         for index, (description, amount, rate) in enumerate(selected_rates, start=1):
             price, unit, usage_type, operation, _ = rate
-            if rate is reserved_compute_rate:
+            if rate[1:4] in reserved_rate_identities:
                 continue
             if amount is not None and amount > 0:
                 source_fields = source_fields_for_rate(rate)
@@ -1591,7 +1659,7 @@ class GenericOfficialPlugin:
             )
 
         architecture = "按客户明确用量核价" if has_billable_cost else "官方单位参考价"
-        if reserved_compute_rate is not None:
+        if reserved_rate_identities:
             architecture = "AWS 官方预留价格"
         if service_stem == "athena":
             architecture = "无服务器查询，按扫描数据量计费"
@@ -1617,11 +1685,28 @@ class GenericOfficialPlugin:
                 f"客户指定的 {requested_model} 在当前区域没有官方计费项，已保持不低于客户确认的"
                 f"同配置处理器和内存，并自动改用其中价格最低的 {selected_instance_model}。"
             )
+        if service_stem == "dynamodb" and reserved_capacity_units:
+            substitution_notices.append(
+                "DynamoDB 预留容量只能按每 100 个 RCU/WCU 一组购买；"
+                "本次已分别向上取整，并使用官方 Heavy Utilization 条款核价。"
+            )
         if not has_billable_cost or reference_rates:
             substitution_notices.append(
                 "未提供完整用量的部分仅展示对应官方单位价，不计入月费合计。"
             )
         specifications = dict(requirement.requirements)
+        if reserved_capacity_units:
+            specifications["reservedCapacityBilling"] = (
+                "DynamoDB Reserved Provisioned Capacity (Heavy Utilization)"
+            )
+            if "read_request_units" in reserved_capacity_units:
+                specifications["reservedReadCapacityUnits"] = (
+                    reserved_capacity_units["read_request_units"]
+                )
+            if "write_request_units" in reserved_capacity_units:
+                specifications["reservedWriteCapacityUnits"] = (
+                    reserved_capacity_units["write_request_units"]
+                )
         reader_billing_mode = str(
             requirement.requirements.get("_billing_variant_reader_billing_mode") or ""
         ).strip()
@@ -1653,22 +1738,28 @@ class GenericOfficialPlugin:
             reference_rates=reference_rates,
             applied_requirement_fields=sorted(
                 applied_fields
+                | reserved_applied_fields
                 | (
                     {
                         "purchase_option",
                         "reserved_term_years",
-                        "payment_option",
+                        *(
+                            []
+                            if service_stem == "dynamodb"
+                            else ["payment_option"]
+                        ),
                         "requested_model",
                         "vcpu",
                         "memory_gib",
                         "instance_count",
                         "node_count",
+                        "nodes",
                         "broker_count",
                         "replication_instances",
                         "hours_per_month",
                         "quantity",
                     }
-                    if reserved_compute_rate is not None
+                    if reserved_rate_identities
                     else set()
                 )
             ),
@@ -2540,6 +2631,56 @@ class GenericOfficialPlugin:
                 include=("piperequest",),
             )
         elif service == "dynamodb":
+            capacity_mode = str(requested.get("capacity_mode") or "").casefold()
+            read_units = requested.get("read_request_units")
+            write_units = requested.get("write_request_units")
+            provisioned = capacity_mode in {"provisioned", "预置", "预置容量"}
+            if read_units:
+                add(
+                    result,
+                    (
+                        "DynamoDB 预置读取容量单位小时价"
+                        if provisioned
+                        else "DynamoDB 按请求读取单位价"
+                    ),
+                    (
+                        float(read_units) * requirement.hours_per_month
+                        if provisioned
+                        else float(read_units)
+                    ),
+                    exact_group="DDB-ReadUnits",
+                    include=(
+                        (
+                            "readcapacityunit-hrs"
+                            if provisioned
+                            else "readrequestunits"
+                        ),
+                    ),
+                    exclude=("ia-",),
+                )
+            if write_units:
+                add(
+                    result,
+                    (
+                        "DynamoDB 预置写入容量单位小时价"
+                        if provisioned
+                        else "DynamoDB 按请求写入单位价"
+                    ),
+                    (
+                        float(write_units) * requirement.hours_per_month
+                        if provisioned
+                        else float(write_units)
+                    ),
+                    exact_group="DDB-WriteUnits",
+                    include=(
+                        (
+                            "writecapacityunit-hrs"
+                            if provisioned
+                            else "writerequestunits"
+                        ),
+                    ),
+                    exclude=("ia-",),
+                )
             storage = requested.get("storage_gib")
             add(
                 result,
