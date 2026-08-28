@@ -3,15 +3,15 @@ from pathlib import Path
 
 from app.core.errors import ManualConfirmationRequired
 from app.domain.models import ServiceRequirement
-from app.integrations.deepseek import _official_profile_cache_model
 from app.integrations.auto_service_discovery import (
-    PROFILE_TTL_SECONDS,
     PROFILE_SCHEMA_VERSION,
+    PROFILE_TTL_SECONDS,
     AutoServiceDiscovery,
     _dimension_field,
     _dimension_fields,
     _flat_rate_dimensions,
 )
+from app.integrations.deepseek import _official_profile_cache_model
 from app.services.plugins.generic_official import GenericOfficialPlugin
 
 
@@ -109,6 +109,37 @@ def test_official_hour_and_storage_dimensions_keep_service_semantics() -> None:
             "usage_type": "EUC1-MagneticStore-ByteHrs",
         }
     )[0] == "magnetic_store_gib_months"
+
+
+def test_official_profiles_name_common_billing_dimensions_semantically() -> None:
+    assert _dimension_field(
+        {
+            "unit": "IOPS-Mo",
+            "usage_type": "APS1-EBS:VolumeP-IOPS.gp3",
+            "description": "Provisioned gp3 IOPS-month",
+        }
+    )[0] == "iops"
+    assert _dimension_field(
+        {
+            "unit": "Queries",
+            "usage_type": "APS1-DNS-Queries",
+            "operation": "DNSQuery",
+        }
+    )[0] == "dns_queries"
+    assert _dimension_field(
+        {
+            "unit": "Mo",
+            "usage_type": "Health-Check-AWS",
+            "description": "Health Check for an AWS endpoint",
+        }
+    )[0] == "health_checks"
+    assert _dimension_field(
+        {
+            "unit": "GB",
+            "usage_type": "APS1-AttachmentsSize-Bytes",
+            "operation": "Send",
+        }
+    )[0] == "attachments_gib"
 
 
 def test_flat_rate_plans_keep_subscription_overage_and_included_quotas() -> None:

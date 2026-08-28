@@ -4,8 +4,11 @@ import hashlib
 import re
 from dataclasses import dataclass
 
+from app.domain.fact_ledger import (
+    merge_unmapped_pricing_facts,
+    remove_facts_mapped_to_fields,
+)
 from app.domain.models import ParsedIntent, ServiceRequirement
-
 
 CUSTOMER_FIELD_SOURCES = {
     "customer_text",
@@ -173,6 +176,12 @@ def overlay_customer_fields(
             )
         }
     )
+    # Template overflow is part of the same immutable customer ledger.  An
+    # automated cleanup pass may map one of these facts to a normal field, but
+    # it may never erase a still-unmapped value merely by returning a shorter
+    # component object.
+    merge_unmapped_pricing_facts(target, source)
+    remove_facts_mapped_to_fields(target)
 
 
 @dataclass(slots=True)
@@ -275,6 +284,7 @@ def enforce_component_integrity(intent: ParsedIntent) -> None:
     deduplicate_derived_components(intent)
     ensure_component_keys(intent)
     for item in intent.services:
+        remove_facts_mapped_to_fields(item)
         locked = set(item.locked_fields)
         for path, source in tuple(item.field_sources.items()):
             if source not in CUSTOMER_FIELD_SOURCES:

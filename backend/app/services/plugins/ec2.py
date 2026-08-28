@@ -442,14 +442,37 @@ class Ec2Plugin(ServicePlugin):
         upfront_commitment_cost = 0.0
         usage_lines: list[UsageLine] = []
         if purchase_option == "on_demand":
+            utilization_percent = required_float(requested, "utilization_percent") or 100.0
+            if utilization_percent > 100:
+                raise ManualConfirmationRequired(
+                    "EC2 使用率不能超过 100%",
+                    code="invalid_requirement",
+                    field="utilization_percent",
+                )
             usage_lines.append(
                 UsageLine(
                     key="ec2",
                     service_code=service_code,
                     usage_type=usage_type,
                     operation=operation,
-                    amount=requirement.quantity * requirement.hours_per_month,
+                    amount=(
+                        requirement.quantity
+                        * requirement.hours_per_month
+                        * utilization_percent
+                        / 100.0
+                    ),
                     group="ec2",
+                    source_fields=[
+                        "quantity",
+                        "hours_per_month",
+                        "requested_model",
+                        "vcpu",
+                        "memory_gib",
+                        "operating_system",
+                        "tenancy",
+                        "purchase_option",
+                        "utilization_percent",
+                    ],
                 )
             )
         elif purchase_option in {"standard_reserved", "convertible_reserved"}:
@@ -478,6 +501,12 @@ class Ec2Plugin(ServicePlugin):
                     volume_type=volume_api_name,
                     amount=requirement.quantity * disk_gib,
                     key="ebs",
+                    source_fields=(
+                        "quantity",
+                        "system_disk_gib",
+                        "total_system_disk_gib",
+                        "volume_type",
+                    ),
                 )
             )
         additional_volumes = requested.get("additional_ebs_volumes")
@@ -496,6 +525,7 @@ class Ec2Plugin(ServicePlugin):
                         volume_type=volume_type,
                         amount=requirement.quantity * count * size_gib,
                         key=f"ebs{index + 1}",
+                        source_fields=("quantity", "additional_ebs_volumes"),
                     )
                 )
         transfer_out_gib = required_float(requested, "data_transfer_out_gib")
@@ -523,6 +553,11 @@ class Ec2Plugin(ServicePlugin):
                     operation=transfer_operation,
                     amount=transfer_out_gib,
                     group="ec2-transfer",
+                    source_fields=[
+                        "data_transfer_out_gib",
+                        "data_transfer_out_gib_per_instance",
+                        "quantity",
+                    ],
                 )
             )
 
@@ -585,12 +620,34 @@ class Ec2Plugin(ServicePlugin):
             ),
             substitution_notice=notice,
             usage_lines=usage_lines,
+            applied_requirement_fields=(
+                [
+                    "quantity",
+                    "hours_per_month",
+                    "requested_model",
+                    "vcpu",
+                    "memory_gib",
+                    "operating_system",
+                    "tenancy",
+                    "purchase_option",
+                    "reserved_term_years",
+                    "payment_option",
+                ]
+                if purchase_option in {"standard_reserved", "convertible_reserved"}
+                else []
+            ),
             monthly_commitment_cost=monthly_commitment_cost,
             upfront_commitment_cost=upfront_commitment_cost,
         )
 
     def _ebs_storage_usage(
-        self, *, region: str, volume_type: str, amount: float, key: str
+        self,
+        *,
+        region: str,
+        volume_type: str,
+        amount: float,
+        key: str,
+        source_fields: tuple[str, ...],
     ) -> UsageLine:
         storage_products = self.catalog.products(
             "AmazonEC2",
@@ -612,6 +669,7 @@ class Ec2Plugin(ServicePlugin):
             operation=operation,
             amount=amount,
             group="ec2-storage",
+            source_fields=list(source_fields),
         )
 
     def _compute_product(

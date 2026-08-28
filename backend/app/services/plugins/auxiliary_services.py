@@ -16,7 +16,14 @@ from app.integrations.aws import PricingCatalog
 from app.services.plugins.base import ServicePlugin, required_float
 
 
-def _usage(product: dict[str, Any], key: str, amount: float, group: str) -> UsageLine:
+def _usage(
+    product: dict[str, Any],
+    key: str,
+    amount: float,
+    group: str,
+    *,
+    source_fields: tuple[str, ...] = (),
+) -> UsageLine:
     service_code, usage_type, operation = PricingCatalog.billing_identity(product)
     return UsageLine(
         key=key,
@@ -25,6 +32,7 @@ def _usage(product: dict[str, Any], key: str, amount: float, group: str) -> Usag
         operation=operation,
         amount=amount,
         group=group,
+        source_fields=list(source_fields),
     )
 
 
@@ -83,7 +91,20 @@ class EbsPlugin(_NoConfirmationPlugin):
             products, context=f"EBS {volume_type} 存储 ({region})"
         )
         lines = (
-            [_usage(product, "ebs", total_storage_gib, "ebs")]
+            [
+                _usage(
+                    product,
+                    "ebs",
+                    total_storage_gib,
+                    "ebs",
+                    source_fields=(
+                        "storage_gib",
+                        "total_storage_gib",
+                        "quantity",
+                        "volume_type",
+                    ),
+                )
+            ]
             if total_storage_gib is not None
             else []
         )
@@ -167,7 +188,15 @@ class DataTransferPlugin(_NoConfirmationPlugin):
                 code="data_transfer_billing_dimension_not_found",
             )
         _, region, product = min(candidates, key=lambda item: (item[0], item[1]))
-        lines = [_usage(product, "dto", amount, "data-transfer")] if amount is not None else []
+        lines = [
+            _usage(
+                product,
+                "dto",
+                amount,
+                "data-transfer",
+                source_fields=("data_transfer_out_gib",),
+            )
+        ] if amount is not None else []
         references = (
             [_reference(product, f"{region} 公网出站流量单价")]
             if amount is None
@@ -307,6 +336,7 @@ class GlobalAcceleratorPlugin(_NoConfirmationPlugin):
                 "gah",
                 accelerators * requirement.hours_per_month,
                 "global-accelerator",
+                source_fields=("accelerators", "quantity", "hours_per_month"),
             )
         ]
         references: list[ReferenceRate] = []
@@ -370,7 +400,19 @@ class GlobalAcceleratorPlugin(_NoConfirmationPlugin):
                     destination_geography=destination,
                 )
             _, transfer_product = min(path_rated, key=lambda item: item[0])
-            lines.append(_usage(transfer_product, "gadt", transfer, "global-accelerator"))
+            lines.append(
+                _usage(
+                    transfer_product,
+                    "gadt",
+                    transfer,
+                    "global-accelerator",
+                    source_fields=(
+                        "data_transfer_out_gib",
+                        "source_regions",
+                        "destination_geography",
+                    ),
+                )
+            )
             if requested.get("destination_geography") in (None, ""):
                 notice = (
                     "客户未指定访问者地域；加速流量暂按源站所在地域估算，"

@@ -29,7 +29,12 @@ from app.domain.customer_facts import (
     explicit_requested_model,
     record_customer_fact_metadata,
 )
-from app.domain.models import ParsedIntent, ServiceRequirement
+from app.domain.fact_ledger import (
+    merge_unmapped_pricing_facts,
+    remove_facts_mapped_to_fields,
+    unmapped_fact_from_field,
+)
+from app.domain.models import ParsedIntent, ServiceRequirement, UnmappedPricingFact
 from app.domain.requirement_fields import (
     canonical_requirement_field_name,
     canonicalize_requirement_fields,
@@ -52,7 +57,6 @@ from app.integrations.service_templates import (
     allowed_requirement_fields,
     compact_template_values,
     component_template,
-    requires_official_field_profile,
     requirement_fields,
     safe_requirement_defaults,
     strip_non_pricing_context_fields,
@@ -83,6 +87,64 @@ def _official_profile_cache_model(model_name: str, profile: dict[str, object] | 
     ).encode("utf-8")
     fingerprint = hashlib.sha256(payload).hexdigest()[:16]
     return f"{model_name}|official-profile:{fingerprint}"
+
+
+def _official_extraction_contract(
+    profile: dict[str, object] | None,
+    source_text: str,
+) -> tuple[tuple[str, ...], str]:
+    """Return the small, source-relevant part of one official price profile.
+
+    Some AWS offers publish hundreds of exact UsageType rows.  Sending all of
+    them to the model increases latency and makes unrelated dimensions compete
+    with the customer's words.  Keep every semantic field discovered from the
+    official units, plus only exact rows whose official wording overlaps the
+    current isolated component.  Anything still unmatched remains in the
+    lossless overflow and cannot be silently quoted.
+    """
+
+    if not profile or profile.get("status") != "verified":
+        return (), ""
+    bindings = [
+        item for item in profile.get("field_bindings", []) if isinstance(item, dict)
+    ]
+    source_folded = source_text.casefold()
+    source_ascii = set(re.findall(r"[a-z][a-z0-9_-]{2,}", source_folded))
+    fields: list[str] = []
+    selected_bindings: list[dict[str, object]] = []
+    seen_fields: set[str] = set()
+    for binding in bindings:
+        field = str(binding.get("field") or "").strip()
+        if not re.fullmatch(r"[a-z][a-z0-9_]{1,62}", field):
+            continue
+        exact_official = field.startswith("official_usage_")
+        if exact_official:
+            searchable = " ".join(
+                str(binding.get(key) or "")
+                for key in ("label", "description", "usage_type", "operation", "unit")
+            ).casefold()
+            official_words = set(re.findall(r"[a-z][a-z0-9_-]{2,}", searchable))
+            if not source_ascii.intersection(official_words):
+                continue
+        if field not in seen_fields:
+            fields.append(field)
+            seen_fields.add(field)
+        if len(selected_bindings) < 32:
+            selected_bindings.append(binding)
+
+    if not selected_bindings:
+        return tuple(fields), ""
+    mappings = [
+        f"- {item.get('field')}（{item.get('label') or '官方计费字段'}）→ "
+        f"单位 {item.get('unit') or 'unit'}"
+        for item in selected_bindings
+    ]
+    prompt = (
+        f"【AWS 官方计费字段补充：{profile.get('display_name') or profile.get('service_key')}】\n"
+        "以下字段来自当前 AWS 官方价格目录，只在客户原话明确对应时填写：\n"
+        + "\n".join(mappings)
+    )
+    return tuple(fields), prompt
 
 
 def _component_prompt_cache_model(
@@ -439,7 +501,7 @@ class DeepSeekIntentParser:
 两句口语直接说明哪两项对不上、让客户选择什么；不要使用“vCPU、GiB、SKU、官方规格、计费维度、
 核价、实例族”等内部词。只给出服务器错误详情中真实存在的选项；否则 customer_question=null。
 返回严格 JSON：
-{"component":{"service":"原服务","calculator_service_name":"原名称","region":null,"quantity":1,"hours_per_month":730,"requirements":{},"source_text":"原文","query_action":null},"customer_question":null}
+{"component":{"service":"原服务","calculator_service_name":"原名称","region":null,"quantity":1,"hours_per_month":730,"requirements":{},"unmapped_pricing_facts":[],"source_text":"原文","query_action":null},"customer_question":null}
 """
         )
         content = (
@@ -1689,29 +1751,23 @@ class DeepSeekIntentParser:
                     f"组件 {index + 1}｜{display_name}｜正在执行结构化参数解析",
                 )
             cache_input = component.model_copy(deep=True)
-            uses_official_profile = requires_official_field_profile(component.service)
-            # Every component priced by the generic official adapter must load
-            # the current AWS field contract before consulting the result
-            # cache.  Restricting this to unfamiliar service names meant common
-            # services such as AMP, Glue and Step Functions could never learn a
-            # newly published or less-common billing field.
+            # Every component loads the same official field profile before the
+            # result cache. Curated templates are business-language helpers,
+            # not a reason to bypass the provider's current billing contract.
             profile = await self._auto_discover_component(
                 component,
                 semaphore=semaphore,
                 reporter=reporter,
                 component_number=index + 1,
             )
-            extra_fields = tuple(
-                str(field)
-                for field in (profile or {}).get("fields", [])
-                if isinstance(field, str) and re.fullmatch(r"[a-z][a-z0-9_]{1,63}", field)
+            extra_fields, generated_prompt = _official_extraction_contract(
+                profile,
+                component.source_text,
             )
             base_cache_model_name = (
                 _official_profile_cache_model(self._settings.ai_model, profile)
-                if uses_official_profile
-                else self._settings.ai_model
+                or self._settings.ai_model
             )
-            generated_prompt = str((profile or {}).get("prompt_text") or "").strip()
             cache_model_name = _component_prompt_cache_model(
                 base_cache_model_name,
                 component.service,
@@ -1847,11 +1903,18 @@ class DeepSeekIntentParser:
                     if remaining_issues:
                         return (
                             index,
-                            component,
-                            [
-                                f"{display_name} 的识别结果与客户原话仍不一致，"
-                                "系统已保留原始需求，请重新提交这一项。"
-                            ],
+                            cleaned,
+                            (
+                                [
+                                    f"{display_name} 中“{fact.evidence}”还不能确定对应哪项价格，"
+                                    "请说明这个数值代表什么。"
+                                    for fact in cleaned.unmapped_pricing_facts
+                                ]
+                                or [
+                                    f"{display_name} 的识别结果与客户原话仍不一致，"
+                                    "请核对这一项配置。"
+                                ]
+                            ),
                         )
 
                 extracted_requirements = {
@@ -1862,28 +1925,18 @@ class DeepSeekIntentParser:
                 }
                 merged_requirements = dict(runtime_defaults)
                 merged_requirements.update(extracted_requirements)
-                # A non-empty intake field can only exist when the inventory
-                # model violated its empty-requirements contract or when this
-                # helper is called directly with a guarded draft.  Preserve it
-                # as customer-locked input on collision.
-                merged_requirements.update(component.requirements)
+                # The inventory pass owns component boundaries only. Its
+                # requirements object is explicitly required to be empty, so
+                # replaying a non-empty intake object here lets an early AI
+                # mistake overwrite the professionally cleaned template (the
+                # source of several invented purchase plans and misclassified
+                # disks). Explicit sales/customer corrections are restored by
+                # _restore_authoritative_component_fields below.
                 if runtime_defaults and default_reason:
                     merged_requirements.setdefault("system_default_assumption", default_reason)
 
                 cleaned.service = component.service
                 cleaned.calculator_service_name = component.calculator_service_name
-                cleaned.region = component.region or cleaned.region
-                if component.quantity != 1:
-                    cleaned.quantity = component.quantity
-                hours_are_explicit = bool(
-                    re.search(
-                        r"\d+(?:\.\d+)?\s*(?:小时|hours?|hrs?)(?:\s*/\s*月)?",
-                        component.source_text,
-                        re.I,
-                    )
-                )
-                if component.hours_per_month != 730 or not hours_are_explicit:
-                    cleaned.hours_per_month = component.hours_per_month
                 cleaned.requirements = canonicalize_requirement_fields(
                     merged_requirements, service=component.service
                 )
@@ -2295,6 +2348,10 @@ class DeepSeekIntentParser:
                 f"客户原话“{evidence}”明确要求 {field_name}={wanted}，"
                 f"当前结果为 {actual if actual not in (None, '') else '缺失'}"
             )
+        issues.extend(
+            f"客户原话“{fact.evidence}”已被保留，但还没有对应到 {fact.field_hint} 的正式报价字段"
+            for fact in filled.unmapped_pricing_facts
+        )
         issues.extend(cls._uncovered_quantitative_claim_issues(source, filled))
         return list(dict.fromkeys(issues))[:8]
 
@@ -2323,6 +2380,14 @@ class DeepSeekIntentParser:
             for path, evidence in filled.field_evidence.items()
             if str(evidence) not in {"system_minimum", "system_derived"}
         }
+        evidence_by_path.update(
+            {
+                f"unmapped.{index}.{fact.field_hint}": re.sub(
+                    r"\s+", "", fact.evidence
+                ).casefold()
+                for index, fact in enumerate(filled.unmapped_pricing_facts)
+            }
+        )
         # Persisted legacy drafts and lightweight test gateways can predate the
         # evidence contract. Existing literal reconciliation still protects
         # them; quantitative coverage becomes mandatory as soon as the current
@@ -2331,6 +2396,11 @@ class DeepSeekIntentParser:
             return []
 
         def value_for(path: str) -> object:
+            if path.startswith("unmapped."):
+                try:
+                    return filled.unmapped_pricing_facts[int(path.split(".", 2)[1])].value
+                except (IndexError, TypeError, ValueError):
+                    return None
             if path == "quantity":
                 return filled.quantity
             if path.startswith("requirements."):
@@ -2352,7 +2422,7 @@ class DeepSeekIntentParser:
             return []
 
         def compatible(path: str, category: str) -> bool:
-            field = path.removeprefix("requirements.").casefold()
+            field = path.removeprefix("requirements.").split(".", 2)[-1].casefold()
             if category == "cpu":
                 return "vcpu" in field or field in {"cpu", "cores"}
             if category == "capacity":
@@ -3061,8 +3131,6 @@ class DeepSeekIntentParser:
 
         if self._auto_discovery is None:
             return None
-        if not requires_official_field_profile(component.service):
-            return None
         display_name = component.calculator_service_name or component.service
         known_template = self._service_key(component.service) in SERVICE_TEMPLATE_FIELDS
         if reporter:
@@ -3208,6 +3276,15 @@ class DeepSeekIntentParser:
         allowed = allowed_fields or allowed_requirement_fields(component.service)
         normalized_requirements: dict[str, object] = {}
         unknown_fields: list[str] = []
+        raw_evidence = payload.get("field_evidence")
+        raw_evidence = raw_evidence if isinstance(raw_evidence, dict) else {}
+        raw_unmapped = payload.get("unmapped_pricing_facts")
+        parsed_unmapped: list[UnmappedPricingFact] = []
+        if isinstance(raw_unmapped, list):
+            for item in raw_unmapped:
+                if not isinstance(item, dict):
+                    raise ValueError("unmapped_pricing_facts 的每一项必须是对象")
+                parsed_unmapped.append(UnmappedPricingFact.model_validate(item))
         for raw_field, value in requirements.items():
             field = str(raw_field)
             canonical = canonical_requirement_field_name(field, service=component.service)
@@ -3223,7 +3300,21 @@ class DeepSeekIntentParser:
                     component.service, {canonical: value}
                 ):
                     continue
-                unknown_fields.append(field)
+                evidence = str(
+                    raw_evidence.get(f"requirements.{field}")
+                    or raw_evidence.get(f"requirements.{canonical}")
+                    or ""
+                ).strip()
+                if evidence:
+                    parsed_unmapped.append(
+                        unmapped_fact_from_field(
+                            field=canonical,
+                            value=value,
+                            evidence=evidence,
+                        )
+                    )
+                else:
+                    unknown_fields.append(field)
                 continue
             # A value already written with the canonical name has precedence
             # over a legacy alias present in the same response.
@@ -3238,6 +3329,12 @@ class DeepSeekIntentParser:
             )
         payload["requirements"] = normalized_requirements
         provided_payload["requirements"] = normalized_requirements
+        payload["unmapped_pricing_facts"] = [
+            item.model_dump(mode="json") for item in parsed_unmapped
+        ]
+        provided_payload["unmapped_pricing_facts"] = list(
+            payload["unmapped_pricing_facts"]
+        )
         evidence = payload.get("field_evidence")
         normalized_evidence: dict[str, object] = {}
         if isinstance(evidence, dict):
@@ -3274,11 +3371,40 @@ class DeepSeekIntentParser:
             source_text=component.source_text,
             original=component,
         )
+        self._validate_unmapped_pricing_facts(result, source_text=component.source_text)
         self._validate_repeated_storage_template(
             result,
             provided_payload=provided_payload,
         )
         return result
+
+    @staticmethod
+    def _validate_unmapped_pricing_facts(
+        component: ServiceRequirement,
+        *,
+        source_text: str,
+    ) -> None:
+        """Require literal evidence for every template-overflow fact."""
+
+        normalized_source = re.sub(r"\s+", "", source_text).casefold()
+        seen: set[tuple[str, str, str]] = set()
+        cleaned: list[UnmappedPricingFact] = []
+        for fact in component.unmapped_pricing_facts:
+            normalized_evidence = re.sub(r"\s+", "", fact.evidence).casefold()
+            if not normalized_evidence or normalized_evidence not in normalized_source:
+                raise ValueError(
+                    f"待映射事实 {fact.field_hint} 的原文证据不存在：{fact.evidence}"
+                )
+            identity = (
+                fact.field_hint.casefold(),
+                json.dumps(fact.value, ensure_ascii=False, sort_keys=True, default=str),
+                normalized_evidence,
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            cleaned.append(fact)
+        component.unmapped_pricing_facts = cleaned
 
     @classmethod
     def _complete_repeated_storage_template(
@@ -3826,6 +3952,8 @@ class DeepSeekIntentParser:
         merged_evidence.update(original.field_evidence)
         filled.field_evidence = merged_evidence
         filled.locked_fields = sorted(set(filled.locked_fields) | locked)
+        merge_unmapped_pricing_facts(filled, original)
+        remove_facts_mapped_to_fields(filled)
 
     @staticmethod
     def _mark_component_field_sources(

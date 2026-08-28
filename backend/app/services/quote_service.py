@@ -26,6 +26,10 @@ from app.domain.customer_configuration import (
     restore_customer_authority,
 )
 from app.domain.customer_facts import customer_match_policy, record_customer_fact_metadata
+from app.domain.fact_ledger import (
+    unconsumed_customer_pricing_facts,
+    unresolved_fact_messages,
+)
 from app.domain.models import (
     CandidateOption,
     ConfirmationItem,
@@ -48,6 +52,7 @@ from app.domain.models import (
 )
 from app.domain.pricing_issues import should_retry_persisted_pricing_issue
 from app.domain.requirement_fields import (
+    canonical_requirement_field_name,
     canonicalize_requirement_fields,
     sanitize_requirement_values,
 )
@@ -6109,6 +6114,8 @@ class QuoteService:
                 "backend_unavailable",
                 "invalid_requirement",
                 "incomplete_billing_dimensions",
+                "unmapped_customer_pricing_facts",
+                "unconsumed_customer_pricing_facts",
                 "billing_product_not_found",
                 "billing_dimension_not_found",
                 "pricing_catalog_unavailable",
@@ -6603,6 +6610,28 @@ class QuoteService:
         late_confirmation_errors: list[ManualConfirmationRequired] = []
         hierarchy = component_hierarchy(intent.services)
 
+        unresolved_components = [
+            {
+                "component_id": str(index),
+                "display_name": self._calculator_service_name(
+                    service.service, service.calculator_service_name
+                ),
+                "facts": unresolved_fact_messages(service),
+            }
+            for index, service in enumerate(intent.services)
+            if service.unmapped_pricing_facts
+        ]
+        if unresolved_components:
+            # The isolated component extractor has already retried with the
+            # official profile. Reaching final pricing with an overflow fact
+            # therefore means a real customer decision is still required; do
+            # not silently omit it or generate a partial customer quote.
+            raise ManualConfirmationRequired(
+                "还有客户明确填写的价格参数没有确定对应项目，请先确认后再报价",
+                code="unmapped_customer_pricing_facts",
+                components=unresolved_components,
+            )
+
         def keep_unpriced_component(
             service: ServiceRequirement,
             index: int,
@@ -6777,10 +6806,58 @@ class QuoteService:
                         selection = await asyncio.to_thread(
                             plugin.select, requirement, "ap-southeast-1"
                         )
-                        if component_selection_cache is not None:
-                            component_selection_cache[selection_cache_key] = (
-                                selection.model_copy(deep=True)
+                    unconsumed = unconsumed_customer_pricing_facts(
+                        requirement,
+                        selection,
+                    )
+                    supplementer = getattr(
+                        self._generic_plugin,
+                        "supplement_selection",
+                        None,
+                    )
+                    if (
+                        unconsumed
+                        and plugin is not self._generic_plugin
+                        and callable(supplementer)
+                    ):
+                        if reporter:
+                            await reporter(
+                                "official_dimension_supplement",
+                                f"组件 {index + 1}｜{display_name}｜"
+                                "正在补齐专用报价器未覆盖的官方计费项",
                             )
+                        selection = await asyncio.to_thread(
+                            supplementer,
+                            requirement,
+                            selection,
+                            unconsumed,
+                            "ap-southeast-1",
+                        )
+                        unconsumed = unconsumed_customer_pricing_facts(
+                            requirement,
+                            selection,
+                        )
+                    if unconsumed:
+                        evidence = {
+                            path: requirement.field_evidence.get(path, "")
+                            for path in unconsumed
+                        }
+                        raise ManualConfirmationRequired(
+                            "客户明确填写的部分数字还没有进入产品选择或价格计算",
+                            code="unconsumed_customer_pricing_facts",
+                            fields=unconsumed,
+                            evidence=evidence,
+                        )
+                    # Cache only a fully reconciled selection.  Caching before
+                    # the ledger check could preserve a partial result and
+                    # replay the same missing-field failure after AI repair.
+                    if (
+                        cached_selection is None
+                        and component_selection_cache is not None
+                    ):
+                        component_selection_cache[selection_cache_key] = (
+                            selection.model_copy(deep=True)
+                        )
                     break
                 except ManualConfirmationRequired as exc:
                     # A customer-confirmed/reviewed model is authoritative.
@@ -7811,46 +7888,18 @@ class QuoteService:
             for key, value in normalized.items()
             if not key.startswith("_") or key.startswith("_billing_variant_")
         }
-        if service == "ec2":
-            volumes = normalized.get("additional_ebs_volumes")
-            system_disk = normalized.get("system_disk_gib")
-            system_type = str(normalized.get("volume_type") or "gp3").lower()
-            if (
-                isinstance(system_disk, (int, float))
-                and not isinstance(system_disk, bool)
-                and isinstance(volumes, list)
-                and volumes
-            ):
-                compatible = all(
-                    isinstance(volume, dict)
-                    and isinstance(volume.get("size_gib"), (int, float))
-                    and not isinstance(volume.get("size_gib"), bool)
-                    and str(volume.get("volume_type") or system_type).lower() == system_type
-                    for volume in volumes
-                )
-                if compatible:
-                    extra_total = sum(
-                        float(volume["size_gib"]) * int(volume.get("count_per_instance") or 1)
-                        for volume in volumes
-                    )
-                    total = float(system_disk) + extra_total
-                    normalized["system_disk_gib"] = total
-                    normalized.pop("additional_ebs_volumes", None)
-                    normalized["ebs_storage_breakdown"] = (
-                        "EC2 Calculator 按每实例 EBS 总容量计费；本次每台按 "
-                        f"{total:g} GiB {system_type} 填写，其中系统盘 "
-                        f"{float(system_disk):g} GiB，额外数据盘合计 {extra_total:g} GiB"
-                    )
-        if service == "rds":
-            # Retention is an RDS deployment policy. Calculator prices backup
-            # storage in GB-month and does not expose retention days as a cost input.
-            normalized.pop("backup_retention_days", None)
+        # Keep system and data disks as separate facts.  The EC2 adapter emits
+        # one official EBS usage line per disk group, so collapsing them into a
+        # synthetic system-disk total destroys the original field trace and can
+        # make a 500 GB data disk disappear from the reviewed configuration.
+        # RDS retention similarly remains available as a selection policy even
+        # though AWS bills backup bytes rather than retention days directly.
         for total_key, per_instance_key in (
             ("data_transfer_in_gib", "data_transfer_in_gib_per_instance"),
             ("data_transfer_regional_gib", "data_transfer_regional_gib_per_instance"),
             ("data_transfer_out_gib", "data_transfer_out_gib_per_instance"),
         ):
-            per_instance = normalized.pop(per_instance_key, None)
+            per_instance = normalized.get(per_instance_key)
             if total_key in normalized or per_instance is None:
                 continue
             if isinstance(per_instance, (int, float)) and not isinstance(per_instance, bool):
@@ -7874,6 +7923,57 @@ class QuoteService:
         pricing_copy = service.model_copy(deep=True)
         pricing_copy.service = service_key
         pricing_copy.requirements = dict(requirements)
+
+        # Canonicalizing a field value without canonicalizing its evidence
+        # produces an invisible customer fact: the adapter sees the value, but
+        # the final ledger still points at the removed alias.  Move every piece
+        # of provenance through the same field-name function.
+        for attribute in (
+            "field_sources",
+            "field_evidence",
+            "field_scopes",
+            "field_match_policies",
+        ):
+            original = getattr(pricing_copy, attribute)
+            remapped: dict[str, Any] = {}
+            for path, value in original.items():
+                if not path.startswith("requirements."):
+                    remapped[path] = value
+                    continue
+                field = path.split(".", 1)[1]
+                canonical = canonical_requirement_field_name(
+                    field,
+                    service=service_key,
+                )
+                canonical_path = f"requirements.{canonical}"
+                if canonical not in pricing_copy.requirements:
+                    continue
+                # A value already written under its canonical name is stronger
+                # than metadata attached to a legacy alias.
+                if canonical_path not in remapped or field == canonical:
+                    remapped[canonical_path] = value
+            setattr(pricing_copy, attribute, remapped)
+        pricing_copy.locked_fields = sorted(
+            {
+                (
+                    "requirements."
+                    + canonical_requirement_field_name(
+                        path.split(".", 1)[1],
+                        service=service_key,
+                    )
+                    if path.startswith("requirements.")
+                    else path
+                )
+                for path in pricing_copy.locked_fields
+                if (
+                    not path.startswith("requirements.")
+                    or canonical_requirement_field_name(
+                        path.split(".", 1)[1], service=service_key
+                    )
+                    in pricing_copy.requirements
+                )
+            }
+        )
         return pricing_copy
 
     @staticmethod

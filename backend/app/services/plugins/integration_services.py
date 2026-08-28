@@ -17,7 +17,14 @@ from app.services.aws_query_executor import ReadOnlyAwsQueryExecutor
 from app.services.plugins.base import ServicePlugin, required_float
 
 
-def _usage(product: dict[str, Any], key: str, amount: float, group: str) -> UsageLine:
+def _usage(
+    product: dict[str, Any],
+    key: str,
+    amount: float,
+    group: str,
+    *,
+    source_fields: tuple[str, ...] = (),
+) -> UsageLine:
     service_code, usage_type, operation = PricingCatalog.billing_identity(product)
     return UsageLine(
         key=key,
@@ -26,6 +33,7 @@ def _usage(product: dict[str, Any], key: str, amount: float, group: str) -> Usag
         operation=operation,
         amount=amount,
         group=group,
+        source_fields=list(source_fields),
     )
 
 
@@ -256,6 +264,14 @@ class MskPlugin(_NoConfirmationPlugin):
                 "mskbroker",
                 cluster_count * broker_count * requirement.hours_per_month,
                 "msk",
+                source_fields=(
+                    "quantity",
+                    "broker_count",
+                    "hours_per_month",
+                    "requested_model",
+                    "vcpu",
+                    "memory_gib",
+                ),
             )
         ]
         references: list[ReferenceRate] = []
@@ -268,6 +284,12 @@ class MskPlugin(_NoConfirmationPlugin):
                     "mskstore",
                     cluster_count * broker_count * storage_gib,
                     "msk",
+                    source_fields=(
+                        "quantity",
+                        "broker_count",
+                        "storage_gib_per_broker",
+                        "total_storage_gib",
+                    ),
                 )
             )
 
@@ -379,7 +401,15 @@ class ApiGatewayPlugin(_NoConfirmationPlugin):
             lines = []
             references = []
             if messages is not None:
-                lines.append(_usage(message_product, "apigwmsg", messages, "api-gateway"))
+                lines.append(
+                    _usage(
+                        message_product,
+                        "apigwmsg",
+                        messages,
+                        "api-gateway",
+                        source_fields=("messages", "api_type"),
+                    )
+                )
             else:
                 references.append(_reference(message_product, "WebSocket 消息单价"))
             if connection_minutes is not None:
@@ -389,6 +419,7 @@ class ApiGatewayPlugin(_NoConfirmationPlugin):
                         "apigwmin",
                         connection_minutes,
                         "api-gateway",
+                        source_fields=("connection_minutes", "api_type"),
                     )
                 )
             else:
@@ -443,7 +474,15 @@ class ApiGatewayPlugin(_NoConfirmationPlugin):
             requests = required_float(requested, key)
             if requests is not None:
                 break
-        lines = [_usage(product, "apigw", requests, "api-gateway")] if requests else []
+        lines = [
+            _usage(
+                product,
+                "apigw",
+                requests,
+                "api-gateway",
+                source_fields=("requests", "request_count", "monthly_requests", "api_type"),
+            )
+        ] if requests else []
         references = [] if requests else [_reference(product, "API Gateway 请求单价")]
         notice = None
         if requests is None:
@@ -495,7 +534,15 @@ class EventBridgeSchedulerPlugin(_NoConfirmationPlugin):
             invocations = required_float(requested, key)
             if invocations is not None:
                 break
-        lines = [_usage(product, "schedule", invocations, "scheduler")] if invocations else []
+        lines = [
+            _usage(
+                product,
+                "schedule",
+                invocations,
+                "scheduler",
+                source_fields=("scheduled_invocations", "invocations", "requests"),
+            )
+        ] if invocations else []
         references = [] if invocations else [_reference(product, "Scheduler 调用单价（含免费层）")]
         return SelectedResource(
             service=self.kind,

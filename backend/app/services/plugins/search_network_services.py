@@ -17,7 +17,14 @@ from app.integrations.aws import PricingCatalog, parse_number
 from app.services.plugins.base import ServicePlugin, required_float
 
 
-def _usage(product: dict[str, Any], key: str, amount: float, group: str) -> UsageLine:
+def _usage(
+    product: dict[str, Any],
+    key: str,
+    amount: float,
+    group: str,
+    *,
+    source_fields: tuple[str, ...] = (),
+) -> UsageLine:
     service_code, usage_type, operation = PricingCatalog.billing_identity(product)
     return UsageLine(
         key=key,
@@ -26,6 +33,7 @@ def _usage(product: dict[str, Any], key: str, amount: float, group: str) -> Usag
         operation=operation,
         amount=amount,
         group=group,
+        source_fields=list(source_fields),
     )
 
 
@@ -304,6 +312,14 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
                 "osnode",
                 data_nodes * requirement.hours_per_month,
                 "opensearch",
+                source_fields=(
+                    "data_nodes",
+                    "quantity",
+                    "hours_per_month",
+                    "requested_model",
+                    "vcpu",
+                    "memory_gib",
+                ),
             )
         ]
         references: list[ReferenceRate] = []
@@ -329,7 +345,20 @@ class OpenSearchPlugin(_NoConfirmationPlugin):
                     "AWS 官方目录没有返回 OpenSearch EBS 存储计费项",
                     code="opensearch_storage_not_found",
                 )
-            lines.append(_usage(storage_product, "osstore", data_nodes * storage_gib, "opensearch"))
+            lines.append(
+                _usage(
+                    storage_product,
+                    "osstore",
+                    data_nodes * storage_gib,
+                    "opensearch",
+                    source_fields=(
+                        "data_nodes",
+                        "storage_gib_per_node",
+                        "total_storage_gib",
+                        "volume_type",
+                    ),
+                )
+            )
         notice = None
         if substituted:
             notice = (
@@ -412,12 +441,32 @@ class NatGatewayPlugin(_NoConfirmationPlugin):
             data_gib = required_float(requirement.requirements, key)
             if data_gib is not None:
                 break
-        lines = [_usage(hourly, "nathour", quantity * requirement.hours_per_month, "nat")]
+        lines = [
+            _usage(
+                hourly,
+                "nathour",
+                quantity * requirement.hours_per_month,
+                "nat",
+                source_fields=("gateway_count", "quantity", "hours_per_month"),
+            )
+        ]
         references: list[ReferenceRate] = []
         if data_gib is None:
             references.append(_reference(processed, "NAT Gateway 每 GB 数据处理单价"))
         else:
-            lines.append(_usage(processed, "natbytes", data_gib, "nat"))
+            lines.append(
+                _usage(
+                    processed,
+                    "natbytes",
+                    data_gib,
+                    "nat",
+                    source_fields=(
+                        "data_processed_gib",
+                        "processed_bytes_gib",
+                        "data_transfer_gib",
+                    ),
+                )
+            )
         return SelectedResource(
             service=self.kind,
             display_name=self.display_name,

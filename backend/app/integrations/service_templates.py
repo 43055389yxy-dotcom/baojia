@@ -237,22 +237,28 @@ GENERIC_TEMPLATE_FIELDS = (
     "kpu_count", "kpu_hours",
 )
 
-# These services have purpose-built pricing adapters.  Every other current or
-# future AWS service is handled by ``GenericOfficialPlugin`` and must enrich
-# its extraction template from the same official Price List profile used for
-# pricing.  Derive the set from the routing enum so adding a dedicated plugin
-# cannot silently leave a second, hand-maintained list stale.  ``redis`` is the
-# adapter route while the customer-facing extraction contract is
-# ``elasticache``.
+# These services have purpose-built pricing adapters.  The distinction only
+# decides which code turns normalized facts into price queries; it must never
+# decide whether extraction receives the official field profile.  Every
+# component, including a dedicated one, merges its fixed business template
+# with the current AWS Price List profile.  Derive the set from the routing
+# enum so adding an adapter cannot silently leave a second list stale.
+# ``redis`` is the adapter route while the customer-facing extraction contract
+# is ``elasticache``.
 DEDICATED_TEMPLATE_SERVICES = frozenset(
     "elasticache" if kind.value == "redis" else kind.value for kind in ServiceKind
 )
 
 
 def requires_official_field_profile(service: str) -> bool:
-    """Return whether this component needs a Price List generated field layer."""
+    """Return whether extraction must merge the official Price List profile.
 
-    return normalized_service_key(service) not in DEDICATED_TEMPLATE_SERVICES
+    Kept as a named policy boundary for callers and audits.  Official profile
+    enrichment is deliberately universal; a dedicated pricing adapter is not
+    permission to hide official billing fields from extraction.
+    """
+
+    return True
 
 COMMON_TEMPLATE_FIELDS = ("system_default_assumption",)
 
@@ -402,6 +408,11 @@ def component_template(
         "quantity": None,
         "hours_per_month": None,
         "requirements": {field: None for field in fields},
+        # This is a lossless safety valve, not a second pricing schema.  The
+        # model uses it only when customer-written price data has no honest
+        # destination in either the curated fields or the official profile.
+        # A later component-scoped repair must map it before final pricing.
+        "unmapped_pricing_facts": [],
         "field_evidence": {
             "region": None,
             "quantity": None,

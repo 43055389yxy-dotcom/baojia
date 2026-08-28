@@ -98,7 +98,14 @@ def _one_matching(
     return PricingCatalog.require_unique(refreshed, context=context)
 
 
-def _usage(product: dict[str, Any], *, key: str, amount: float, group: str) -> UsageLine:
+def _usage(
+    product: dict[str, Any],
+    *,
+    key: str,
+    amount: float,
+    group: str,
+    source_fields: tuple[str, ...] = (),
+) -> UsageLine:
     service_code, usage_type, operation = PricingCatalog.billing_identity(product)
     return UsageLine(
         key=key,
@@ -107,6 +114,7 @@ def _usage(product: dict[str, Any], *, key: str, amount: float, group: str) -> U
         operation=operation,
         amount=amount,
         group=group,
+        source_fields=list(source_fields),
     )
 
 
@@ -149,7 +157,13 @@ class Route53Plugin(_MinimumAssumptionPlugin):
             self.catalog.products("AmazonRoute53", {"usagetype": "HostedZone"}, max_pages=1),
             context="Route 53 Hosted Zone",
         )
-        line = _usage(product, key="rt53", amount=hosted_zones, group="route53")
+        line = _usage(
+            product,
+            key="rt53",
+            amount=hosted_zones,
+            group="route53",
+            source_fields=("hosted_zones",),
+        )
         return SelectedResource(
             service=self.kind,
             display_name=self.display_name,
@@ -225,11 +239,31 @@ class WafPlugin(_MinimumAssumptionPlugin):
             f"AWS WAF Request ({region})",
         )
         lines = [
-            _usage(acl, key="wafacl", amount=web_acls, group="waf"),
-            _usage(rule, key="wafrule", amount=billed_rules, group="waf"),
+            _usage(
+                acl,
+                key="wafacl",
+                amount=web_acls,
+                group="waf",
+                source_fields=("web_acls",),
+            ),
+            _usage(
+                rule,
+                key="wafrule",
+                amount=billed_rules,
+                group="waf",
+                source_fields=("web_acls", "rules"),
+            ),
         ]
         if billed_requests is not None:
-            lines.append(_usage(request, key="wafreq", amount=billed_requests, group="waf"))
+            lines.append(
+                _usage(
+                    request,
+                    key="wafreq",
+                    amount=billed_requests,
+                    group="waf",
+                    source_fields=("web_acls", "requests"),
+                )
+            )
         reference_rates = (
             [_reference(request, description="AWS WAF 请求单价")]
             if requests is None
@@ -307,7 +341,13 @@ class SqsPlugin(_MinimumAssumptionPlugin):
             ),
         )
         line = (
-            _usage(product, key="sqs", amount=requests, group="sqs")
+            _usage(
+                product,
+                key="sqs",
+                amount=requests,
+                group="sqs",
+                source_fields=("requests", "payload_size_kib", "queue_type"),
+            )
             if requests is not None
             else None
         )
@@ -346,7 +386,13 @@ class SesPlugin(_MinimumAssumptionPlugin):
             f"SES 出站邮件 ({region})",
         )
         line = (
-            _usage(product, key="ses", amount=messages, group="ses")
+            _usage(
+                product,
+                key="ses",
+                amount=messages,
+                group="ses",
+                source_fields=("outbound_messages",),
+            )
             if messages is not None
             else None
         )
@@ -395,7 +441,15 @@ class CloudWatchPlugin(_MinimumAssumptionPlugin):
             if logs is None:
                 reference_rates.append(_reference(product, description="CloudWatch Logs 写入单价"))
             else:
-                lines.append(_usage(product, key="cwlog", amount=logs, group="cloudwatch"))
+                lines.append(
+                    _usage(
+                        product,
+                        key="cwlog",
+                        amount=logs,
+                        group="cloudwatch",
+                        source_fields=("log_ingestion_gib", "include_logs"),
+                    )
+                )
                 specs["logIngestionGiB"] = logs
         if include_metrics:
             metrics = required_float(requested, "custom_metrics")
@@ -408,7 +462,15 @@ class CloudWatchPlugin(_MinimumAssumptionPlugin):
             if metrics is None:
                 reference_rates.append(_reference(product, description="CloudWatch 自定义指标单价"))
             else:
-                lines.append(_usage(product, key="cwmet", amount=metrics, group="cloudwatch"))
+                lines.append(
+                    _usage(
+                        product,
+                        key="cwmet",
+                        amount=metrics,
+                        group="cloudwatch",
+                        source_fields=("custom_metrics", "include_metrics"),
+                    )
+                )
                 specs["customMetrics"] = metrics
         if not lines and not reference_rates:
             raise ManualConfirmationRequired(

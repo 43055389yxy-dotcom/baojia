@@ -47,6 +47,25 @@ class ExecutionEvent(BaseModel):
     status: Literal["completed", "warning"] = "completed"
 
 
+class UnmappedPricingFact(BaseModel):
+    """Customer-written pricing data that has not yet found a safe field.
+
+    A fixed extraction template is a hint, not a data-loss boundary.  When the
+    model understands a customer value but neither the curated component
+    fields nor the current official Price List profile provides a trustworthy
+    destination, keep the fact here.  Later component-scoped repair may map it
+    to a normal requirement field; until then final pricing must fail closed.
+    """
+
+    field_hint: str = Field(min_length=1, max_length=120)
+    value: int | float | str
+    unit: str | None = Field(default=None, max_length=40)
+    scope: Literal["component_total", "aggregate", "per_resource", "per_node"] = (
+        "component_total"
+    )
+    evidence: str = Field(min_length=1, max_length=300)
+
+
 class ServiceRequirement(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -103,6 +122,12 @@ class ServiceRequirement(BaseModel):
     field_scopes: dict[
         str, Literal["component_total", "aggregate", "per_resource", "per_node"]
     ] = Field(default_factory=dict)
+    # Lossless overflow for price-changing customer facts that do not yet map
+    # to a known curated or official field.  Adapters never read this as a
+    # price input: it is an explicit stop signal, not a place for guessed
+    # values.  This prevents an unknown field from disappearing at a template
+    # allow-list boundary.
+    unmapped_pricing_facts: list[UnmappedPricingFact] = Field(default_factory=list)
 
 
 class ParsedIntent(BaseModel):
@@ -198,6 +223,10 @@ class UsageLine(BaseModel):
     operation: str
     amount: float = Field(gt=0)
     group: str | None = None
+    # Requirement fields that produced this official charge.  This is audit
+    # metadata only and is not submitted to AWS.  It lets the final quote
+    # prove that every customer-written pricing fact reached a billing line.
+    source_fields: list[str] = Field(default_factory=list)
 
 
 class ReferenceRate(BaseModel):
@@ -239,6 +268,10 @@ class SelectedResource(BaseModel):
     remarks: list[str] = Field(default_factory=list)
     usage_lines: list[UsageLine] = Field(default_factory=list)
     reference_rates: list[ReferenceRate] = Field(default_factory=list)
+    # Fields used to choose/validate the official product even when they do
+    # not directly become a usage amount (for example vCPU and memory used to
+    # choose an instance type).
+    applied_requirement_fields: list[str] = Field(default_factory=list)
     monthly_commitment_cost: float = Field(default=0, ge=0)
     upfront_commitment_cost: float = Field(default=0, ge=0)
 

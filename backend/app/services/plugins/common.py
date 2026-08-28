@@ -32,7 +32,14 @@ def _one_product(
     return PricingCatalog.require_unique(products, context=context)
 
 
-def _line(product: dict[str, Any], *, key: str, amount: float, group: str) -> UsageLine:
+def _line(
+    product: dict[str, Any],
+    *,
+    key: str,
+    amount: float,
+    group: str,
+    source_fields: tuple[str, ...] = (),
+) -> UsageLine:
     service_code, usage_type, operation = PricingCatalog.billing_identity(product)
     return UsageLine(
         key=key,
@@ -41,6 +48,7 @@ def _line(product: dict[str, Any], *, key: str, amount: float, group: str) -> Us
         operation=operation,
         amount=amount,
         group=group,
+        source_fields=list(source_fields),
     )
 
 
@@ -206,7 +214,13 @@ class S3Plugin(ServicePlugin):
         )
         attrs = PricingCatalog.attributes(product)
         storage_line = (
-            _line(product, key="s3", amount=storage_gib, group="s3")
+            _line(
+                product,
+                key="s3",
+                amount=storage_gib,
+                group="s3",
+                source_fields=("storage_gib",),
+            )
             if storage_gib is not None
             else None
         )
@@ -251,6 +265,7 @@ class S3Plugin(ServicePlugin):
                     key=key,
                     amount=scoped_amount(requirement, field, amount),
                     group="s3",
+                    source_fields=(field,),
                 )
             )
         return SelectedResource(
@@ -352,10 +367,19 @@ class AlbPlugin(ServicePlugin):
                 key="albh",
                 amount=requirement.quantity * requirement.hours_per_month,
                 group="alb",
+                source_fields=("quantity", "hours_per_month", "load_balancer_type"),
             ),
         ]
         if processed is not None:
-            lines.append(_line(lcu, key="alblcu", amount=processed, group="alb"))
+            lines.append(
+                _line(
+                    lcu,
+                    key="alblcu",
+                    amount=processed,
+                    group="alb",
+                    source_fields=("processed_bytes_gib", "data_processed_gib"),
+                )
+            )
         reference_rates = (
             [_reference(lcu, description="Application LCU 单价")]
             if processed is None
@@ -435,7 +459,15 @@ class CloudFrontPlugin(ServicePlugin):
             f"CloudFront {geography} 公网下行",
         )
         lines = (
-            [_line(transfer, key="cfout", amount=transfer_gib, group="cloudfront")]
+            [
+                _line(
+                    transfer,
+                    key="cfout",
+                    amount=transfer_gib,
+                    group="cloudfront",
+                    source_fields=("data_transfer_out_gib", "traffic_geography"),
+                )
+            ]
             if transfer_gib is not None
             else []
         )
@@ -456,7 +488,15 @@ class CloudFrontPlugin(ServicePlugin):
                 },
                 f"CloudFront {geography} HTTPS 请求",
             )
-            lines.append(_line(requests, key="cfreq", amount=request_count, group="cloudfront"))
+            lines.append(
+                _line(
+                    requests,
+                    key="cfreq",
+                    amount=request_count,
+                    group="cloudfront",
+                    source_fields=("https_requests", "requests", "traffic_geography"),
+                )
+            )
         return SelectedResource(
             service=self.kind,
             display_name=self.display_name,

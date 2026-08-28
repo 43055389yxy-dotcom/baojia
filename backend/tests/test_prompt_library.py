@@ -209,8 +209,8 @@ def test_generic_services_receive_complete_dynamic_billing_vocabulary() -> None:
     assert BILLING_DIMENSION_FIELDS <= set(DYNAMIC_SEMANTIC_TEMPLATE_FIELDS)
     assert requires_official_field_profile("lambda") is True
     assert requires_official_field_profile("step_functions") is True
-    assert requires_official_field_profile("ec2") is False
-    assert requires_official_field_profile("elasticache") is False
+    assert requires_official_field_profile("ec2") is True
+    assert requires_official_field_profile("elasticache") is True
 
 
 def test_every_component_template_uses_only_canonical_pricing_field_names() -> None:

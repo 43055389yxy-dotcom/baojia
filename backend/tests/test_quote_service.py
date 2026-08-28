@@ -2967,7 +2967,7 @@ def test_per_instance_transfer_is_converted_to_calculator_total() -> None:
     )
 
     assert normalized["data_transfer_out_gib"] == 3072
-    assert "data_transfer_out_gib_per_instance" not in normalized
+    assert normalized["data_transfer_out_gib_per_instance"] == 1024
 
 
 def test_transfer_only_ec2_item_is_merged_into_single_compute_workload() -> None:
@@ -3679,16 +3679,16 @@ def test_minimum_defaults_are_applied_only_to_requested_services() -> None:
     assert len(notices) == 3
 
 
-def test_rds_retention_days_are_not_sent_as_calculator_cost_input() -> None:
+def test_rds_retention_days_remain_available_as_selection_policy() -> None:
     normalized = QuoteService._calculator_requirements(
         {"storage_gib": 500, "backup_retention_days": 7}, 1, "rds"
     )
 
     assert normalized["storage_gib"] == 500
-    assert "backup_retention_days" not in normalized
+    assert normalized["backup_retention_days"] == 7
 
 
-def test_same_type_ec2_volumes_are_aggregated_for_calculator_storage_field() -> None:
+def test_ec2_system_and_data_disks_remain_separate_pricing_facts() -> None:
     normalized = QuoteService._calculator_requirements(
         {
             "system_disk_gib": 100,
@@ -3701,9 +3701,11 @@ def test_same_type_ec2_volumes_are_aggregated_for_calculator_storage_field() -> 
         "ec2",
     )
 
-    assert normalized["system_disk_gib"] == 400
-    assert "additional_ebs_volumes" not in normalized
-    assert "系统盘 100 GiB" in normalized["ebs_storage_breakdown"]
+    assert normalized["system_disk_gib"] == 100
+    assert normalized["additional_ebs_volumes"] == [
+        {"size_gib": 300, "volume_type": "gp3", "count_per_instance": 1}
+    ]
+    assert "ebs_storage_breakdown" not in normalized
 
 
 def test_legacy_ec2_disk_alias_is_preserved_for_calculator() -> None:

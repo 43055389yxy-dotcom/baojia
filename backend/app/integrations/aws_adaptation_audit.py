@@ -3,12 +3,12 @@ from __future__ import annotations
 from typing import Any
 
 from app.integrations.aws_product_registry import AwsProductRegistry
+from app.integrations.aws_supported_services import CURATED_SERVICE_OFFER_CODES
 from app.integrations.service_templates import (
     DEDICATED_TEMPLATE_SERVICES,
     DYNAMIC_SEMANTIC_TEMPLATE_FIELDS,
     SERVICE_TEMPLATE_FIELDS,
 )
-from app.integrations.aws_supported_services import CURATED_SERVICE_OFFER_CODES
 
 
 class AwsAdaptationAudit:
@@ -116,8 +116,7 @@ class AwsAdaptationAudit:
                     }
                 ),
                 "dedicated_adapter_templates": len(DEDICATED_TEMPLATE_SERVICES),
-                "official_profile_enriched_templates": len(SERVICE_TEMPLATE_FIELDS)
-                - len(DEDICATED_TEMPLATE_SERVICES),
+                "official_profile_enriched_templates": len(SERVICE_TEMPLATE_FIELDS),
                 "dynamic_semantic_fields": len(DYNAMIC_SEMANTIC_TEMPLATE_FIELDS),
                 "verified_template_offer_bindings": verified_template_bindings,
                 "missing_template_offer_bindings": len(missing_template_bindings),
@@ -168,8 +167,8 @@ class AwsAdaptationAudit:
                     "专用字段模板",
                     "ready_on_demand",
                     f"{len(SERVICE_TEMPLATE_FIELDS)} 个旧版固定模板常驻；其中 "
-                    f"{len(SERVICE_TEMPLATE_FIELDS) - len(DEDICATED_TEMPLATE_SERVICES)} 个"
-                    "模板继续合并官方计费字段；全部其他官方组件也按相同规则独立生成，"
+                    f"{len(SERVICE_TEMPLATE_FIELDS)} 个模板都继续合并官方计费字段；"
+                    "全部其他官方组件也按相同规则独立生成，"
                     "不存在常用与次要组件之分。",
                 ),
                 stage(

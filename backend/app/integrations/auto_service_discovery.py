@@ -18,7 +18,7 @@ from app.integrations.service_templates import DYNAMIC_SEMANTIC_TEMPLATE_FIELDS
 
 PROFILE_TTL_SECONDS = 10 * 24 * 60 * 60
 FAILED_RETRY_SECONDS = 6 * 60 * 60
-PROFILE_SCHEMA_VERSION = 12
+PROFILE_SCHEMA_VERSION = 13
 
 
 def canonical_service_name(value: str) -> str:
@@ -103,13 +103,33 @@ def _dimension_field(dimension: dict[str, Any]) -> tuple[str | None, str | None]
     # generic requests and left connection minutes unnamed, so the extraction
     # allow-list later discarded both customer values.
     if "message" in unit or "message" in text:
+        if any(token in text for token in ("received", "receive", "inbound")):
+            return "inbound_messages", "接收消息数量"
+        if any(token in text for token in ("recipient", "send", "outbound")):
+            return "outbound_messages", "发送消息数量"
         return "messages", "消息数量"
     if "minute" in unit and any(
         token in text for token in ("connection", "websocket", "apigatewayminute")
     ):
         return "connection_minutes", "连接时长（分钟）"
+    if "query" in unit or "query" in text:
+        if any(token in text for token in ("dns", "route 53", "route53")):
+            return "dns_queries", "DNS 查询数量"
+        return "requests", "查询或请求数量"
     if any(token in unit for token in ("request", "api call", "event")):
         return "requests", "请求数量"
+
+    # Provisioned performance is a first-class billing dimension.  Leaving an
+    # IOPS-Month row in the opaque ``official_usage_*`` namespace meant EBS,
+    # RDS and OpenSearch could extract a customer's IOPS but never connect it
+    # back to the official charge.
+    if "iops" in unit or "iops" in text or "piops" in unit or "piops" in text:
+        return "iops", "预置 IOPS"
+
+    if "health check" in text or "health-check" in text:
+        return "health_checks", "健康检查数量"
+    if "alarm" in text and any(token in unit for token in ("month", "mo", "count")):
+        return "alarms", "告警数量"
 
     if any(token in unit for token in ("gb-hour", "gb-hours", "gib-hour")):
         if "memory" in text and "store" in text:
@@ -126,6 +146,8 @@ def _dimension_field(dimension: dict[str, Any]) -> tuple[str | None, str | None]
     if unit in {"gb", "gbyte", "gigabyte", "gigabytes", "gib"} or (
         "byte" in unit and any(token in text for token in ("process", "processed", "ingest"))
     ):
+        if "attachment" in text:
+            return "attachments_gib", "附件数据量（GiB）"
         if any(token in text for token in ("transfer", "egress", "data out", "outbound")):
             return "data_transfer_out_gib", "出站流量（GiB）"
         if any(
@@ -162,6 +184,10 @@ def _dimension_field(dimension: dict[str, Any]) -> tuple[str | None, str | None]
             return "memory_store_gib_hours", "内存存储（GiB 小时）"
         return "hours_per_month", "运行时长（小时/月）"
     if any(token in unit for token in ("quantity", "unit")):
+        if "listener" in text:
+            return "listener_count", "监听器数量"
+        if "endpoint" in text:
+            return "endpoint_count", "端点数量"
         return "resource_count", "计费资源数量"
     return None, None
 

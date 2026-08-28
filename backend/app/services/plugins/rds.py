@@ -280,6 +280,19 @@ class RdsPlugin(ServicePlugin):
                     operation=operation,
                     amount=amount,
                     group="rds",
+                    source_fields=[
+                        "quantity",
+                        "hours_per_month",
+                        "requested_model",
+                        "vcpu",
+                        "memory_gib",
+                        "engine",
+                        "deployment",
+                        "instance_count",
+                        "cluster_members",
+                        "read_replica_count",
+                        "purchase_option",
+                    ],
                 )
             )
         elif purchase_option == "reserved":
@@ -378,6 +391,30 @@ class RdsPlugin(ServicePlugin):
             rationale="先用 RDS Orderable API 核验区域/引擎可订购性，再从官方目录选最小满足规格。",
             substitution_notice=" ".join(notice_parts) or None,
             usage_lines=usage_lines,
+            applied_requirement_fields=(
+                [
+                    "quantity",
+                    "hours_per_month",
+                    "requested_model",
+                    "vcpu",
+                    "memory_gib",
+                    "engine",
+                    "deployment",
+                    "instance_count",
+                    "cluster_members",
+                    "read_replica_count",
+                    "purchase_option",
+                    "reserved_term_years",
+                    "payment_option",
+                    "backup_retention_days",
+                ]
+                if purchase_option == "reserved"
+                else (
+                    ["backup_retention_days"]
+                    if requested.get("backup_retention_days") is not None
+                    else []
+                )
+            ),
             monthly_commitment_cost=monthly_commitment_cost,
             upfront_commitment_cost=upfront_commitment_cost,
         )
@@ -441,6 +478,13 @@ class RdsPlugin(ServicePlugin):
                 operation=operation,
                 amount=storage_amount,
                 group="rds-storage",
+                source_fields=[
+                    "quantity",
+                    "storage_gib",
+                    "storage_type",
+                    "deployment",
+                    "engine",
+                ],
             ),
             storage_type,
         )

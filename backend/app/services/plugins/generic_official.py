@@ -76,6 +76,20 @@ _SERVICE_CODE_ALIASES = {
     "pinpoint": "AmazonPinpoint",
 }
 
+# Fixed business templates sometimes use a service-qualified name while the
+# official dimension layer intentionally uses one cross-service semantic name.
+# This bridge is used only when a dedicated adapter left an explicit customer
+# field unconsumed.  It does not choose a price or service; the exact official
+# profile still decides which UsageType/Operation/Unit is valid.
+_SUPPLEMENT_FIELD_ALIASES = {
+    "ebs_iops": "iops",
+    "storage_iops": "iops",
+    "ebs_throughput_mbps": "throughput_mbps",
+    "storage_throughput_mbps": "throughput_mbps",
+    "log_storage_gib": "storage_gib",
+    "snapshot_changed_gib": "backup_storage_gib",
+}
+
 
 def _canonical(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.casefold())
@@ -1095,6 +1109,7 @@ class GenericOfficialPlugin:
                     substitution_notice=None,
                     usage_lines=[],
                     reference_rates=[],
+                    applied_requirement_fields=list(requirement.requirements),
                 )
         is_unknown_service = requirement.service not in SERVICE_TEMPLATE_FIELDS
         profile = None
@@ -1159,6 +1174,7 @@ class GenericOfficialPlugin:
                 ),
                 usage_lines=[],
                 reference_rates=[],
+                applied_requirement_fields=list(requirement.requirements),
             )
         rates = self._profile_rates(profile) if is_unknown_service else []
         if not rates:
@@ -1456,11 +1472,71 @@ class GenericOfficialPlugin:
             upfront_commitment_cost = (
                 reserved_price.upfront * requirement.quantity * reserved_nodes
             )
+
+        def source_fields_for_rate(
+            candidate: tuple[float, str, str, str, dict[str, object]],
+        ) -> list[str]:
+            """Trace one selected official row back to customer fields."""
+
+            _price, unit, usage_type, operation, product = candidate
+            fields: set[str] = set()
+            raw_bindings = (profile or {}).get("field_bindings")
+            if isinstance(raw_bindings, list):
+                for binding in raw_bindings:
+                    if not isinstance(binding, dict):
+                        continue
+                    if (
+                        str(binding.get("usage_type") or "") != usage_type
+                        or str(binding.get("operation") or "") != operation
+                        or str(binding.get("unit") or "") != unit
+                    ):
+                        continue
+                    field = str(binding.get("field") or "")
+                    if not field:
+                        continue
+                    derived_sources = {
+                        "endpoint_hours": {"endpoint_count", "hours_per_month"},
+                        "memory_store_gib_hours": {
+                            "data_in_gib",
+                            "write_records",
+                            "memory_retention_hours",
+                        },
+                        "magnetic_store_gib_months": {
+                            "data_in_gib",
+                            "write_records",
+                            "magnetic_retention_days",
+                        },
+                        "kpu_hours": {"kpu_count", "kpu_hours", "hours_per_month"},
+                    }.get(field)
+                    if derived_sources:
+                        fields.update(derived_sources)
+                    else:
+                        fields.add(field)
+            attrs = PricingCatalog.attributes(product)
+            if attrs.get("instanceType"):
+                fields.update(
+                    {
+                        "requested_model",
+                        "vcpu",
+                        "memory_gib",
+                        "instance_count",
+                        "node_count",
+                        "broker_count",
+                        "replication_instances",
+                        "hours_per_month",
+                        "quantity",
+                    }
+                )
+            return sorted(fields)
+
+        applied_fields: set[str] = set()
         for index, (description, amount, rate) in enumerate(selected_rates, start=1):
             price, unit, usage_type, operation, _ = rate
             if rate is reserved_compute_rate:
                 continue
             if amount is not None and amount > 0:
+                source_fields = source_fields_for_rate(rate)
+                applied_fields.update(source_fields)
                 usage_lines.append(
                     UsageLine(
                         key=f"gen{index}",
@@ -1469,6 +1545,7 @@ class GenericOfficialPlugin:
                         operation=operation,
                         amount=amount,
                         group=requirement.service,
+                        source_fields=source_fields,
                     )
                 )
             else:
@@ -1574,8 +1651,145 @@ class GenericOfficialPlugin:
             substitution_notice=" ".join(substitution_notices) or None,
             usage_lines=usage_lines,
             reference_rates=reference_rates,
+            applied_requirement_fields=sorted(
+                applied_fields
+                | (
+                    {
+                        "purchase_option",
+                        "reserved_term_years",
+                        "payment_option",
+                        "requested_model",
+                        "vcpu",
+                        "memory_gib",
+                        "instance_count",
+                        "node_count",
+                        "broker_count",
+                        "replication_instances",
+                        "hours_per_month",
+                        "quantity",
+                    }
+                    if reserved_compute_rate is not None
+                    else set()
+                )
+            ),
             monthly_commitment_cost=monthly_commitment_cost,
             upfront_commitment_cost=upfront_commitment_cost,
+        )
+
+    def supplement_selection(
+        self,
+        requirement: ServiceRequirement,
+        selection: SelectedResource,
+        missing_paths: list[str],
+        default_region: str,
+    ) -> SelectedResource:
+        """Attach official usage rows omitted by a dedicated adapter.
+
+        Dedicated adapters remain authoritative for product/instance choice.
+        The generic official profile is allowed to contribute only rows whose
+        trace explicitly names one of the still-unconsumed customer fields.
+        This prevents both silent loss and the opposite failure mode—billing
+        the same compute or storage row twice.
+        """
+
+        target_fields = {
+            path.split(".", 1)[1] if path.startswith("requirements.") else path
+            for path in missing_paths
+        }
+        if not target_fields:
+            return selection
+
+        supplemental_requirement = requirement.model_copy(deep=True)
+        reverse_aliases: dict[str, str] = {}
+        for field in sorted(target_fields):
+            alias = _SUPPLEMENT_FIELD_ALIASES.get(field)
+            if not alias or field not in supplemental_requirement.requirements:
+                continue
+            # Never overwrite another explicit customer value. A disagreement
+            # between two real fields must stay visible to the ledger.
+            if alias in supplemental_requirement.requirements:
+                continue
+            supplemental_requirement.requirements[alias] = (
+                supplemental_requirement.requirements[field]
+            )
+            source_path = f"requirements.{field}"
+            alias_path = f"requirements.{alias}"
+            if source_path in supplemental_requirement.field_sources:
+                supplemental_requirement.field_sources[alias_path] = (
+                    supplemental_requirement.field_sources[source_path]
+                )
+            if source_path in supplemental_requirement.field_evidence:
+                supplemental_requirement.field_evidence[alias_path] = (
+                    supplemental_requirement.field_evidence[source_path]
+                )
+            if source_path in supplemental_requirement.field_scopes:
+                supplemental_requirement.field_scopes[alias_path] = (
+                    supplemental_requirement.field_scopes[source_path]
+                )
+            reverse_aliases[alias] = field
+
+        supplemental = self.select(supplemental_requirement, default_region)
+        normalized_targets = set(target_fields)
+
+        def remap_source(field: str) -> str:
+            prefix = "requirements." if field.startswith("requirements.") else ""
+            raw = field.split(".", 1)[1] if prefix else field
+            mapped = reverse_aliases.get(raw, raw)
+            return f"{prefix}{mapped}" if prefix else mapped
+
+        merged_lines = [line.model_copy(deep=True) for line in selection.usage_lines]
+        applied = set(selection.applied_requirement_fields)
+        for index, line in enumerate(supplemental.usage_lines, start=1):
+            remapped_sources = [remap_source(field) for field in line.source_fields]
+            base_sources = {
+                field.split(".", 1)[1]
+                if field.startswith("requirements.")
+                else field
+                for field in remapped_sources
+            }
+            matched = base_sources & normalized_targets
+            if not matched:
+                continue
+            applied.update(matched)
+            identity = (
+                line.service_code,
+                line.usage_type,
+                line.operation,
+                float(line.amount),
+            )
+            existing = next(
+                (
+                    item
+                    for item in merged_lines
+                    if (
+                        item.service_code,
+                        item.usage_type,
+                        item.operation,
+                        float(item.amount),
+                    )
+                    == identity
+                ),
+                None,
+            )
+            if existing is not None:
+                existing.source_fields = sorted(
+                    set(existing.source_fields) | set(remapped_sources)
+                )
+                continue
+            merged_lines.append(
+                line.model_copy(
+                    update={
+                        "key": f"supplement-{index}-{line.key}",
+                        "source_fields": sorted(set(remapped_sources)),
+                    }
+                )
+            )
+
+        return selection.model_copy(
+            update={
+                "usage_lines": merged_lines,
+                "applied_requirement_fields": sorted(applied),
+            }
         )
 
     @staticmethod

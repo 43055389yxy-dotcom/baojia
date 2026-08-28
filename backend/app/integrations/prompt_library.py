@@ -57,7 +57,7 @@ CORE_PROMPT = """你是 AWS 官方成本报价的需求整理员。
    - 可选用量：客户没说流量、请求、监控、快照等就省略，不提问、不生成占位值。
    - 客户问题：一次列完所有真正阻止报价且客户能回答的问题；不得把 AWS/API 技术失败转给客户。
 11. 返回结构：
-{"customer_summary":"原意摘要","services":[{"service":"ec2","calculator_service_name":"Amazon EC2","region":null,"quantity":1,"hours_per_month":730,"requirements":{},"source_text":"对应原文","query_action":null}],"ambiguities":[]}
+{"customer_summary":"原意摘要","services":[{"service":"ec2","calculator_service_name":"Amazon EC2","region":null,"quantity":1,"hours_per_month":730,"requirements":{},"unmapped_pricing_facts":[],"source_text":"对应原文","query_action":null}],"ambiguities":[]}
 12. 字段名必须严格使用各服务提示中的标准 snake_case 名称。不得创造近义字段，例如
 system_disk_size_gib、memory_gb、cpu_count、instance_type；必须分别写成
 system_disk_gib、memory_gib、vcpu、requested_model。输出前检查客户明确给出的每个数量、容量、
@@ -174,7 +174,7 @@ ambiguities。后端从 AWS 官方目录筛掉低于任一明确要求的型号�
 
 COMPONENT_CLEANUP_PROMPT = """你是 AWS 报价单组件模板填写器。
 输入只包含当前组件客户原文和一个锁定 JSON。只填写这一项，返回严格 JSON：
-{"customer_summary":"简短摘要","services":[{"service":"原服务","calculator_service_name":"原官方名","region":null,"quantity":1,"hours_per_month":730,"requirements":{},"source_text":"原文","query_action":null}],"ambiguities":[]}
+{"customer_summary":"简短摘要","services":[{"service":"原服务","calculator_service_name":"原官方名","region":null,"quantity":1,"hours_per_month":730,"requirements":{},"unmapped_pricing_facts":[],"source_text":"原文","query_action":null}],"ambiguities":[]}
 
 刚性规则：
 1. services 必须恰好 1 项；不得新增、删除、替换服务，也不得引用其他组件的数据。
@@ -897,7 +897,7 @@ INVENTORY_RUNTIME_PROMPT = """你只负责把客户原文按独立组件拆开�
 第 2 步（后续逐组件执行）：只提取会改变 AWS 价格的字段，删除用途说明、背景描述、历史价格等干扰项。
 第 3 步（后续逐组件执行）：拿完整 source_text 与计价字段逐项对账，任何数字、单位、拓扑和用量都不得漏掉。
 返回严格 JSON：
-{"customer_summary":"原意摘要","services":[{"service":"稳定小写标识","calculator_service_name":"AWS 官方服务名","region":null,"quantity":1,"hours_per_month":730,"requirements":{},"source_text":"该组件完整原话","query_action":null}],"ambiguities":[]}
+{"customer_summary":"原意摘要","services":[{"service":"稳定小写标识","calculator_service_name":"AWS 官方服务名","region":null,"quantity":1,"hours_per_month":730,"requirements":{},"unmapped_pricing_facts":[],"source_text":"该组件完整原话","query_action":null}],"ambiguities":[]}
 
 规则：
 1. 原文每个独立组件都必须保留；同服务但区域、环境、规格或用途不同必须分开。
@@ -1009,6 +1009,8 @@ def _service_rule_with_locked_contract(service_key: str) -> str:
         f"{rule}\n\n【系统锁定的完整字段清单】\n"
         + ", ".join(fields)
         + "。\n客户明确提到且含义对应的值必须填入；没有提到的字段保持 null。"
+        "如果客户明确给出的计价信息确实没有对应字段，必须放入 "
+        "unmapped_pricing_facts，绝不能删除或硬塞进含义不同的字段。"
     )
 
 
@@ -1034,7 +1036,10 @@ def build_component_extraction_prompt(service_key: str, source_text: str = "") -
 硬规则：
 1. 原文明说才填写；没说的字段必须保持 null。唯一例外是输入中单独标明的“系统最低运行建议”，
    可在客户未给对应运行规格时填入模板。不得自行推测、推荐、反推规格或生成价格。
-2. 服务身份、模板字段名和 source_text 不得修改；不得增加模板外字段。
+2. 服务身份、模板字段名和 source_text 不得修改；不得创造 requirements 字段。
+   模板确实没有位置承接的客户计价事实，逐条写入 unmapped_pricing_facts：field_hint 写含义，
+   value 写标准化数值，unit 写单位，scope 写 component_total、aggregate、per_resource 或 per_node，
+   evidence 必须逐字复制客户原话。它是防丢失清单，不是猜价字段。
 3. 型号、CPU、内存、容量、数量即使互相矛盾也全部如实保留，不得替客户修正。
 4. 容量统一为 GiB：TB/TiB 乘 1024；GB/GiB 保留数值。数量不能乘进单节点规格。
 5. 客户明确的区域和数量必须填写；未明确则保持 null。
@@ -1045,7 +1050,8 @@ def build_component_extraction_prompt(service_key: str, source_text: str = "") -
    当前组件完整模板规则：
    {service_rule}
    {variant_rule}
-8. 输出前在本次回答内部完成一次自检：逐个核对原文中的所有数字和单位是否都进入正确字段，并检查
+8. 输出前在本次回答内部完成一次自检：逐个核对原文中的所有数字和单位是否都进入正确字段或
+   unmapped_pricing_facts，并检查
    单项容量×数量=总容量。由另外两个客户值计算得到的字段，field_evidence 固定写 system_derived；
    system_derived 只能用于算术推导，不能用于猜测客户没说的型号、规格或功能。
 9. requirements 只允许保留会改变 AWS SKU、单价、计费数量或总金额的字段。用途、背景、软件小版本、

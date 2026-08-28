@@ -292,6 +292,18 @@ class RedisPlugin(ServicePlugin):
                     operation=operation,
                     amount=amount,
                     group="redis",
+                    source_fields=[
+                        "quantity",
+                        "hours_per_month",
+                        "requested_model",
+                        "vcpu",
+                        "memory_gib",
+                        "engine",
+                        "shards",
+                        "replicas_per_shard",
+                        "node_count",
+                        "purchase_option",
+                    ],
                 )
             )
         elif purchase_option == "reserved":
@@ -354,6 +366,24 @@ class RedisPlugin(ServicePlugin):
             rationale="节点规格来自 AWS 产品目录；节点数按 ElastiCache 分片与副本架构计算。",
             substitution_notice=notice,
             usage_lines=usage_lines,
+            applied_requirement_fields=(
+                [
+                    "quantity",
+                    "hours_per_month",
+                    "requested_model",
+                    "vcpu",
+                    "memory_gib",
+                    "engine",
+                    "shards",
+                    "replicas_per_shard",
+                    "node_count",
+                    "purchase_option",
+                    "reserved_term_years",
+                    "payment_option",
+                ]
+                if purchase_option == "reserved"
+                else []
+            ),
             monthly_commitment_cost=monthly_commitment_cost,
             upfront_commitment_cost=upfront_commitment_cost,
         )
