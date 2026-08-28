@@ -55,6 +55,10 @@ from app.domain.structured_component_updates import (
     apply_component_update,
     decode_component_update,
 )
+from app.integrations.aws_regions import (
+    bilingual_aws_region_label,
+    commercial_aws_region_options,
+)
 from app.integrations.calculator_web import (
     AwsCalculatorWebAutomator,
     GenericCalculatorInput,
@@ -115,7 +119,11 @@ class QuoteService:
             return {"regions": [], "requires_confirmation": True}
         return await identifier(text)
 
-    def recover_configuration_review_after_failure(self, draft_id: str | None) -> None:
+    def recover_configuration_review_after_failure(
+        self,
+        draft_id: str | None,
+        customer_request: str | None = None,
+    ) -> None:
         """Return a failed customer edit to the editable table immediately."""
 
         if not draft_id or self._confirmation_sessions is None:
@@ -129,8 +137,16 @@ class QuoteService:
         restored = self._confirmation_sessions.restore_draft(draft_id)
         if restored is None:
             return
-        customer_request, intent = restored
-        self._drafts[draft_id] = (customer_request, intent.model_copy(deep=True))
+        stored_customer_request, intent = restored
+        # A failed brand-new request can arrive while the browser still holds
+        # the previous draft id. Never roll that unrelated customer link back
+        # into review or attach the new workload to the old confirmation URL.
+        if customer_request is not None and stored_customer_request != customer_request:
+            return
+        self._drafts[draft_id] = (
+            stored_customer_request,
+            intent.model_copy(deep=True),
+        )
         self._confirmation_sessions.prepare_configuration_review(
             draft_id=draft_id,
             intent=intent,
@@ -201,6 +217,8 @@ class QuoteService:
         configuration_revision_component_ids: set[int] = set()
         configuration_revision_scope_ids: set[int] | None = None
         configuration_revision_original_intent: ParsedIntent | None = None
+        addition_only = False
+        new_component_ids: set[int] = set()
         cached = self._drafts.get(request.draft_id) if request.draft_id else None
         if cached is None and request.draft_id and self._confirmation_sessions is not None:
             cached = self._confirmation_sessions.restore_draft(request.draft_id)
@@ -560,6 +578,34 @@ class QuoteService:
         # the original request; explicit component regions still win.
         DeepSeekIntentParser._inherit_single_workload_region(intent, request.customer_request)
         DeepSeekIntentParser._ensure_missing_region_ambiguity(intent)
+
+        # Product identity is the routing key for every later field template,
+        # region check and price adapter.  An isolated AI identity lookup may
+        # exhaust its retries, but that must never turn a generic workload
+        # heading into a fabricated "managed or EC2 self-hosted" customer
+        # question.  Stop at the internal boundary and let the existing retry
+        # action rerun the affected component; all successfully resolved
+        # components remain cacheable and are not reprocessed.
+        unresolved_identities = [
+            {
+                "component_id": str(index + 1),
+                "display_name": component.calculator_service_name or component.service,
+                "source_text": component.source_text,
+                "reason": component.field_sources.get(
+                    "_identity_resolution_reason",
+                    "没有从 AWS 官方产品清单中确定唯一匹配结果",
+                ),
+            }
+            for index, component in enumerate(intent.services)
+            if component.field_sources.get("_identity_resolution_status") == "failed"
+        ]
+        if unresolved_identities:
+            raise ManualConfirmationRequired(
+                "部分组件名称尚未完成 AWS 官方产品匹配；系统已单独重试失败组件，"
+                "未确认前不会生成客户选择题或继续报价",
+                code="service_identity_resolution_failed",
+                components=unresolved_identities,
+            )
         self._apply_sales_pricing_choice(intent, request)
         parse_elapsed = time.perf_counter() - started_at
         logger.info("Quote preview AI parse completed in %.2fs", parse_elapsed)
@@ -949,7 +995,11 @@ class QuoteService:
                                 display_name=display_name,
                                 region=service.region or "未指定区域",
                                 quantity=service.quantity,
-                                requirements=normalized,
+                                # Pricing adapters receive a normalized copy,
+                                # but the review UI must keep the customer's
+                                # original structure (for example separate
+                                # system and data disks).
+                                requirements=dict(current.requirements),
                                 source_text=current.source_text,
                                 selection_reason="需要客户选择可用区域或替代方案",
                                 requires_confirmation=True,
@@ -989,7 +1039,7 @@ class QuoteService:
                             display_name=display_name,
                             region=service.region or "未指定区域",
                             quantity=service.quantity,
-                            requirements=normalized,
+                            requirements=dict(current.requirements),
                             source_text=current.source_text,
                             selection_reason=issue_message,
                             status="technical_issue",
@@ -1027,7 +1077,7 @@ class QuoteService:
                         display_name=display_name,
                         region=service.region or "未指定区域",
                         quantity=service.quantity,
-                        requirements=normalized,
+                        requirements=dict(current.requirements),
                         source_text=current.source_text,
                         selection_reason="需要客户补充或确认配置",
                         requires_confirmation=True,
@@ -1062,7 +1112,7 @@ class QuoteService:
                     "component_id": str(index),
                     "display_name": display_name,
                     "quantity": current.quantity,
-                    "requirements": normalized,
+                    "requirements": dict(current.requirements),
                     "source_text": current.source_text,
                     "status": ("customer_issue" if selection.requires_confirmation else "ready"),
                     "confirmation_reason": confirmation_reason,
@@ -1119,11 +1169,62 @@ class QuoteService:
                         "aws_start",
                         f"组件 {index + 1}｜{display_name}｜正在查询 AWS 官方规格",
                     )
-                result = await preview_one(index, service)
+                try:
+                    result = await preview_one(index, service)
+                except Exception as exc:
+                    # An adapter bug or malformed cached value belongs to this
+                    # component only. Do not let asyncio.gather cancel the
+                    # remaining independent services or collapse the whole
+                    # quote into an opaque internal-error page.
+                    logger.exception(
+                        "Unexpected component preview failure for %s (index %d)",
+                        display_name,
+                        index,
+                    )
+                    technical_error = ManualConfirmationRequired(
+                        "组件内部校验本次未完成",
+                        code="component_validation_backend_unavailable",
+                        service_index=index,
+                        display_name=display_name,
+                        error_type=type(exc).__name__,
+                    )
+                    issue_message = (
+                        "该组件内部校验本次失败，系统只会重试这一项，"
+                        "不会让整份报价重新运行。"
+                    )
+                    result = (
+                        index,
+                        PreviewSelection(
+                            component_id=str(index),
+                            service=service.service,
+                            display_name=display_name,
+                            region=service.region or "未指定区域",
+                            quantity=service.quantity,
+                            requirements=dict(service.requirements),
+                            source_text=service.source_text,
+                            selection_reason=issue_message,
+                            status="technical_issue",
+                            issue_message=issue_message,
+                            issue_code=technical_error.code,
+                            issue_category="retryable",
+                        ),
+                        None,
+                        ExecutionEvent(
+                            stage="aws",
+                            message=(
+                                f"第 {index + 1} 项内部校验未完成：{display_name}；"
+                                "已隔离该组件并等待单独重试"
+                            ),
+                            status="warning",
+                        ),
+                        technical_error,
+                    )
                 if reporter is not None:
                     selection = result[1]
                     state = (
-                        "需要客户确认"
+                        "等待单独重试"
+                        if selection is not None and selection.status == "technical_issue"
+                        else "需要客户确认"
                         if selection is not None and selection.requires_confirmation
                         else "官方规格核验完成"
                     )
@@ -1741,10 +1842,18 @@ class QuoteService:
             )
         for notice in notices:
             if not confirmation_options.get(notice):
+                notice_meta = confirmation_components.get(notice)
+                service: ServiceRequirement | None = None
+                if notice_meta is not None:
+                    component_index = notice_meta[0]
+                    if component_index is not None and component_index.isdigit():
+                        index = int(component_index)
+                        if 0 <= index < len(intent.services):
+                            service = intent.services[index]
                 generated = (
                     self._region_confirmation_options()
                     if self._is_region_confirmation_notice(notice)
-                    else self._default_confirmation_options(notice)
+                    else self._default_confirmation_options(notice, service)
                 )
                 if generated:
                     confirmation_options[notice] = generated
@@ -1794,6 +1903,18 @@ class QuoteService:
             )
             for notice in notices
         ]
+        if addition_only and new_component_ids:
+            # A customer addition is an isolated component workflow.  Existing
+            # rows may retain an older unresolved edit notice, but those rows
+            # must never be folded into the new component's question window.
+            # Keep only questions produced by the newly appended component(s).
+            added_component_ids = {str(index) for index in new_component_ids}
+            confirmation_items = [
+                item
+                for item in confirmation_items
+                if item.component_id in added_component_ids
+            ]
+            notices = [item.question for item in confirmation_items]
         unavailable_choices = [
             item.question
             for item in confirmation_items
@@ -1859,7 +1980,23 @@ class QuoteService:
         )
         if self._confirmation_sessions is not None and customer_link_publication_allowed:
             if confirmation_text:
-                if configuration_revision_requested:
+                if addition_only and new_component_ids:
+                    # Unlike an edit to an existing validated row, a new row
+                    # has no previous value to roll back to.  Persist the new
+                    # component and, when important information is missing,
+                    # ask only that component's questions on the same stable
+                    # customer link.  The old confirmed rows remain immutable
+                    # and are not sent back through the catalog.
+                    confirmation_token = self._confirmation_sessions.create_or_replace(
+                        draft_id=draft_id,
+                        customer_request=request.customer_request,
+                        customer_summary=intent.customer_summary,
+                        intent=intent,
+                        confirmation_text=confirmation_text,
+                        items=confirmation_items,
+                        quote_request=request,
+                    )
+                elif configuration_revision_requested:
                     # A later edit belongs to the final configuration table.
                     # Never throw the customer back into the full-page initial
                     # questionnaire and never publish the AI's unvalidated
@@ -2045,9 +2182,9 @@ class QuoteService:
                 return index
         return None
 
-    @staticmethod
+    @classmethod
     def _compact_candidate_options(
-        candidates: list[CandidateOption], requirement: object
+        cls, candidates: list[CandidateOption], requirement: object
     ) -> list[ConfirmationOption]:
         requirements = getattr(requirement, "requirements", {})
         requested_vcpu = requirements.get("vcpu") if isinstance(requirements, dict) else None
@@ -2087,10 +2224,9 @@ class QuoteService:
         options: list[ConfirmationOption] = []
         for candidate in ordered:
             if candidate.family == "aws_region":
-                label = str(candidate.specifications.get("label") or candidate.model)
                 options.append(
                     ConfirmationOption(
-                        label=label,
+                        label=cls._localized_region_label(candidate.model),
                         value=candidate.model,
                         specifications=candidate.specifications,
                     )
@@ -2571,23 +2707,69 @@ class QuoteService:
         hydrated: list[ConfirmationItem] = []
         changed = False
         for item in session.confirmation_items:
+            configuration = configurations.get(item.component_id or "")
+            component = (
+                ServiceRequirement(
+                    service=configuration.service,
+                    calculator_service_name=configuration.display_name,
+                    region=configuration.region,
+                    quantity=configuration.quantity,
+                    requirements=dict(configuration.requirements),
+                    source_text=configuration.source_text,
+                )
+                if configuration is not None
+                else None
+            )
+
+            # Pending links may have persisted raw region codes before the
+            # customer-facing localization rule was introduced. Upgrade those
+            # labels on read without changing the official supported-region
+            # list or the stored decision value.
+            localized_options = [
+                option.model_copy(
+                    update={"label": self._localized_region_label(option.value)}
+                )
+                if re.fullmatch(r"[a-z]{2}(?:-[a-z0-9]+)+-\d+", option.value)
+                else option
+                for option in item.options
+            ]
+            if localized_options != item.options:
+                item = item.model_copy(update={"options": localized_options})
+                changed = True
+
+            # Links created before managed alternatives carried their details
+            # used a generic "采用 AWS 托管方案" option. Rebuild every pending
+            # architecture choice on read, even when it already has options,
+            # so old links immediately show the recommended product, function
+            # and migration difference instead of requiring a new quote run.
+            if "自建" in item.question and any(
+                marker in item.question.casefold() for marker in ("托管", "managed", "aws")
+            ):
+                architecture_options = self._default_confirmation_options(
+                    item.question, component
+                )
+                if architecture_options and architecture_options != item.options:
+                    changed = True
+                    hydrated.append(
+                        item.model_copy(
+                            update={
+                                "options": architecture_options,
+                                "selection_mode": self._confirmation_selection_mode(
+                                    item.question, architecture_options
+                                ),
+                            }
+                        )
+                    )
+                    continue
+
             if item.options or not self._question_requires_finite_choice(item.question):
                 hydrated.append(item)
                 continue
-            configuration = configurations.get(item.component_id or "")
-            if configuration is None:
+            if component is None:
                 hydrated.append(
                     item.model_copy(update={"selection_mode": "buttons"})
                 )
                 continue
-            component = ServiceRequirement(
-                service=configuration.service,
-                calculator_service_name=configuration.display_name,
-                region=configuration.region,
-                quantity=configuration.quantity,
-                requirements=dict(configuration.requirements),
-                source_text=configuration.source_text,
-            )
             kind = self._service_kind(component.service)
             plugin = self._plugins.get(kind) if kind is not None else self._generic_plugin
             if plugin is None:
@@ -2624,7 +2806,137 @@ class QuoteService:
         return session.model_copy(update={"confirmation_items": hydrated})
 
     @staticmethod
-    def _default_confirmation_options(notice: str) -> list[ConfirmationOption]:
+    def _sanitize_choice_value(value: str) -> str:
+        return re.sub(r"[:|]", "_", value.strip())[:120]
+
+    @classmethod
+    def _extract_architecture_subject(
+        cls, notice: str, component: ServiceRequirement | None = None
+    ) -> str | None:
+        patterns = (
+            r"与\s*([^。；,，\n]+?)\s*完全等价",
+            r"^\s*(?:\d+[、.．]\s*)?([^。；,，\n]+?)\s*没有完全等价",
+            r"按原配置在 EC2 上自建\s*([^？。；,，\n]+)",
+            r"自建\s*([^）)？。；,，\n]+)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, notice)
+            if match:
+                subject = match.group(1).strip(" \u3000\n\t:：()（）")
+                if subject:
+                    return subject
+
+        if component is not None:
+            match = re.search(r"自建\s*([^）)]+)", component.calculator_service_name or "")
+            if match:
+                candidate = match.group(1).strip()
+                if candidate:
+                    return candidate
+            source = component.source_text or ""
+            source_match = re.search(r"^\s*\d+、?\s*([^：:，,\n]+)", source)
+            if source_match:
+                candidate = source_match.group(1).strip()
+                if candidate:
+                    return candidate
+        return None
+
+    @classmethod
+    def _managed_recommendations_for_subject(
+        cls, subject: str | None, notice: str
+    ) -> list[tuple[str, str, str, str]]:
+        if not subject:
+            return []
+
+        mapped = DeepSeekIntentParser._fully_managed_equivalent(subject)
+        recommendations: list[tuple[str, str, str, str]] = []
+        if mapped is not None:
+            service_key, display_name = mapped
+            feature_hint = {
+                "rds": "关系数据库",
+                "elasticache": "缓存",
+                "msk": "消息队列",
+                "mq": "消息服务",
+                "opensearch": "搜索与分析",
+                "documentdb": "文档数据库（MongoDB 兼容）",
+                "amp": "监控指标存储",
+                "eks": "容器编排",
+            }.get(service_key, "托管服务")
+            recommendations.append(
+                (
+                    service_key,
+                    display_name,
+                    feature_hint,
+                    "AWS 负责底层运维，配置方式和费用项目以该托管服务为准。",
+                )
+            )
+            return recommendations
+
+        # These are functionally related managed alternatives, not claims of
+        # complete equivalence.  The important difference is part of the same
+        # data record and is always shown to the customer.  Keeping the policy
+        # here gives every architecture question one shared presentation and
+        # submission path instead of product-specific UI branches.
+        folded = re.sub(r"[^a-z0-9]+", "", f"{subject} {notice}".casefold())
+        alternatives: tuple[
+            tuple[tuple[str, ...], str, str, str, str], ...
+        ] = (
+            (
+                ("doris", "apachedoris"),
+                "redshift",
+                "Amazon Redshift",
+                "托管数据仓库和分析查询",
+                "不是 Apache Doris，SQL 兼容性、数据导入方式和运维方式会变化。",
+            ),
+            (
+                ("flink", "apacheflink"),
+                "kinesis_analytics",
+                "Amazon Managed Service for Apache Flink",
+                "托管 Flink 流处理作业",
+                "计算资源和状态由 AWS 管理，不再按原来的固定服务器节点部署。",
+            ),
+            (
+                ("emqx", "tbmq", "tbmqemqx"),
+                "AWSIoT",
+                "AWS IoT Core",
+                "托管 MQTT 设备消息接入",
+                "不是原产品集群，协议能力、客户端接入和管理方式需要按 IoT Core 调整。",
+            ),
+            (
+                ("dolphinscheduler", "apachedolphinscheduler"),
+                "mwaa",
+                "Amazon Managed Workflows for Apache Airflow (MWAA)",
+                "托管工作流调度",
+                "不是 DolphinScheduler，任务定义、插件和迁移方式会变化。",
+            ),
+            (
+                ("clickhouse",),
+                "redshift",
+                "Amazon Redshift",
+                "托管数据仓库和分析查询",
+                "不是 ClickHouse，SQL 兼容性、表引擎和数据导入方式会变化。",
+            ),
+            (
+                ("xxljob",),
+                "step_functions",
+                "AWS Step Functions + EventBridge Scheduler",
+                "托管任务编排和定时触发",
+                "不是 XXL-JOB，任务注册、调度和执行方式需要重新适配。",
+            ),
+        )
+        for aliases, service_key, display_name, feature, difference in alternatives:
+            if any(alias in folded for alias in aliases):
+                recommendations.append(
+                    (service_key, display_name, feature, difference)
+                )
+                break
+        return recommendations
+
+    @classmethod
+    def _default_confirmation_options(
+        cls,
+        notice: str,
+        component: ServiceRequirement | None = None,
+    ) -> list[ConfirmationOption]:
         """Return safe business choices for questions with a closed answer set.
 
         These values are intentionally data, not model names. AWS model
@@ -2744,9 +3056,38 @@ class QuoteService:
                 ),
             ]
         if "自建" in notice and any(marker in folded for marker in ("托管", "managed", "aws")):
+            subject = cls._extract_architecture_subject(notice, component)
+            managed_choices = cls._managed_recommendations_for_subject(subject, notice)
+            # A generic "use AWS managed" choice is not an informed customer
+            # decision. If the exact recommended product and its role are not
+            # known, leave the option set empty so the existing publication
+            # gate keeps the question internal instead of sending a blind
+            # choice to the customer.
+            if not managed_choices:
+                return []
+            managed_service, managed_display, managed_func, managed_difference = (
+                managed_choices[0]
+            )
+            managed_label = f"采用 {managed_display}"
+            managed_description = (
+                f"主要用途：{managed_func}。与原方案的差别：{managed_difference}"
+            )
+            managed_value = (
+                f"managed:{cls._sanitize_choice_value(managed_service)}:"
+                f"{cls._sanitize_choice_value(managed_display)}:"
+                f"{cls._sanitize_choice_value(managed_func)}"
+            )
             return [
-                ConfirmationOption(label="采用 AWS 托管方案", value="aws_managed"),
-                ConfirmationOption(label="保留原产品自建", value="self_hosted"),
+                ConfirmationOption(
+                    label=managed_label,
+                    value=managed_value,
+                    description=managed_description,
+                ),
+                ConfirmationOption(
+                    label="保留原产品，在 Amazon EC2 上自建",
+                    value="self_hosted",
+                    description="继续使用原软件和原节点配置，由您负责软件安装、升级和运维。",
+                ),
             ]
         if any(marker in folded for marker in ("rds", "数据库")) and any(
             marker in folded for marker in ("部署方式", "单可用区", "主备", "multi-az", "multi_az")
@@ -2786,43 +3127,17 @@ class QuoteService:
         they intentionally do not appear in a commercial-account quote.
         """
 
-        regions = (
-            ("美国东部（弗吉尼亚北部）", "us-east-1"),
-            ("美国东部（俄亥俄）", "us-east-2"),
-            ("美国西部（加利福尼亚北部）", "us-west-1"),
-            ("美国西部（俄勒冈）", "us-west-2"),
-            ("非洲（开普敦）", "af-south-1"),
-            ("香港", "ap-east-1"),
-            ("台北", "ap-east-2"),
-            ("孟买", "ap-south-1"),
-            ("海得拉巴", "ap-south-2"),
-            ("新加坡", "ap-southeast-1"),
-            ("悉尼", "ap-southeast-2"),
-            ("雅加达", "ap-southeast-3"),
-            ("墨尔本", "ap-southeast-4"),
-            ("马来西亚", "ap-southeast-5"),
-            ("新西兰", "ap-southeast-6"),
-            ("泰国", "ap-southeast-7"),
-            ("东京", "ap-northeast-1"),
-            ("首尔", "ap-northeast-2"),
-            ("大阪", "ap-northeast-3"),
-            ("加拿大（中部）", "ca-central-1"),
-            ("加拿大西部（卡尔加里）", "ca-west-1"),
-            ("法兰克福", "eu-central-1"),
-            ("苏黎世", "eu-central-2"),
-            ("爱尔兰", "eu-west-1"),
-            ("伦敦", "eu-west-2"),
-            ("巴黎", "eu-west-3"),
-            ("斯德哥尔摩", "eu-north-1"),
-            ("米兰", "eu-south-1"),
-            ("西班牙", "eu-south-2"),
-            ("以色列（特拉维夫）", "il-central-1"),
-            ("墨西哥（中部）", "mx-central-1"),
-            ("中东（巴林）", "me-south-1"),
-            ("中东（阿联酋）", "me-central-1"),
-            ("南美洲（圣保罗）", "sa-east-1"),
-        )
-        return [ConfirmationOption(label=f"{name}（{code}）", value=code) for name, code in regions]
+        return [
+            ConfirmationOption(label=f"{label} · {code}", value=code)
+            for code, label in commercial_aws_region_options()
+        ]
+
+    @classmethod
+    def _localized_region_label(cls, region: str) -> str:
+        """Return one consistent customer-facing Chinese AWS region label."""
+
+        code = region.strip().casefold()
+        return f"{bilingual_aws_region_label(code)} · {code}"
 
     async def _apply_confirmation_responses(
         self,
@@ -2938,6 +3253,49 @@ class QuoteService:
                         }
                         component.field_sources["service"] = "customer_confirmation"
                         resolved_markers.append(("托管",))
+                continue
+
+            if answer_folded.startswith("managed:"):
+                parts = answer.split(":", 3)
+                managed_service = parts[1].strip().casefold() if len(parts) > 1 else ""
+                managed_display = (
+                    parts[2].strip() if len(parts) > 2 else "AWS 托管服务"
+                )
+                component = (
+                    intent.services[component_index]
+                    if component_index is not None and 0 <= component_index < len(intent.services)
+                    else bound_service(ServiceKind.EC2)
+                )
+                if component is not None and managed_service:
+                    subject = self._extract_architecture_subject(question, component)
+                    if managed_service == "aws_managed" and subject:
+                        mapped = DeepSeekIntentParser._fully_managed_equivalent(subject)
+                        if mapped is not None:
+                            managed_service = mapped[0]
+                            managed_display = mapped[1]
+                    mapped = (
+                        managed_service,
+                        managed_display
+                        or component.calculator_service_name
+                        or subject
+                        or "AWS 托管服务",
+                    )
+                    DeepSeekIntentParser._apply_fully_managed_equivalent(
+                        component,
+                        subject or component.calculator_service_name or "",
+                        component.source_text or question,
+                        mapped,
+                    )
+                    component.field_sources.pop("_pending_architecture_decision", None)
+                    component.field_sources["_architecture_decision"] = "aws_managed"
+                    component.field_evidence["_architecture_decision"] = (
+                        f"客户选择使用 {managed_display}"
+                    )
+                    component.query_action = None
+                    component.locked_fields = sorted(
+                        set(component.locked_fields) | {"_architecture_decision"}
+                    )
+                    resolved_markers.append(("托管", "选择"))
                 continue
 
             if answer_folded.startswith("billing_variant:"):
@@ -3251,11 +3609,22 @@ class QuoteService:
                     resolved_markers.append(("部署方式",))
                     continue
 
-            if "区域" in question_folded or "region" in question_folded:
+            if any(
+                marker in question_folded
+                for marker in ("地区", "区域", "地域", "region")
+            ):
                 region = self._region_from_confirmation(answer)
                 if region:
                     if component_index is not None and 0 <= component_index < len(intent.services):
-                        intent.services[component_index].region = region
+                        component = intent.services[component_index]
+                        component.region = region
+                        component.field_sources["region"] = "customer_confirmation"
+                        component.field_evidence["region"] = (
+                            "客户从该服务实际支持的 AWS 地区中选择"
+                        )
+                        component.locked_fields = sorted(
+                            set(component.locked_fields) | {"region"}
+                        )
                     else:
                         # A service-availability answer carries a component id
                         # and changes that row only. Quote-wide region questions
@@ -3267,6 +3636,13 @@ class QuoteService:
                                 ServiceKind.GLOBAL_ACCELERATOR,
                             }:
                                 service.region = region
+                                service.field_sources["region"] = "customer_confirmation"
+                                service.field_evidence["region"] = (
+                                    "客户确认本次方案的公共 AWS 地区"
+                                )
+                                service.locked_fields = sorted(
+                                    set(service.locked_fields) | {"region"}
+                                )
                     resolved_markers.append(("区域",))
                     continue
 
@@ -3456,8 +3832,15 @@ class QuoteService:
                             "请选择",
                         )
                     ):
-                        service.requirements.pop("vcpu", None)
-                        service.requirements.pop("memory_gib", None)
+                        for replaced_field in ("vcpu", "memory_gib"):
+                            service.requirements.pop(replaced_field, None)
+                            replaced_path = f"requirements.{replaced_field}"
+                            service.field_sources[replaced_path] = (
+                                "customer_confirmation_removed"
+                            )
+                            service.field_evidence[replaced_path] = (
+                                "客户已选择官方型号，以该型号规格替代原 CPU/内存约束"
+                            )
                         # This is an explicit customer override of the old
                         # CPU/memory sentence. Keep the source text for audit,
                         # but do not let literal recovery restore the rejected
@@ -3549,8 +3932,14 @@ class QuoteService:
             removed = set(previous_requirements) - set(service.requirements)
             for field in removed:
                 path = f"requirements.{field}"
-                sources.pop(path, None)
-                locked.discard(path)
+                if sources.get(path) == "customer_confirmation_removed":
+                    # A customer-selected official model intentionally replaces
+                    # the old literal CPU/memory shape.  Retain this tombstone so
+                    # later fact-recovery passes cannot silently restore it.
+                    locked.add(path)
+                else:
+                    sources.pop(path, None)
+                    locked.discard(path)
             service.field_sources = sources
             service.locked_fields = sorted(locked)
 
@@ -3564,6 +3953,7 @@ class QuoteService:
             or folded.startswith("cache_engine_version:")
             or folded.startswith("traffic_geography:")
             or folded.startswith("billing_variant:")
+            or folded.startswith("managed:")
             or folded.startswith("replace_service:")
             or folded == "exclude_component"
             or cls._region_from_confirmation(answer) is not None
@@ -3892,24 +4282,33 @@ class QuoteService:
 
     @staticmethod
     def _customer_service_name(selection: PreviewSelection, requirement: ServiceRequirement) -> str:
-        identity = " ".join(
+        primary_identity = " ".join(
             filter(
                 None,
                 (
                     selection.display_name,
                     selection.service,
                     requirement.product_identity,
-                    requirement.source_text,
                 ),
             )
         ).casefold()
+        source_identity = str(requirement.source_text or "").casefold()
+        identity = f"{primary_identity} {source_identity}"
+        # Resolve the purchased component before inspecting free-form source
+        # text. A DMS migration sentence naturally mentions PostgreSQL or
+        # MySQL, but those are migration endpoints, not the DMS product name.
+        if any(
+            marker in primary_identity
+            for marker in ("database migration", "databasemigration", "aws dms")
+        ) or selection.service == "dms":
+            return "AWS DMS"
         if "eks worker" in identity or "worker nodes" in identity:
             return "EKS 工作节点"
         if "elasticache" in identity or "redis" in identity:
             return "Redis"
-        if "postgres" in identity:
+        if "postgres" in primary_identity:
             return "RDS PostgreSQL"
-        if "mysql" in identity:
+        if "mysql" in primary_identity:
             return "RDS MySQL"
         if "opensearch" in identity:
             return "OpenSearch"
@@ -4603,6 +5002,14 @@ class QuoteService:
             "messages",
             "connection_minutes",
             "throughput_mbps_per_tib",
+            "write_records",
+            "memory_retention_hours",
+            "magnetic_retention_days",
+            "backup_storage_gib",
+            "cross_region_copy_gib",
+            "provisioned_throughput_mibps",
+            "kpu_count",
+            "kpu_hours",
         }
         for service in intent.services:
             requirements = service.requirements
@@ -4710,6 +5117,26 @@ class QuoteService:
             cached = self._confirmation_sessions.restore_draft(request.draft_id)
         if cached and cached[0] == request.customer_request:
             intent = cached[1].model_copy(deep=True)
+            if request.draft_id and self._confirmation_sessions is not None:
+                component_answers, global_answers = (
+                    self._confirmation_sessions.historical_answers_by_component(
+                        request.draft_id
+                    )
+                )
+                replay_responses = dict(global_answers)
+                replay_components: dict[str, int] = {}
+                for component_index, answers in component_answers.items():
+                    for question, answer in answers.items():
+                        response_key = self._scoped_confirmation_response_key(
+                            component_index, question
+                        )
+                        replay_responses[response_key] = answer
+                        replay_components[response_key] = component_index
+                await self._apply_confirmation_responses(
+                    intent,
+                    replay_responses,
+                    response_components=replay_components,
+                )
             if request.draft_id:
                 self._drafts[request.draft_id] = (
                     request.customer_request,
@@ -4837,7 +5264,59 @@ class QuoteService:
                 code="pricing_scenarios_unavailable",
             )
 
-        primary = scenario_quotes[0][1]
+        # A scenario is a real commitment comparison only when at least one
+        # component produced an official Reserved commitment line.  Generic
+        # usage services normally have no 1/3-year Reserved product; showing
+        # their unchanged on-demand total under a reserved heading is
+        # misleading.  Omit those duplicate columns when an on-demand column
+        # already exists, otherwise keep one clearly labelled fallback.
+        has_on_demand_scenario = any(
+            scenario_request.pricing_mode == "on_demand"
+            for scenario_request, _ in scenario_quotes
+        )
+        scenario_records: list[
+            tuple[QuoteRequest, QuoteResponse, dict[str, str]]
+        ] = []
+        kept_on_demand_fallback = False
+        for scenario_request, quote in scenario_quotes:
+            basis = self._component_pricing_basis(
+                quote.selections,
+                quote.priced_lines,
+                scenario_request.pricing_mode,
+            )
+            if (
+                scenario_request.pricing_mode != "on_demand"
+                and "reserved" not in basis.values()
+            ):
+                original_label = self._pricing_scenario_label(scenario_request)
+                unavailable_scenario_notices.append(
+                    f"{original_label}：本单没有服务取得这种官方预留价格，"
+                    "系统没有复制按需价冒充优惠价。"
+                )
+                if has_on_demand_scenario or kept_on_demand_fallback:
+                    continue
+                scenario_request = scenario_request.model_copy(
+                    update={
+                        "pricing_mode": "on_demand",
+                        "reserved_term_years": None,
+                        "reserved_term_options": None,
+                        "payment_option": None,
+                    }
+                )
+                basis = {
+                    selection.component_id or str(index): "on_demand"
+                    for index, selection in enumerate(quote.selections)
+                }
+                kept_on_demand_fallback = True
+            scenario_records.append((scenario_request, quote, basis))
+
+        if not scenario_records:
+            raise ManualConfirmationRequired(
+                "当前没有可展示的官方报价方案，请稍后重试",
+                code="pricing_scenarios_unavailable",
+            )
+
+        primary = scenario_records[0][1]
         if unavailable_scenario_notices:
             primary = primary.model_copy(
                 update={
@@ -4862,16 +5341,17 @@ class QuoteService:
                     quote.selections,
                     quote.priced_lines,
                 ),
+                component_pricing_basis=basis,
                 is_partial=quote.is_partial,
                 incomplete_component_ids=quote.incomplete_component_ids,
             )
-            for scenario_request, quote in scenario_quotes
+            for scenario_request, quote, basis in scenario_records
         ]
         self._validate_component_scenarios(primary.selections, scenarios)
         all_incomplete_component_ids = list(
             dict.fromkeys(
                 component_id
-                for _, quote in scenario_quotes
+                for _, quote, _ in scenario_records
                 for component_id in quote.incomplete_component_ids
             )
         )
@@ -4907,6 +5387,34 @@ class QuoteService:
                 if pattern.fullmatch(line.key)
             )
         return costs
+
+    @staticmethod
+    def _component_pricing_basis(
+        selections: list[SelectedResource],
+        priced_lines: list[PricedLine],
+        pricing_mode: str,
+    ) -> dict[str, str]:
+        """Expose whether each comparison cell has a real commitment price."""
+
+        basis: dict[str, str] = {}
+        for fallback_index, selection in enumerate(selections):
+            component_id = selection.component_id or str(fallback_index)
+            if pricing_mode == "on_demand":
+                basis[component_id] = "on_demand"
+                continue
+            try:
+                ordinal = int(component_id) + 1
+            except ValueError:
+                ordinal = fallback_index + 1
+            has_reserved_line = any(
+                line.key == f"s{ordinal}commit"
+                and line.operation.casefold() == "reserved"
+                for line in priced_lines
+            )
+            basis[component_id] = (
+                "reserved" if has_reserved_line else "on_demand_fallback"
+            )
+        return basis
 
     @staticmethod
     def _validate_component_scenarios(
@@ -5091,7 +5599,7 @@ class QuoteService:
                     )
             options = self._compact_candidate_options(candidates, service) if candidates else []
             if not options:
-                options = self._default_confirmation_options(question)
+                options = self._default_confirmation_options(question, service)
             items.append(
                 ConfirmationItem(
                     question=question,
@@ -5215,11 +5723,6 @@ class QuoteService:
                 requirements.pop(key, None)
 
             kind = QuoteService._service_kind(service.service)
-            is_memorydb = re.sub(
-                r"[^a-z0-9]", "", service.service.casefold()
-            ) in {"memorydb", "amazonmemorydb"}
-            if kind not in {ServiceKind.EC2, ServiceKind.RDS, ServiceKind.REDIS} and not is_memorydb:
-                continue
 
             if request.pricing_mode == "on_demand":
                 requirements["purchase_option"] = "on_demand"
@@ -5623,6 +6126,7 @@ class QuoteService:
                 "service_region_not_supported",
                 "auto_discovery_",
                 "pricing_service_registry_unavailable",
+                "service_identity_resolution_failed",
                 "msk_specification_not_found",
                 "product_identity_invariant_failed",
                 # BCM Pricing Calculator failures are AWS/API execution
@@ -5711,10 +6215,11 @@ class QuoteService:
             "unsupported_service",
         }:
             return False
-        return cls._catalog_issue_category(error, component) in {
-            "retryable",
-            "catalog_mapping",
-        }
+        # A catalog-mapping failure is deterministic: the component adapter
+        # has already performed its one bounded cache refresh. Repeating the
+        # same lookup cannot create a missing semantic mapping and only leaves
+        # the UI spinning. Only transient provider failures are retryable.
+        return cls._catalog_issue_category(error, component) == "retryable"
 
     @staticmethod
     def _catalog_issue_message(
@@ -7021,9 +7526,78 @@ class QuoteService:
                 service=service.service,
                 display_name=quote_input.calculator_service_name,
             )
+            # The Calculator agent returns the model name, while the preview
+            # stage has already verified that model's CPU and memory against
+            # the official regional catalog. Never display the customer's
+            # requested shape beside the selected model: that produced false
+            # combinations such as ``m7g.xlarge · 8C/16G`` and
+            # ``cache.m5.4xlarge · 64G``. Official model specifications always
+            # overwrite presentation aliases in the final quote.
+            reviewed_model = str(
+                service.requirements.get("_review_selected_model") or ""
+            ).strip()
+            reviewed_specifications = service.requirements.get(
+                "_review_selected_specifications"
+            )
+            official_specifications = (
+                dict(reviewed_specifications)
+                if (
+                    isinstance(reviewed_specifications, dict)
+                    and reviewed_model
+                    and self._models_equivalent(reviewed_model, group.selected_model)
+                )
+                else {}
+            )
+            if not official_specifications:
+                seed = PreviewSelection(
+                    component_id=str(index - 1),
+                    service=service.service,
+                    display_name=quote_input.calculator_service_name,
+                    region=service.region or request.region or "ap-southeast-1",
+                    quantity=service.quantity,
+                    requirements=dict(service.requirements),
+                    source_text=service.source_text,
+                    candidates=[],
+                )
+                candidates = await self._configuration_candidates(seed, service)
+                official_candidate = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if self._models_equivalent(candidate.model, group.selected_model)
+                    ),
+                    None,
+                )
+                if official_candidate is not None:
+                    official_specifications = dict(official_candidate.specifications)
+            requested_shape_present = any(
+                isinstance(service.requirements.get(field), (int, float))
+                and not isinstance(service.requirements.get(field), bool)
+                for field in ("vcpu", "memory_gib")
+            )
+            model_looks_sized = bool(
+                re.fullmatch(
+                    r"(?:db\.|cache\.)?[a-z][a-z0-9-]*\.[a-z0-9-]+(?:\.search)?",
+                    group.selected_model.casefold(),
+                )
+            )
+            if requested_shape_present and model_looks_sized and not {
+                "vCPU",
+                "memoryGiB",
+            }.issubset(official_specifications):
+                raise ManualConfirmationRequired(
+                    f"{quote_input.calculator_service_name} 已选中 {group.selected_model}，"
+                    "但系统尚未取得该型号对应的官方处理器和内存，已停止生成报价",
+                    code="calculator_model_specifications_unverified",
+                    service=service.service,
+                    model=group.selected_model,
+                    region=service.region or request.region,
+                )
             specifications = {
                 "quantity": quote_input.quantity,
-                **service.requirements,
+                **self._complete_selection_specifications(
+                    service, official_specifications
+                ),
             }
             for key in (
                 "storage_iops",

@@ -116,6 +116,19 @@ def test_prose_cannot_masquerade_as_model_or_numeric_field() -> None:
     assert normalized["memory_gib"] == 16
 
 
+def test_catalog_model_survives_service_prefix_difference_for_adapter_validation() -> None:
+    normalized = canonicalize_requirement_fields(
+        {
+            "requested_model": "r5.xlarge",
+            "storage_gib": 200,
+        },
+        service="dms",
+    )
+
+    assert normalized["requested_model"] == "r5.xlarge"
+    assert normalized["storage_gib"] == 200
+
+
 def test_valid_models_and_numeric_strings_still_survive_contract_validation() -> None:
     ec2 = canonicalize_requirement_fields(
         {"requested_model": "M6G.2XLARGE", "vcpu": "8 vCPU", "memory_gib": "32 GiB"},
@@ -128,3 +141,26 @@ def test_valid_models_and_numeric_strings_still_survive_contract_validation() ->
 
     assert ec2 == {"requested_model": "m6g.2xlarge", "vcpu": 8, "memory_gib": 32}
     assert msk == {"requested_model": "m7g.large", "broker_count": 3}
+
+
+def test_dynamic_official_numeric_fields_are_normalized_before_pricing() -> None:
+    normalized = canonicalize_requirement_fields(
+        {
+            "write_records": "2亿条",
+            "memory_retention_hours": "24小时",
+            "magnetic_retention_days": "180天",
+            "endpoint_count": "2个",
+            "task_count": "3个",
+            "kpu_count": "4KPU",
+        },
+        service="future_official_service",
+    )
+
+    assert normalized == {
+        "write_records": 200_000_000,
+        "memory_retention_hours": 24,
+        "magnetic_retention_days": 180,
+        "endpoint_count": 2,
+        "task_count": 3,
+        "kpu_count": 4,
+    }

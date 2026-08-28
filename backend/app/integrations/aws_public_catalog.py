@@ -180,6 +180,14 @@ class PublicAwsPriceCatalog:
             region_index = self._region_index(offer)
             regions = region_index.get("regions") or {}
             if isinstance(regions, dict):
+                # Some global offers publish an empty region index while their
+                # current all-regions document is the only price document.
+                # Falling through to that official document is safe because
+                # there are no regional rows to mix.  Previously these offers
+                # were reported as unsupported despite having a valid current
+                # version URL.
+                if not regions:
+                    return self._absolute_url(offer.current_version_url)
                 if region_code and isinstance(regions.get(region_code), dict):
                     path = str(regions[region_code].get("currentVersionUrl") or "")
                     if path:
@@ -269,6 +277,13 @@ class PublicAwsPriceCatalog:
         all_terms = document.get("terms") or {}
         on_demand = all_terms.get("OnDemand") or {}
         reserved = all_terms.get("Reserved") or {}
+        flat_rate = all_terms.get("FlatRate") or {}
+        flat_rate_plans = (
+            flat_rate.get("plans")
+            if isinstance(flat_rate, dict)
+            and isinstance(flat_rate.get("plans"), list)
+            else []
+        )
         if not isinstance(raw_products, dict):
             return []
         result: list[dict[str, Any]] = []
@@ -285,6 +300,13 @@ class PublicAwsPriceCatalog:
                 terms["OnDemand"] = on_demand[sku]
             if isinstance(reserved, dict) and isinstance(reserved.get(sku), dict):
                 terms["Reserved"] = reserved[sku]
+            matching_plans = [
+                plan
+                for plan in flat_rate_plans
+                if isinstance(plan, dict) and str(plan.get("sku") or "") == str(sku)
+            ]
+            if matching_plans:
+                terms["FlatRate"] = {"plans": matching_plans}
             result.append(
                 {
                     "formatVersion": document.get("formatVersion") or "v1.0",

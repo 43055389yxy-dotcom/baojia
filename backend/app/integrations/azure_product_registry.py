@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from app.core.data_paths import AZURE_DATA_ROOT
+
 AZURE_PRODUCT_REGISTRY_SCHEMA_VERSION = 1
 
 
@@ -39,9 +41,7 @@ class AzureProductRegistry:
     """Azure-only identity and field registry backed by its own SQLite file."""
 
     def __init__(self, database_path: Path | None = None) -> None:
-        self._database_path = database_path or (
-            Path(__file__).resolve().parents[2] / ".cache" / "azure_product_registry.sqlite3"
-        )
+        self._database_path = database_path or AZURE_DATA_ROOT / "azure_product_registry.sqlite3"
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._initialize()
@@ -184,11 +184,7 @@ class AzureProductRegistry:
                 existed = True
             else:
                 base_key = _service_key(service_name)
-                service_key = (
-                    f"azure_catalog_{base_key}"
-                    if len(matches) > 1
-                    else base_key
-                )
+                service_key = f"azure_catalog_{base_key}" if len(matches) > 1 else base_key
                 existed = self.resolve_product(service_key) is not None
             self.register_identity(
                 service_key=service_key,
@@ -211,9 +207,7 @@ class AzureProductRegistry:
             if row is None:
                 return
             aliases = {
-                str(value)
-                for value in json.loads(str(row["aliases_json"]))
-                if str(value).strip()
+                str(value) for value in json.loads(str(row["aliases_json"])) if str(value).strip()
             }
             aliases.add(alias)
             connection.execute(

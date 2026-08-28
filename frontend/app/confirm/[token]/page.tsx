@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { ConfigurationOptionPicker, type ConfigurationChoice } from "../../components/configuration-option-picker";
 
 type Item = {
@@ -108,13 +108,42 @@ type Session = {
   configuration_items: ConfigurationItem[];
 };
 
+type PendingAddition = {
+  sourceText: string;
+  existingComponentIds: string[];
+  expectedNumber: number;
+};
+
+function additionStorageKey(token: string): string {
+  return `astraquote:aws:addition:${token}`;
+}
+
+function readPendingAddition(token: string): PendingAddition | null {
+  if (typeof window === "undefined" || !token) return null;
+  try {
+    const raw = window.sessionStorage.getItem(additionStorageKey(token));
+    if (!raw || raw === "active") return null;
+    const parsed = JSON.parse(raw) as Partial<PendingAddition>;
+    if (!parsed.sourceText || !Array.isArray(parsed.existingComponentIds)) return null;
+    return {
+      sourceText: parsed.sourceText,
+      existingComponentIds: parsed.existingComponentIds.map(String),
+      expectedNumber: Number(parsed.expectedNumber) || parsed.existingComponentIds.length + 1,
+    };
+  } catch {
+    return null;
+  }
+}
+
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "/api/backend";
+const EXPECTED_CLOUD_PROVIDER = "aws" as const;
 const DELETE_COMPONENT_MARKER = "__DELETE_COMPONENT__";
 const FIELD_LABELS: Record<string, string> = {
   requested_model: "官方型号",
   vcpu: "处理器", memory_gib: "内存", operating_system: "操作系统",
   architecture: "处理器架构", tenancy: "租用方式", business_type: "实例用途",
   system_disk_gib: "系统盘", total_system_disk_gib: "系统盘总容量",
+  additional_ebs_volumes: "数据盘", size_gib: "容量", count_per_instance: "每台数量",
   total_worker_system_disk_gib: "工作节点系统盘总容量", storage_gib: "单项存储容量",
   total_storage_gib: "总存储容量", storage_gib_per_node: "每节点存储",
   storage_gib_per_broker: "每个 Broker 存储", engine: "数据库或缓存引擎", engine_version: "引擎版本",
@@ -154,9 +183,9 @@ const FIELD_LABELS: Record<string, string> = {
   requests: "每月请求量", memory_mb: "函数内存", duration_ms: "平均执行时长",
   flow_runs: "每月流程运行次数", bucket_count: "存储桶数量", object_count: "对象数量",
   messages: "每月消息数", connection_minutes: "每月连接分钟",
-  throughput_mbps_per_tib: "每 TiB 吞吐量（MB/s/TiB）",
+  throughput_mbps: "吞吐量（MB/s）", throughput_mbps_per_tib: "每 TiB 吞吐量（MB/s/TiB）",
   https_requests: "每月 HTTPS 请求量", listeners: "监听器数量",
-  storage_iops: "存储 IOPS", storage_throughput_mbps: "存储吞吐量",
+  iops: "IOPS", storage_iops: "存储 IOPS", storage_throughput_mbps: "存储吞吐量",
   backup_retention_days: "备份保留天数", read_replica_count: "只读副本数",
   detailed_monitoring: "详细监控", performance_insights: "性能分析",
   enhanced_monitoring: "增强监控", dedicated_master: "专用主节点",
@@ -173,7 +202,9 @@ const FIELD_LABELS: Record<string, string> = {
   backup_storage_gib: "备份存储量", restore_gib: "恢复数据量",
   deployment_updates: "本地服务器更新次数", author_users: "作者数量",
   reader_users: "读者数量", session_capacity: "读者会话次数",
-  spice_gib: "SPICE 容量",
+  spice_gib: "SPICE 容量", endpoint_hours: "端点运行小时",
+  resource_count: "计费资源数量", memory_store_gib_hours: "内存存储量（GiB 小时）",
+  magnetic_store_gib_months: "磁性存储量（GiB 月）",
   accelerators: "加速器数量", broker_hours: "Broker 运行小时",
   scheduled_invocations: "计划调用次数", schedules: "计划数量",
   io_requests: "I/O 请求量", api_calls: "每月服务发现 API 调用量",
@@ -186,8 +217,66 @@ const FIELD_LABELS: Record<string, string> = {
   state_transitions: "状态转换次数", duration_gb_seconds: "执行时长（GB-秒）",
   input_tokens: "输入 Token 数", output_tokens: "输出 Token 数", images: "图片数量",
   data_in_gib: "每月写入数据量", data_out_gib: "每月读取数据量",
+  throughput_mode: "吞吐模式", provisioned_throughput_mibps: "预置吞吐量",
   capacity_mode: "容量模式", put_payload_units: "写入计费单位数",
   read_request_units: "读请求单位", write_request_units: "写请求单位",
+  active_connections_per_minute: "每分钟活动连接数",
+  advanced_security: "高级安全功能",
+  aurora_cluster: "Aurora 集群",
+  average_connection_duration_seconds: "平均连接时长（秒）",
+  backup_frequency: "备份频率", cold_storage_gib: "冷存储容量",
+  crawler_dpu_hours: "Crawler 运行量（DPU 小时）",
+  cross_region_copy_gib: "跨区域复制数据量",
+  data_catalog_objects: "数据目录对象数量", data_tiering: "数据分层",
+  data_transfer_in_gib_per_instance: "每台每月入站流量",
+  data_transfer_out_gib_per_instance: "每台每月出站流量",
+  data_transfer_regional_gib_per_instance: "每台每月区域内流量",
+  deliveries: "投递数量", delivery_type: "投递方式",
+  deployment_mode: "部署模式", destination: "目标位置",
+  destination_geography: "目标地区", dpu_hours: "运行量（DPU 小时）",
+  ebs_iops: "磁盘 IOPS", ebs_throughput_mbps: "磁盘吞吐量",
+  edition: "版本", endpoint_count: "端点数量", endpoint_type: "终端类型",
+  engine_type: "引擎类型", ephemeral_storage_gib: "临时存储容量",
+  ephemeral_storage_mb: "临时存储容量（MB）",
+  extended_retention_hours: "延长保留时长（小时）",
+  file_system_type: "文件系统类型", include_logs: "包含日志",
+  include_metrics: "包含指标", instance_hours: "实例运行小时",
+  interactive_session_dpu_hours: "交互会话运行量（DPU 小时）",
+  job_count: "作业数量", job_type: "作业类型", key_type: "密钥类型",
+  launch_type: "运行方式", lcu_count: "LCU 数量",
+  lifecycle_policy: "生命周期规则", listener_count: "监听器数量",
+  machine_to_machine_tokens: "机器间访问令牌数量",
+  monthly_active_users: "每月活跃用户数", multi_az: "多可用区部署",
+  new_connections_per_second: "每秒新建连接数",
+  payload_size_kib: "单次消息大小（KiB）", price_class: "价格区域范围",
+  processed_bytes_ec2_ip_gib_per_hour: "每小时处理数据量",
+  protected_resource: "受保护资源", protected_service: "备份对象服务",
+  provisioned_concurrency: "预置并发数",
+  provisioned_throughput_units: "预置吞吐容量",
+  queue_type: "队列类型", request_size_mb: "单次请求大小（MB）",
+  requests_per_second: "每秒请求数", rotation_enabled: "自动轮换",
+  rule_evaluations_per_request: "每次请求规则检查数",
+  rule_evaluations_per_second: "每秒规则检查数", scheme: "访问方式",
+  shard_hours: "分片运行小时", snapshot_frequency: "快照频率",
+  snapshot_retention_days: "快照保留天数", source_regions: "来源区域",
+  source_storage_gib_per_node: "原节点存储容量",
+  streams_read_requests: "Streams 读取请求量",
+  task_count: "任务数量", task_hours: "任务运行小时", tasks: "运行任务数",
+  traces_recorded: "记录的追踪数量", traces_retrieved: "查询的追踪数量",
+  traces_stored: "存储的追踪数量", user_count: "用户数量", users: "用户数量",
+  warm_node_count: "Warm 节点数量", warm_storage_gib: "温存储容量",
+  worker_management: "工作节点管理方式", worker_memory_gib: "工作节点内存",
+  worker_node_count: "工作节点总数", worker_nodes_per_cluster: "每集群工作节点数",
+  worker_requested_model: "工作节点型号", worker_system_disk_gib: "工作节点系统盘",
+  worker_vcpu: "工作节点处理器", workflow_type: "工作流类型",
+  hours_per_user_per_day: "每位用户每天使用小时",
+  kpu_count: "KPU 数量", kpu_hours: "KPU 运行小时",
+  magnetic_retention_days: "磁性存储保留天数",
+  memory_retention_hours: "内存存储保留小时",
+  product_variant: "产品类型", quantity_detail: "数量说明",
+  reader_nodes: "只读节点数", replica_count: "副本数量",
+  user_volume_gib: "用户盘容量", write_records: "写入记录数量",
+  writer_nodes: "写入节点数",
 };
 
 const AWS_SERVICE_EDIT_FIELDS: Record<string, string[]> = {
@@ -210,22 +299,7 @@ const AWS_SERVICE_EDIT_FIELDS: Record<string, string[]> = {
   cloudwatch: ["log_ingestion_gib"],
 };
 
-const AZURE_SERVICE_EDIT_FIELDS: Record<string, string[]> = {
-  azure_vm: ["requested_sku", "vcpu", "memory_gib", "operating_system"],
-  managed_disks: ["requested_sku", "disk_type", "disk_size_gib", "storage_gib", "iops", "throughput_mbps"],
-  azure_sql: ["requested_sku", "service_tier", "compute_model", "vcore", "memory_gib", "storage_gib", "high_availability", "license_model"],
-  azure_postgresql: ["requested_sku", "service_tier", "compute_model", "vcore", "memory_gib", "storage_gib", "high_availability", "backup_retention_days"],
-  azure_mysql: ["requested_sku", "service_tier", "compute_model", "vcore", "memory_gib", "storage_gib", "high_availability", "backup_retention_days"],
-  azure_cache: ["requested_sku", "service_tier", "capacity", "memory_gib", "replicas", "shards"],
-  blob_storage: ["requested_sku", "access_tier", "redundancy", "storage_gib", "write_operations", "read_operations", "data_retrieval_gib"],
-  load_balancer: ["requested_sku", "load_balancer_type", "rules", "data_processed_gib"],
-  application_gateway: ["requested_sku", "service_tier", "capacity_units", "data_processed_gib"],
-  front_door: ["requested_sku", "service_tier", "data_transfer_out_gib", "requests"],
-  bandwidth: ["data_transfer_out_gib", "source_region", "destination_zone"],
-  aks: ["service_tier", "cluster_count", "worker_requested_sku", "worker_node_count", "worker_vcpu", "worker_memory_gib", "worker_system_disk_gib"],
-  monitor: ["log_ingestion_gib", "retention_days", "custom_metrics", "alerts"],
-  api_management: ["requested_sku", "service_tier", "units", "requests", "data_transfer_out_gib"],
-};
+const AZURE_SERVICE_EDIT_FIELDS: Record<string, string[]> = {};
 
 // Optional billing dimensions are service contracts, not a universal menu.
 // Never show one product's storage/log/query fields on an unrelated product.
@@ -254,7 +328,7 @@ const AWS_SERVICE_OPTIONAL_USAGE_FIELDS: Record<string, string[]> = {
   global_accelerator: ["data_transfer_out_gib"],
   msk: ["broker_hours", "storage_gib_per_broker", "data_transfer_in_gib", "data_transfer_out_gib"],
   apigateway: ["requests", "messages", "connection_minutes", "data_transfer_out_gib"],
-  fsx: ["storage_gib", "throughput_mbps_per_tib", "iops", "backup_storage_gib"],
+  fsx: ["storage_gib", "throughput_mbps", "throughput_mbps_per_tib", "iops", "backup_storage_gib"],
   scheduler: ["scheduled_invocations", "schedules"],
   opensearch: ["total_storage_gib", "data_transfer_out_gib"],
   documentdb: ["storage_gib", "io_requests", "backup_storage_gib"],
@@ -264,8 +338,7 @@ const AWS_SERVICE_OPTIONAL_USAGE_FIELDS: Record<string, string[]> = {
   kms: ["key_count", "requests"],
   lambda: ["memory_mb", "duration_ms", "requests"],
   dynamodb: ["read_request_units", "write_request_units", "storage_gib", "backup_storage_gib", "restore_gib"],
-  efs: ["storage_gib"],
-  fsx: ["storage_gib", "backup_storage_gib"],
+  efs: ["storage_gib", "provisioned_throughput_mibps", "data_in_gib", "data_out_gib"],
   sns: ["requests", "data_transfer_out_gib"],
   kinesis: ["data_in_gib", "data_out_gib"],
   redshift: ["managed_storage_gib", "snapshot_storage_gib", "hours_per_month"],
@@ -829,13 +902,16 @@ export default function CustomerConfirmationPage() {
   const [componentEditorNotices, setComponentEditorNotices] = useState<Record<string, string>>({});
   const [transientNotice, setTransientNotice] = useState("");
   const [recentlyUpdatedComponentIds, setRecentlyUpdatedComponentIds] = useState<string[]>([]);
+  const [pendingAddition, setPendingAddition] = useState<PendingAddition | null>(() => (
+    readPendingAddition(token)
+  ));
   const [addingConfigurationInProgress, setAddingConfigurationInProgress] = useState(() => {
     if (typeof window === "undefined" || !token) return false;
-    return window.sessionStorage.getItem(`astraquote:addition:${token}`) === "active";
+    return Boolean(window.sessionStorage.getItem(additionStorageKey(token)));
   });
   const [regionConfirmationInProgress, setRegionConfirmationInProgress] = useState(() => {
     if (typeof window === "undefined" || !token) return false;
-    return window.sessionStorage.getItem(`astraquote:region-confirmation:${token}`) === "active";
+    return window.sessionStorage.getItem(`astraquote:aws:region-confirmation:${token}`) === "active";
   });
   const regionalRegions = useMemo(() => Array.from(new Set(
     (session?.configuration_items ?? [])
@@ -869,7 +945,54 @@ export default function CustomerConfirmationPage() {
     && Boolean(session?.confirmation_items.length);
   const showConfigurationReview = session?.status === "configuration_review"
     || ((isConfigurationRefreshActive || isSessionReviewing)
+      && Boolean(session?.configuration_items.length))
+    || (addingConfigurationInProgress
+      && hasStandaloneConfirmationQuestions
       && Boolean(session?.configuration_items.length));
+
+  const clearPendingAddition = useCallback(() => {
+    setPendingAddition(null);
+    setAddingConfigurationInProgress(false);
+    if (typeof window !== "undefined") {
+      window.sessionStorage.removeItem(additionStorageKey(token));
+    }
+  }, [token]);
+
+  const finishPendingAddition = useCallback((payload: Session): boolean => {
+    const pending = pendingAddition ?? readPendingAddition(token);
+    if (!pending) {
+      clearPendingAddition();
+      return false;
+    }
+    const originalIds = new Set(pending.existingComponentIds);
+    const addedItems = payload.configuration_items.filter(
+      (item) => !originalIds.has(item.component_id),
+    );
+    if (addedItems.length === 0) {
+      setAdditionFeedback(pending.sourceText);
+      setAddingConfiguration(true);
+      setError(payload.confirmation_text?.includes("没有完成")
+        ? payload.confirmation_text
+        : "这次没有生成新的配置项，原内容已保留，请补充服务名称、数量或主要规格后重试。");
+      clearPendingAddition();
+      return false;
+    }
+    const addedNumbers = addedItems.map(
+      (item, index) => item.component_number ?? String(pending.expectedNumber + index),
+    );
+    setRecentlyUpdatedComponentIds(addedItems.map((item) => item.component_id));
+    setTransientNotice(`已新增为第 ${addedNumbers.join("、")} 项，原有配置未改动。`);
+    setAdditionFeedback("");
+    setAddingConfiguration(false);
+    clearPendingAddition();
+    window.setTimeout(() => {
+      document.getElementById(`configuration-${addedItems[0].component_id}`)?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+    }, 80);
+    return true;
+  }, [clearPendingAddition, pendingAddition, token]);
 
   function discardComponentDraft(componentId: string) {
     setComponentDrafts((current) => {
@@ -1128,6 +1251,9 @@ export default function CustomerConfirmationPage() {
       .then(async (response) => {
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.message ?? "确认单不存在或已失效");
+        if (payload.cloud_provider !== EXPECTED_CLOUD_PROVIDER) {
+          throw new Error("该链接不属于 AWS 报价系统，系统已阻止跨云读取。");
+        }
         const expectedPrefix = payload.cloud_provider === "azure" ? "azure_" : "aws_";
         if (!token.startsWith(expectedPrefix)) {
           throw new Error("确认链接的云厂商标识不一致，系统已阻止打开。");
@@ -1143,22 +1269,22 @@ export default function CustomerConfirmationPage() {
           && payload.confirmation_items.every(isRegionConfirmation)
         ) {
           setRegionConfirmationInProgress(true);
-          window.sessionStorage.setItem(`astraquote:region-confirmation:${token}`, "active");
+          window.sessionStorage.setItem(`astraquote:aws:region-confirmation:${token}`, "active");
         }
         if (!["reviewing", "submitted", "processing"].includes(payload.status)) {
           setRegionConfirmationInProgress(false);
-          window.sessionStorage.removeItem(`astraquote:region-confirmation:${token}`);
+          window.sessionStorage.removeItem(`astraquote:aws:region-confirmation:${token}`);
         }
         if (["configuration_review", "approved", "completed"].includes(payload.status)) {
-          setAddingConfigurationInProgress(false);
-          window.sessionStorage.removeItem(`astraquote:addition:${token}`);
+          if (addingConfigurationInProgress) finishPendingAddition(payload);
+          else clearPendingAddition();
           setRegionConfirmationInProgress(false);
-          window.sessionStorage.removeItem(`astraquote:region-confirmation:${token}`);
+          window.sessionStorage.removeItem(`astraquote:aws:region-confirmation:${token}`);
         }
       })
       .catch((reason) => setError(reason instanceof Error ? reason.message : "无法读取确认单"))
       .finally(() => setLoading(false));
-  }, [token]);
+  }, [token, addingConfigurationInProgress, clearPendingAddition, finishPendingAddition]);
 
   useEffect(() => {
     if (!token || session?.status !== "configuration_review") return;
@@ -1167,6 +1293,9 @@ export default function CustomerConfirmationPage() {
         .then(async (response) => {
           const payload = await response.json();
           if (!response.ok) throw new Error(payload.message ?? "确认单不存在或已失效");
+          if (payload.cloud_provider !== EXPECTED_CLOUD_PROVIDER) {
+            throw new Error("该链接不属于 AWS 报价系统，系统已阻止跨云读取。");
+          }
           const expectedPrefix = payload.cloud_provider === "azure" ? "azure_" : "aws_";
           if (!token.startsWith(expectedPrefix)) {
             throw new Error("确认链接的云厂商标识不一致，系统已阻止继续操作。");
@@ -1280,20 +1409,20 @@ export default function CustomerConfirmationPage() {
               return next;
             });
             setRefreshingComponentIds([]);
-            setAddingConfigurationInProgress(false);
-            window.sessionStorage.removeItem(`astraquote:addition:${token}`);
+            if (addingConfigurationInProgress) finishPendingAddition(payload);
+            else clearPendingAddition();
           }
           if (payload.status === "pending") setAnswers({});
           if (!["reviewing", "submitted", "processing"].includes(payload.status)) {
             setRegionConfirmationInProgress(false);
-            window.sessionStorage.removeItem(`astraquote:region-confirmation:${token}`);
+            window.sessionStorage.removeItem(`astraquote:aws:region-confirmation:${token}`);
           }
         })
         .catch(() => undefined);
     };
     const timer = window.setInterval(refresh, 1800);
     return () => window.clearInterval(timer);
-  }, [token, session?.status, refreshingComponentIds, addingConfigurationInProgress, submittedComponentSnapshots, deletedComponents, isAzureConfirmation]);
+  }, [token, session?.status, refreshingComponentIds, addingConfigurationInProgress, submittedComponentSnapshots, deletedComponents, isAzureConfirmation, clearPendingAddition, finishPendingAddition]);
 
   useEffect(() => {
     if (recentlyUpdatedComponentIds.length === 0) return;
@@ -1325,7 +1454,7 @@ export default function CustomerConfirmationPage() {
     setError("");
     if (isRegionOnlyRound) {
       setRegionConfirmationInProgress(true);
-      window.sessionStorage.setItem(`astraquote:region-confirmation:${token}`, "active");
+      window.sessionStorage.setItem(`astraquote:aws:region-confirmation:${token}`, "active");
     }
     // Close the question dialog immediately after a valid submission.  The
     // retained configuration table becomes the progress surface while the
@@ -1348,17 +1477,17 @@ export default function CustomerConfirmationPage() {
       }));
       if (!["reviewing", "submitted", "processing"].includes((payload as Session).status)) {
         setRegionConfirmationInProgress(false);
-        window.sessionStorage.removeItem(`astraquote:region-confirmation:${token}`);
+        window.sessionStorage.removeItem(`astraquote:aws:region-confirmation:${token}`);
       }
       if (["configuration_review", "approved", "completed"].includes((payload as Session).status)) {
-        setAddingConfigurationInProgress(false);
-        window.sessionStorage.removeItem(`astraquote:addition:${token}`);
+        if (addingConfigurationInProgress) finishPendingAddition(payload as Session);
+        else clearPendingAddition();
       }
     } catch (reason) {
       setSession(pendingSession);
       if (isRegionOnlyRound) {
         setRegionConfirmationInProgress(false);
-        window.sessionStorage.removeItem(`astraquote:region-confirmation:${token}`);
+        window.sessionStorage.removeItem(`astraquote:aws:region-confirmation:${token}`);
       }
       setError(reason instanceof Error ? reason.message : "提交失败，请重试");
     } finally {
@@ -1485,7 +1614,13 @@ export default function CustomerConfirmationPage() {
     setRefreshingComponentIds((current) => Array.from(new Set([...current, ...affectedComponentIds])));
     setAddingConfigurationInProgress(Boolean(addedConfiguration));
     if (addedConfiguration) {
-      window.sessionStorage.setItem(`astraquote:addition:${token}`, "active");
+      const pending: PendingAddition = {
+        sourceText: addedConfiguration,
+        existingComponentIds: session.configuration_items.map((item) => item.component_id),
+        expectedNumber: session.configuration_items.length + 1,
+      };
+      setPendingAddition(pending);
+      window.sessionStorage.setItem(additionStorageKey(token), JSON.stringify(pending));
     }
     setReviewSeconds(0);
     if (componentId) {
@@ -1514,8 +1649,7 @@ export default function CustomerConfirmationPage() {
       }));
       if (addedConfiguration
         && ["configuration_review", "approved", "completed"].includes((payload as Session).status)) {
-        setAddingConfigurationInProgress(false);
-        window.sessionStorage.removeItem(`astraquote:addition:${token}`);
+        finishPendingAddition(payload as Session);
       }
       if (additionOnly) {
         // The inline add form owns only the new row. Do not discard another
@@ -1536,8 +1670,7 @@ export default function CustomerConfirmationPage() {
     } catch (reason) {
       setRefreshingComponentIds((current) => current.filter((id) => !affectedComponentIds.includes(id)));
       if (addedConfiguration) {
-        setAddingConfigurationInProgress(false);
-        window.sessionStorage.removeItem(`astraquote:addition:${token}`);
+        clearPendingAddition();
       }
       setError(reason instanceof Error ? reason.message : "提交修改失败，请重试");
     } finally {
@@ -1769,7 +1902,7 @@ export default function CustomerConfirmationPage() {
                     ].filter(Boolean).join(" ");
                     return (
                       <Fragment key={item.component_id}>
-                        <tr className={`${rowClassName} ${item.parent_component_id ? "review-child-row" : ""}`.trim()}>
+                        <tr id={`configuration-${item.component_id}`} className={`${rowClassName} ${item.parent_component_id ? "review-child-row" : ""}`.trim()}>
                           <td className="review-index-cell">{item.component_number ?? String(index + 1).padStart(2, "0")}</td>
                           <td className="review-service-cell"><strong>{item.parent_component_id ? "↳ " : ""}{displayServiceName(item)}</strong>{item.parent_component_number && <small className="component-parent-label">由 {item.parent_component_number} · {item.parent_display_name ?? "父组件"} 衍生</small>}</td>
                           <td className="review-detail-cell">
@@ -2215,6 +2348,29 @@ export default function CustomerConfirmationPage() {
                       </Fragment>
                     );
                   })}
+                  {addingConfigurationInProgress
+                    && pendingAddition
+                    && session.configuration_items.length <= pendingAddition.existingComponentIds.length
+                    && (
+                      <tr className="customer-pending-addition-row" aria-live="polite">
+                        <td className="review-index-cell">{pendingAddition.expectedNumber}</td>
+                        <td className="review-service-cell"><strong>正在识别新组件</strong></td>
+                        <td className="review-detail-cell">
+                          <div className="configuration-comparison">
+                            <div className="configuration-comparison-source">
+                              <small className="configuration-comparison-label">客户新加内容</small>
+                              <p>{pendingAddition.sourceText}</p>
+                            </div>
+                            <div className="configuration-comparison-result customer-pending-addition-result">
+                              <small className="configuration-comparison-label">独立处理窗口</small>
+                              <span>只识别并核验第 {pendingAddition.expectedNumber} 项</span>
+                              <small>原有 {pendingAddition.existingComponentIds.length} 项配置保持不变</small>
+                            </div>
+                          </div>
+                        </td>
+                        <td className="review-action-cell"><span className="row-refresh-state"><i />处理中</span></td>
+                      </tr>
+                    )}
                 </tbody>
               </table>
             </div>
@@ -2232,7 +2388,7 @@ export default function CustomerConfirmationPage() {
                 <button
                   className="customer-submit"
                   type="button"
-                  disabled={submitting || isConfigurationRefreshActive || customerBlockingItems.length > 0}
+                  disabled={submitting || isConfigurationRefreshActive || hasStandaloneConfirmationQuestions || customerBlockingItems.length > 0}
                   onClick={() => void approveConfiguration()}
                 >{submitting
                     ? "正在确认…"
@@ -2247,6 +2403,30 @@ export default function CustomerConfirmationPage() {
                 : "系统将按您填写的字段重新校验配置，未修改内容保持不变。"}</p>
             )}
             {error && <p className="customer-submit-error">{error}</p>}
+            {addingConfigurationInProgress && hasStandaloneConfirmationQuestions && (
+              <div className="customer-addition-modal-backdrop" role="presentation">
+                <div className="customer-addition-modal" role="dialog" aria-modal="true" aria-label="补充新增配置信息">
+                  <header>
+                    <div>
+                      <small>新增配置 · 第 {pendingAddition?.expectedNumber ?? session.configuration_items.length} 项</small>
+                      <h2>请补充这项配置</h2>
+                      <p>这里只处理刚刚新增的内容，原来的配置不会重新运行。</p>
+                    </div>
+                  </header>
+                  <div className="customer-addition-questions customer-questions">
+                    {renderConfirmationItems()}
+                  </div>
+                  <footer>
+                    <button
+                      className="customer-submit"
+                      type="button"
+                      disabled={submitting || isSessionReviewing || session.confirmation_items.some((item) => !confirmationComplete(item, answers[confirmationAnswerKey(item)]))}
+                      onClick={() => void submit()}
+                    >{submitting || isSessionReviewing ? "正在处理…" : "确认并加入配置"}</button>
+                  </footer>
+                </div>
+              </div>
+            )}
           </>
         ) : hasStandaloneConfirmationQuestions && session ? (
           <div className="customer-question-page">

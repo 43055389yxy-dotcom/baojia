@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from typing import Any
 
@@ -15,6 +16,23 @@ class AiGateway:
 
     def __init__(self, settings: Settings):
         self._settings = settings
+
+    def _proxy_url(self) -> str | None:
+        """Return an explicit proxy without parsing unrelated NO_PROXY entries."""
+
+        if not self._settings.ai_trust_env_proxy:
+            return None
+        for name in (
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+        ):
+            if value := os.environ.get(name):
+                return value
+        return None
 
     async def complete_json(
         self,
@@ -49,7 +67,13 @@ class AiGateway:
         timeout = httpx.Timeout(timeout_seconds, connect=10.0)
         last_error: Exception | None = None
 
-        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            # Passing the proxy explicitly avoids an httpx failure when a
+            # desktop NO_PROXY list contains a raw IPv6 loopback entry.
+            trust_env=False,
+            proxy=self._proxy_url(),
+        ) as client:
             for attempt in range(max_attempts):
                 try:
                     response = await client.post(

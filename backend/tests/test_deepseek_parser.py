@@ -40,6 +40,66 @@ def test_shared_literal_ledger_recovers_write_and_read_volumes() -> None:
     assert "requirements.data_out_gib" in parsed.services[0].locked_fields
 
 
+def test_dynamic_literal_ledger_preserves_all_customer_pricing_facts() -> None:
+    cases = (
+        (
+            "future_firehose",
+            "每月摄入数据约10TB，目标端写入Amazon S3",
+            ("data_in_gib",),
+            {"data_in_gib": 10 * 1024},
+        ),
+        (
+            "future_firewall",
+            "部署2个防火墙Endpoint，每月处理流量约5TB",
+            ("endpoint_count", "data_processed_gib"),
+            {"endpoint_count": 2, "data_processed_gib": 5 * 1024},
+        ),
+        (
+            "future_migration",
+            "复制实例4核16GB，存储200GB，同时运行3个迁移任务",
+            ("vcpu", "memory_gib", "storage_gib", "task_count"),
+            {"vcpu": 4, "memory_gib": 16, "storage_gib": 200, "task_count": 3},
+        ),
+        (
+            "future_time_series",
+            "Timestream for LiveAnalytics每月写入约4亿条时序数据，"
+            "内存存储保留24小时，磁性存储保留180天",
+            (
+                "product_variant", "write_records", "memory_retention_hours",
+                "magnetic_retention_days",
+            ),
+            {
+                "product_variant": "live_analytics",
+                "write_records": 400_000_000,
+                "memory_retention_hours": 24,
+                "magnetic_retention_days": 180,
+            },
+        ),
+    )
+
+    for service, source, fields, expected in cases:
+        component = ServiceRequirement(service=service, source_text=source)
+        DeepSeekIntentParser._overlay_literal_component_facts(
+            source,
+            component,
+            extra_fields=fields,
+        )
+        for field, value in expected.items():
+            assert component.requirements[field] == value
+            assert f"requirements.{field}" in component.locked_fields
+
+    dms_component = ServiceRequirement(
+        service="dms",
+        source_text="复制实例4核16GB，同时运行3个迁移任务",
+    )
+    DeepSeekIntentParser._overlay_literal_component_facts(
+        dms_component.source_text,
+        dms_component,
+    )
+    assert dms_component.requirements["task_count"] == 3
+    assert "replication_instances" not in dms_component.requirements
+
+
 def test_kinesis_literal_ledger_preserves_mode_shards_and_monthly_write_volume() -> None:
     source = (
         "Amazon Kinesis Data Streams：数量1，Provisioned模式，"
@@ -181,6 +241,60 @@ async def test_every_current_official_region_code_is_accepted_from_the_live_allo
 
 
 @pytest.mark.asyncio
+async def test_sales_region_preflight_accepts_one_region_per_numbered_component() -> None:
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid")
+    )
+
+    result = await parser.identify_sales_region(
+        "1、Amazon DocumentDB：区域ap-southeast-1（新加坡），数量1。\n"
+        "2、Amazon Neptune：区域us-east-1（弗吉尼亚北部），数量1。\n"
+        "3、Amazon FSx for OpenZFS：区域eu-central-1（法兰克福），数量1。"
+    )
+
+    assert result == {
+        "regions": ["ap-southeast-1", "us-east-1", "eu-central-1"],
+        "requires_confirmation": False,
+        "reason": "每个编号组件都已明确填写可用的 AWS 区域。",
+    }
+
+
+@pytest.mark.asyncio
+async def test_sales_region_preflight_asks_for_public_region_when_one_row_is_missing_it() -> None:
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid")
+    )
+
+    result = await parser.identify_sales_region(
+        "1、Amazon DocumentDB：区域ap-southeast-1（新加坡），数量1。\n"
+        "2、Amazon Neptune：数量1。"
+    )
+
+    assert result["regions"] == []
+    assert result["requires_confirmation"] is True
+
+
+def test_literal_region_replay_never_overwrites_customer_confirmed_replacement() -> None:
+    component = ServiceRequirement(
+        service="amazon_timestream_for_liveanalytics",
+        calculator_service_name="Amazon Timestream for LiveAnalytics",
+        region="ap-south-1",
+        source_text=(
+            "Amazon Timestream for LiveAnalytics：区域eu-west-2（伦敦），数量1。"
+        ),
+        field_sources={"region": "customer_confirmation"},
+        field_evidence={"region": "客户从该服务实际支持的 AWS 地区中选择"},
+        locked_fields=["region"],
+    )
+    intent = ParsedIntent(customer_summary="Timestream", services=[component])
+
+    DeepSeekIntentParser._reconcile_explicit_regions(component.source_text, intent)
+
+    assert component.region == "ap-south-1"
+    assert component.field_sources["region"] == "customer_confirmation"
+
+
+@pytest.mark.asyncio
 async def test_official_catalog_identity_precedes_closed_ai_service_classifier() -> None:
     class OfficialDiscovery:
         @staticmethod
@@ -240,6 +354,666 @@ async def test_official_catalog_identity_precedes_closed_ai_service_classifier()
     assert parsed.services[0].requirements["reader_nodes"] == 2
     assert parsed.services[0].requirements["instance_count"] == 3
     assert parsed.ambiguities == []
+
+
+@pytest.mark.asyncio
+async def test_official_offer_code_is_routed_to_existing_dms_adapter() -> None:
+    class OfficialDiscovery:
+        @staticmethod
+        def resolve_official_product(*labels: str) -> dict[str, object] | None:
+            assert labels == ("AWS Database Migration Svc",)
+            return {
+                "service_code": "AWSDatabaseMigrationSvc",
+                "service_key": "database_migration_svc",
+                "display_name": "AWSDatabaseMigrationSvc",
+                "aliases": ["AWS Database Migration Service", "AWS DMS"],
+            }
+
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        auto_discovery=OfficialDiscovery(),  # type: ignore[arg-type]
+    )
+    component = ServiceRequirement(
+        service="database_migration_svc",
+        calculator_service_name="AWS Database Migration Svc",
+        source_text=(
+            "AWS Database Migration Svc：复制节点4核16GB、200GB存储，"
+            "同时运行3个迁移任务。"
+        ),
+    )
+
+    await parser._resolve_unknown_component_service(
+        component,
+        semaphore=asyncio.Semaphore(1),
+        reporter=None,
+        component_number=1,
+    )
+
+    assert component.service == "dms"
+    assert component.product_identity == "AWSDatabaseMigrationSvc"
+
+
+@pytest.mark.asyncio
+async def test_known_generic_service_loads_official_field_profile_before_ai_cleanup() -> None:
+    class RecordingDiscovery:
+        calls: list[tuple[str, str, str | None]] = []
+
+        @classmethod
+        def ensure_profile(
+            cls, *, service_key: str, display_name: str, region: str | None
+        ) -> dict[str, object]:
+            cls.calls.append((service_key, display_name, region))
+            return {
+                "status": "verified",
+                "service_code": "AWSLambda",
+                "fields": ["requests", "duration_ms", "memory_mb"],
+                "field_bindings": [],
+            }
+
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        auto_discovery=RecordingDiscovery(),  # type: ignore[arg-type]
+    )
+    component = ServiceRequirement(
+        service="lambda",
+        calculator_service_name="AWS Lambda",
+        region="ap-southeast-1",
+        source_text="Lambda 每月调用 100 万次",
+    )
+
+    profile = await parser._auto_discover_component(
+        component,
+        semaphore=asyncio.Semaphore(1),
+        reporter=None,
+        component_number=1,
+    )
+
+    assert profile is not None and profile["status"] == "verified"
+    assert RecordingDiscovery.calls == [
+        ("lambda", "AWS Lambda", "ap-southeast-1")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dedicated_adapter_does_not_download_redundant_field_profile() -> None:
+    class FailingDiscovery:
+        @staticmethod
+        def ensure_profile(**_: object) -> dict[str, object]:
+            raise AssertionError("专用适配器不得重复建立通用字段档案")
+
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        auto_discovery=FailingDiscovery(),  # type: ignore[arg-type]
+    )
+
+    profile = await parser._auto_discover_component(
+        ServiceRequirement(service="ec2", source_text="EC2 4核16GB"),
+        semaphore=asyncio.Semaphore(1),
+        reporter=None,
+        component_number=1,
+    )
+
+    assert profile is None
+
+
+def test_usage_semantics_select_timestream_liveanalytics_without_marketing_name() -> None:
+    source = "时序数据：每月新增约2亿条，历史数据保留180天。"
+    parsed = ParsedIntent(
+        customer_summary=source,
+        services=[
+            ServiceRequirement(
+                service="timestream",
+                calculator_service_name="Amazon Timestream",
+                source_text=source,
+                requirements={"write_records": 200_000_000, "magnetic_retention_days": 180},
+            )
+        ],
+    )
+
+    DeepSeekIntentParser._reconcile_explicit_capacities(source, parsed)
+
+    item = parsed.services[0]
+    assert item.requirements["product_variant"] == "live_analytics"
+    assert item.field_sources["requirements.product_variant"] == "system_derived"
+
+
+def test_efs_throughput_and_backup_usage_are_not_dropped_by_literal_recovery() -> None:
+    efs_source = "共享文件存储：容量约8TB，期望吞吐量不低于500MB/s。"
+    backup_source = "备份数据总量约10TB，保留30天，其中3TB复制到另一个AWS区域。"
+    parsed = ParsedIntent(
+        customer_summary=f"{efs_source}\n{backup_source}",
+        services=[
+            ServiceRequirement(service="efs", source_text=efs_source),
+            ServiceRequirement(service="backup", source_text=backup_source),
+        ],
+    )
+
+    DeepSeekIntentParser._reconcile_explicit_capacities(parsed.customer_summary, parsed)
+
+    assert parsed.services[0].requirements == {
+        "storage_gib": 8192,
+        "provisioned_throughput_mibps": 500,
+        "throughput_mode": "provisioned",
+    }
+    assert parsed.services[1].requirements["backup_storage_gib"] == 10240
+    assert parsed.services[1].requirements["backup_retention_days"] == 30
+    assert parsed.services[1].requirements["cross_region_copy_gib"] == 3072
+
+
+def test_efs_component_template_preserves_class_region_and_read_write_usage() -> None:
+    source = (
+        "Amazon EFS：新加坡，EFS Standard（Regional），容量6TB，"
+        "每月读取12TB、写入5TB。"
+    )
+    parsed = ParsedIntent(
+        customer_summary=source,
+        services=[ServiceRequirement(service="efs", source_text=source)],
+    )
+
+    DeepSeekIntentParser._reconcile_explicit_capacities(source, parsed)
+
+    requirements = parsed.services[0].requirements
+    assert requirements["storage_gib"] == 6144
+    assert requirements["storage_class"] == "standard"
+    assert requirements["deployment_type"] == "regional"
+    assert requirements["data_out_gib"] == 12288
+    assert requirements["data_in_gib"] == 5120
+
+
+def test_documentdb_node_count_and_labelled_disk_do_not_get_confused_with_memory() -> None:
+    source = (
+        "MongoDB集群：现网3节点，单节点4核32GB，单节点数据盘500GB，"
+        "迁云后优先考虑托管方案。"
+    )
+    parsed = ParsedIntent(
+        customer_summary=source,
+        services=[ServiceRequirement(service="documentdb", source_text=source)],
+    )
+
+    DeepSeekIntentParser._reconcile_explicit_capacities(source, parsed)
+
+    assert parsed.services[0].requirements == {
+        "vcpu": 4,
+        "memory_gib": 32,
+        "storage_gib": 500,
+        "instance_count": 3,
+    }
+
+
+def test_numbered_unknown_heading_owns_row_instead_of_destination_service() -> None:
+    source = (
+        "5、Amazon Data Firehose：区域ap-southeast-2（悉尼），数量1，"
+        "每月摄入数据约10TB，目标端写入Amazon S3。"
+    )
+
+    parsed = DeepSeekIntentParser._intent_from_numbered_blocks(source)
+
+    assert parsed is not None
+    assert len(parsed.services) == 1
+    assert parsed.services[0].service == "amazon_data_firehose"
+    assert parsed.services[0].calculator_service_name == "Amazon Data Firehose"
+    assert "Amazon S3" in parsed.services[0].source_text
+
+
+def test_numbered_conversational_row_does_not_promote_origin_to_second_component() -> None:
+    source = (
+        "7、静态资源和下载文件要做CDN，用户主要在东南亚，每月下行8TB，"
+        "源站是上面的Amazon S3对象存储"
+    )
+
+    parsed = DeepSeekIntentParser._intent_from_numbered_blocks(source)
+
+    assert parsed is not None
+    assert [item.service for item in parsed.services] == ["cloudfront"]
+
+
+@pytest.mark.asyncio
+async def test_ai_selects_renamed_main_service_from_official_candidates() -> None:
+    class CandidateDiscovery:
+        @staticmethod
+        def resolve_official_product(*labels: str) -> None:
+            assert labels == ("Amazon Data Firehose",)
+            return None
+
+        @staticmethod
+        def candidate_official_products(
+            *labels: str,
+            limit: int = 12,
+        ) -> list[dict[str, object]]:
+            assert labels == ("Amazon Data Firehose",)
+            assert limit == 12
+            return [
+                {
+                    "service_code": "AmazonKinesisFirehose",
+                    "service_key": "kinesis_firehose",
+                    "display_name": "AmazonKinesisFirehose",
+                    "aliases": ["Amazon Kinesis Firehose", "Kinesis Firehose"],
+                },
+                {
+                    "service_code": "AmazonS3",
+                    "service_key": "s3",
+                    "display_name": "AmazonS3",
+                    "aliases": ["Amazon S3", "S3"],
+                },
+            ]
+
+    class MainServiceGateway:
+        async def complete_json(self, **kwargs: object) -> dict[str, object]:
+            prompt = str(kwargs["system_prompt"])
+            assert "目标端" in prompt
+            assert "AmazonKinesisFirehose" in prompt
+            assert "AmazonS3" in prompt
+            return {
+                "service_code": "AmazonKinesisFirehose",
+                "confidence": "high",
+            }
+
+    source = (
+        "Amazon Data Firehose：区域ap-southeast-2（悉尼），数量1，"
+        "每月摄入数据约10TB，目标端写入Amazon S3。"
+    )
+    component = ServiceRequirement(
+        service="amazon_data_firehose",
+        calculator_service_name="Amazon Data Firehose",
+        source_text=source,
+        original_source_text=source,
+    )
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        auto_discovery=CandidateDiscovery(),  # type: ignore[arg-type]
+    )
+    parser._gateway = MainServiceGateway()  # type: ignore[assignment]
+
+    await parser._resolve_unknown_component_service(
+        component,
+        semaphore=asyncio.Semaphore(1),
+        reporter=None,
+        component_number=1,
+    )
+
+    assert component.service == "kinesis_firehose"
+    assert component.calculator_service_name == "Amazon Data Firehose"
+    assert component.product_identity == "AmazonKinesisFirehose"
+    assert component.field_sources["_official_service_code"] == "AmazonKinesisFirehose"
+
+    parsed = ParsedIntent(customer_summary="Firehose", services=[component])
+    parser._reconcile_explicit_component_inventory(source, parsed)
+    assert len(parsed.services) == 1
+    assert parsed.services[0].service == "kinesis_firehose"
+
+
+@pytest.mark.asyncio
+async def test_ai_can_resolve_unseen_customer_wording_from_full_official_directory() -> None:
+    class FullDirectoryDiscovery:
+        @staticmethod
+        def resolve_official_product(*labels: str) -> None:
+            assert labels == ("实时投递管道",)
+            return None
+
+        @staticmethod
+        def candidate_official_products(
+            *labels: str,
+            limit: int = 12,
+        ) -> list[dict[str, object]]:
+            assert labels == ("实时投递管道",)
+            assert limit == 12
+            return []
+
+        @staticmethod
+        def official_products(*, limit: int = 500) -> list[dict[str, object]]:
+            assert limit == 500
+            return [
+                {
+                    "service_code": "AmazonKinesisFirehose",
+                    "service_key": "kinesis_firehose",
+                    "display_name": "AmazonKinesisFirehose",
+                    "aliases": ["Amazon Kinesis Firehose", "Kinesis Firehose"],
+                },
+                {
+                    "service_code": "AmazonS3",
+                    "service_key": "s3",
+                    "display_name": "AmazonS3",
+                    "aliases": ["Amazon S3", "S3"],
+                },
+            ]
+
+    class FullDirectoryGateway:
+        async def complete_json(self, **kwargs: object) -> dict[str, object]:
+            assert "实时投递管道" in str(kwargs["user_content"])
+            assert "不是功能推荐" in str(kwargs["system_prompt"])
+            return {
+                "service_code": "AmazonKinesisFirehose",
+                "confidence": "high",
+            }
+
+    source = "实时投递管道：每月摄入10TB，目标端写入Amazon S3"
+    parsed = DeepSeekIntentParser._intent_from_numbered_blocks(f"1、{source}")
+    assert parsed is not None
+    assert len(parsed.services) == 1
+    assert parsed.services[0].service.startswith("unknown_component_")
+
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        auto_discovery=FullDirectoryDiscovery(),  # type: ignore[arg-type]
+    )
+    parser._gateway = FullDirectoryGateway()  # type: ignore[assignment]
+    await parser._resolve_unknown_component_service(
+        parsed.services[0],
+        semaphore=asyncio.Semaphore(1),
+        reporter=None,
+        component_number=1,
+    )
+
+    assert parsed.services[0].service == "kinesis_firehose"
+    assert parsed.services[0].product_identity == "AmazonKinesisFirehose"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("heading", "source", "returned_identity", "service_code", "service_key"),
+    [
+        (
+            "共享文件存储",
+            "共享文件存储：容量约8TB，期望吞吐量不低于500MB/s。",
+            "efs",
+            "AmazonEFS",
+            "efs",
+        ),
+        (
+            "时序数据",
+            "时序数据：每月新增约2亿条，历史数据保留180天。",
+            "Amazon Timestream",
+            "AmazonTimestream",
+            "timestream",
+        ),
+    ],
+)
+async def test_generic_customer_heading_accepts_unique_official_identity_spelling(
+    heading: str,
+    source: str,
+    returned_identity: str,
+    service_code: str,
+    service_key: str,
+) -> None:
+    """A correct AI decision must not be discarded for using key/display spelling."""
+
+    class FullDirectoryDiscovery:
+        @staticmethod
+        def resolve_official_product(*_labels: str) -> None:
+            return None
+
+        @staticmethod
+        def candidate_official_products(
+            *_labels: str,
+            limit: int = 12,
+        ) -> list[dict[str, object]]:
+            assert limit == 12
+            return []
+
+        @staticmethod
+        def official_products(*, limit: int = 500) -> list[dict[str, object]]:
+            assert limit == 500
+            return [
+                {
+                    "service_code": service_code,
+                    "service_key": service_key,
+                    "display_name": service_code,
+                    "aliases": [
+                        service_code,
+                        "Amazon EFS" if service_key == "efs" else "Amazon Timestream",
+                    ],
+                },
+                {
+                    "service_code": "AmazonS3",
+                    "service_key": "s3",
+                    "display_name": "AmazonS3",
+                    "aliases": ["Amazon S3"],
+                },
+            ]
+
+    class ServiceKeyGateway:
+        async def complete_json(self, **_: object) -> dict[str, object]:
+            # Models sometimes use another unique identity from the closed
+            # candidate row even when the requested JSON key says service_code.
+            return {"service": returned_identity, "confidence": "high"}
+
+    component = ServiceRequirement(
+        service="unknown_component_generic",
+        calculator_service_name=heading,
+        source_text=source,
+    )
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        auto_discovery=FullDirectoryDiscovery(),  # type: ignore[arg-type]
+    )
+    parser._gateway = ServiceKeyGateway()  # type: ignore[assignment]
+
+    await parser._resolve_unknown_component_service(
+        component,
+        semaphore=asyncio.Semaphore(1),
+        reporter=None,
+        component_number=1,
+    )
+
+    assert component.service == service_key
+    assert component.product_identity == service_code
+    assert component.field_sources.get("_identity_resolution_status") is None
+
+
+@pytest.mark.asyncio
+async def test_full_directory_identity_validation_retries_only_failed_component() -> None:
+    class FullDirectoryDiscovery:
+        @staticmethod
+        def resolve_official_product(*_labels: str) -> None:
+            return None
+
+        @staticmethod
+        def candidate_official_products(
+            *_labels: str,
+            limit: int = 12,
+        ) -> list[dict[str, object]]:
+            return []
+
+        @staticmethod
+        def official_products(*, limit: int = 500) -> list[dict[str, object]]:
+            return [
+                {
+                    "service_code": "AmazonEFS",
+                    "service_key": "efs",
+                    "display_name": "AmazonEFS",
+                    "aliases": ["Amazon EFS"],
+                }
+            ]
+
+    class RetryGateway:
+        calls = 0
+
+        async def complete_json(self, **kwargs: object) -> dict[str, object]:
+            self.calls += 1
+            if self.calls == 1:
+                return {"service_code": "共享文件存储", "confidence": "low"}
+            assert "上一次没有返回可验证的唯一官方产品" in str(kwargs["system_prompt"])
+            return {"service_code": "AmazonEFS", "confidence": "high"}
+
+    component = ServiceRequirement(
+        service="unknown_component_storage",
+        calculator_service_name="共享文件存储",
+        source_text="共享文件存储：容量8TB。",
+    )
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        auto_discovery=FullDirectoryDiscovery(),  # type: ignore[arg-type]
+    )
+    gateway = RetryGateway()
+    parser._gateway = gateway  # type: ignore[assignment]
+
+    await parser._resolve_unknown_component_service(
+        component,
+        semaphore=asyncio.Semaphore(1),
+        reporter=None,
+        component_number=1,
+    )
+
+    assert gateway.calls == 2
+    assert component.service == "efs"
+    assert component.product_identity == "AmazonEFS"
+
+
+@pytest.mark.asyncio
+async def test_wrong_lexical_shortlist_falls_back_to_full_official_directory() -> None:
+    remembered: list[tuple[str, str]] = []
+
+    class RenamedDiscovery:
+        @staticmethod
+        def resolve_official_product(*_labels: str) -> None:
+            return None
+
+        @staticmethod
+        def candidate_official_products(
+            *_labels: str,
+            limit: int = 12,
+        ) -> list[dict[str, object]]:
+            assert limit == 12
+            return [
+                {
+                    "service_code": "AWSManagedServices",
+                    "service_key": "managed_services",
+                    "display_name": "AWSManagedServices",
+                    "aliases": ["AWS Managed Services"],
+                }
+            ]
+
+        @staticmethod
+        def official_products(*, limit: int = 500) -> list[dict[str, object]]:
+            assert limit == 500
+            return [
+                {
+                    "service_code": "AWSManagedServices",
+                    "service_key": "managed_services",
+                    "display_name": "AWSManagedServices",
+                    "aliases": ["AWS Managed Services"],
+                },
+                {
+                    "service_code": "AmazonKinesisAnalytics",
+                    "service_key": "kinesis_analytics",
+                    "display_name": "AmazonKinesisAnalytics",
+                    "aliases": ["Amazon Kinesis Analytics"],
+                },
+            ]
+
+        @staticmethod
+        def remember_official_alias(service_code: str, alias: str) -> None:
+            remembered.append((service_code, alias))
+
+    class RenamedGateway:
+        calls = 0
+
+        async def complete_json(self, **kwargs: object) -> dict[str, object]:
+            self.calls += 1
+            prompt = str(kwargs["system_prompt"])
+            if self.calls == 1:
+                assert "AmazonKinesisAnalytics" not in prompt
+                return {"service_code": "unknown", "confidence": "low"}
+            assert "AmazonKinesisAnalytics" in prompt
+            return {
+                "service_code": "AmazonKinesisAnalytics",
+                "confidence": "high",
+            }
+
+    source = "Amazon Managed Service for Apache Flink：持续运行，配置4个KPU"
+    component = ServiceRequirement(
+        service="amazon_managed_service_for_apache_flink",
+        calculator_service_name="Amazon Managed Service for Apache Flink",
+        source_text=source,
+    )
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        auto_discovery=RenamedDiscovery(),  # type: ignore[arg-type]
+    )
+    gateway = RenamedGateway()
+    parser._gateway = gateway  # type: ignore[assignment]
+
+    await parser._resolve_unknown_component_service(
+        component,
+        semaphore=asyncio.Semaphore(1),
+        reporter=None,
+        component_number=1,
+    )
+
+    assert gateway.calls == 2
+    assert component.service == "kinesis_analytics"
+    assert component.product_identity == "AmazonKinesisAnalytics"
+    assert remembered == [
+        (
+            "AmazonKinesisAnalytics",
+            "Amazon Managed Service for Apache Flink",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_heading_is_rechecked_when_ai_mistakes_dependency_for_main_service() -> None:
+    class FlinkDiscovery:
+        @staticmethod
+        def resolve_official_product(*_labels: str) -> None:
+            return None
+
+        @staticmethod
+        def candidate_official_products(
+            *_labels: str,
+            limit: int = 12,
+        ) -> list[dict[str, object]]:
+            assert limit == 12
+            return [
+                {
+                    "service_code": "AmazonKinesisAnalytics",
+                    "service_key": "kinesis_analytics",
+                    "display_name": "AmazonKinesisAnalytics",
+                    "aliases": ["Amazon Managed Service for Apache Flink"],
+                },
+                {
+                    "service_code": "AmazonMSK",
+                    "service_key": "msk",
+                    "display_name": "AmazonMSK",
+                    "aliases": ["Amazon Managed Streaming for Apache Kafka"],
+                },
+            ]
+
+    class FlinkGateway:
+        async def complete_json(self, **kwargs: object) -> dict[str, object]:
+            assert "主 AWS 服务" in str(kwargs["system_prompt"])
+            assert "目标端" in str(kwargs["system_prompt"])
+            assert "Flink实时计算" in str(kwargs["user_content"])
+            return {
+                "service_code": "AmazonKinesisAnalytics",
+                "confidence": "high",
+            }
+
+    component = ServiceRequirement(
+        # Simulate the first AI pass incorrectly treating the referenced Kafka
+        # source as the purchased service.
+        service="msk",
+        calculator_service_name="Amazon MSK",
+        source_text=(
+            "Flink实时计算：当前主要用于Kafka流数据处理，预计3个计算节点，"
+            "单节点8核32GB，任务需要7×24小时运行。"
+        ),
+    )
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        auto_discovery=FlinkDiscovery(),  # type: ignore[arg-type]
+    )
+    parser._gateway = FlinkGateway()  # type: ignore[assignment]
+
+    await parser._resolve_unknown_component_service(
+        component,
+        semaphore=asyncio.Semaphore(1),
+        reporter=None,
+        component_number=1,
+    )
+
+    assert component.service == "kinesis_analytics"
+    assert component.product_identity == "AmazonKinesisAnalytics"
 
 
 @pytest.mark.asyncio
@@ -627,6 +1401,57 @@ def test_component_feedback_uses_only_configured_stable_ai() -> None:
 
     assert len(gateways) == 1
     assert gateways[0]._settings.ai_model == "deepseek.v3.2"
+
+
+def test_service_identity_uses_independent_configured_ai_routes() -> None:
+    parser = DeepSeekIntentParser(
+        Settings(
+            ai_provider="bedrock",
+            bedrock_api_key="bedrock-test",
+            bedrock_model="deepseek.v3.2",
+            deepseek_api_key="deepseek-test",
+            deepseek_model="deepseek-chat",
+        )
+    )
+
+    gateways = parser._service_identity_gateways()
+
+    assert [gateway._settings.ai_model for gateway in gateways] == [
+        "deepseek.v3.2",
+        "deepseek-chat",
+        "zai.glm-4.7-flash",
+    ]
+
+
+def test_legacy_official_amazon_es_identity_routes_to_opensearch() -> None:
+    assert DeepSeekIntentParser._service_key("AmazonES") == "opensearch"
+    assert DeepSeekIntentParser._service_key("ElasticsearchService") == "opensearch"
+
+
+def test_failed_product_identity_is_not_rewritten_as_self_hosted_ec2() -> None:
+    component = ServiceRequirement(
+        service="unknown_component_search",
+        calculator_service_name="日志检索",
+        source_text=(
+            "日志检索：计划部署3个数据节点，单节点8核32GB，"
+            "单节点存储500GB，日志保留约30天。"
+        ),
+        requirements={"vcpu": 8, "memory_gib": 32, "storage_gib": 500},
+        field_sources={
+            "_identity_resolution_status": "failed",
+            "_identity_resolution_reason": "服务名称识别线路暂时无法连接",
+        },
+    )
+    parsed = ParsedIntent(customer_summary="日志检索", services=[component])
+
+    DeepSeekIntentParser._append_third_party_managed_decisions(
+        parsed,
+        component.source_text,
+    )
+
+    assert component.service == "unknown_component_search"
+    assert component.calculator_service_name == "日志检索"
+    assert "自建" not in component.calculator_service_name
 
 
 @pytest.mark.asyncio
@@ -1586,6 +2411,28 @@ def test_compact_mixed_service_capacities_and_annual_transfer_are_lossless() -> 
     assert parsed.services[1].requirements["memory_gib"] == 2
     assert parsed.services[2].requirements["storage_gib"] == 3072
     assert parsed.services[3].requirements["data_transfer_out_gib"] == pytest.approx(4096 / 12)
+
+
+def test_ec2_label_first_data_disk_is_preserved_losslessly() -> None:
+    text = (
+        "应用服务器：预计部署3台Linux服务器，单台8核32GB，"
+        "系统盘200GB，数据盘500GB。"
+    )
+    parsed = ParsedIntent(
+        customer_summary="ec2 disks",
+        services=[ServiceRequirement(service="ec2", quantity=3, source_text=text)],
+    )
+
+    DeepSeekIntentParser._reconcile_explicit_capacities(text, parsed)
+
+    component = parsed.services[0]
+    assert component.requirements["system_disk_gib"] == 200
+    assert component.requirements["additional_ebs_volumes"] == [
+        {"size_gib": 500, "volume_type": "gp3", "count_per_instance": 1}
+    ]
+    assert component.field_sources["requirements.additional_ebs_volumes"] == (
+        "customer_text"
+    )
 
 
 def test_modern_service_audit_preserves_identity_units_and_eks_workers() -> None:
@@ -3225,6 +4072,40 @@ def test_component_evidence_rejects_capacity_used_as_node_count() -> None:
         parser._component_from_template_output(raw, component)
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "snippet"),
+    [
+        ("master_nodes", 1, "1个主节点"),
+        ("core_nodes", 3, "3个核心节点"),
+        ("task_nodes", 2, "2个任务节点"),
+    ],
+)
+def test_component_evidence_accepts_generic_role_node_counts(
+    field: str,
+    value: int,
+    snippet: str,
+) -> None:
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid")
+    )
+    component = ServiceRequirement(service="emr", source_text=snippet)
+    raw = {
+        "component": {
+            "service": "emr",
+            "region": None,
+            "quantity": 1,
+            "requirements": {field: value},
+            "field_evidence": {f"requirements.{field}": snippet},
+            "source_text": component.source_text,
+            "query_action": None,
+        }
+    }
+
+    parsed = parser._component_from_template_output(raw, component)
+
+    assert parsed.requirements[field] == value
+
+
 def test_selective_audit_only_flags_suspicious_incomplete_repeated_component() -> None:
     source = "OpenSearch 3个节点，每节点500GB存储"
     original = ServiceRequirement(service="opensearch", source_text=source)
@@ -3970,11 +4851,15 @@ def test_memorydb_identity_and_explicit_capacity_survive_redis_normalization() -
                 "connection_minutes": 15_000_000.0,
             },
         ),
-        (
-            "global_accelerator",
-            "AWS Global Accelerator：数量1，配置2个Listener、4个Endpoint，每月通过加速器传输约3TB数据",
-            {"data_transfer_out_gib": 3072.0},
-        ),
+            (
+                "global_accelerator",
+                "AWS Global Accelerator：数量1，配置2个Listener、4个Endpoint，每月通过加速器传输约3TB数据",
+                {
+                    "listener_count": 2,
+                    "endpoint_count": 4,
+                    "data_transfer_out_gib": 3072.0,
+                },
+            ),
     ],
 )
 def test_universal_pricing_fact_ledger_preserves_official_dimensions(
@@ -6692,6 +7577,18 @@ def test_compact_chinese_vm_wording_preserves_count_cpu_and_memory() -> None:
     assert component.field_sources["quantity"] == "customer_text"
     assert component.field_sources["requirements.vcpu"] == "customer_text"
     assert component.field_sources["requirements.memory_gib"] == "customer_text"
+
+
+def test_colloquial_liang_vm_wording_preserves_count_when_ai_is_unavailable() -> None:
+    text = "1、俩台ec2"
+
+    parsed = DeepSeekIntentParser._intent_from_numbered_blocks(text)
+
+    assert parsed is not None
+    DeepSeekIntentParser._reconcile_explicit_capacities(text, parsed)
+    assert parsed.services[0].service == "ec2"
+    assert parsed.services[0].quantity == 2
+    assert parsed.services[0].field_sources["quantity"] == "customer_text"
 
 
 def test_customer_replacement_model_prevents_old_shape_from_being_restored() -> None:

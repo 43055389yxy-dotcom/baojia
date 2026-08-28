@@ -8,10 +8,11 @@ import time
 import unicodedata
 from pathlib import Path
 
+from app.core.data_paths import AWS_DATA_ROOT
 from app.domain.models import ServiceRequirement
 
 COMPONENT_RESULT_TTL_SECONDS = 90 * 24 * 60 * 60
-COMPONENT_RESULT_CACHE_VERSION = "component-template-v3-pricing-fact-conservation"
+COMPONENT_RESULT_CACHE_VERSION = "component-template-v4-semantic-pricing-contract"
 
 
 class ValidatedComponentResultCache:
@@ -23,11 +24,7 @@ class ValidatedComponentResultCache:
     """
 
     def __init__(self, database_path: Path | None = None) -> None:
-        self._database_path = database_path or (
-            Path(__file__).resolve().parents[2]
-            / ".cache"
-            / "validated_component_results.sqlite3"
-        )
+        self._database_path = database_path or AWS_DATA_ROOT / "validated_component_results.sqlite3"
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._initialize()
@@ -78,9 +75,7 @@ class ValidatedComponentResultCache:
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
-    def get(
-        self, component: ServiceRequirement, model_name: str
-    ) -> ServiceRequirement | None:
+    def get(self, component: ServiceRequirement, model_name: str) -> ServiceRequirement | None:
         cache_key = self._key(component, model_name)
         cutoff = time.time() - COMPONENT_RESULT_TTL_SECONDS
         with self._lock, self._connect() as connection:

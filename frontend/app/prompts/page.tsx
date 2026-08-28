@@ -19,17 +19,12 @@ type PromptLibrary = { items: PromptItem[]; usage: string };
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "/api/backend";
 
 export default function PromptLibraryPage() {
-  const [provider, setProvider] = useState<"aws" | "azure">("aws");
+  const provider = "aws" as const;
   const [library, setLibrary] = useState<PromptLibrary | null>(null);
   const [query, setQuery] = useState("");
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState<string | null>(null);
   const [message, setMessage] = useState("");
-
-  useEffect(() => {
-    const selected = new URLSearchParams(window.location.search).get("provider") === "azure" ? "azure" : "aws";
-    queueMicrotask(() => setProvider(selected));
-  }, []);
 
   useEffect(() => {
     void fetch(`${API_BASE}/api/prompt-library?provider=${provider}`, { cache: "no-store" })
@@ -86,13 +81,6 @@ export default function PromptLibraryPage() {
     }
   }
 
-  function switchProvider(nextProvider: "aws" | "azure") {
-    if (nextProvider === provider) return;
-    setLibrary(null);
-    setMessage("");
-    setProvider(nextProvider);
-  }
-
   return (
     <main className="prompt-app">
       <header className="site-header prompt-header">
@@ -114,11 +102,6 @@ export default function PromptLibraryPage() {
           <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="EC2、Redis、区域、默认值……" />
         </label>
       </section>
-
-      <nav className="cloud-provider-switch prompt-provider-switch" aria-label="提示词云平台">
-        <button className={provider === "aws" ? "selected" : ""} onClick={() => switchProvider("aws")}>AWS 提示词</button>
-        <button className={provider === "azure" ? "selected" : ""} onClick={() => switchProvider("azure")}>Microsoft Azure 提示词</button>
-      </nav>
 
       {message && <div className="prompt-message">{message}</div>}
 

@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import re
 import threading
-from pathlib import Path
 
-from app.integrations.service_templates import normalized_service_key
+from app.core.data_paths import AWS_DATA_ROOT
 from app.integrations.auto_service_discovery import AutoServiceDiscovery
+from app.integrations.service_templates import (
+    normalized_service_key,
+    requirement_fields,
+)
 
 
 CORE_PROMPT = """你是 AWS 官方成本报价的需求整理员。
@@ -327,7 +330,7 @@ WAF 明确保护 CloudFront 时 region 写 global；global 是全局范围，不
 """,
     "backup": """【AWS Backup / RDS Backup】
 service 必须写 backup。字段：backup_storage_gib, warm_storage_gib, cold_storage_gib,
-restore_gib, backup_frequency, backup_retention_days, protected_service。
+restore_gib, cross_region_copy_gib, backup_frequency, backup_retention_days, protected_service。
 RDS 自动备份保留天数属于 RDS 自身字段，不要重复新增 AWS Backup；只有客户单独列出 AWS Backup
 或跨服务集中备份时才保留本服务。没给备份容量时省略容量，不猜测、不向客户追问技术字段；
 只展示最低存储计费单位的官方单价，不虚构月容量。后端适配器未接入属于系统状态，绝不能写进 ambiguities。
@@ -420,8 +423,11 @@ Public-VPC、Private-VPC、公有/私有 VPC 都属于 Amazon VPC 网络，绝�
 “WAF 挂载 ALB”等关联说明不得复制生成第二个 ALB。
 """,
     "dms": """【AWS DMS】
-字段：requested_model, replication_instances, hours_per_month, multi_az。客户明确写 dms.* 型号时必须原样保留；
-未给迁移流量、任务数量或额外存储时省略，不向客户追问。服务数量按复制实例套数处理。
+字段：requested_model, vcpu, memory_gib, replication_instances, task_count,
+hours_per_month, multi_az, storage_gib, data_processed_gib。客户明确写 dms.* 型号时必须原样保留；
+只写“4核16GB”时分别填写 vcpu=4、memory_gib=16，绝不能当成型号。迁移任务数量写 task_count，
+只有客户明确说复制实例数量时才填写 replication_instances，任务数绝不能冒充复制实例数。
+未给迁移流量、任务数量或额外存储时省略，不向客户追问。
 """,
     "kms": """【AWS KMS】
 字段：key_count, requests。与 Secrets Manager 同一行出现时必须拆成两个独立服务；未给密钥数时按 1 个客户托管密钥，
@@ -487,7 +493,10 @@ backup_storage_gib, restore_gib。未指定容量模式时采用最低成本默�
 仅展示最小读写请求或容量单位的官方单价。未要求备份、Streams、Global Tables 时全部省略。
 """,
         "efs": """【Amazon EFS】
-字段：storage_gib, storage_class, throughput_mode, provisioned_throughput_mibps, lifecycle_policy。
+字段：storage_gib, storage_class, deployment_type, throughput_mode,
+provisioned_throughput_mibps, data_in_gib, data_out_gib, lifecycle_policy。
+EFS Standard、Infrequent Access、Archive 分别写入 storage_class；Regional 与 One Zone 写入
+deployment_type。客户每月写入量写 data_in_gib，每月读取量写 data_out_gib。
 客户没给容量时仅展示 1 GiB 官方单位价；没指定存储级别或吞吐模式时采用满足需求的最低价默认。
 未要求复制、归档或预置吞吐时不得自动开启。
 """,
@@ -581,10 +590,12 @@ CloudWatch 只有在客户另行明确要求日志、CloudWatch 指标或告警�
 定时任务使用 scheduler。没给事件量时仅展示官方单位价，不虚构事件数或 Pipes 请求。
 """,
         "fsx": """【Amazon FSx】
-字段：file_system_type, storage_gib, throughput_mbps, throughput_mbps_per_tib, iops, backup_storage_gib。
+字段：file_system_type, deployment_type, storage_type, storage_gib, throughput_mbps,
+throughput_mbps_per_tib, iops, backup_storage_gib。
 Windows、Lustre、ONTAP、OpenZFS 仅按客户明确要求选择；没指定类型时不要猜业务能力，保留原文并使用
 满足已知要求的最低价方案。Lustre 的“MB/s/TiB”必须写 throughput_mbps_per_tib，绝不能当成文件系统
-总吞吐量，也不能因它是选型档位而删除。未给容量时仅展示最低存储单位价，未要求备份时不添加。
+总吞吐量，也不能因它是选型档位而删除。Single-AZ、Multi-AZ 等部署方式写 deployment_type，
+客户明确 SSD/HDD 时写 storage_type。未给容量时仅展示最低存储单位价，未要求备份时不添加。
 """,
     }
 )
@@ -686,7 +697,7 @@ PROMPT_META.update(
     }
 )
 
-_OVERRIDE_PATH = Path(__file__).resolve().parents[2] / ".cache" / "prompt_overrides.json"
+_OVERRIDE_PATH = AWS_DATA_ROOT / "prompt_overrides.json"
 _OVERRIDE_LOCK = threading.RLock()
 
 
@@ -922,7 +933,7 @@ COMPONENT_CRITICAL_RULES: dict[str, str] = {
     "s3": "容量写 storage_gib；按量但未给容量时保持 null，不虚构 1GB 月用量。",
     "elb": "ALB 写 load_balancer_type=application，NLB 写 network；挂载关系不能复制出第二个负载均衡器。",
     "waf": "Web ACL 数、规则数、请求量和保护对象分别填写；只写一套时不能虚构请求量。",
-    "dms": "dms.* 写 requested_model；复制实例数量写 replication_instances。",
+    "dms": "dms.* 写 requested_model；CPU/内存写 vcpu、memory_gib；复制实例数量写 replication_instances；迁移任务数写 task_count，两种数量不能混用。",
     "vpc": "私网和公网子网分别填写；没有容量和用量字段。",
 }
 
@@ -980,6 +991,27 @@ def _variant_prompt_key(service_key: str, source_text: str) -> str | None:
     return None
 
 
+def _service_rule_with_locked_contract(service_key: str) -> str:
+    """Return editable guidance plus the runtime's complete field contract.
+
+    The prose prompt and the extraction allow-list previously evolved in two
+    different files.  A field could therefore be present in the JSON template
+    but absent from the service guidance (or vice versa).  Append the generated
+    contract at call time so every current and future template change reaches
+    the model without another handwritten prompt edit.
+    """
+
+    key = normalized_service_key(service_key)
+    module_key = key if key in SERVICE_PROMPTS else "generic_service"
+    rule = prompt_text(module_key)
+    fields = requirement_fields(key)
+    return (
+        f"{rule}\n\n【系统锁定的完整字段清单】\n"
+        + ", ".join(fields)
+        + "。\n客户明确提到且含义对应的值必须填入；没有提到的字段保持 null。"
+    )
+
+
 def build_component_extraction_prompt(service_key: str, source_text: str = "") -> str:
     """Small fixed-template prompt used for exactly one component."""
 
@@ -993,11 +1025,7 @@ def build_component_extraction_prompt(service_key: str, source_text: str = "") -
     # EC2/RDS/S3/... prompt library unused and forcing the model to fall back
     # to generic interpretation.  Load exactly one service prompt here; never
     # concatenate rules from unrelated services.
-    service_rule = (
-        prompt_text(key)
-        if key in SERVICE_PROMPTS
-        else prompt_text("generic_service")
-    )
+    service_rule = _service_rule_with_locked_contract(key)
     variant_key = _variant_prompt_key(service_key, source_text)
     variant_rule = prompt_text(variant_key) if variant_key else ""
     return f"""你正在执行需求清洗的第 2、3 步，是单个 AWS 组件的固定模板填写器。
@@ -1030,11 +1058,7 @@ def build_component_audit_prompt(service_key: str) -> str:
 
     key = normalized_service_key(service_key)
     critical = COMPONENT_CRITICAL_RULES.get(key, "不得增加模板外字段。")
-    service_rule = (
-        prompt_text(key)
-        if key in SERVICE_PROMPTS
-        else prompt_text("generic_service")
-    )
+    service_rule = _service_rule_with_locked_contract(key)
     return f"""你是单个 AWS 组件的结构化结果审核员。
 对比客户原话和已填写模板，只检查：漏填、错填、单位错误、数量/单节点规格混淆、改变客户原意。
 不要选型、报价、补默认值或询问缺失的可选参数。输入中明确标记的系统最低运行建议不是客户原话，
@@ -1075,12 +1099,11 @@ def build_service_prompt(service_key: str) -> str:
         "redis": "elasticache",
     }
     normalized_key = aliases.get(service_key.strip().lower(), service_key.strip().lower())
-    module_key = normalized_key if normalized_key in SERVICE_PROMPTS else "generic_service"
     return "\n\n".join(
         [
             COMPONENT_CLEANUP_PROMPT,
             HARD_LOWEST_COST_GUARD,
-            prompt_text(module_key),
+            _service_rule_with_locked_contract(normalized_key),
             MINIMUM_RUNNABLE_DEFAULT_GUARD,
         ]
     )
@@ -1095,7 +1118,7 @@ def build_system_prompt(text: str) -> str:
     page.  Service prompts are not separate intake conversations.
     """
     keys = prompt_keys_for_request(text)
-    modules = [prompt_text(key) for key in keys]
+    modules = [_service_rule_with_locked_contract(key) for key in keys]
     if not modules:
         modules = [prompt_text("generic_service")]
     return "\n\n".join(

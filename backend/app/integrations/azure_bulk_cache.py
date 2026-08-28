@@ -12,6 +12,8 @@ from typing import Any
 
 import httpx
 
+from app.core.data_paths import AZURE_DATA_ROOT
+
 AZURE_RETAIL_ENDPOINT = "https://prices.azure.com/api/retail/prices"
 AZURE_BULK_SCHEMA_VERSION = 3
 AZURE_BULK_REFRESH_SECONDS = 24 * 60 * 60
@@ -58,9 +60,7 @@ class AzureBulkRetailCache:
     """Atomic local snapshots of the complete public Azure retail catalog."""
 
     def __init__(self, database_path: Path | None = None) -> None:
-        self.database_path = database_path or (
-            Path(__file__).resolve().parents[2] / ".cache" / "azure_bulk_retail_catalog.sqlite3"
-        )
+        self.database_path = database_path or AZURE_DATA_ROOT / "azure_bulk_retail_catalog.sqlite3"
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._sync_lock = asyncio.Lock()

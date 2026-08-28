@@ -259,6 +259,16 @@ _MODEL_PATTERNS: dict[str, re.Pattern[str]] = {
     "mq": re.compile(r"^mq\.[a-z][a-z0-9.-]+$", re.I),
 }
 
+# Product APIs and the AWS Price List do not always spell the same official
+# model with identical service prefixes. Preserve any conservative
+# dot-delimited catalog token and let the service adapter verify whether it is
+# actually offered in the selected region. This prevents a valid choice from
+# being silently deleted while still rejecting prose such as ``4核16G``.
+_GENERIC_CATALOG_MODEL_TOKEN = re.compile(
+    r"^[a-z][a-z0-9-]*(?:\.[a-z0-9-]+){1,4}$",
+    re.I,
+)
+
 
 _NUMERIC_REQUIREMENT_FIELDS = {
     "vcpu", "memory_gib", "memory_mb", "ephemeral_storage_mb",
@@ -280,7 +290,7 @@ _NUMERIC_REQUIREMENT_FIELDS = {
     "active_connections_per_minute", "requests_per_second",
     "rule_evaluations_per_request", "rule_evaluations_per_second", "lcu_count",
     "utilization_percent", "snapshot_changed_gib", "backup_storage_gib",
-    "warm_storage_gib", "cold_storage_gib", "restore_gib",
+    "warm_storage_gib", "cold_storage_gib", "restore_gib", "cross_region_copy_gib",
     "provisioned_throughput_mibps", "throughput_mbps", "rpu", "dpu_hours",
     "throughput_mbps_per_tib", "connection_minutes",
     "crawler_dpu_hours", "interactive_session_dpu_hours",
@@ -290,7 +300,8 @@ _NUMERIC_REQUIREMENT_FIELDS = {
     "managed_storage_gib", "snapshot_storage_gib", "provisioned_dpu_hours",
     "resource_count", "flow_runs", "bucket_count", "object_count",
     "deployment_updates", "author_users", "reader_users", "session_capacity",
-    "spice_gib",
+    "spice_gib", "write_records", "memory_retention_hours",
+    "magnetic_retention_days", "kpu_hours",
 }
 
 
@@ -309,6 +320,8 @@ _INTEGER_REQUIREMENT_FIELDS = {
     "user_count",
     "messages", "flow_runs", "bucket_count", "object_count",
     "deployment_updates", "author_users", "reader_users", "session_capacity",
+    "listener_count", "endpoint_count", "task_count", "replica_count",
+    "writer_nodes", "reader_nodes", "kpu_count", "write_records",
 }
 
 
@@ -346,7 +359,11 @@ def sanitize_requirement_values(
     if isinstance(model, str):
         model = model.strip().casefold()
         pattern = _MODEL_PATTERNS.get(service_key)
-        if not model or (pattern is not None and not pattern.fullmatch(model)):
+        if not model or (
+            pattern is not None
+            and not pattern.fullmatch(model)
+            and not _GENERIC_CATALOG_MODEL_TOKEN.fullmatch(model)
+        ):
             cleaned.pop("requested_model", None)
         else:
             cleaned["requested_model"] = model.removeprefix("kafka.") if service_key == "msk" else model
@@ -583,15 +600,21 @@ def _parse_numeric_value(value: object, *, gib: bool) -> float | None:
         return None
     text = value.strip().replace(",", "")
     match = re.fullmatch(
-        r"([0-9]+(?:\.[0-9]+)?)\s*"
-        r"(tib|tb|ti?b?|gib|gb|gi?b?|mib|mb|vcpu|核|iops|io/s|mb/s|mib/s|%|天|days?)?\s*",
+        r"([0-9]+(?:\.[0-9]+)?)\s*(万|亿)?\s*"
+        r"(tib|tb|ti?b?|gib|gb|gi?b?|mib|mb|vcpu|核|kpu|iops|io/s|mb/s|mib/s|%|天|days?)?\s*"
+        r"(?:条|次|个|台|节点|人|小时|分钟)?\s*",
         text,
         flags=re.IGNORECASE,
     )
     if not match:
         return None
     number = float(match.group(1))
-    unit = (match.group(2) or "").casefold()
+    scale = match.group(2) or ""
+    if scale == "万":
+        number *= 10_000
+    elif scale == "亿":
+        number *= 100_000_000
+    unit = (match.group(3) or "").casefold()
     if gib and unit in {"tb", "tib", "t", "ti"}:
         return number * 1024
     if gib and unit in {"mb", "mib"}:

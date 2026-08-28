@@ -7,7 +7,6 @@ from typing import Annotated
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, PydanticBaseSettingsSource, SettingsConfigDict
 
-
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -28,6 +27,10 @@ class Settings(BaseSettings):
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-chat"
+    # Local desktop deployments commonly reach external AI endpoints through
+    # the system HTTP(S) proxy.  Ignoring it turns every AI call into a connect
+    # timeout while the rest of the application still appears online.
+    ai_trust_env_proxy: bool = True
 
     ai_provider: str = "auto"
     bedrock_api_key: str = ""

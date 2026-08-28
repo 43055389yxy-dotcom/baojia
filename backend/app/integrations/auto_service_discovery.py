@@ -9,13 +9,16 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
+from app.core.data_paths import AWS_DATA_ROOT
 from app.core.errors import ManualConfirmationRequired
 from app.integrations.aws import PricingCatalog
 from app.integrations.aws_product_registry import AwsProductRegistry
+from app.integrations.aws_supported_services import CURATED_SERVICE_OFFER_CODES
+from app.integrations.service_templates import DYNAMIC_SEMANTIC_TEMPLATE_FIELDS
 
 PROFILE_TTL_SECONDS = 10 * 24 * 60 * 60
 FAILED_RETRY_SECONDS = 6 * 60 * 60
-PROFILE_SCHEMA_VERSION = 7
+PROFILE_SCHEMA_VERSION = 12
 
 
 def canonical_service_name(value: str) -> str:
@@ -75,9 +78,7 @@ def _dimension_field(dimension: dict[str, Any]) -> tuple[str | None, str | None]
         return "bucket_count", "存储桶数量"
     if "object-day" in unit or "object day" in unit:
         return "object_count", "对象数量"
-    if "onpremupdates" in unit or (
-        "on-premises instance" in text and "update" in text
-    ):
+    if "onpremupdates" in unit or ("on-premises instance" in text and "update" in text):
         return "deployment_updates", "本地服务器更新次数"
     if "session" in unit and "reader" in text:
         return "session_capacity", "读者会话次数"
@@ -110,7 +111,12 @@ def _dimension_field(dimension: dict[str, Any]) -> tuple[str | None, str | None]
     if any(token in unit for token in ("request", "api call", "event")):
         return "requests", "请求数量"
 
+    if any(token in unit for token in ("gb-hour", "gb-hours", "gib-hour")):
+        if "memory" in text and "store" in text:
+            return "memory_store_gib_hours", "内存存储（GiB 小时）"
     if any(token in unit for token in ("gb-month", "gb-mo", "gib-month")):
+        if "magnetic" in text and "store" in text:
+            return "magnetic_store_gib_months", "磁性存储（GiB 月）"
         if any(token in text for token in ("backup", "snapshot")):
             return "backup_storage_gib", "备份或快照存储（GiB/月）"
         if "managed" in text:
@@ -118,8 +124,7 @@ def _dimension_field(dimension: dict[str, Any]) -> tuple[str | None, str | None]
         return "storage_gib", "存储容量（GiB/月）"
 
     if unit in {"gb", "gbyte", "gigabyte", "gigabytes", "gib"} or (
-        "byte" in unit
-        and any(token in text for token in ("process", "processed", "ingest"))
+        "byte" in unit and any(token in text for token in ("process", "processed", "ingest"))
     ):
         if any(token in text for token in ("transfer", "egress", "data out", "outbound")):
             return "data_transfer_out_gib", "出站流量（GiB）"
@@ -134,7 +139,9 @@ def _dimension_field(dimension: dict[str, Any]) -> tuple[str | None, str | None]
             )
         ):
             return "data_scanned_gib", "扫描数据量（GiB）"
-        if any(token in text for token in ("process", "processed", "ingest")):
+        if any(token in text for token in ("ingest", "ingested", "incoming data")):
+            return "data_in_gib", "摄入数据量（GiB）"
+        if any(token in text for token in ("process", "processed")):
             return "data_processed_gib", "处理数据量（GiB）"
         if any(token in text for token in ("backup", "snapshot")):
             return "backup_storage_gib", "备份或快照存储（GiB）"
@@ -142,11 +149,17 @@ def _dimension_field(dimension: dict[str, Any]) -> tuple[str | None, str | None]
             return "storage_gib", "存储容量（GiB）"
         return None, None
 
+    if any(token in unit for token in ("kpu-hour", "kpu hour")):
+        return "kpu_hours", "KPU 小时"
     if any(token in unit for token in ("dpu-hour", "dpu hour")):
         return "dpu_hours", "DPU 小时"
     if any(token in unit for token in ("mibps", "mbps")):
         return "throughput_mbps", "吞吐能力（MiB/s）"
     if any(token in unit for token in ("hour", "hrs")):
+        if "endpoint" in text:
+            return "endpoint_hours", "端点运行时长（端点小时）"
+        if "memory" in text and "store" in text:
+            return "memory_store_gib_hours", "内存存储（GiB 小时）"
         return "hours_per_month", "运行时长（小时/月）"
     if any(token in unit for token in ("quantity", "unit")):
         return "resource_count", "计费资源数量"
@@ -160,8 +173,7 @@ def _dimension_bindings(dimensions: list[dict[str, Any]]) -> list[dict[str, Any]
         field, label = _dimension_field(dimension)
         if not field:
             identity_text = "_".join(
-                str(dimension.get(key) or "")
-                for key in ("usage_type", "operation", "unit")
+                str(dimension.get(key) or "") for key in ("usage_type", "operation", "unit")
             )
             slug = re.sub(r"[^a-z0-9]+", "_", identity_text.casefold()).strip("_")
             if not slug:
@@ -199,22 +211,118 @@ def _dimension_bindings(dimensions: list[dict[str, Any]]) -> list[dict[str, Any]
 
 
 def _dimension_fields(dimensions: list[dict[str, Any]]) -> list[str]:
-    fields = {
-        "requested_model",
-        "vcpu",
-        "memory_gib",
-        "storage_gib",
-        "hours_per_month",
-        "requests",
-        "data_transfer_out_gib",
-        "purpose",
-    }
+    fields = set(DYNAMIC_SEMANTIC_TEMPLATE_FIELDS)
     for binding in _dimension_bindings(dimensions):
         fields.add(str(binding["field"]))
     for dimension in dimensions:
         if dimension.get("instance_type"):
             fields.update(("requested_model", "vcpu", "memory_gib"))
     return sorted(fields)
+
+
+def _flat_rate_dimensions(
+    product: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Normalize AWS FlatRate plans into the audited dimension contract."""
+
+    raw_flat_rate = (product.get("terms") or {}).get("FlatRate") or {}
+    plans = raw_flat_rate.get("plans") if isinstance(raw_flat_rate, dict) else None
+    if not isinstance(plans, list):
+        return [], []
+    raw_product = product.get("product") or {}
+    attrs = raw_product.get("attributes") or {}
+    product_sku = str(raw_product.get("sku") or "")
+    matched_plans = [
+        plan
+        for plan in plans
+        if isinstance(plan, dict)
+        and (not product_sku or str(plan.get("sku") or "") == product_sku)
+    ]
+    if product_sku and not matched_plans:
+        return [], []
+
+    dimensions: list[dict[str, Any]] = []
+    options: list[dict[str, Any]] = []
+    for plan in matched_plans:
+        plan_code = str(plan.get("planCode") or plan.get("sku") or "").strip()
+        family = str(plan.get("planFamilyCode") or attrs.get("productFamily") or "")
+        subscription = plan.get("subscriptionPrice") or {}
+        raw_subscription_price = (subscription.get("pricePerUnit") or {}).get("USD")
+        try:
+            subscription_price = float(raw_subscription_price)
+        except (TypeError, ValueError):
+            subscription_price = None
+        usage_type = str(
+            attrs.get("usagetype")
+            or attrs.get("usageType")
+            or f"FlatRate-{plan_code}"
+        )
+        operation = str(attrs.get("operation") or "Subscription")
+        if subscription_price is not None:
+            dimensions.append(
+                {
+                    "usage_type": usage_type,
+                    "operation": operation,
+                    "unit": "Quantity",
+                    "price": subscription_price,
+                    "description": str(
+                        subscription.get("description") or f"{plan_code} subscription"
+                    ),
+                    "product_family": family,
+                    "instance_type": plan_code or None,
+                    "vcpu": None,
+                    "memory": None,
+                    "term_type": "FlatRate",
+                }
+            )
+
+        features: list[dict[str, Any]] = []
+        for feature in plan.get("features") or []:
+            if not isinstance(feature, dict):
+                continue
+            quota = feature.get("usageQuota") or {}
+            feature_payload = {
+                "feature_code": str(feature.get("featureCode") or ""),
+                "feature_name": str(feature.get("featureName") or ""),
+                "usage_type": str(feature.get("usageType") or ""),
+                "unit": str(quota.get("unit") or "unit"),
+                "included_quantity": quota.get("value"),
+                "pooling": str(quota.get("usagePoolingPolicy") or ""),
+                "overage_policy": str(feature.get("overagePolicy") or ""),
+            }
+            features.append(feature_payload)
+            raw_overage_price = (
+                (feature.get("overage") or {}).get("pricePerUnit") or {}
+            ).get("USD")
+            try:
+                overage_price = float(raw_overage_price)
+            except (TypeError, ValueError):
+                continue
+            dimensions.append(
+                {
+                    "usage_type": feature_payload["usage_type"]
+                    or f"FlatRate-{plan_code}-{feature_payload['feature_code']}",
+                    "operation": feature_payload["feature_code"] or operation,
+                    "unit": feature_payload["unit"],
+                    "price": overage_price,
+                    "description": f"{feature_payload['feature_name']} overage".strip(),
+                    "product_family": family,
+                    "instance_type": plan_code or None,
+                    "vcpu": None,
+                    "memory": None,
+                    "term_type": "FlatRateOverage",
+                }
+            )
+        options.append(
+            {
+                "plan_code": plan_code,
+                "plan_family": family,
+                "monthly_price": subscription_price,
+                "description": str(subscription.get("description") or ""),
+                "features": features,
+            }
+        )
+    return dimensions, options
 
 
 class AutoServiceDiscovery:
@@ -232,9 +340,7 @@ class AutoServiceDiscovery:
     ):
         self.catalog = catalog
         self.product_registry = product_registry
-        self._database_path = database_path or (
-            Path(__file__).resolve().parents[2] / ".cache" / "auto_service_profiles.sqlite3"
-        )
+        self._database_path = database_path or AWS_DATA_ROOT / "auto_service_profiles.sqlite3"
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._profile_locks: dict[str, threading.Lock] = {}
@@ -252,6 +358,30 @@ class AutoServiceDiscovery:
         if self.product_registry is None:
             return None
         return self.product_registry.resolve_product(*labels)
+
+    def candidate_official_products(
+        self,
+        *labels: str,
+        limit: int = 12,
+    ) -> list[dict[str, Any]]:
+        """Return provider-owned candidates for an unfamiliar product name."""
+
+        if self.product_registry is None:
+            return []
+        return self.product_registry.candidate_products(*labels, limit=limit)
+
+    def official_products(self, *, limit: int = 500) -> list[dict[str, Any]]:
+        """Return every current official identity for rare-name AI fallback."""
+
+        if self.product_registry is None:
+            return []
+        return self.product_registry.official_products(limit=limit)
+
+    def remember_official_alias(self, service_code: str, alias: str) -> None:
+        """Persist one closed-choice AI identity result for future local use."""
+
+        if self.product_registry is not None:
+            self.product_registry.add_alias(service_code, alias)
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -277,7 +407,12 @@ class AutoServiceDiscovery:
 
     @staticmethod
     def _profile_key(service_key: str, region: str | None) -> str:
-        return f"{service_stem(service_key)}:{(region or 'global').casefold()}"
+        # Cache identity must preserve the complete provider product boundary.
+        # ``service_stem`` intentionally removes Service/Services for fuzzy
+        # name resolution, but using it here made distinct offers such as
+        # AmazonBedrock and AmazonBedrockService share one profile.  Resolution
+        # may be tolerant; persisted fields and prices must never be.
+        return f"{canonical_service_name(service_key)}:{(region or 'global').casefold()}"
 
     def get_profile(self, service_key: str, region: str | None = None) -> dict[str, Any] | None:
         key = self._profile_key(service_key, region)
@@ -308,9 +443,7 @@ class AutoServiceDiscovery:
     ) -> dict[str, Any] | None:
         profile_key = self._profile_key(service_key, region)
         with self._lock:
-            profile_lock = self._profile_locks.setdefault(
-                profile_key, threading.Lock()
-            )
+            profile_lock = self._profile_locks.setdefault(profile_key, threading.Lock())
         with profile_lock:
             return self._ensure_profile_once(
                 service_key=service_key,
@@ -331,13 +464,10 @@ class AutoServiceDiscovery:
         if cached is not None and not force_refresh:
             age = time.time() - float(cached.get("updated_at") or 0)
             schema_is_current = (
-                int(cached.get("profile_schema_version") or 0)
-                >= PROFILE_SCHEMA_VERSION
+                int(cached.get("profile_schema_version") or 0) >= PROFILE_SCHEMA_VERSION
             )
             retry_after = (
-                FAILED_RETRY_SECONDS
-                if cached.get("status") == "failed"
-                else PROFILE_TTL_SECONDS
+                FAILED_RETRY_SECONDS if cached.get("status") == "failed" else PROFILE_TTL_SECONDS
             )
             if age < retry_after and schema_is_current:
                 service_code = str(cached.get("service_code") or "")
@@ -394,6 +524,21 @@ class AutoServiceDiscovery:
             if registry_match:
                 return registry_match
         codes = self.catalog.service_codes()
+        # Curated component names and AWS Price List offer codes are not
+        # necessarily alike. Examples include DMS ->
+        # AWSDatabaseMigrationSvc, EMR -> ElasticMapReduce and AppConfig ->
+        # AWSSystemsManager.  The application already maintains one audited
+        # mapping for these identities; profile discovery must consume that
+        # same contract instead of trying to rediscover it with fuzzy text
+        # matching.  Verify the mapped offer against the current AWS catalogue
+        # before returning it so a stale mapping cannot silently pass.
+        normalized_key = service_key.strip().casefold().replace("-", "_").replace(" ", "_")
+        curated_offer = CURATED_SERVICE_OFFER_CODES.get(normalized_key)
+        if curated_offer:
+            codes_by_name = {canonical_service_name(code): code for code in codes}
+            current_offer = codes_by_name.get(canonical_service_name(curated_offer))
+            if current_offer:
+                return current_offer
         for label in labels:
             exact = [code for code in codes if service_stem(code) == service_stem(label)]
             if len(exact) == 1:
@@ -432,17 +577,13 @@ class AutoServiceDiscovery:
     ) -> dict[str, Any]:
         assert self.catalog is not None
         filters = {"regionCode": region} if region and region != "global" else {}
-        products = self._catalog_products(
-            service_code, filters, max_pages=10, refresh=refresh
-        )
+        products = self._catalog_products(service_code, filters, max_pages=10, refresh=refresh)
         if filters:
             # One ServiceCode can contain both regional usage and global
             # subscriptions.  Discover both so a newly encountered product can
             # build a complete cached profile on its first quote.  Only global
             # records are merged; prices from other regions remain isolated.
-            all_products = self._catalog_products(
-                service_code, {}, max_pages=10, refresh=refresh
-            )
+            all_products = self._catalog_products(service_code, {}, max_pages=10, refresh=refresh)
             seen_skus = {
                 str(item.get("product", {}).get("sku") or item.get("sku") or "")
                 for item in products
@@ -451,14 +592,11 @@ class AutoServiceDiscovery:
                 item
                 for item in all_products
                 if self._is_global_product(item)
-                and str(
-                    item.get("product", {}).get("sku")
-                    or item.get("sku")
-                    or ""
-                )
+                and str(item.get("product", {}).get("sku") or item.get("sku") or "")
                 not in seen_skus
             )
         dimensions: list[dict[str, Any]] = []
+        plan_options: list[dict[str, Any]] = []
         attribute_names: set[str] = set()
         seen: set[tuple[str, str, str, str]] = set()
         for product in products:
@@ -494,6 +632,9 @@ class AutoServiceDiscovery:
                             "memory": attrs.get("memory") or attrs.get("memoryGib"),
                         }
                     )
+            flat_dimensions, flat_options = _flat_rate_dimensions(product)
+            dimensions.extend(flat_dimensions)
+            plan_options.extend(flat_options)
         safe_dimensions = [item for item in dimensions if self._safe_dimension(item)]
         if not safe_dimensions:
             raise ManualConfirmationRequired(
@@ -522,6 +663,7 @@ class AutoServiceDiscovery:
             # later storage, backup and user rows; the confirmation page could
             # then offer a choice that final pricing no longer knew about.
             "dimensions": safe_dimensions,
+            "plan_options": plan_options,
             "status": "verified",
             "updated_at": time.time(),
         }
@@ -531,12 +673,11 @@ class AutoServiceDiscovery:
     @staticmethod
     def _is_global_product(product: dict[str, Any]) -> bool:
         attrs = PricingCatalog.attributes(product)
-        region = str(
-            attrs.get("regionCode")
-            or attrs.get("regioncode")
-            or attrs.get("region")
-            or ""
-        ).strip().casefold()
+        region = (
+            str(attrs.get("regionCode") or attrs.get("regioncode") or attrs.get("region") or "")
+            .strip()
+            .casefold()
+        )
         location = str(attrs.get("location") or "").strip().casefold()
         return region in {"", "global"} and location in {
             "",
@@ -581,9 +722,7 @@ class AutoServiceDiscovery:
         result = {"checked": len(rows), "refreshed": 0, "failed": 0}
         for row in rows:
             retry_after = (
-                FAILED_RETRY_SECONDS
-                if str(row["status"]) == "failed"
-                else PROFILE_TTL_SECONDS
+                FAILED_RETRY_SECONDS if str(row["status"]) == "failed" else PROFILE_TTL_SECONDS
             )
             if now - float(row["updated_at"]) < retry_after:
                 continue
@@ -612,23 +751,16 @@ class AutoServiceDiscovery:
             "tax",
             "support",
             "professional service",
-            "marketplace",
         )
         return not any(token in text for token in blocked)
 
     @staticmethod
     def _profile_prompt(profile: dict[str, Any]) -> str:
         units = sorted(
-            {
-                str(item.get("unit"))
-                for item in profile.get("dimensions", [])
-                if item.get("unit")
-            }
+            {str(item.get("unit")) for item in profile.get("dimensions", []) if item.get("unit")}
         )
         fields = ", ".join(str(item) for item in profile.get("fields", []))
-        attributes = ", ".join(
-            str(item) for item in profile.get("attribute_names", [])[:40]
-        )
+        attributes = ", ".join(str(item) for item in profile.get("attribute_names", [])[:40])
         mappings = []
         for binding in profile.get("field_bindings", [])[:40]:
             if not isinstance(binding, dict):
@@ -639,6 +771,19 @@ class AutoServiceDiscovery:
                 f"Operation={binding.get('operation') or '-'}；"
                 f"Unit={binding.get('unit') or '-'}"
             )
+        plan_lines = []
+        for plan in profile.get("plan_options", [])[:20]:
+            if not isinstance(plan, dict):
+                continue
+            features = ", ".join(
+                f"{feature.get('feature_name') or feature.get('feature_code')}="
+                f"{feature.get('included_quantity')} {feature.get('unit')}"
+                for feature in plan.get("features", [])
+                if isinstance(feature, dict)
+            )
+            plan_lines.append(
+                f"- {plan.get('plan_code')}：{plan.get('monthly_price')} USD；{features}"
+            )
         return (
             f"【自动发现：{profile.get('display_name')}】\n"
             f"AWS 官方 ServiceCode：{profile.get('service_code')}。\n"
@@ -647,6 +792,9 @@ class AutoServiceDiscovery:
             f"官方计费单位：{', '.join(units[:20]) or '未返回'}。\n"
             "官方字段对应关系：\n"
             + ("\n".join(mappings) if mappings else "- 仅提供官方单位参考价")
+            + "\n"
+            "官方套餐选项：\n"
+            + ("\n".join(plan_lines) if plan_lines else "- 无")
             + "\n"
             "只填客户明确值；空缺保持 null。该卡片由官方目录自动生成，不包含可执行代码。"
         )

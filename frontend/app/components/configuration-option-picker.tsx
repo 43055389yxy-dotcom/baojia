@@ -5,6 +5,7 @@ import { useMemo, useState } from "react";
 export type ConfigurationChoice = {
   label: string;
   value: string;
+  description?: string | null;
   model?: string | null;
   specifications?: Record<string, unknown>;
   monthly_catalog_cost?: number | null;
@@ -113,20 +114,33 @@ export function ConfigurationOptionPicker({
   if (!catalog) {
     const buttonValue = (value ?? "").split("；", 1)[0];
     return (
-      <label className={`${className} configuration-picker-result`.trim()}>
-        <span>请选择</span>
-        <select
-          className="configuration-picker-select"
-          aria-label="选择确认项"
-          value={options.some((option) => option.value === buttonValue) ? buttonValue : ""}
-          onChange={(event) => onChange(event.target.value)}
-        >
-          <option value="">请选择一个选项</option>
-          {options.map((option) => (
-            <option value={option.value} key={option.value}>{option.label}</option>
-          ))}
-        </select>
-      </label>
+      <div className={`${className} configuration-picker-choice-wrap`.trim()}>
+        <div className="configuration-picker-choice-heading">
+          <strong>选择一个方案</strong>
+          <span>点击下面的卡片即可选择</span>
+        </div>
+        <div className="configuration-picker-explanations" role="radiogroup" aria-label="选择确认方案">
+          {options.map((option) => {
+            const selected = buttonValue === option.value;
+            return (
+            <button
+              type="button"
+              key={`explanation-${option.value}`}
+              role="radio"
+              aria-checked={selected}
+              className={selected ? "selected" : ""}
+              onClick={() => onChange(option.value)}
+            >
+              <span className="configuration-picker-choice-mark" aria-hidden="true">{selected ? "✓" : ""}</span>
+              <span className="configuration-picker-choice-copy">
+                <strong>{option.label}</strong>
+                {option.description && <span>{option.description}</span>}
+              </span>
+            </button>
+            );
+          })}
+        </div>
+      </div>
     );
   }
 

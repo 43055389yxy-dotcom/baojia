@@ -131,6 +131,8 @@ type PreviewSelection = {
   confirmation_reason?: string | null;
   status?: "ready" | "customer_issue" | "technical_issue" | "unsupported";
   issue_message?: string | null;
+  issue_code?: string | null;
+  issue_category?: "retryable" | "compatibility" | "catalog_mapping" | "system_configuration" | "unsupported" | null;
 };
 type ConfirmationItem = {
   question: string;
@@ -251,6 +253,7 @@ type PricingScenario = {
   currency: string;
   priced_lines: PricedLine[];
   component_costs?: Record<string, number>;
+  component_pricing_basis?: Record<string, "on_demand" | "reserved" | "on_demand_fallback">;
   is_partial?: boolean;
   incomplete_component_ids?: string[];
 };
@@ -268,28 +271,23 @@ type AzurePricingMode = "pay_as_you_go" | "reservation" | "savings_plan" | "spot
 type AzurePaymentOption = "monthly" | "upfront";
 type CloudProvider = "aws" | "azure";
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "/api/backend";
-const CONFIRMATION_CONTEXT_KEY = "astraquote.pending-confirmation.v1";
-const QUOTE_JOB_CONTEXT_KEY = "astraquote.pending-quote.v1";
-const SALES_REGION_CONTEXT_KEYS: Record<CloudProvider, string> = {
-  aws: "astraquote.aws.current-sales-region.v2",
-  azure: "astraquote.azure.current-sales-region.v2",
-};
+const CONFIRMATION_CONTEXT_KEY = "astraquote.aws.pending-confirmation.v1";
+const QUOTE_JOB_CONTEXT_KEY = "astraquote.aws.pending-quote.v1";
+const SALES_REGION_CONTEXT_KEY = "astraquote.aws.current-sales-region.v2";
 
-function readSalesRegionContext(provider: CloudProvider): string | null {
-  return window.sessionStorage.getItem(SALES_REGION_CONTEXT_KEYS[provider]);
+function readSalesRegionContext(_provider: CloudProvider): string | null {
+  void _provider;
+  return window.sessionStorage.getItem(SALES_REGION_CONTEXT_KEY);
 }
 
-function writeSalesRegionContext(provider: CloudProvider, region: string) {
-  window.sessionStorage.setItem(SALES_REGION_CONTEXT_KEYS[provider], region);
+function writeSalesRegionContext(_provider: CloudProvider, region: string) {
+  void _provider;
+  window.sessionStorage.setItem(SALES_REGION_CONTEXT_KEY, region);
 }
 
-function clearSalesRegionContext(provider: CloudProvider) {
-  window.sessionStorage.removeItem(SALES_REGION_CONTEXT_KEYS[provider]);
-}
-
-function clearAllSalesRegionContexts() {
-  clearSalesRegionContext("aws");
-  clearSalesRegionContext("azure");
+function clearSalesRegionContext(_provider: CloudProvider) {
+  void _provider;
+  window.sessionStorage.removeItem(SALES_REGION_CONTEXT_KEY);
 }
 
 type PendingConfirmationContext = {
@@ -329,20 +327,6 @@ const serviceNames: Record<string, string> = {
   xray: "AWS X-Ray",
   cloud_map: "AWS Cloud Map",
   appconfig: "AWS AppConfig",
-  azure_vm: "Azure Virtual Machines",
-  managed_disks: "Azure Managed Disks",
-  azure_sql: "Azure SQL Database",
-  azure_postgresql: "Azure Database for PostgreSQL",
-  azure_mysql: "Azure Database for MySQL",
-  azure_cache: "Azure Managed Redis",
-  blob_storage: "Azure Blob Storage",
-  load_balancer: "Azure Load Balancer",
-  application_gateway: "Azure Application Gateway",
-  front_door: "Azure Front Door",
-  bandwidth: "Azure Bandwidth",
-  aks: "Azure Kubernetes Service",
-  monitor: "Azure Monitor",
-  api_management: "Azure API Management",
 };
 
 function serviceDisplayName(selection: { service: string; display_name: string }): string {
@@ -356,10 +340,12 @@ const specificationNames: Record<string, string> = {
   customerDeployment: "客户确认架构", clusterMembers: "每集群数据库实例数",
   shards: "分片", replicasPerShard: "每分片副本", totalNodes: "节点", quantity: "数量",
   dataTransferOutGiB: "公网下行", processedBytesGiB: "处理流量",
-  systemDiskGiB: "系统盘", volumeType: "磁盘类型",
+  systemDiskGiB: "系统盘", volumeType: "磁盘类型", additional_ebs_volumes: "数据盘",
   hostedZones: "域名托管区", webACLs: "Web ACL", rules: "规则总数", requests: "每月请求总量",
   messages: "每月消息数", connectionMinutes: "每月连接分钟",
   throughputMbpsPerTiB: "每 TiB 吞吐量",
+  data_in_gib: "每月写入", data_out_gib: "每月读取",
+  throughput_mode: "吞吐模式", provisioned_throughput_mibps: "预置吞吐量",
   rulesPerWebACL: "每个 ACL 规则", requestsPerWebACL: "每个 ACL 每月请求",
   memory_mb: "函数内存", duration_ms: "平均执行时长",
   queueType: "队列类型", outboundMessages: "出站邮件", logIngestionGiB: "日志写入",
@@ -384,8 +370,25 @@ const specificationNames: Record<string, string> = {
   capacity_units: "容量单位", log_ingestion_gib: "日志写入", retention_days: "保留天数",
 };
 
+function formatAdditionalEbsVolumes(value: unknown): string | null {
+  if (!Array.isArray(value)) return null;
+  const descriptions = value.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const volume = entry as Record<string, unknown>;
+    const size = Number(volume.size_gib);
+    if (!Number.isFinite(size)) return [];
+    const count = Math.max(1, Number(volume.count_per_instance) || 1);
+    const type = typeof volume.volume_type === "string" ? volume.volume_type : "gp3";
+    return [`${size.toLocaleString("zh-CN")} GiB ${type} × ${count} 块/台`];
+  });
+  return descriptions.length > 0 ? descriptions.join("；") : null;
+}
+
 function formatPreviewValue(key: string, value: unknown): string {
   if (typeof value === "boolean") return value ? "是" : "否";
+  if (key === "additional_ebs_volumes") {
+    return formatAdditionalEbsVolumes(value) ?? "未识别";
+  }
   if (Array.isArray(value)) return value.join("、");
   if (value && typeof value === "object") return JSON.stringify(value);
   const normalizedValues: Record<string, string> = {
@@ -675,6 +678,10 @@ function compactSpecifications(selection: Selection) {
       && !hiddenSpecificationKeys.has(key)
     ))
     .map(([key, value]) => {
+      if (key === "additional_ebs_volumes") {
+        const volumes = formatAdditionalEbsVolumes(value);
+        if (volumes) return `${specificationNames[key] ?? key}: ${volumes}`;
+      }
       const numericValue = typeof value === "number" ? value.toLocaleString("zh-CN") : String(value);
       const suffix = key.toLowerCase().includes("gib")
         ? " GiB"
@@ -691,7 +698,7 @@ function compactSpecifications(selection: Selection) {
 }
 
 export default function Home() {
-  const [cloudProvider, setCloudProvider] = useState<CloudProvider>("aws");
+  const [cloudProvider] = useState<CloudProvider>("aws");
   const [health, setHealth] = useState<Health | null>(null);
   const [requirement, setRequirement] = useState("");
   const [job, setJob] = useState<Job | null>(null);
@@ -727,6 +734,8 @@ export default function Home() {
   const confirmationRecoveryStarted = useRef(false);
   const quoteRecoveryStarted = useRef(false);
   const lateConfirmationTokenStarted = useRef<string | null>(null);
+  const directQuotePreflightRecoveryStarted = useRef<string | null>(null);
+  const identityRecoveryAttempted = useRef(false);
   const previewPollFailures = useRef<Map<string, number>>(new Map());
   const previewRestartedJobs = useRef<Set<string>>(new Set());
   const componentRetryAttempts = useRef<Map<string, number>>(new Map());
@@ -764,7 +773,10 @@ export default function Home() {
         });
     };
     checkHealth();
-    const healthTimer = window.setInterval(checkHealth, 5000);
+    // The backend caches the external AWS probe.  A slower UI heartbeat is
+    // enough to detect a stopped local server without flooding AWS while a
+    // real quote is being calculated.
+    const healthTimer = window.setInterval(checkHealth, 30000);
     return () => {
       active = false;
       window.clearInterval(healthTimer);
@@ -780,11 +792,15 @@ export default function Home() {
       const saved = window.sessionStorage.getItem(CONFIRMATION_CONTEXT_KEY);
       if (!saved) return;
       const context = JSON.parse(saved) as PendingConfirmationContext;
-      if (!context.token || !context.draftId || !context.customerRequest || !context.cloudProvider) {
+      if (
+        !context.token
+        || !context.draftId
+        || !context.customerRequest
+        || context.cloudProvider !== cloudProvider
+      ) {
         window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
         return;
       }
-      setCloudProvider(context.cloudProvider);
       setRequirement(context.customerRequest);
       workflowPhase.current = "confirmation";
       setPreviewDraftId(context.draftId);
@@ -821,8 +837,10 @@ export default function Home() {
         cloudProvider?: CloudProvider;
         draftId?: string;
       };
-      if (!context.jobId || !context.customerRequest || !context.cloudProvider) return;
-      setCloudProvider(context.cloudProvider);
+      if (!context.jobId || !context.customerRequest || context.cloudProvider !== cloudProvider) {
+        window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY);
+        return;
+      }
       if (context.draftId) setPreviewDraftId(context.draftId);
       workflowPhase.current = "quote";
       setRequirement(context.customerRequest);
@@ -980,8 +998,6 @@ export default function Home() {
       : checking
         ? 2
         : 1;
-  const quoteFlowStarted = officialPricingStarted || running || Boolean(confirmationText) || Boolean(salesReview) || job?.status === "completed";
-
   useEffect(() => {
     const element = timeline.current;
     if (element) element.scrollTop = element.scrollHeight;
@@ -1036,6 +1052,58 @@ export default function Home() {
   }, [job?.status, job?.error, confirmationItems, confirmationText, requirement, cloudProvider]);
 
   useEffect(() => {
+    if (
+      job?.status !== "failed"
+      || job.kind !== "quote"
+      || job.error?.code !== "official_spec_confirmation_required"
+      || !confirmationText
+      || typeof job.error?.details?.confirmation_token === "string"
+      || !requirement.trim()
+      || directQuotePreflightRecoveryStarted.current === job.job_id
+    ) return;
+    // Older/direct retry paths could reach formal pricing before a customer
+    // confirmation URL existed. Send the unchanged request back through the
+    // normal sales preflight once, which batches every question and publishes
+    // one stable link instead of showing a dead-end copy-only prompt.
+    directQuotePreflightRecoveryStarted.current = job.job_id;
+    window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY);
+    workflowPhase.current = "idle";
+    setJob(null);
+    setPreviewDraftId(null);
+    setConfirmationToken(null);
+    void submitRequirement();
+  // This recovery is keyed by the failed job id and must run at most once.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job?.job_id, job?.status, job?.kind, job?.error, confirmationText, requirement]);
+
+  useEffect(() => {
+    if (
+      job?.status !== "failed"
+      || job.error?.code !== "service_identity_resolution_failed"
+      || !requirement.trim()
+      || identityRecoveryAttempted.current
+    ) return;
+    // Product-name resolution is an internal operation. Retry the unchanged
+    // request once through the repaired/local-cache path instead of asking a
+    // salesperson to interpret an old failed job or resubmit every component.
+    identityRecoveryAttempted.current = true;
+    workflowPhase.current = "idle";
+    window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY);
+    setPreviewDraftId(null);
+    setSalesReview(null);
+    void runPreflight(
+      requirement,
+      undefined,
+      {},
+      false,
+      cloudProvider,
+      salesRegion ?? readSalesRegionContext(cloudProvider) ?? undefined,
+    );
+  // The recovery is deliberately limited to one attempt per entered request.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job?.job_id, job?.status, job?.error, requirement, cloudProvider, salesRegion]);
+
+  useEffect(() => {
     if (!running && !retryActivityVisible) return;
     const interval = window.setInterval(() => setElapsedSeconds((value) => value + 1), 1000);
     return () => window.clearInterval(interval);
@@ -1079,7 +1147,7 @@ export default function Home() {
       return;
     }
     const failedComponentIds = (salesReview.selections ?? [])
-      .filter((selection) => ["technical_issue", "unsupported"].includes(selection.status ?? ""))
+      .filter((selection) => selection.issue_category === "retryable")
       .map((selection) => Number(selection.component_id))
       .filter((componentId) => Number.isInteger(componentId) && componentId >= 0);
     if (!failedComponentIds.length) {
@@ -1088,6 +1156,10 @@ export default function Home() {
     }
     const retryKey = `${salesReview.draft_id}:${failedComponentIds.join(",")}`;
     const attempt = componentRetryAttempts.current.get(retryKey) ?? 0;
+    if (attempt >= 3) {
+      setComponentRetryStatus(null);
+      return;
+    }
     const delays = [1500, 4000, 10000, 30000, 60000, 120000];
     const delay = delays[Math.min(attempt, delays.length - 1)];
     setComponentRetryStatus({
@@ -1674,6 +1746,7 @@ export default function Home() {
 
   async function submitRequirement() {
     if (running || salesRegionChecking || requirement.trim().length < 3) return;
+    identityRecoveryAttempted.current = false;
     workflowPhase.current = "idle";
     setConfirmationReply("");
     setConfirmationToken(null);
@@ -1687,9 +1760,7 @@ export default function Home() {
     const provider = cloudProvider;
     setSalesRegionChecking(true);
     try {
-      const endpoint = provider === "azure"
-        ? "/api/azure/quotes/region-preflight"
-        : "/api/quotes/region-preflight";
+      const endpoint = "/api/quotes/region-preflight";
       const response = await fetch(`${API_BASE}${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1882,7 +1953,7 @@ export default function Home() {
     setReceivedCustomerAnswers({});
     window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
     window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY);
-    clearAllSalesRegionContexts();
+    clearSalesRegionContext(cloudProvider);
     window.scrollTo({ top: 0, behavior: "smooth" });
     window.setTimeout(() => requirementInput.current?.focus(), 350);
   }
@@ -1906,25 +1977,6 @@ export default function Home() {
           </div>
         </div>
       </header>
-
-      {!quoteFlowStarted && <nav className="cloud-provider-switch" aria-label="选择云平台">
-        <button type="button" className={cloudProvider === "aws" ? "selected" : ""} onClick={() => {
-          workflowPhase.current = "idle";
-          setCloudProvider("aws");
-          setPricingMode("standard_reserved");
-          setIncludeOnDemandScenario(true);
-          setReservedTermYears([1, 3]);
-          setPaymentOption("all_upfront");
-          window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY);
-          clearAllSalesRegionContexts();
-          setJob(null);
-          setSalesReview(null);
-          setSalesRegion(null);
-          setSalesRegionOptions([]);
-          setSalesRegionPromptOpen(false);
-        }}>AWS 报价</button>
-        <button type="button" className={cloudProvider === "azure" ? "selected" : ""} onClick={() => { workflowPhase.current = "idle"; window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY); clearAllSalesRegionContexts(); setCloudProvider("azure"); setPricingMode(null); setAzurePricingMode("pay_as_you_go"); setAzureTermYears(1); setAzurePaymentOption("monthly"); setJob(null); setSalesReview(null); setSalesRegion(null); setSalesRegionOptions([]); setSalesRegionPromptOpen(false); }}>Microsoft Azure 报价</button>
-      </nav>}
 
       <nav className="quote-steps" aria-label="报价步骤">
         {["输入需求", "配置确认", "官方报价"].map((label, index) => {
@@ -2489,16 +2541,49 @@ export default function Home() {
             <p className="kicker">需要检查</p>
             <h2>本次没有生成价格</h2>
             <p>{job.error.message}</p>
+            {Array.isArray(job.error.details?.components) && job.error.details.components.length > 0 && (
+              <div className="error-component-list">
+                <strong>本次未通过的组件</strong>
+                <ul>
+                  {(job.error.details.components as Array<Record<string, unknown>>).map((component, index) => (
+                    <li key={`${String(component.component_id ?? index)}-${String(component.display_name ?? "")}`}>
+                      <b>组件 {String(component.component_id ?? index + 1)} · {String(component.display_name ?? "未识别组件")}</b>
+                      {component.reason && <span>{String(component.reason)}</span>}
+                      {component.source_text && <small>客户填写：{String(component.source_text)}</small>}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             <button
               className="reconnect-button"
               type="button"
               disabled={!requirement.trim()}
-              onClick={() => void startQuote(
-                requirement,
-                previewDraftId ?? undefined,
-                [{ stage: "recovery", message: "保留全部已确认配置，重新匹配官方计费项", time: "刚刚" }],
-                cloudProvider,
-              )}
+              onClick={() => {
+                const restartFromPreflight = job.kind === "preview" || [
+                  "connection_lost",
+                  "official_spec_confirmation_required",
+                  "internal_error",
+                ].includes(job.error?.code ?? "");
+                if (restartFromPreflight) {
+                  workflowPhase.current = "idle";
+                  window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY);
+                  void runPreflight(
+                    requirement,
+                    job.kind === "preview" ? previewDraftId ?? undefined : undefined,
+                    {},
+                    false,
+                    cloudProvider,
+                  );
+                  return;
+                }
+                void startQuote(
+                  requirement,
+                  previewDraftId ?? undefined,
+                  [{ stage: "recovery", message: "保留全部已确认配置，重新匹配官方计费项", time: "刚刚" }],
+                  cloudProvider,
+                );
+              }}
             >
               保留配置并重新报价
             </button>
@@ -2558,7 +2643,13 @@ export default function Home() {
                     {quoteScenarios(job.result!).map((scenario) => {
                       const cost = scenarioServiceCost(scenario, selection, index);
                       const scenarioIncomplete = scenarioComponentIsIncomplete(scenario, selection, index);
-                      return <td className="row-cost" key={scenario.label}>{selection.pricing_status === "unpriced" || scenarioIncomplete ? "报价异常" : cost > 0 ? formatMoney(cost, scenario.currency) : ((selection.pricing_status === "reference_only" || selection.reference_rates?.length) ? "缺少用量" : formatMoney(0, scenario.currency))}</td>;
+                      const componentId = selection.component_id ?? String(index);
+                      const pricingBasis = scenario.component_pricing_basis?.[componentId];
+                      return <td className="row-cost" key={scenario.label}>
+                        {selection.pricing_status === "unpriced" || scenarioIncomplete ? "报价异常" : cost > 0 ? formatMoney(cost, scenario.currency) : ((selection.pricing_status === "reference_only" || selection.reference_rates?.length) ? "缺少用量" : formatMoney(0, scenario.currency))}
+                        {scenario.pricing_mode !== "on_demand" && pricingBasis === "on_demand_fallback" && <small>该服务按需价</small>}
+                        {pricingBasis === "reserved" && <small>官方承诺价</small>}
+                      </td>;
                     })}
                     <td className="reference-rate">{referenceRateText(selection) || "-"}</td>
                   </tr>

@@ -21,6 +21,7 @@ from app.integrations.aws_supported_services import (
     RETIRED_AWS_SERVICE_PROFILES,
 )
 from app.integrations.service_templates import SERVICE_TEMPLATE_FIELDS
+from app.services.aws_query_executor import ReadOnlyAwsQueryExecutor
 
 _SERVICE_CODE_ALIASES = {
     # Several AWS resources are billed inside a parent offer rather than an
@@ -301,6 +302,132 @@ class GenericOfficialPlugin:
             rates.append((price, unit, identity[1], identity[2], product))
         return rates
 
+    def _enrich_missing_instance_shapes(
+        self,
+        requirement: ServiceRequirement,
+        rates: list[tuple[float, str, str, str, dict[str, object]]],
+        region: str,
+    ) -> list[tuple[float, str, str, str, dict[str, object]]]:
+        """Join managed-service instance prices to the official EC2 shape API.
+
+        Several AWS Price List offers publish an EC2-compatible instanceType
+        but omit vCPU and memory (Amazon EMR is a common example). Repeatedly
+        downloading that same offer can never add the missing shape. Query the
+        provider's read-only EC2 specification endpoint for only the customer
+        requested shapes and attach those official attributes to matching
+        price rows in memory.
+        """
+
+        requested = requirement.requirements
+        requested_shapes: set[tuple[int, int]] = set()
+        for prefix in ("", "master_", "core_", "task_"):
+            raw_vcpu = requested.get(f"{prefix}vcpu")
+            raw_memory = requested.get(f"{prefix}memory_gib")
+            if raw_vcpu in (None, "") or raw_memory in (None, ""):
+                continue
+            try:
+                requested_shapes.add((int(float(raw_vcpu)), int(float(raw_memory))))
+            except (TypeError, ValueError):
+                continue
+        requested_models = {
+            str(requested.get(field) or "").strip()
+            for field in (
+                "requested_model",
+                "master_requested_model",
+                "core_requested_model",
+                "task_requested_model",
+            )
+            if str(requested.get(field) or "").strip()
+        }
+        missing_models = {
+            str(PricingCatalog.attributes(rate[4]).get("instanceType") or "").strip()
+            for rate in rates
+            if PricingCatalog.attributes(rate[4]).get("instanceType")
+            and any(value is None for value in self._official_instance_shape(rate[4])[1:])
+        }
+        if not missing_models or (not requested_shapes and not requested_models):
+            return rates
+
+        shapes_by_model: dict[str, tuple[float, float]] = {}
+        executor = ReadOnlyAwsQueryExecutor(self.clients)
+
+        def remember(payload: dict[str, object]) -> None:
+            for page in payload.get("pages", [payload]):
+                if not isinstance(page, dict):
+                    continue
+                for item in page.get("InstanceTypes", []):
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        shapes_by_model[str(item["InstanceType"]).casefold()] = (
+                            float(item["VCpuInfo"]["DefaultVCpus"]),
+                            float(item["MemoryInfo"]["SizeInMiB"]) / 1024,
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        continue
+
+        try:
+            exact_models = sorted(requested_models & missing_models)
+            if exact_models:
+                remember(
+                    executor.execute(
+                        service="ec2",
+                        operation="describe_instance_types",
+                        region=region,
+                        parameters={"InstanceTypes": exact_models},
+                        paginate=False,
+                    )
+                )
+            for vcpu, memory_gib in sorted(requested_shapes):
+                remember(
+                    executor.execute(
+                        service="ec2",
+                        operation="describe_instance_types",
+                        region=region,
+                        parameters={
+                            "Filters": [
+                                {
+                                    "Name": "vcpu-info.default-vcpus",
+                                    "Values": [str(vcpu)],
+                                },
+                                {
+                                    "Name": "memory-info.size-in-mib",
+                                    "Values": [str(memory_gib * 1024)],
+                                },
+                            ]
+                        },
+                        max_items=100,
+                    )
+                )
+        except ManualConfirmationRequired:
+            # The normal catalog path remains authoritative. If the read-only
+            # shape endpoint is unavailable, return the untouched rows and let
+            # the caller expose one bounded technical issue instead of looping.
+            return rates
+
+        enriched = []
+        for price, unit, usage_type, operation, product in rates:
+            attrs = PricingCatalog.attributes(product)
+            model = str(attrs.get("instanceType") or "").casefold()
+            shape = shapes_by_model.get(model)
+            if shape is None:
+                enriched.append((price, unit, usage_type, operation, product))
+                continue
+            vcpu, memory_gib = shape
+            copied_product = {
+                **product,
+                "product": {
+                    **dict(product.get("product", {})),
+                    "attributes": {
+                        **attrs,
+                        "vcpu": str(vcpu),
+                        "memory": f"{memory_gib:g} GiB",
+                    },
+                },
+            }
+            enriched.append((price, unit, usage_type, operation, copied_product))
+        return enriched
+
     @staticmethod
     def _official_instance_shape(
         product: dict[str, object],
@@ -416,6 +543,7 @@ class GenericOfficialPlugin:
         region = requirement.region or default_region
         service_code = self._service_code(requirement)
         rates = self._catalog_rates(service_code, region)
+        rates = self._enrich_missing_instance_shapes(requirement, rates, region)
         by_model: dict[
             str,
             tuple[float, tuple[float, str, str, str, dict[str, object]]],
@@ -970,17 +1098,19 @@ class GenericOfficialPlugin:
                 )
         is_unknown_service = requirement.service not in SERVICE_TEMPLATE_FIELDS
         profile = None
-        # A stable service-code alias is enough to query the official catalog.
-        # Do not make first-use profile discovery a hard dependency for services
-        # whose AWS service code is already known (for example Managed Grafana).
-        # Discovery may still enrich field bindings, but a temporary discovery
-        # failure must not turn a valid official catalog into a customer-facing
-        # "interface unavailable" error.
+        # A stable service-code alias is enough to query the official catalog,
+        # but it is not a complete field contract.  Build/reuse the official
+        # dimension profile for every service routed through this generic
+        # adapter, including curated names.  Previously only unfamiliar names
+        # received field bindings, so a well-known service could preserve fewer
+        # customer fields than a newly discovered one.  Profile discovery is
+        # still an enrichment rather than a hard dependency when the service
+        # code itself is already known.
         try:
             service_code = self._service_code(requirement)
         except ManualConfirmationRequired:
             service_code = ""
-        if is_unknown_service and self.auto_discovery is not None:
+        if self.auto_discovery is not None:
             # ensure_profile owns the 10-day validity check. Calling get_profile
             # directly here previously allowed stale field mappings to live forever.
             try:
@@ -1033,6 +1163,7 @@ class GenericOfficialPlugin:
         rates = self._profile_rates(profile) if is_unknown_service else []
         if not rates:
             rates = self._catalog_rates(service_code, region)
+        rates = self._enrich_missing_instance_shapes(requirement, rates, region)
         self._require_cross_field_billing_mode(requirement)
         self._require_billing_variant_choice(requirement, profile)
         semantic_rates = self._semantic_rates(requirement, rates)
@@ -1040,27 +1171,44 @@ class GenericOfficialPlugin:
             key.startswith("_billing_variant_") and bool(value)
             for key, value in requirement.requirements.items()
         )
+        profile_bound_rates = (
+            self._auto_semantic_rates(requirement, rates, profile=profile)
+            if profile
+            else []
+        )
         if profile and confirmed_billing_variants:
             # Customer-confirmed catalog identities are authoritative. Build
             # those exact profile-bound lines first, then merge any dedicated
             # semantic lines (for example QuickSight SPICE) without allowing
             # the latter to replace a confirmed choice with a cheaper row.
-            selected_rates = self._auto_semantic_rates(
-                requirement,
-                rates,
-                profile=profile,
-            )
-            used_identities = {
-                (rate[1], rate[2], rate[3]) for _label, _amount, rate in selected_rates
-            }
-            selected_rates.extend(
-                item
-                for item in semantic_rates
-                if (item[2][1], item[2][2], item[2][3]) not in used_identities
-            )
+            selected_rates = profile_bound_rates
+            secondary_rates = semantic_rates
         else:
+            # Dedicated service semantics remain the preferred interpretation,
+            # but they are no longer allowed to hide another explicit customer
+            # field that the official profile can bind.  The previous all-or-
+            # nothing choice made (for example) a Cognito MAU reference line
+            # prevent machine-token usage from ever reaching pricing.
             selected_rates = semantic_rates
-        auto_discovered = False
+            secondary_rates = [
+                item for item in profile_bound_rates if item[1] is not None
+            ]
+        identity_positions = {
+            (rate[1], rate[2], rate[3]): index
+            for index, (_label, _amount, rate) in enumerate(selected_rates)
+        }
+        for item in secondary_rates:
+            identity = (item[2][1], item[2][2], item[2][3])
+            position = identity_positions.get(identity)
+            if position is None:
+                identity_positions[identity] = len(selected_rates)
+                selected_rates.append(item)
+                continue
+            # A field-bound customer amount is stronger than a reference-only
+            # semantic row for the exact same AWS dimension.
+            if selected_rates[position][1] is None and item[1] is not None:
+                selected_rates[position] = item
+        auto_discovered = bool(profile_bound_rates) and is_unknown_service
         strict_semantic_services = {"emr", "redshift", "athena"}
         service_stem = _stem(requirement.service)
 
@@ -1072,7 +1220,7 @@ class GenericOfficialPlugin:
             selected_rates = self._auto_semantic_rates(
                 requirement,
                 rates,
-                profile=profile if is_unknown_service else None,
+                profile=profile,
             )
             auto_discovered = bool(selected_rates)
 
@@ -1101,13 +1249,15 @@ class GenericOfficialPlugin:
                 service_code, region, refresh=True, max_pages=40
             )
             if refreshed_rates:
-                rates = refreshed_rates
+                rates = self._enrich_missing_instance_shapes(
+                    requirement, refreshed_rates, region
+                )
                 selected_rates = self._semantic_rates(requirement, rates)
                 if not selected_rates and service_stem not in strict_semantic_services:
                     selected_rates = self._auto_semantic_rates(
                         requirement,
                         rates,
-                        profile=profile if is_unknown_service else None,
+                        profile=profile,
                     )
                     auto_discovered = bool(selected_rates)
                 if memorydb_requires_node and selected_rates and not has_instance_rate():
@@ -1122,7 +1272,7 @@ class GenericOfficialPlugin:
             selected_rates = self._auto_semantic_rates(
                 requirement,
                 rates,
-                profile=profile if is_unknown_service else None,
+                profile=profile,
             )
             auto_discovered = bool(selected_rates)
 
@@ -1144,7 +1294,7 @@ class GenericOfficialPlugin:
 
         if not selected_rates and service_stem not in strict_semantic_services:
             selected_rates = self._auto_semantic_rates(
-                requirement, rates, profile=profile if is_unknown_service else None
+                requirement, rates, profile=profile
             )
             auto_discovered = bool(selected_rates)
         if not selected_rates:
@@ -1180,7 +1330,13 @@ class GenericOfficialPlugin:
         # row creates a plausible but false quote.
         requested_vcpu = requirement.requirements.get("vcpu")
         requested_memory = requirement.requirements.get("memory_gib")
-        if requested_vcpu is not None or requested_memory is not None:
+        flink_capacity_was_converted = (
+            service_code.casefold() == "amazonkinesisanalytics"
+            and isinstance(requirement.requirements.get("kpu_count"), (int, float))
+        )
+        if (
+            requested_vcpu is not None or requested_memory is not None
+        ) and not flink_capacity_was_converted:
             def exposes_requested_shape(rate) -> bool:
                 attrs = PricingCatalog.attributes(rate[2][4])
                 if requested_vcpu is not None:
@@ -1249,38 +1405,57 @@ class GenericOfficialPlugin:
         usage_lines: list[UsageLine] = []
         reference_rates: list[ReferenceRate] = []
         reserved_compute_rate = None
-        if (
-            service_stem == "memorydb"
-            and requirement.requirements.get("purchase_option") == "reserved"
-        ):
-            reserved_compute_rate = next(
-                (
-                    rate
-                    for _, amount, rate in selected_rates
-                    if amount is not None
-                    and PricingCatalog.attributes(rate[4]).get("instanceType")
-                ),
-                None,
-            )
+        reserved_price = None
+        if requirement.requirements.get("purchase_option") == "reserved":
+            # Do not keep a service allow-list here.  A managed service supports
+            # this exact Reserved offer only when its selected official product
+            # exposes a matching Reserved term in the AWS Price List.  This
+            # makes new services work automatically and prevents an on-demand
+            # rate from being presented as a 1/3-year commitment price.
+            for _, amount, candidate in selected_rates:
+                if amount is None:
+                    continue
+                if not PricingCatalog.attributes(candidate[4]).get("instanceType"):
+                    continue
+                try:
+                    candidate_reserved = PricingCatalog.reserved_price(
+                        candidate[4],
+                        years=int(
+                            requirement.requirements.get("reserved_term_years") or 1
+                        ),
+                        payment_option=str(
+                            requirement.requirements.get("payment_option")
+                            or "no_upfront"
+                        ),
+                    )
+                except ManualConfirmationRequired as exc:
+                    if exc.code in {
+                        "reserved_term_not_found",
+                        "reserved_price_dimensions_missing",
+                    }:
+                        continue
+                    raise
+                reserved_compute_rate = candidate
+                reserved_price = candidate_reserved
+                break
         monthly_commitment_cost = 0.0
         upfront_commitment_cost = 0.0
-        if reserved_compute_rate is not None:
-            reserved = PricingCatalog.reserved_price(
-                reserved_compute_rate[4],
-                years=int(requirement.requirements.get("reserved_term_years") or 1),
-                payment_option=str(
-                    requirement.requirements.get("payment_option") or "no_upfront"
-                ),
-            )
+        if reserved_compute_rate is not None and reserved_price is not None:
             reserved_nodes = float(
                 requirement.requirements.get("node_count")
                 or requirement.requirements.get("instance_count")
+                or requirement.requirements.get("broker_count")
+                or requirement.requirements.get("replication_instances")
                 or 1
             )
             monthly_commitment_cost = (
-                reserved.monthly_amortized * requirement.quantity * reserved_nodes
+                reserved_price.monthly_amortized
+                * requirement.quantity
+                * reserved_nodes
             )
-            upfront_commitment_cost = reserved.upfront * requirement.quantity * reserved_nodes
+            upfront_commitment_cost = (
+                reserved_price.upfront * requirement.quantity * reserved_nodes
+            )
         for index, (description, amount, rate) in enumerate(selected_rates, start=1):
             price, unit, usage_type, operation, _ = rate
             if rate is reserved_compute_rate:
@@ -1340,7 +1515,7 @@ class GenericOfficialPlugin:
 
         architecture = "按客户明确用量核价" if has_billable_cost else "官方单位参考价"
         if reserved_compute_rate is not None:
-            architecture = "AWS 官方 MemoryDB 预留节点"
+            architecture = "AWS 官方预留价格"
         if service_stem == "athena":
             architecture = "无服务器查询，按扫描数据量计费"
         elif service_stem == "emr":
@@ -1580,6 +1755,112 @@ class GenericOfficialPlugin:
                     else "AWS-Lambda-Duration"
                 ),
             )
+        elif service == "efs":
+            # EFS publishes Standard storage, IA/Archive storage, small-file
+            # overhead, early-deletion penalties and throughput usage under
+            # the same offer.  A generic "lowest GB-Mo" choice therefore
+            # selected ArchiveEarlyDelete-SmallFiles ($0.01) for a Standard
+            # Regional file system.  Bind the exact customer-facing storage
+            # class first; only then is price used as a tie-breaker.
+            storage = requested.get("storage_gib")
+            storage_class = _canonical(
+                str(requested.get("storage_class") or "standard")
+            )
+            deployment_type = _canonical(
+                str(requested.get("deployment_type") or "regional")
+            )
+            one_zone = "onezone" in deployment_type or "onezone" in storage_class
+            wants_archive = "archive" in storage_class
+            wants_ia = any(
+                marker in storage_class
+                for marker in ("infrequentaccess", "standardia", "efsia")
+            ) or storage_class == "ia"
+
+            storage_candidates = []
+            for rate in rates:
+                if not any(
+                    token in str(rate[1]).casefold()
+                    for token in ("gb-mo", "gb-month", "gib-month")
+                ):
+                    continue
+                attrs = PricingCatalog.attributes(rate[4])
+                official_class = _canonical(str(attrs.get("storageClass") or ""))
+                usage = _canonical(str(rate[2]))
+                if any(marker in usage for marker in ("smallfiles", "earlydelete")):
+                    continue
+                if wants_archive:
+                    compatible = official_class == "archive"
+                elif wants_ia:
+                    compatible = official_class == (
+                        "onezoneinfrequentaccess" if one_zone else "infrequentaccess"
+                    )
+                else:
+                    compatible = official_class == (
+                        "onezonegeneralpurpose" if one_zone else "generalpurpose"
+                    )
+                if compatible:
+                    storage_candidates.append(rate)
+            if not storage_candidates:
+                return []
+            selected_storage = min(
+                [rate for rate in storage_candidates if rate[0] > 0]
+                or storage_candidates,
+                key=lambda rate: (rate[0], rate[2], rate[3]),
+            )
+            result.append(
+                (
+                    "EFS 存储单价",
+                    (
+                        scoped_amount(requirement, "storage_gib", float(storage))
+                        if storage not in (None, "")
+                        else None
+                    ),
+                    selected_storage,
+                )
+            )
+
+            throughput_mode = _canonical(
+                str(requested.get("throughput_mode") or "elastic")
+            )
+            if throughput_mode == "elastic":
+                for field, operation, label in (
+                    ("data_out_gib", "read", "EFS 弹性吞吐读取单价"),
+                    ("data_in_gib", "write", "EFS 弹性吞吐写入单价"),
+                ):
+                    amount = requested.get(field)
+                    if amount in (None, ""):
+                        continue
+                    candidates = [
+                        rate
+                        for rate in rates
+                        if "gb" in str(rate[1]).casefold()
+                        and "etdataaccessbytes" in _canonical(str(rate[2]))
+                        and str(rate[3]).casefold() == operation
+                    ]
+                    if not candidates:
+                        return []
+                    selected = min(
+                        [rate for rate in candidates if rate[0] > 0] or candidates,
+                        key=lambda rate: (rate[0], rate[2], rate[3]),
+                    )
+                    result.append(
+                        (
+                            label,
+                            scoped_amount(requirement, field, float(amount)),
+                            selected,
+                        )
+                    )
+            elif throughput_mode == "provisioned":
+                provisioned = requested.get("provisioned_throughput_mibps")
+                if provisioned not in (None, ""):
+                    add(
+                        result,
+                        "EFS 预置吞吐量单价",
+                        float(provisioned),
+                        include=("provisionedtp",),
+                        unit_contains=("mibps-mo", "mbps-mo"),
+                    )
+            return result
         elif service == "fsx":
             # FSx for Lustre publishes the selected MB/s/TiB tier on the
             # storage product itself (for example Storage.SSD.250). It is a
@@ -1591,6 +1872,158 @@ class GenericOfficialPlugin:
             ).strip().casefold()
             storage = requested.get("storage_gib")
             throughput_tier = requested.get("throughput_mbps_per_tib")
+            # OpenZFS meters provisioned SSD storage, provisioned throughput,
+            # and backup storage independently. A plain "cheapest GB-Mo"
+            # search can accidentally select the tiny Intelligent-Tiering
+            # monitoring fee and produce a plausible-looking wrong total.
+            if file_system_type == "openzfs":
+                requested_deployment = _canonical(
+                    str(
+                        requested.get("deployment_type")
+                        or requested.get("deployment_option")
+                        or ""
+                    )
+                )
+
+                def openzfs_rates(*, unit_tokens: tuple[str, ...]) -> list:
+                    matched = []
+                    for rate in rates:
+                        attrs = PricingCatalog.attributes(rate[4])
+                        if str(attrs.get("fileSystemType") or "").casefold() != "openzfs":
+                            continue
+                        operation = str(attrs.get("operation") or rate[3] or "").casefold()
+                        if "openzfs" not in operation:
+                            continue
+                        unit = str(rate[1]).casefold()
+                        if not any(token in unit for token in unit_tokens):
+                            continue
+                        deployment = _canonical(str(attrs.get("deploymentOption") or ""))
+                        if requested_deployment and deployment != requested_deployment:
+                            continue
+                        matched.append(rate)
+                    return matched
+
+                storage_candidates = []
+                for rate in openzfs_rates(unit_tokens=("gb-mo", "gb-month", "gib-month")):
+                    attrs = PricingCatalog.attributes(rate[4])
+                    text = " ".join(
+                        str(value)
+                        for value in (
+                            rate[2], rate[3], attrs.get("storageTier"),
+                            attrs.get("storageType"), attrs.get("cacheType"),
+                        )
+                        if value
+                    ).casefold()
+                    if any(
+                        token in text
+                        for token in (
+                            "backup", "snapshot", "monitoring", "frequent access",
+                            "infrequent access", "archive", "ssd cache", "int_",
+                        )
+                    ):
+                        continue
+                    if str(attrs.get("storageType") or "").casefold() != "ssd":
+                        continue
+                    storage_candidates.append(rate)
+                if not storage_candidates:
+                    return []
+                selected_storage = min(
+                    [rate for rate in storage_candidates if rate[0] > 0]
+                    or storage_candidates,
+                    key=lambda rate: (rate[0], rate[2], rate[3]),
+                )
+                selected_deployment = _canonical(
+                    str(
+                        PricingCatalog.attributes(selected_storage[4]).get(
+                            "deploymentOption"
+                        )
+                        or ""
+                    )
+                )
+                result.append(
+                    (
+                        "FSx for OpenZFS SSD 存储单价",
+                        (
+                            scoped_amount(requirement, "storage_gib", float(storage))
+                            if storage
+                            else None
+                        ),
+                        selected_storage,
+                    )
+                )
+
+                throughput = requested.get("throughput_mbps")
+                if throughput not in (None, ""):
+                    throughput_candidates = [
+                        rate
+                        for rate in openzfs_rates(
+                            unit_tokens=("mibps-mo", "mbps-mo", "mb/s-month")
+                        )
+                        if _canonical(
+                            str(
+                                PricingCatalog.attributes(rate[4]).get(
+                                    "deploymentOption"
+                                )
+                                or ""
+                            )
+                        )
+                        == selected_deployment
+                    ]
+                    if not throughput_candidates:
+                        return []
+                    selected_throughput = min(
+                        [rate for rate in throughput_candidates if rate[0] > 0]
+                        or throughput_candidates,
+                        key=lambda rate: (rate[0], rate[2], rate[3]),
+                    )
+                    result.append(
+                        (
+                            "FSx for OpenZFS 预置吞吐量单价",
+                            scoped_amount(
+                                requirement, "throughput_mbps", float(throughput)
+                            ),
+                            selected_throughput,
+                        )
+                    )
+
+                backup_storage = requested.get("backup_storage_gib")
+                if backup_storage not in (None, ""):
+                    backup_candidates = []
+                    for rate in openzfs_rates(
+                        unit_tokens=("gb-mo", "gb-month", "gib-month")
+                    ):
+                        attrs = PricingCatalog.attributes(rate[4])
+                        identity = " ".join(
+                            str(value)
+                            for value in (rate[2], rate[3], attrs.get("storageTier"))
+                            if value
+                        ).casefold()
+                        if "backup" not in identity:
+                            continue
+                        deployment = _canonical(str(attrs.get("deploymentOption") or ""))
+                        if deployment not in {"", "na", selected_deployment}:
+                            continue
+                        backup_candidates.append(rate)
+                    if not backup_candidates:
+                        return []
+                    selected_backup = min(
+                        [rate for rate in backup_candidates if rate[0] > 0]
+                        or backup_candidates,
+                        key=lambda rate: (rate[0], rate[2], rate[3]),
+                    )
+                    result.append(
+                        (
+                            "FSx for OpenZFS 备份存储单价",
+                            scoped_amount(
+                                requirement,
+                                "backup_storage_gib",
+                                float(backup_storage),
+                            ),
+                            selected_backup,
+                        )
+                    )
+                return result
+
             candidates = []
             for rate in rates:
                 attrs = PricingCatalog.attributes(rate[4])
@@ -2192,14 +2625,42 @@ class GenericOfficialPlugin:
             )
         elif service == "dms":
             model = str(requested.get("requested_model") or "").strip()
+            if model and not re.fullmatch(
+                r"(?:dms\.)?[a-z][a-z0-9-]*\."
+                r"(?:micro|small|medium|large|xlarge|\d+xlarge)",
+                model,
+                re.I,
+            ):
+                model = ""
+            if model.startswith("dms."):
+                model = model[4:]
+            replication_instances = float(
+                requested.get("replication_instances") or requirement.quantity
+            )
             add(
                 result,
                 f"AWS DMS {model or '复制实例'} 小时价",
-                requirement.quantity * requirement.hours_per_month,
-                include=("instanceusg", "createdmsinstance"),
+                replication_instances * requirement.hours_per_month,
+                include_any=("instanceusg", "createdmsinstance"),
                 exclude=("multi-az", "serverless"),
                 model=model or None,
+                min_vcpu=float(requested["vcpu"]) if requested.get("vcpu") else None,
+                min_memory_gib=(
+                    float(requested["memory_gib"])
+                    if requested.get("memory_gib")
+                    else None
+                ),
             )
+            storage = requested.get("storage_gib")
+            if storage not in (None, ""):
+                add(
+                    result,
+                    "AWS DMS 额外日志存储单价",
+                    scoped_amount(requirement, "storage_gib", float(storage)),
+                    include=("storage",),
+                    exclude=("snapshot", "backup", "s3"),
+                    unit_contains=("gb",),
+                )
         elif service == "quicksight":
             edition = str(requested.get("edition") or "enterprise").casefold()
             reader_billing_mode = str(
@@ -2329,6 +2790,48 @@ class GenericOfficialPlugin:
         return result
 
     @staticmethod
+    def _derive_flink_kpu_count(requirement: ServiceRequirement) -> None:
+        """Translate customer node capacity into Managed Flink KPUs.
+
+        Managed Service for Apache Flink is billed in KPUs rather than EC2-like
+        node shapes. One KPU represents one vCPU and 4 GiB of memory, so an
+        explicit node count plus CPU/RAM can be converted without guessing a
+        product or dropping the customer's capacity.
+        """
+
+        identities = {
+            _stem(requirement.service),
+            _stem(requirement.product_identity or ""),
+            _stem(requirement.calculator_service_name or ""),
+        }
+        if not identities.intersection(
+            {"kinesisanalytics", "managedserviceforapacheflink"}
+        ):
+            return
+        requested = requirement.requirements
+        if isinstance(requested.get("kpu_count"), (int, float)):
+            return
+        vcpu = requested.get("vcpu")
+        memory_gib = requested.get("memory_gib")
+        if not isinstance(vcpu, (int, float)) and not isinstance(
+            memory_gib, (int, float)
+        ):
+            return
+        per_node_kpus = max(
+            float(vcpu) if isinstance(vcpu, (int, float)) else 0.0,
+            (
+                float(memory_gib) / 4.0
+                if isinstance(memory_gib, (int, float))
+                else 0.0
+            ),
+        )
+        node_count = requested.get("node_count") or requested.get("instance_count") or 1
+        if not isinstance(node_count, (int, float)) or float(node_count) <= 0:
+            node_count = 1
+        requested["kpu_count"] = max(1, math.ceil(per_node_kpus * float(node_count)))
+        requirement.field_sources["requirements.kpu_count"] = "system_derived"
+
+    @staticmethod
     def _auto_semantic_rates(
         requirement: ServiceRequirement,
         rates: list[tuple[float, str, str, str, dict[str, object]]],
@@ -2344,6 +2847,7 @@ class GenericOfficialPlugin:
         inflate the quotation total.
         """
 
+        GenericOfficialPlugin._derive_flink_kpu_count(requirement)
         requested = requirement.requirements
 
         def details(rate):
@@ -2356,18 +2860,26 @@ class GenericOfficialPlugin:
                     rate[3],
                     attrs.get("productFamily"),
                     attrs.get("instanceType"),
+                    rate[4].get("officialDimensionDescription"),
                 )
                 if value
             ).casefold()
             return attrs, text
 
         def safe(rate) -> bool:
-            _, text = details(rate)
+            attrs, text = details(rate)
+            product_variant = str(requested.get("product_variant") or "").casefold()
+            if product_variant == "live_analytics" and (
+                "influx" in text or attrs.get("instanceType")
+            ):
+                return False
+            if product_variant == "influxdb" and "influx" not in text:
+                return False
             return not any(
                 token in text
                 for token in (
                     "credit", "refund", "discount", "tax", "support",
-                    "marketplace", "professional service",
+                    "professional service",
                 )
             )
 
@@ -2490,7 +3002,80 @@ class GenericOfficialPlugin:
                     and field == "reader_users"
                 ):
                     continue
-                if field == "hours_per_month":
+                if field == "endpoint_hours":
+                    endpoint_count = requested.get("endpoint_count")
+                    value = (
+                        float(endpoint_count) * requirement.hours_per_month
+                        if isinstance(endpoint_count, (int, float))
+                        and not isinstance(endpoint_count, bool)
+                        and endpoint_count > 0
+                        else None
+                    )
+                elif field == "memory_store_gib_hours":
+                    retention_hours = requested.get("memory_retention_hours")
+                    monthly_ingest_gib = requested.get("data_in_gib")
+                    if monthly_ingest_gib in (None, "") and requested.get("write_records"):
+                        # Lowest official billable write size is 1 KiB.  The
+                        # customer record count remains visible separately;
+                        # this derived amount is only the lowest-price estimate
+                        # requested when record size was omitted.
+                        monthly_ingest_gib = float(requested["write_records"]) / 1_048_576
+                    value = (
+                        float(monthly_ingest_gib) * float(retention_hours)
+                        if monthly_ingest_gib not in (None, "")
+                        and retention_hours not in (None, "")
+                        else None
+                    )
+                elif field == "magnetic_store_gib_months":
+                    retention_days = requested.get("magnetic_retention_days")
+                    monthly_ingest_gib = requested.get("data_in_gib")
+                    if monthly_ingest_gib in (None, "") and requested.get("write_records"):
+                        monthly_ingest_gib = float(requested["write_records"]) / 1_048_576
+                    value = (
+                        max(100.0, float(monthly_ingest_gib) * float(retention_days) / 30.0)
+                        if monthly_ingest_gib not in (None, "")
+                        and retention_days not in (None, "")
+                        else None
+                    )
+                elif field == "data_in_gib" and requested.get("write_records"):
+                    value = requested.get("data_in_gib")
+                    if value in (None, ""):
+                        value = float(requested["write_records"]) / 1_048_576
+                elif field == "kpu_hours":
+                    value = requested.get("kpu_hours")
+                    kpu_count = requested.get("kpu_count")
+                    if value in (None, "") and isinstance(kpu_count, (int, float)):
+                        # Managed Service for Apache Flink bills the configured
+                        # KPUs plus one application-management KPU per running
+                        # application.  ``quantity`` is the application count.
+                        value = (
+                            float(kpu_count) + float(requirement.quantity)
+                        ) * float(requirement.hours_per_month)
+                elif field == "storage_gib":
+                    value = requested.get("storage_gib")
+                    kpu_count = requested.get("kpu_count")
+                    is_flink_storage = any(
+                        "runningapplicationstorage" in str(binding.get("usage_type") or "").casefold()
+                        and "interactive" not in str(binding.get("usage_type") or "").casefold()
+                        for binding in bindings
+                    ) and "flink" in (
+                        f"{requirement.calculator_service_name or ''} "
+                        f"{requirement.source_text or ''}"
+                    ).casefold()
+                    if (
+                        value in (None, "")
+                        and is_flink_storage
+                        and isinstance(kpu_count, (int, float))
+                    ):
+                        # AWS allocates 50 GiB of running application storage
+                        # per configured KPU.  This is a billed dimension, not
+                        # an invented customer disk request.
+                        value = (
+                            float(kpu_count)
+                            * 50.0
+                            * float(requirement.quantity)
+                        )
+                elif field == "hours_per_month":
                     hours_are_explicit = bool(
                         requirement.field_evidence.get("hours_per_month")
                         or re.search(
@@ -2507,6 +3092,26 @@ class GenericOfficialPlugin:
                 selected_usage_type = str(
                     requested.get(f"_billing_variant_{field}") or ""
                 ).strip()
+                if not selected_usage_type and "flink" in (
+                    f"{requirement.calculator_service_name or ''} "
+                    f"{requirement.source_text or ''}"
+                ).casefold():
+                    selected_usage_type = next(
+                        (
+                            str(binding.get("usage_type") or "")
+                            for binding in bindings
+                            if (
+                                field == "kpu_hours"
+                                and "kpu-hour-java" in str(binding.get("usage_type") or "").casefold()
+                            )
+                            or (
+                                field == "storage_gib"
+                                and "runningapplicationstorage" in str(binding.get("usage_type") or "").casefold()
+                                and "interactive" not in str(binding.get("usage_type") or "").casefold()
+                            )
+                        ),
+                        "",
+                    )
 
                 def bound_rate(rate, *, candidates=bindings) -> bool:
                     if selected_usage_type and str(rate[2]) != selected_usage_type:
@@ -2565,6 +3170,40 @@ class GenericOfficialPlugin:
                 and not any(token in details(rate)[1] for token in ("backup", "snapshot")),
             ),
             (
+                "backup_storage_gib",
+                "AWS 官方备份存储单价",
+                lambda rate: any(
+                    token in str(rate[1]).casefold()
+                    for token in ("gb-mo", "gb-month", "gib-month")
+                )
+                and any(
+                    token in details(rate)[1]
+                    for token in ("backup", "warm storage")
+                ),
+            ),
+            (
+                "provisioned_throughput_mibps",
+                "AWS 官方预置吞吐量单价",
+                lambda rate: any(
+                    token in str(rate[1]).casefold()
+                    for token in ("mibps", "mbps", "mb/s")
+                )
+                or all(
+                    token in details(rate)[1]
+                    for token in ("provisioned", "throughput")
+                ),
+            ),
+            (
+                "cross_region_copy_gib",
+                "AWS 官方跨区域复制单价",
+                lambda rate: str(rate[1]).casefold()
+                in {"gb", "gbyte", "gigabyte", "gib"}
+                and any(
+                    token in details(rate)[1]
+                    for token in ("cross-region", "cross region", "transfer", "copy")
+                ),
+            ),
+            (
                 "requests",
                 "AWS 官方请求单价",
                 lambda rate: any(
@@ -2583,6 +3222,15 @@ class GenericOfficialPlugin:
                     token in details(rate)[1]
                     for token in ("email", "message", "outbound")
                 ),
+            ),
+            (
+                "data_in_gib",
+                "AWS 官方数据摄入单价",
+                lambda rate: (
+                    str(rate[1]).casefold() in {"gb", "gbyte", "gigabyte"}
+                    or "byte" in str(rate[1]).casefold()
+                )
+                and any(token in details(rate)[1] for token in ("ingest", "incoming data")),
             ),
             (
                 "data_processed_gib",

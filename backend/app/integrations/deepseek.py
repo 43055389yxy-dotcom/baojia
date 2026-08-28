@@ -7,7 +7,6 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 
-from botocore.loaders import create_loader
 from pydantic import ValidationError
 
 from app.core.config import Settings
@@ -38,6 +37,7 @@ from app.domain.requirement_fields import (
 )
 from app.integrations.ai_gateway import AiGateway
 from app.integrations.auto_service_discovery import AutoServiceDiscovery
+from app.integrations.aws_regions import official_aws_region_labels
 from app.integrations.component_result_cache import ValidatedComponentResultCache
 from app.integrations.prompt_library import (
     build_component_audit_prompt,
@@ -52,6 +52,7 @@ from app.integrations.service_templates import (
     allowed_requirement_fields,
     compact_template_values,
     component_template,
+    requires_official_field_profile,
     requirement_fields,
     safe_requirement_defaults,
     strip_non_pricing_context_fields,
@@ -62,11 +63,11 @@ AiTranscriptReporter = Callable[[str, str], Awaitable[None]]
 
 
 def _official_profile_cache_model(model_name: str, profile: dict[str, object] | None) -> str | None:
-    """Version unknown-component results with their official field contract.
+    """Version generic-adapter results with their official field contract.
 
-    Existing dedicated component templates keep their historical cache key.
-    Unknown components are cacheable only after AWS returned a verified field
-    profile, so an old result can never bypass a newer official contract.
+    Purpose-built adapters keep their historical cache key. Generic components
+    are cacheable only after AWS returned a verified field profile, so an old
+    result can never bypass a newer official contract.
     """
 
     if not profile or profile.get("status") != "verified":
@@ -245,6 +246,50 @@ class DeepSeekIntentParser:
             return AiGateway(recovery_settings)
         return self._gateway
 
+    def _service_identity_gateways(self) -> list[AiGateway]:
+        """Return independent configured routes for one unresolved product name.
+
+        Product identity is a hard quote boundary, so one provider connection
+        timeout must not make a single unfamiliar customer phrase fail the
+        entire quote.  Each route gets one attempt; switching route is faster
+        and more useful than repeating the same unavailable endpoint.
+        """
+
+        if type(self._gateway) is not AiGateway:
+            return [self._gateway]
+
+        gateways: list[AiGateway] = []
+        identities: set[tuple[str, str]] = set()
+
+        def append(gateway: AiGateway) -> None:
+            identity = (
+                gateway._settings.ai_base_url.rstrip("/"),
+                gateway._settings.ai_model,
+            )
+            if identity not in identities and gateway._settings.ai_api_key:
+                identities.add(identity)
+                gateways.append(gateway)
+
+        append(self._recovery_gateway())
+        if self._settings.deepseek_api_key:
+            append(
+                AiGateway(
+                    self._settings.model_copy(update={"ai_provider": "deepseek"})
+                )
+            )
+        if self._settings.bedrock_api_key:
+            append(
+                AiGateway(
+                    self._settings.model_copy(
+                        update={
+                            "ai_provider": "bedrock",
+                            "bedrock_model": "zai.glm-4.7-flash",
+                        }
+                    )
+                )
+            )
+        return gateways
+
     def _component_ai_gateways(self) -> list[AiGateway]:
         """Return the single stable route used for customer revisions."""
 
@@ -304,6 +349,36 @@ class DeepSeekIntentParser:
                 "reason": "客户填写的区域代码不在当前 AWS 官方区域目录中，必须由销售重新选择。",
             }
 
+        # A numbered quote may intentionally place every component in a
+        # different region.  That is not a missing quote-wide region: each row
+        # is its own pricing boundary.  Let component parsing preserve those
+        # regions instead of forcing the salesperson to replace them with one
+        # global value.  If even one row has no single verified region, the
+        # normal sales picker remains the fallback for only those unresolved
+        # rows; ``QuoteService._apply_sales_region`` never overwrites rows that
+        # already carry a customer-supplied region.
+        numbered_blocks = self._numbered_requirement_blocks(text)
+        if numbered_blocks:
+            component_regions: list[str] = []
+            every_component_has_one_region = True
+            for block in numbered_blocks:
+                regions = [
+                    region
+                    for region in self._regions_in_text(block)
+                    if region in official_regions
+                ]
+                if len(regions) != 1:
+                    every_component_has_one_region = False
+                    break
+                if regions[0] not in component_regions:
+                    component_regions.append(regions[0])
+            if every_component_has_one_region and component_regions:
+                return {
+                    "regions": component_regions,
+                    "requires_confirmation": False,
+                    "reason": "每个编号组件都已明确填写可用的 AWS 区域。",
+                }
+
         return {
             "regions": [],
             "requires_confirmation": True,
@@ -314,17 +389,7 @@ class DeepSeekIntentParser:
     def official_aws_region_labels() -> dict[str, str]:
         """Return botocore's bundled official commercial AWS region names."""
 
-        endpoints = create_loader().load_data("endpoints")
-        labels: dict[str, str] = {}
-        for partition in endpoints.get("partitions", []):
-            if partition.get("partition") != "aws":
-                continue
-            for code, metadata in partition.get("regions", {}).items():
-                if not isinstance(metadata, dict):
-                    continue
-                description = str(metadata.get("description") or code).strip()
-                labels[str(code)] = description or str(code)
-        return labels
+        return official_aws_region_labels()
 
     async def _complete_component_json(
         self,
@@ -1624,10 +1689,12 @@ class DeepSeekIntentParser:
                     f"组件 {index + 1}｜{display_name}｜正在执行结构化参数解析",
                 )
             cache_input = component.model_copy(deep=True)
-            is_unknown_service = self._service_key(component.service) not in SERVICE_TEMPLATE_FIELDS
-            # Unknown services must load the current AWS field contract before
-            # consulting the result cache. Otherwise a 90-day-old, incomplete
-            # extraction can bypass a newly learned official dimension.
+            uses_official_profile = requires_official_field_profile(component.service)
+            # Every component priced by the generic official adapter must load
+            # the current AWS field contract before consulting the result
+            # cache.  Restricting this to unfamiliar service names meant common
+            # services such as AMP, Glue and Step Functions could never learn a
+            # newly published or less-common billing field.
             profile = await self._auto_discover_component(
                 component,
                 semaphore=semaphore,
@@ -1641,7 +1708,7 @@ class DeepSeekIntentParser:
             )
             base_cache_model_name = (
                 _official_profile_cache_model(self._settings.ai_model, profile)
-                if is_unknown_service
+                if uses_official_profile
                 else self._settings.ai_model
             )
             generated_prompt = str((profile or {}).get("prompt_text") or "").strip()
@@ -2319,6 +2386,18 @@ class DeepSeekIntentParser:
                         "instance", "broker", "task", "cluster", "deployment",
                     )
                 )
+            if category == "endpoint_count":
+                return "endpoint" in field
+            if category == "listener_count":
+                return "listener" in field
+            if category == "task_count":
+                return "task" in field
+            if category == "write_records":
+                return any(marker in field for marker in ("record", "write"))
+            if category == "memory_retention_hours":
+                return "memory" in field and "retention" in field
+            if category == "magnetic_retention_days":
+                return "magnetic" in field and "retention" in field
             return False
 
         claim_patterns = (
@@ -2381,6 +2460,43 @@ class DeepSeekIntentParser:
             ("requests", re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次)?\s*(?:(?:api\s*)?请求|调用(?:量|次数)?)", re.I)),
             ("duration", re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(ms|毫秒|秒)", re.I)),
             ("role_count", re.compile(r"(\d+)\s*(?:个|台)?\s*(?:worker|工作)?\s*(?:节点|分片|副本|规则|用户)", re.I)),
+            (
+                "endpoint_count",
+                re.compile(r"(\d+)\s*(?:个|台)?\s*(?:防火墙\s*)?(?:endpoint|端点)", re.I),
+            ),
+            (
+                "listener_count",
+                re.compile(r"(\d+)\s*(?:个|条)?\s*(?:listener|监听器)", re.I),
+            ),
+            (
+                "task_count",
+                re.compile(r"(\d+)\s*(?:个|项)?\s*(?:迁移\s*)?(?:task|任务)", re.I),
+            ),
+            (
+                "write_records",
+                re.compile(
+                    r"(?:写入|摄入|摄取)(?:约|大约|预计)?\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:条|个|次)?\s*"
+                    r"(?:时序)?(?:数据|记录|record)?",
+                    re.I,
+                ),
+            ),
+            (
+                "memory_retention_hours",
+                re.compile(
+                    r"(?:内存(?:存储|层)?|memory\s*store).*?"
+                    r"(\d+(?:\.\d+)?)\s*小时",
+                    re.I,
+                ),
+            ),
+            (
+                "magnetic_retention_days",
+                re.compile(
+                    r"(?:磁性|磁盘)(?:存储|层)?.*?"
+                    r"(\d+(?:\.\d+)?)\s*天",
+                    re.I,
+                ),
+            ),
         )
         issues: list[str] = []
         for category, pattern in claim_patterns:
@@ -2393,7 +2509,9 @@ class DeepSeekIntentParser:
                 unit = match.group(2).casefold() if match.lastindex and match.lastindex >= 2 and match.group(2) else ""
                 if category == "capacity" and unit in {"tib", "tb", "t"}:
                     wanted *= 1024
-                elif category in {"messages", "requests", "connection_minutes"}:
+                elif category in {
+                    "messages", "requests", "connection_minutes", "write_records"
+                }:
                     wanted *= {"万": 10_000, "亿": 100_000_000}.get(match.group(2), 1)
                 elif category == "duration" and match.group(2).casefold() == "秒":
                     wanted *= 1000
@@ -2455,6 +2573,140 @@ class DeepSeekIntentParser:
         """
 
         current_key = self._service_key(component.service)
+        heading = self._self_hosted_product_name(component)
+
+        def selected_official_product(
+            raw: dict[str, object],
+            products: dict[str, dict[str, object]],
+        ) -> dict[str, object] | None:
+            """Validate a model answer against the closed official candidate set.
+
+            The provider directory uses offer codes such as ``AmazonEFS`` while
+            models commonly return the equally unambiguous runtime key ``efs``
+            or display name ``Amazon EFS``.  The old implementation accepted
+            only the offer-code spelling.  A correct semantic classification
+            was therefore discarded and the untouched generic heading later
+            became a fake third-party/self-hosted question.
+
+            Accept every provider-owned identity spelling, but only when it
+            resolves to exactly one product already present in this call's
+            closed candidate set.  This remains validation, never fuzzy model
+            guessing or an alias table in the quote program.
+            """
+
+            returned_values = {
+                str(raw.get(field) or "").strip()
+                for field in (
+                    "service_code",
+                    "service_key",
+                    "service",
+                    "display_name",
+                    "product",
+                )
+                if str(raw.get(field) or "").strip()
+            }
+            returned_targets = {
+                re.sub(r"[^a-z0-9]", "", value.casefold())
+                for value in returned_values
+            }
+            if not returned_targets:
+                return None
+            matches: list[dict[str, object]] = []
+            for product in products.values():
+                identities = {
+                    str(product.get("service_code") or ""),
+                    str(product.get("service_key") or ""),
+                    str(product.get("display_name") or ""),
+                    *(
+                        str(alias)
+                        for alias in product.get("aliases", [])
+                        if str(alias).strip()
+                    ),
+                }
+                identity_targets = {
+                    re.sub(r"[^a-z0-9]", "", value.casefold())
+                    for value in identities
+                    if value
+                }
+                if returned_targets & identity_targets:
+                    matches.append(product)
+            unique = {
+                str(product.get("service_code") or ""): product for product in matches
+            }
+            return next(iter(unique.values())) if len(unique) == 1 else None
+
+        def apply_official_identity(product: dict[str, object]) -> None:
+            aliases = [
+                str(value).strip()
+                for value in product.get("aliases", [])
+                if str(value).strip()
+            ]
+            human_name = (
+                heading
+                if heading and re.match(r"^(?:Amazon|AWS)\s+", heading, re.I)
+                else next(
+                    (
+                        alias
+                        for alias in aliases
+                        if re.match(r"^(?:Amazon|AWS)\s+", alias, re.I)
+                    ),
+                    str(product.get("display_name") or component.service),
+                )
+            )
+            official_identity = str(
+                product.get("service_key")
+                or product.get("service_code")
+                or component.service
+            )
+            # The AWS Price List frequently exposes an offer-code spelling
+            # (for example ``AWSDatabaseMigrationSvc``) while the runtime
+            # adapter uses a stable internal key (``dms``).  Always pass an
+            # official catalog hit through the same canonical router so a
+            # renamed product cannot silently fall back to the generic plugin.
+            routed_identity = self._service_key(official_identity)
+            normalized_identity = re.sub(
+                r"[^a-z0-9]", "", official_identity.casefold()
+            )
+            component.service = (
+                routed_identity
+                if routed_identity != normalized_identity
+                else official_identity
+            )
+            if not (heading and re.match(r"^(?:Amazon|AWS)\s+", heading, re.I)):
+                canonical_display = next(
+                    (
+                        display
+                        for key, display, _markers in self._INVENTORY_DEFINITIONS
+                        if self._service_key(key) == routed_identity
+                    ),
+                    None,
+                )
+                if canonical_display:
+                    human_name = canonical_display
+            component.calculator_service_name = human_name
+            component.product_identity = str(product.get("service_code") or "") or None
+            component.field_sources["_official_service_code"] = str(
+                product.get("service_code") or ""
+            )
+            component.field_sources.pop("_pending_architecture_decision", None)
+            component.field_sources.pop("_third_party_product", None)
+            if component.field_sources.get("requirements.operating_system") not in {
+                "customer_text",
+                "customer_confirmation",
+                "customer_correction",
+                "sales_confirmation",
+            }:
+                component.requirements.pop("operating_system", None)
+
+        async def remember_official_identity(product: dict[str, object]) -> None:
+            """Cache the customer wording only after an exact official choice."""
+
+            if self._auto_discovery is None or not heading:
+                return
+            remember = getattr(self._auto_discovery, "remember_official_alias", None)
+            service_code = str(product.get("service_code") or "").strip()
+            if callable(remember) and service_code:
+                await asyncio.to_thread(remember, service_code, heading)
 
         # Provider identity is authoritative and cheaper than AI
         # classification.  In particular, an AI prompt limited to the older
@@ -2462,12 +2714,11 @@ class DeepSeekIntentParser:
         # in AWS Price List and used to turn Amazon Neptune into EC2.  Resolve
         # the literal component heading against the persistent official
         # registry first; only a true catalog miss may reach the classifier.
-        heading = self._self_hosted_product_name(component)
         official_product: dict[str, object] | None = None
+        labels: tuple[str, ...] = ()
         if self._auto_discovery is not None:
             resolver = getattr(self._auto_discovery, "resolve_official_product", None)
             if callable(resolver):
-                labels: tuple[str, ...]
                 if heading:
                     labels = (heading,)
                 elif current_key not in SERVICE_TEMPLATE_FIELDS:
@@ -2480,76 +2731,226 @@ class DeepSeekIntentParser:
                 if labels:
                     official_product = await asyncio.to_thread(resolver, *labels)
         if official_product is not None:
-            aliases = [
-                str(value).strip()
-                for value in official_product.get("aliases", [])
-                if str(value).strip()
-            ]
-            human_name = (
-                heading
-                if heading and re.match(r"^(?:Amazon|AWS)\s+", heading, re.I)
-                else next(
-                    (
-                        alias
-                        for alias in aliases
-                        if re.match(r"^(?:Amazon|AWS)\s+", alias, re.I)
-                    ),
-                    str(official_product.get("display_name") or component.service),
-                )
-            )
-            component.service = str(
-                official_product.get("service_key")
-                or official_product.get("service_code")
-                or component.service
-            )
-            component.calculator_service_name = human_name
-            component.product_identity = str(official_product.get("service_code") or "") or None
-            component.field_sources["_official_service_code"] = str(
-                official_product.get("service_code") or ""
-            )
-            component.field_sources.pop("_pending_architecture_decision", None)
-            component.field_sources.pop("_third_party_product", None)
-            if component.field_sources.get("requirements.operating_system") not in {
-                "customer_text",
-                "customer_confirmation",
-                "customer_correction",
-                "sales_confirmation",
-            }:
-                component.requirements.pop("operating_system", None)
+            apply_official_identity(official_product)
+            await remember_official_identity(official_product)
             return
 
-        if current_key in SERVICE_TEMPLATE_FIELDS:
+        heading_inventory = {
+            self._service_key(service_key)
+            for service_key, _display_name in self._inventory_keys_for_line(heading or "")
+        }
+        if current_key in SERVICE_TEMPLATE_FIELDS and (
+            not heading or current_key in heading_inventory
+        ):
             component.service = current_key
             return
 
+        # A current marketing name may differ from the long-lived Price List
+        # code. Retrieve a short list from the complete local official catalog,
+        # then let AI understand the wording and validate its answer back to an
+        # exact service code. This is global and does not require adding a new
+        # parser branch every time AWS renames a product.
+        official_candidates: list[dict[str, object]] = []
+        if self._auto_discovery is not None and labels:
+            candidate_resolver = getattr(
+                self._auto_discovery,
+                "candidate_official_products",
+                None,
+            )
+            if callable(candidate_resolver):
+                official_candidates = await asyncio.to_thread(
+                    candidate_resolver,
+                    *labels,
+                    limit=12,
+                )
+            if not official_candidates:
+                directory_loader = getattr(
+                    self._auto_discovery,
+                    "official_products",
+                    None,
+                )
+                if callable(directory_loader):
+                    official_candidates = await asyncio.to_thread(
+                        directory_loader,
+                        limit=500,
+                    )
+
         catalog = {key: display for key, display, _markers in self._INVENTORY_DEFINITIONS}
-        choices = "\n".join(f"- {key}: {catalog.get(key, key)}" for key in SERVICE_TEMPLATE_FIELDS)
+        official_by_code = {
+            str(product.get("service_code") or ""): product
+            for product in official_candidates
+            if str(product.get("service_code") or "")
+        }
+        if official_by_code:
+            choices = "\n".join(
+                "- "
+                + code
+                + ": "
+                + ", ".join(
+                    dict.fromkeys(
+                        [
+                            str(product.get("display_name") or ""),
+                                *(
+                                    str(alias)
+                                    for alias in list(product.get("aliases") or [])[:2]
+                                ),
+                        ]
+                    )
+                )
+                for code, product in official_by_code.items()
+            )
+            response_field = "service_code"
+            selection_rule = (
+                "只能从候选中返回一个 service_code；这些候选全部来自本地同步的 AWS 官方目录。"
+                "不要把中文功能描述原样返回。"
+            )
+        else:
+            choices = "\n".join(
+                f"- {key}: {catalog.get(key, key)}" for key in SERVICE_TEMPLATE_FIELDS
+            )
+            response_field = "service"
+            selection_rule = "只能从允许的稳定标识中选择一个服务。"
         prompt = (
-            "你只负责判断一段客户原话对应哪个 AWS 服务，不提取参数、不报价。\n"
+            "你只负责判断这一条需求采购的主 AWS 服务，不提取参数、不报价。\n"
+            "目标端、源站、写入位置、读取来源、被保护资源和被监控资源只是关联服务，"
+            "不能取代本条主服务，也不能据此创建第二个采购组件。\n"
             "只能返回严格 JSON："
-            '{"service":"允许的稳定标识或unknown","confidence":"high|low"}。\n'
+            f'{{"{response_field}":"候选值或unknown","confidence":"high|low"}}。\n'
             "只有含义明确时才能选服务；无法确定必须返回 unknown。\n"
-            "同义描述按 AWS 托管服务归类，不使用 EC2 自建替代。\n"
-            "允许的稳定标识如下：\n"
+            "同义名称和新旧名称按同一个 AWS 托管服务理解，不使用 EC2 自建替代。\n"
+            "这是产品身份识别，不是功能推荐；第三方产品不能因为功能相似就改成某个 AWS 产品。\n"
+            f"{selection_rule}\n"
+            "候选如下：\n"
             f"{choices}"
         )
         content = f"当前临时名称：{component.service}\n客户原话：\n{component.source_text}"
+
+        async def complete_identity_json(
+            system_prompt: str,
+            *,
+            timeout_seconds: float,
+        ) -> dict[str, object]:
+            last_error: Exception | None = None
+            gateways = self._service_identity_gateways()
+            for route_index, gateway in enumerate(gateways):
+                try:
+                    async with semaphore:
+                        return await gateway.complete_json(
+                            system_prompt=system_prompt,
+                            user_content=content,
+                            timeout_seconds=timeout_seconds,
+                            max_attempts=1,
+                        )
+                except Exception as exc:
+                    last_error = exc
+                    if reporter and route_index + 1 < len(gateways):
+                        await reporter(
+                            "component_classify",
+                            f"组件 {component_number}｜当前识别线路未响应，"
+                            "正在切换备用线路继续核验本组件",
+                        )
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("No configured AI route is available for service identity")
+
         if reporter:
             await reporter(
                 "component_classify",
                 f"组件 {component_number}｜正在核验服务归属",
             )
         try:
-            async with semaphore:
-                raw = await self._recovery_gateway().complete_json(
-                    system_prompt=prompt,
-                    user_content=content,
-                    timeout_seconds=20,
-                    max_attempts=1,
-                )
-            candidate = self._service_key(str(raw.get("service") or ""))
+            raw = await complete_identity_json(prompt, timeout_seconds=25)
             confidence = str(raw.get("confidence") or "").strip().casefold()
+            if official_by_code:
+                selected_product = selected_official_product(raw, official_by_code)
+                if selected_product is None or confidence != "high":
+                    # A lexical shortlist can be non-empty yet completely
+                    # wrong after an AWS marketing rename (Managed Service for
+                    # Apache Flink -> AmazonKinesisAnalytics).  In that case a
+                    # retry against the complete local official directory is
+                    # useful; repeating the same shortlist is not.  The model
+                    # still returns an exact existing service code and cannot
+                    # invent a product.
+                    directory_loader = (
+                        getattr(self._auto_discovery, "official_products", None)
+                        if self._auto_discovery is not None
+                        else None
+                    )
+                    full_products = (
+                        await asyncio.to_thread(directory_loader, limit=500)
+                        if callable(directory_loader)
+                        else []
+                    )
+                    full_by_code = {
+                        str(product.get("service_code") or ""): product
+                        for product in full_products
+                        if str(product.get("service_code") or "")
+                    }
+                    if set(full_by_code) - set(official_by_code):
+                        full_choices = "\n".join(
+                            "- "
+                            + code
+                            + ": "
+                            + ", ".join(
+                                dict.fromkeys(
+                                    [
+                                        str(product.get("display_name") or ""),
+                                        *(
+                                            str(alias)
+                                            for alias in list(product.get("aliases") or [])[:3]
+                                        ),
+                                    ]
+                                )
+                            )
+                            for code, product in full_by_code.items()
+                        )
+                        fallback_prompt = prompt.replace(choices, full_choices)
+                        raw = await complete_identity_json(
+                            fallback_prompt,
+                            timeout_seconds=30,
+                        )
+                        confidence = str(raw.get("confidence") or "").strip().casefold()
+                        selected_product = selected_official_product(raw, full_by_code)
+                    else:
+                        # The first call already used the complete directory.
+                        # Previously there was no semantic retry in this path:
+                        # one malformed key (for example ``efs`` instead of
+                        # ``AmazonEFS``) silently escaped into pricing. Retry
+                        # only this component with the validation failure made
+                        # explicit; do not rerun the other quote components.
+                        retry_prompt = (
+                            prompt
+                            + "\n上一次没有返回可验证的唯一官方产品。请重新阅读客户原话，"
+                            "必须返回候选行开头的 service_code；无法确定时返回 unknown。"
+                        )
+                        raw = await complete_identity_json(
+                            retry_prompt,
+                            timeout_seconds=30,
+                        )
+                        confidence = str(raw.get("confidence") or "").strip().casefold()
+                        selected_product = selected_official_product(raw, full_by_code)
+                    if selected_product is None or confidence != "high":
+                        component.field_sources["_identity_resolution_status"] = "failed"
+                        component.field_sources["_identity_resolution_reason"] = (
+                            "没有从 AWS 官方产品清单中确定唯一匹配结果"
+                        )
+                        return
+                apply_official_identity(selected_product)
+                await remember_official_identity(selected_product)
+                if reporter:
+                    await reporter(
+                        "component_classify",
+                        f"组件 {component_number}｜服务归属已确认："
+                        f"{component.calculator_service_name or component.service}",
+                    )
+                return
+
+            candidate = self._service_key(str(raw.get("service") or ""))
             if candidate not in SERVICE_TEMPLATE_FIELDS or confidence != "high":
+                component.field_sources["_identity_resolution_status"] = "failed"
+                component.field_sources["_identity_resolution_reason"] = (
+                    "没有从 AWS 官方产品清单中确定唯一匹配结果"
+                )
                 return
             component.service = candidate
             component.calculator_service_name = catalog.get(
@@ -2562,6 +2963,10 @@ class DeepSeekIntentParser:
                     f"{component.calculator_service_name or candidate}",
                 )
         except Exception:
+            component.field_sources["_identity_resolution_status"] = "failed"
+            component.field_sources["_identity_resolution_reason"] = (
+                "服务名称识别线路暂时无法连接"
+            )
             logger.exception("Unknown component classification failed for %s", component.service)
 
     async def _fill_component_template_with_retries(
@@ -2652,17 +3057,22 @@ class DeepSeekIntentParser:
         reporter: AiTranscriptReporter | None,
         component_number: int,
     ) -> dict[str, object] | None:
-        """Create/reuse a metadata-only profile for a previously unknown service."""
+        """Create/reuse the official field profile used by generic pricing."""
 
         if self._auto_discovery is None:
             return None
-        if self._service_key(component.service) in SERVICE_TEMPLATE_FIELDS:
+        if not requires_official_field_profile(component.service):
             return None
         display_name = component.calculator_service_name or component.service
+        known_template = self._service_key(component.service) in SERVICE_TEMPLATE_FIELDS
         if reporter:
             await reporter(
                 "catalog",
-                f"【组件 {component_number}】正在读取 AWS 官方目录并建立新组件缓存：{display_name}",
+                (
+                    f"【组件 {component_number}】正在核对 AWS 官方计价字段缓存：{display_name}"
+                    if known_template
+                    else f"【组件 {component_number}】正在读取 AWS 官方目录并建立新组件缓存：{display_name}"
+                ),
             )
         try:
             async with semaphore:
@@ -2676,7 +3086,7 @@ class DeepSeekIntentParser:
                 if profile.get("status") == "verified":
                     await reporter(
                         "catalog",
-                        f"【组件 {component_number}】已生成官方目录字段模板并写入持久缓存",
+                        f"【组件 {component_number}】官方计价字段已核对并写入持久缓存",
                     )
                 else:
                     await reporter(
@@ -3204,7 +3614,13 @@ class DeepSeekIntentParser:
             patterns = role_patterns.get(
                 field,
                 [
-                    r"(\d+)\s*(?:个|台)?\s*(?:broker|worker|工作|数据)?\s*节点",
+                    # Generic role-node count.  The role name is deliberately
+                    # not enumerated: AWS services use many valid labels such
+                    # as 主、核心、任务、协调 and reader/writer.  Requiring the
+                    # number to appear before the node noun still prevents a
+                    # capacity phrase such as ``每节点500GB`` from becoming a
+                    # node count.
+                    r"(\d+)\s*(?:个|台)?\s*(?:[a-z][a-z0-9_-]*|[\u4e00-\u9fff]{0,8})?\s*节点",
                     r"(?:broker|worker|工作|数据)?\s*节点(?:数量|数|总数)\s*[:：]?\s*(\d+)",
                     r"(?:数量|总数)\s*[:：]\s*(\d+)",
                 ],
@@ -3876,7 +4292,13 @@ class DeepSeekIntentParser:
             return "nat_gateway"
         if canonical in {"vpc", "awsvpc", "amazonvpc"}:
             return "vpc"
-        if canonical in {"dms", "awsdms", "awsdatabasemigrationservice"}:
+        if canonical in {
+            "dms",
+            "awsdms",
+            "awsdatabasemigrationservice",
+            "awsdatabasemigrationsvc",
+            "databasemigrationsvc",
+        }:
             return "dms"
         if canonical in {"kms", "awskms", "keymanagementservice", "awskeymanagementservice"}:
             return "kms"
@@ -3888,7 +4310,14 @@ class DeepSeekIntentParser:
             return "ecr"
         if canonical in {"msk", "amazonmsk", "managedstreamingforkafka", "kafka"}:
             return "msk"
-        if canonical in {"opensearch", "amazonopensearch", "amazonopensearchservice"}:
+        if canonical in {
+            "es",
+            "amazones",
+            "elasticsearchservice",
+            "opensearch",
+            "amazonopensearch",
+            "amazonopensearchservice",
+        }:
             return "opensearch"
         if canonical in {
             "documentdb",
@@ -4493,6 +4922,43 @@ class DeepSeekIntentParser:
                 current.append(line)
         return ["\n".join(block).strip() for block in blocks if "\n".join(block).strip()]
 
+    @classmethod
+    def _inventory_numbered_requirement_blocks(cls, text: str) -> list[str]:
+        """Expand clear skipped row numbers for inventory without changing UI counts.
+
+        Some pasted lists jump from item 2 to item 5. The legacy block splitter
+        intentionally keeps non-sequential numbers attached because numeric
+        specification rows can look similar. At the service-inventory boundary
+        we can safely split a later line when its remainder is independently a
+        named component heading.
+        """
+
+        expanded: list[str] = []
+        for block in cls._numbered_requirement_blocks(text):
+            current: list[str] = []
+            for raw_line in block.splitlines():
+                line = raw_line.strip()
+                marker = cls._numbered_requirement_match(line)
+                remainder = marker.group(2).strip() if marker else ""
+                clear_heading = bool(
+                    marker
+                    and current
+                    and not cls._looks_like_numbered_component_field(remainder)
+                    and (
+                        cls._inventory_keys_for_line(remainder)
+                        or re.match(r"^(?:Amazon|AWS)\s+", remainder, re.I)
+                        or re.match(r"^[^：:\n]{1,80}\s*[：:]", remainder)
+                    )
+                )
+                if clear_heading:
+                    expanded.append("\n".join(current).strip())
+                    current = [remainder]
+                else:
+                    current.append(line)
+            if current:
+                expanded.append("\n".join(current).strip())
+        return [block for block in expanded if block]
+
     @staticmethod
     def _unknown_numbered_component_identity(block: str) -> tuple[str, str]:
         """Create a neutral identity without guessing an AWS product.
@@ -4513,6 +4979,73 @@ class DeepSeekIntentParser:
             digest = hashlib.sha256(block.encode("utf-8")).hexdigest()[:12]
             ascii_slug = f"unknown_component_{digest}"
         return ascii_slug[:80], display
+
+    @classmethod
+    def _numbered_block_service_identities(
+        cls,
+        block: str,
+    ) -> list[tuple[str, str]]:
+        """Inventory the purchased service without promoting dependencies.
+
+        A numbered row is one ownership boundary. Its heading is stronger
+        identity evidence than product names in the description: in
+        ``Data Firehose: ... target S3`` the S3 mention is a destination, not
+        the service being purchased. An unfamiliar explicit product heading
+        stays neutral so the official-candidate AI classifier can resolve it.
+        """
+
+        source = cls._strip_numbered_requirement_prefix(block).strip()
+        first_line = next(
+            (line.strip() for line in source.splitlines() if line.strip()),
+            "",
+        )
+        heading_match = re.match(r"^([^：:\n]{1,160})\s*[：:]", first_line)
+        heading = ""
+        explicit_named_heading = False
+        if heading_match:
+            heading = re.sub(r"\s+", " ", heading_match.group(1)).strip()
+            heading_identities = cls._inventory_keys_for_line(heading)
+            if heading_identities:
+                return list(dict.fromkeys(heading_identities))
+            heading_fallback = cls._fallback_numbered_block_services(heading)
+            if heading_fallback:
+                return heading_fallback
+            explicit_named_heading = bool(
+                re.match(r"^(?:Amazon|AWS)\s+", heading, re.I)
+                or re.fullmatch(r"[A-Za-z][A-Za-z0-9 ._+/-]{1,100}", heading)
+            )
+
+        # Relationship words create an ownership boundary inside conversational
+        # rows without a colon. Prefer a service named before that boundary;
+        # products after it are destinations, origins or protected resources.
+        relationship = re.search(
+            r"(?:目标端|目标是|写入到?|发送到?|保存到?|存放到?|源站(?:是|为)?|"
+            r"读取自|来源于|后端(?:是|为)?|被保护(?:资源)?|被监控(?:资源)?)",
+            source,
+            re.I,
+        )
+        if relationship:
+            primary_text = source[: relationship.start()]
+            primary_identities = cls._inventory_keys_for_line(primary_text)
+            if not primary_identities:
+                primary_identities = cls._fallback_numbered_block_services(primary_text)
+            if primary_identities:
+                return list(dict.fromkeys(primary_identities))
+            # An unfamiliar name before an explicit dependency boundary must
+            # reach AI as the main-product question. The known product after
+            # the boundary is never allowed to take ownership of the row.
+            return [cls._unknown_numbered_component_identity(source)]
+
+        if explicit_named_heading:
+            return [cls._unknown_numbered_component_identity(source)]
+
+        identities = cls._inventory_keys_for_line(source)
+        if identities:
+            return list(dict.fromkeys(identities))
+        fallback = cls._fallback_numbered_block_services(source)
+        if fallback:
+            return fallback
+        return [cls._unknown_numbered_component_identity(source)]
 
     @classmethod
     def _drop_reference_only_workloads(
@@ -4687,16 +5220,12 @@ class DeepSeekIntentParser:
         still performed independently for every component afterwards.
         """
 
-        blocks = cls._numbered_requirement_blocks(text)
+        blocks = cls._inventory_numbered_requirement_blocks(text)
         if not blocks:
             return None
         services: list[ServiceRequirement] = []
         for block in blocks:
-            identities = cls._inventory_keys_for_line(block)
-            if not identities:
-                identities = cls._fallback_numbered_block_services(block)
-            if not identities:
-                identities = [cls._unknown_numbered_component_identity(block)]
+            identities = cls._numbered_block_service_identities(block)
             seen: set[str] = set()
             for key, display in identities:
                 if key in seen:
@@ -4772,19 +5301,13 @@ class DeepSeekIntentParser:
 
         declarations: list[tuple[str, str, str, str | None]] = []
         single_owner_blocks: list[tuple[str, str, str]] = []
-        numbered_blocks = cls._numbered_requirement_blocks(text)
+        numbered_blocks = cls._inventory_numbered_requirement_blocks(text)
         if numbered_blocks:
             # Sales supplied the boundaries.  Inventory every literal service
             # inside each block once and bind the complete block to it.  This
             # is deliberately performed before looking at the AI output.
             for block_index, block in enumerate(numbered_blocks, start=1):
-                block_keys: list[tuple[str, str]] = []
-                for line in block.splitlines():
-                    for key, display in cls._inventory_keys_for_line(line):
-                        if key not in {existing_key for existing_key, _ in block_keys}:
-                            block_keys.append((key, display))
-                if not block_keys:
-                    block_keys = cls._fallback_numbered_block_services(block)
+                block_keys = cls._numbered_block_service_identities(block)
                 for key, display in block_keys:
                     owner_digest = hashlib.sha256(
                         f"{block_index}\x1f{key}\x1f{block}".encode("utf-8")
@@ -4905,15 +5428,22 @@ class DeepSeekIntentParser:
             if item.field_sources.get("_official_service_code"):
                 filtered.append(item)
                 continue
-            source_inventory = cls._inventory_keys_for_line(item.source_text or "")
-            source_keys = {key for key, _ in source_inventory}
+            source_inventory = (
+                cls._numbered_block_service_identities(item.source_text or "")
+                if numbered_blocks
+                else cls._inventory_keys_for_line(item.source_text or "")
+            )
+            source_keys = {cls._service_key(key) for key, _ in source_inventory}
             item_key = cls._service_key(item.service)
             if len(source_keys) == 1:
                 # The customer's own component text is stronger evidence than
                 # a generated service label.  Rebind rather than discard so an
                 # unfamiliar alias cannot create a missing or duplicate row.
                 source_key, source_display = source_inventory[0]
-                if item_key in SERVICE_TEMPLATE_FIELDS and item_key != source_key:
+                if (
+                    item_key in SERVICE_TEMPLATE_FIELDS
+                    and item_key != cls._service_key(source_key)
+                ):
                     item.quantity = 1
                     item.requirements = {}
                     item.field_evidence = {}
@@ -4945,7 +5475,7 @@ class DeepSeekIntentParser:
                     index
                     for index, item in enumerate(filtered)
                     if index not in used
-                    and cls._service_key(item.service) == key
+                    and cls._service_key(item.service) == cls._service_key(key)
                     and source_belongs_to_declaration(item, line)
                 ),
                 None,
@@ -4955,7 +5485,8 @@ class DeepSeekIntentParser:
                     (
                         index
                         for index, item in enumerate(filtered)
-                        if index not in used and cls._service_key(item.service) == key
+                        if index not in used
+                        and cls._service_key(item.service) == cls._service_key(key)
                     ),
                     None,
                 )
@@ -5014,7 +5545,7 @@ class DeepSeekIntentParser:
                 owner_key
                 for key, _display, line, owner_key in declarations
                 if owner_key is not None
-                and cls._service_key(item.service) == key
+                and cls._service_key(item.service) == cls._service_key(key)
                 and source_belongs_to_declaration(item, line)
             ]
             if len(owner_matches) == 1:
@@ -5118,7 +5649,11 @@ class DeepSeekIntentParser:
         # workload and must enter the managed-vs-self-hosted decision first.
         # Official future AWS services remain untouched because their headings
         # identify them as AWS/Amazon services.
-        original_blocks = cls._numbered_requirement_blocks(original_text) if original_text else []
+        original_blocks = (
+            cls._inventory_numbered_requirement_blocks(original_text)
+            if original_text
+            else []
+        )
 
         def customer_explicitly_selected_ec2(product: str, source: str) -> bool:
             """Treat an explicit EC2 host/model as a completed architecture choice."""
@@ -5248,6 +5783,13 @@ class DeepSeekIntentParser:
 
         for item in parsed.services:
             source = item.source_text or ""
+            # A failed official-product lookup is an unresolved identity, not
+            # evidence that the customer asked for EC2 self-hosting.  Keep the
+            # original heading intact so a later component-only retry can
+            # classify it; never manufacture an architecture choice from an
+            # AI/network failure.
+            if item.field_sources.get("_identity_resolution_status") == "failed":
+                continue
             # An exact provider-catalog identity always wins over generic VM
             # shape prose. Managed databases also describe CPU, memory and an
             # "instance", which must not make them look like standalone EC2.
@@ -5320,6 +5862,8 @@ class DeepSeekIntentParser:
                 item.quantity = max(int(node_match.group(1)), 1)
 
         for item in parsed.services:
+            if item.field_sources.get("_identity_resolution_status") == "failed":
+                continue
             source = item.source_text or ""
             if not re.search(r"(?<![a-z0-9])nacos(?![a-z0-9])", source, re.I):
                 continue
@@ -5356,6 +5900,8 @@ class DeepSeekIntentParser:
         # presenting it as an ordinary application server.  This is generic:
         # ClickHouse, XXL-JOB and future named middleware follow the same path.
         for item in parsed.services:
+            if item.field_sources.get("_identity_resolution_status") == "failed":
+                continue
             if cls._service_key(item.service) != "ec2":
                 continue
             if item.field_sources.get("_official_service_code"):
@@ -5434,6 +5980,8 @@ class DeepSeekIntentParser:
             and any(marker in notice.casefold() for marker in ("托管", "managed", "aws"))
         ]
         for item in parsed.services:
+            if item.field_sources.get("_identity_resolution_status") == "failed":
+                continue
             if cls._service_key(item.service) != "ec2":
                 continue
             display = item.calculator_service_name or ""
@@ -5651,7 +6199,7 @@ class DeepSeekIntentParser:
         """Keep explicitly requested simple metered services even when AI omits them."""
 
         represented = {cls._service_key(item.service) for item in parsed.services}
-        numbered_blocks = cls._numbered_requirement_blocks(text)
+        numbered_blocks = cls._inventory_numbered_requirement_blocks(text)
 
         def explicitly_owned_source(markers: tuple[str, ...]) -> str:
             """Return a customer block that actually owns this service.
@@ -6315,6 +6863,16 @@ class DeepSeekIntentParser:
                 )
                 item.quantity = max(value, 1)
                 continue
+            # The shared literal ledger already distinguishes a labelled
+            # top-level ``数量2`` from internal counts such as ``3 Worker``.
+            # Respect that customer-owned deployment count before collapsing
+            # topology fields to a single group.
+            quantity_evidence = str(item.field_evidence.get("quantity") or "")
+            if (
+                item.field_sources.get("quantity") == "customer_text"
+                and re.search(r"数量\s*[:：]?\s*\d+", quantity_evidence, re.I)
+            ):
+                continue
             has_internal_topology = any(
                 isinstance(item.requirements.get(field), (int, float))
                 and not isinstance(item.requirements.get(field), bool)
@@ -6751,6 +7309,7 @@ class DeepSeekIntentParser:
             "一": 1,
             "二": 2,
             "两": 2,
+            "俩": 2,
             "三": 3,
             "四": 4,
             "五": 5,
@@ -6760,7 +7319,7 @@ class DeepSeekIntentParser:
             "九": 9,
         }
         chinese_units = {"十": 10, "百": 100, "千": 1000}
-        count_token = r"\d+|[零〇一二两三四五六七八九十百千]+"
+        count_token = r"\d+|[零〇一二两俩三四五六七八九十百千]+"
 
         def exact_count(value: str) -> int | None:
             token = str(value or "").strip()
@@ -6963,6 +7522,21 @@ class DeepSeekIntentParser:
             # brokers and search nodes all understand the same compact sales
             # wording, including an unambiguous omitted GiB suffix.
             template_fields = set(requirement_fields(service)) | set(extra_fields)
+            if "product_variant" in template_fields:
+                if re.search(r"(?:for\s*)?live\s*analytics|liveanalytics", source, re.I):
+                    requirements["product_variant"] = "live_analytics"
+                    variant_evidence = re.search(
+                        r"(?:for\s*)?live\s*analytics|liveanalytics", source, re.I
+                    )
+                    assert variant_evidence is not None
+                    lock(item, "product_variant", variant_evidence.group(0))
+                elif re.search(r"(?:for\s*)?influx\s*db|influxdb", source, re.I):
+                    requirements["product_variant"] = "influxdb"
+                    variant_evidence = re.search(
+                        r"(?:for\s*)?influx\s*db|influxdb", source, re.I
+                    )
+                    assert variant_evidence is not None
+                    lock(item, "product_variant", variant_evidence.group(0))
             compute_shape = explicit_compute_shape(source)
             customer_replaced_shape = (
                 item.field_sources.get("_customer_shape_replaced_by_model")
@@ -7141,14 +7715,113 @@ class DeepSeekIntentParser:
             # source-of-truth protection.
             if "data_in_gib" in template_fields:
                 incoming_volume = labelled_volume(
-                    r"每月(?:共|合计)?(?:写入|摄取|导入|流入)(?:数据|流量)?(?:量)?|"
-                    r"(?:写入|摄取|导入|流入)(?:数据|流量)?(?:量)?|"
-                    r"数据(?:写入|摄取|导入|流入)量|"
+                    r"每月(?:共|合计)?(?:写入|摄取|摄入|导入|流入)(?:数据|流量)?(?:量)?|"
+                    r"(?:写入|摄取|摄入|导入|流入)(?:数据|流量)?(?:量)?|"
+                    r"数据(?:写入|摄取|摄入|导入|流入)量|"
                     r"monthly\s+(?:data\s+)?(?:ingest|ingestion|input|written)"
                 )
                 if incoming_volume is not None:
                     requirements["data_in_gib"] = incoming_volume[0]
                     lock(item, "data_in_gib", incoming_volume[1])
+
+            # Configuration counts are often the multiplier behind an
+            # official hourly dimension.  They are not interchangeable with
+            # the component's top-level quantity: one firewall can have two
+            # endpoints and one DMS replication instance can run three tasks.
+            count_contracts = (
+                (
+                    "endpoint_count",
+                    r"(?:部署|配置|包含|使用)?\s*(\d+)\s*(?:个|台)?\s*"
+                    r"(?:防火墙\s*)?(?:endpoint|端点)",
+                ),
+                (
+                    "listener_count",
+                    r"(?:部署|配置|包含|使用)?\s*(\d+)\s*(?:个|条)?\s*"
+                    r"(?:listener|监听器)",
+                ),
+                (
+                    "task_count",
+                    r"(?:同时(?:运行|执行)?|运行|执行|包含|配置)?\s*(\d+)\s*(?:个|项)?\s*"
+                    r"(?:迁移\s*)?(?:task|任务)",
+                ),
+                (
+                    "replication_instances",
+                    r"(?:复制实例(?:数量|数)|replication\s+instances?)\s*"
+                    r"[:：]?\s*(\d+)\s*(?:个|台)?|"
+                    r"(\d+)\s*(?:个|台)\s*(?:复制实例|replication\s+instances?)",
+                ),
+            )
+            for count_field, pattern in count_contracts:
+                if count_field not in template_fields:
+                    continue
+                count_match = re.search(pattern, source, re.I)
+                if count_match:
+                    count_value = next(
+                        group for group in count_match.groups() if group is not None
+                    )
+                    requirements[count_field] = int(count_value)
+                    lock(item, count_field, count_match.group(0))
+
+            if "write_records" in template_fields:
+                record_match = re.search(
+                    r"(?:每月|月度|月均)?\s*(?:写入|摄入|摄取)(?:约|大约|预计)?\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:条|个|次)?\s*"
+                    r"(?:时序)?(?:数据|记录|record)?",
+                    source,
+                    re.I,
+                ) or re.search(
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:条|个|次)\s*"
+                    r"(?:时序)?(?:数据|记录)\s*(?:写入|摄入|摄取)",
+                    source,
+                    re.I,
+                )
+                if record_match:
+                    requirements["write_records"] = scaled_number(
+                        record_match.group(1), record_match.group(2)
+                    )
+                    lock(item, "write_records", record_match.group(0))
+
+            retention_contracts = (
+                (
+                    "memory_retention_hours",
+                    r"(?:内存(?:存储|层)?|memory\s*store)\s*(?:数据)?\s*"
+                    r"(?:保留|留存|retention)?\s*[:：]?\s*(\d+(?:\.\d+)?)\s*小时",
+                ),
+                (
+                    "magnetic_retention_days",
+                    r"(?:磁性|磁盘)(?:存储|层)?\s*(?:数据)?\s*"
+                    r"(?:保留|留存|retention)?\s*[:：]?\s*(\d+(?:\.\d+)?)\s*天",
+                ),
+            )
+            for retention_field, pattern in retention_contracts:
+                if retention_field not in template_fields:
+                    continue
+                retention_match = re.search(pattern, source, re.I)
+                if retention_match:
+                    requirements[retention_field] = float(retention_match.group(1))
+                    lock(item, retention_field, retention_match.group(0))
+
+            if (
+                "product_variant" in template_fields
+                and not requirements.get("product_variant")
+                and any(
+                    field in requirements
+                    for field in (
+                        "write_records",
+                        "memory_retention_hours",
+                        "magnetic_retention_days",
+                    )
+                )
+            ):
+                # Timestream for LiveAnalytics and Timestream for InfluxDB
+                # share a catalog family. Record ingestion and hot/cold
+                # retention are LiveAnalytics dimensions, so the product type
+                # is determined even when the customer only says "时序数据".
+                requirements["product_variant"] = "live_analytics"
+                item.field_sources["requirements.product_variant"] = "system_derived"
+                item.field_evidence["requirements.product_variant"] = (
+                    "客户给出了时序记录写入或分层保留用量"
+                )
 
             if "data_out_gib" in template_fields:
                 outgoing_volume = labelled_volume(
@@ -7181,12 +7854,59 @@ class DeepSeekIntentParser:
 
             if "backup_storage_gib" in template_fields:
                 backup_volume = labelled_volume(
-                    r"备份存储(?:容量)?|备份容量|快照存储(?:容量)?|快照容量|"
+                    r"备份存储(?:容量)?|备份容量|备份数据(?:总量|容量)?|"
+                    r"快照存储(?:容量)?|快照容量|"
                     r"backup storage|snapshot storage"
                 )
                 if backup_volume is not None:
                     requirements["backup_storage_gib"] = backup_volume[0]
                     lock(item, "backup_storage_gib", backup_volume[1])
+
+            if "backup_retention_days" in template_fields:
+                backup_retention = re.search(
+                    r"(?:备份[^。；,，\n]{0,20}?)?(?:保留|留存)\s*"
+                    r"(\d+(?:\.\d+)?)\s*天",
+                    source,
+                    re.I,
+                )
+                if backup_retention:
+                    requirements["backup_retention_days"] = int(
+                        float(backup_retention.group(1))
+                    )
+                    lock(item, "backup_retention_days", backup_retention.group(0))
+
+            if "cross_region_copy_gib" in template_fields:
+                cross_region_copy = labelled_volume(
+                    r"(?:跨区域|跨区|异地)(?:复制|备份)(?:数据|容量|流量)?|"
+                    r"复制到(?:另一个|其他|异地)?\s*(?:aws\s*)?区域(?:的数据|容量|流量)?|"
+                    r"cross[ -]?region\s+(?:copy|backup|transfer)"
+                )
+                if cross_region_copy is not None:
+                    requirements["cross_region_copy_gib"] = cross_region_copy[0]
+                    lock(item, "cross_region_copy_gib", cross_region_copy[1])
+
+            if "provisioned_throughput_mibps" in template_fields:
+                throughput_match = re.search(
+                    r"(?:吞吐(?:量|能力)?|throughput)"
+                    r"[^\d。；,，\n]{0,18}?(\d+(?:\.\d+)?)\s*"
+                    r"(?:mi?b|mb)\s*(?:/\s*s|ps)",
+                    source,
+                    re.I,
+                )
+                if throughput_match:
+                    requirements["provisioned_throughput_mibps"] = float(
+                        throughput_match.group(1)
+                    )
+                    requirements["throughput_mode"] = "provisioned"
+                    lock(
+                        item,
+                        "provisioned_throughput_mibps",
+                        throughput_match.group(0),
+                    )
+                    item.field_sources["requirements.throughput_mode"] = "system_derived"
+                    item.field_evidence["requirements.throughput_mode"] = (
+                        throughput_match.group(0)
+                    )
 
             role_values_found = False
             for role_field, role_labels in (
@@ -7379,7 +8099,7 @@ class DeepSeekIntentParser:
             if service == "ec2":
                 quantity_match = (
                     re.search(
-                        rf"(?<![零〇一二两三四五六七八九十百千\d])({count_token})"
+                        rf"(?<![零〇一二两俩三四五六七八九十百千\d])({count_token})"
                         r"\s*(?:台|个\s*(?:worker|工作)?节点)",
                         source,
                         flags=re.IGNORECASE,
@@ -7509,24 +8229,24 @@ class DeepSeekIntentParser:
                 if volume_match := re.search(r"\b(gp[23]|io[12]|st1|sc1)\b", source, re.I):
                     requirements["volume_type"] = volume_match.group(1).lower()
                     lock(item, "volume_type", volume_match.group(0))
-                data_disk_match = re.search(
-                    r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tib|tb|t)"
-                    r"[^\d。；,，\n]{0,12}?(?:数据盘|附加盘)",
-                    source,
-                    flags=re.IGNORECASE,
-                )
-                if data_disk_match:
+                # Preserve an explicitly labelled EC2 data disk regardless of
+                # word order.  Sales text commonly uses both ``500GB 数据盘``
+                # and ``数据盘 500GB``; the old one-way expression silently
+                # dropped the latter after an incomplete AI response.
+                data_disk = labelled_volume(r"数据盘|附加盘|数据卷|附加卷")
+                if data_disk is not None:
                     volume_type = "gp3"
                     nearby_type = re.search(r"\b(gp[23]|io[12]|st1|sc1)\b", source, re.IGNORECASE)
                     if nearby_type:
                         volume_type = nearby_type.group(1).lower()
                     requirements["additional_ebs_volumes"] = [
                         {
-                            "size_gib": gib(data_disk_match.group(1), data_disk_match.group(2)),
+                            "size_gib": data_disk[0],
                             "volume_type": volume_type,
                             "count_per_instance": 1,
                         }
                     ]
+                    lock(item, "additional_ebs_volumes", data_disk[1])
                 # Never leave a model-invented scalar alias beside the
                 # canonical per-instance volume list.
                 requirements.pop("data_disk_gib", None)
@@ -7658,20 +8378,33 @@ class DeepSeekIntentParser:
                 ):
                     requirements.pop("requested_model", None)
                 value = first(
-                    r"(?:mongodb|documentdb)[^\d。；\n]{0,20}"
-                    r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tb|tib|t)",
+                    r"(?:数据盘|磁盘|硬盘|存储|容量)(?:容量)?\s*"
+                    r"(?:约|大约|为|[:：])?\s*(\d+(?:\.\d+)?)\s*"
+                    r"(gib|gi?b|gb|g|tb|tib|t)",
                     source,
                 )
                 if value is None:
+                    # Compact rows such as ``MongoDB 2T`` carry an
+                    # unambiguous data capacity. Stop at the first numeric
+                    # token so a later ``4核32GB`` compute shape can never be
+                    # reinterpreted as database storage.
                     value = first(
-                        r"(?:存储|容量)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*"
+                        r"(?:mongodb|documentdb)[^\d。；,，\n]{0,10}?"
+                        r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tb|tib|t)",
+                        source,
+                    )
+                if value is None:
+                    value = first(
+                        r"(?:单节点|每个?节点)[^。；,，\n]{0,18}?"
+                        r"(?:数据盘|磁盘|硬盘|存储)(?:容量)?\s*"
+                        r"(?:约|大约|为|[:：])?\s*(\d+(?:\.\d+)?)\s*"
                         r"(gib|gi?b|gb|g|tb|tib|t)",
                         source,
                     )
                 if value is not None:
                     requirements["storage_gib"] = value
                 if instance_match := re.search(
-                    r"(?<![\w.])(\d+)\s*(?:个|台)?\s*(?:数据库)?实例",
+                    r"(?<!\d)(\d+)\s*(?:个|台)?\s*(?:(?:数据库)?实例|节点)",
                     source,
                     re.I,
                 ):
@@ -8011,6 +8744,33 @@ class DeepSeekIntentParser:
                         item.quantity = node_count
                 if match := re.search(r"(?:[×x*]\s*)?(\d+)\s*分片", source, re.I):
                     requirements["shards"] = int(match.group(1))
+            elif service == "efs":
+                # These are AWS's closed EFS product choices, not guesses
+                # about arbitrary customer wording.  The component AI remains
+                # responsible for filling the template; this replay prevents
+                # an explicit Standard/Regional choice from disappearing at a
+                # later model or cache boundary.
+                if re.search(r"\b(?:efs\s+)?standard\b|标准存储", source, re.I):
+                    requirements["storage_class"] = "standard"
+                    lock(item, "storage_class", "EFS Standard")
+                elif re.search(r"\b(?:efs\s+)?(?:ia|infrequent\s+access)\b|低频访问", source, re.I):
+                    requirements["storage_class"] = "infrequent_access"
+                    lock(item, "storage_class", "EFS Infrequent Access")
+                elif re.search(r"\b(?:efs\s+)?archive\b|归档", source, re.I):
+                    requirements["storage_class"] = "archive"
+                    lock(item, "storage_class", "EFS Archive")
+                if re.search(r"\bone[ -]?zone\b|单可用区", source, re.I):
+                    requirements["deployment_type"] = "one_zone"
+                    lock(item, "deployment_type", "One Zone")
+                elif re.search(r"\bregional\b|多可用区", source, re.I):
+                    requirements["deployment_type"] = "regional"
+                    lock(item, "deployment_type", "Regional")
+                if re.search(r"elastic\s+throughput|弹性吞吐", source, re.I):
+                    requirements["throughput_mode"] = "elastic"
+                    lock(item, "throughput_mode", "Elastic Throughput")
+                elif re.search(r"provisioned\s+throughput|预置吞吐", source, re.I):
+                    requirements["throughput_mode"] = "provisioned"
+                    lock(item, "throughput_mode", "Provisioned Throughput")
             elif service == "s3":
                 value = first(
                     r"(?:文件存储|存储(?:容量)?|对象存储|容量)\s*[:：]?\s*"
@@ -9346,6 +10106,18 @@ class DeepSeekIntentParser:
         global_region = cls._explicit_global_region(text)
         for item in parsed.services:
             if cls._service_key(item.service) in cls._GLOBAL_REGION_SERVICE_KEYS:
+                continue
+
+            # A customer-confirmed replacement region is newer than the
+            # original request. Replaying the literal source on the next
+            # validation round must never restore the old unsupported region
+            # and ask the same question again.
+            if (
+                item.region
+                and item.field_sources.get("region")
+                in {"customer_confirmation", "customer_correction"}
+            ):
+                item.locked_fields = sorted(set(item.locked_fields) | {"region"})
                 continue
 
             local_regions = cls._regions_in_text(item.source_text)

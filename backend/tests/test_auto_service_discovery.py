@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from app.core.errors import ManualConfirmationRequired
 from app.domain.models import ServiceRequirement
 from app.integrations.deepseek import _official_profile_cache_model
 from app.integrations.auto_service_discovery import (
@@ -8,6 +9,8 @@ from app.integrations.auto_service_discovery import (
     PROFILE_SCHEMA_VERSION,
     AutoServiceDiscovery,
     _dimension_field,
+    _dimension_fields,
+    _flat_rate_dimensions,
 )
 from app.services.plugins.generic_official import GenericOfficialPlugin
 
@@ -59,6 +62,110 @@ def test_official_field_profiles_expire_after_ten_days() -> None:
     assert PROFILE_TTL_SECONDS == 10 * 24 * 60 * 60
 
 
+def test_distinct_official_products_never_share_a_profile_cache_key() -> None:
+    assert AutoServiceDiscovery._profile_key(
+        "bedrock", "us-east-1"
+    ) != AutoServiceDiscovery._profile_key(
+        "bedrock_service", "us-east-1"
+    )
+    assert AutoServiceDiscovery._profile_key(
+        "chime", "us-east-1"
+    ) != AutoServiceDiscovery._profile_key(
+        "chime_services", "us-east-1"
+    )
+
+
+def test_dynamic_profiles_expose_configuration_facts_before_ai_extraction() -> None:
+    fields = set(_dimension_fields([]))
+
+    assert {
+        "data_in_gib",
+        "endpoint_count",
+        "task_count",
+        "write_records",
+        "memory_retention_hours",
+        "magnetic_retention_days",
+        "product_variant",
+    } <= fields
+
+
+def test_official_hour_and_storage_dimensions_keep_service_semantics() -> None:
+    assert _dimension_field(
+        {
+            "unit": "Hourly",
+            "usage_type": "APN2-FirewallEndpoint-Hours",
+            "description": "Firewall endpoint hour",
+        }
+    )[0] == "endpoint_hours"
+    assert _dimension_field(
+        {
+            "unit": "GB-Hours",
+            "usage_type": "EUC1-MemoryStore-ByteHrs",
+        }
+    )[0] == "memory_store_gib_hours"
+    assert _dimension_field(
+        {
+            "unit": "GB-Mo",
+            "usage_type": "EUC1-MagneticStore-ByteHrs",
+        }
+    )[0] == "magnetic_store_gib_months"
+
+
+def test_flat_rate_plans_keep_subscription_overage_and_included_quotas() -> None:
+    product = {
+        "serviceCode": "CloudFrontPlans",
+        "product": {
+            "sku": "plan-a",
+            "attributes": {
+                "usagetype": "Global-CloudFrontPlan-Pro",
+                "operation": "CloudFrontPlan",
+            },
+        },
+        "terms": {
+            "FlatRate": {
+                "plans": [
+                    {
+                        "sku": "plan-a",
+                        "planCode": "Pro",
+                        "planFamilyCode": "CloudFrontPlan",
+                        "subscriptionPrice": {
+                            "description": "Pro plan",
+                            "pricePerUnit": {"USD": "100.00"},
+                        },
+                        "features": [
+                            {
+                                "featureCode": "Requests",
+                                "featureName": "Requests",
+                                "usageType": "Global-Requests",
+                                "usageQuota": {"unit": "Requests", "value": "1000000"},
+                                "overage": {"pricePerUnit": {"USD": "0.01"}},
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+    }
+
+    dimensions, plans = _flat_rate_dimensions(product)
+
+    assert dimensions[0]["instance_type"] == "Pro"
+    assert dimensions[0]["unit"] == "Quantity"
+    assert dimensions[0]["price"] == 100
+    assert dimensions[1]["usage_type"] == "Global-Requests"
+    assert plans[0]["features"][0]["included_quantity"] == "1000000"
+
+
+def test_official_bedrock_marketplace_dimension_is_not_discarded() -> None:
+    assert AutoServiceDiscovery._safe_dimension(
+        {
+            "usage_type": "APS1-MP:InputTokenCount",
+            "unit": "1M tokens",
+            "description": "AWS Marketplace software usage for Bedrock model tokens",
+        }
+    )
+
+
 def test_managed_service_name_resolves_by_unique_official_core_stem(tmp_path: Path) -> None:
     class GrafanaCatalog:
         @staticmethod
@@ -74,6 +181,44 @@ def test_managed_service_name_resolves_by_unique_official_core_stem(tmp_path: Pa
         discovery.resolve_service_code("amazon_managed_grafana", "Amazon Managed Grafana")
         == "AmazonGrafana"
     )
+
+
+def test_curated_component_resolves_its_differently_named_official_offer(
+    tmp_path: Path,
+) -> None:
+    class CuratedCatalog:
+        @staticmethod
+        def service_codes() -> list[str]:
+            return ["AWSDatabaseMigrationSvc", "AWSSystemsManager", "AWSLambda"]
+
+    discovery = AutoServiceDiscovery(
+        CuratedCatalog(),  # type: ignore[arg-type]
+        tmp_path / "auto-profiles.sqlite3",
+    )
+
+    assert discovery.resolve_service_code("dms", "AWS DMS") == "AWSDatabaseMigrationSvc"
+    assert discovery.resolve_service_code("appconfig", "AWS AppConfig") == "AWSSystemsManager"
+
+
+def test_curated_component_never_returns_an_offer_missing_from_current_catalog(
+    tmp_path: Path,
+) -> None:
+    class StaleCatalog:
+        @staticmethod
+        def service_codes() -> list[str]:
+            return ["AWSLambda"]
+
+    discovery = AutoServiceDiscovery(
+        StaleCatalog(),  # type: ignore[arg-type]
+        tmp_path / "auto-profiles.sqlite3",
+    )
+
+    try:
+        discovery.resolve_service_code("dms", "AWS DMS")
+    except ManualConfirmationRequired as exc:
+        assert exc.code == "auto_discovery_service_code_not_found"
+    else:  # pragma: no cover - protects the audited fail-closed contract
+        raise AssertionError("stale curated offer should not resolve")
 
 
 def test_unknown_component_result_cache_is_bound_to_official_contract() -> None:

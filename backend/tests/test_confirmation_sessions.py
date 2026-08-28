@@ -563,6 +563,46 @@ def test_customer_answers_are_partitioned_by_component(tmp_path: Path) -> None:
     assert global_answers == {region_question: "法兰克福"}
 
 
+def test_final_review_keeps_answers_bound_to_their_component(tmp_path: Path) -> None:
+    store = ConfirmationSessionStore(tmp_path / "retained-answers.sqlite3")
+    intent = ParsedIntent(
+        customer_summary="MSK",
+        services=[
+            ServiceRequirement(
+                service="msk",
+                requirements={"vcpu": 8, "memory_gib": 16},
+            )
+        ],
+    )
+    question = "MSK 没有完全一样的型号，请选择合适的配置。"
+    item = ConfirmationItem(
+        question=question,
+        answer_key="component-0:msk-model",
+        component_id="0",
+        service="msk",
+    )
+    token = store.create_or_replace(
+        draft_id="draft-retained-answers",
+        customer_request="MSK 8核16G",
+        customer_summary="MSK",
+        intent=intent,
+        confirmation_text="确认",
+        items=[item],
+    )
+    store.submit(token, {item.answer_key or "": "选择 m7g.xlarge"})
+    store.prepare_configuration_review(
+        draft_id="draft-retained-answers",
+        intent=intent,
+    )
+
+    component_answers, global_answers = store.historical_answers_by_component(
+        "draft-retained-answers"
+    )
+
+    assert component_answers == {0: {question: "选择 m7g.xlarge"}}
+    assert global_answers == {}
+
+
 def test_identical_visible_questions_keep_independent_component_answers(
     tmp_path: Path,
 ) -> None:

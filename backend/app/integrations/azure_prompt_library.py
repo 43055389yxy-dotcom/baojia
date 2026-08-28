@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import threading
-from pathlib import Path
+
+from app.core.data_paths import AZURE_DATA_ROOT
 
 AZURE_CORE_PROMPT = """你是 Microsoft Azure 零售价格报价的需求整理员。
 把客户原文整理成 Azure Retail Prices API 可查询的严格结构化数据。只理解需求，不编造 SKU、不计算价格。
@@ -38,7 +39,7 @@ AZURE_SERVICE_PROMPTS: dict[str, str] = {
     "monitor": """【Azure Monitor / Log Analytics】字段：log_ingestion_gib, retention_days, metrics。未给日志量时只展示最小计费单位单价。""",
 }
 
-_OVERRIDE_PATH = Path(__file__).resolve().parents[2] / ".cache" / "azure_prompt_overrides.json"
+_OVERRIDE_PATH = AZURE_DATA_ROOT / "azure_prompt_overrides.json"
 _LOCK = threading.RLock()
 
 

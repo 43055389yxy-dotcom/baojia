@@ -287,6 +287,11 @@ class PreviewSelection(BaseModel):
 class ConfirmationOption(BaseModel):
     label: str
     value: str
+    # Short customer-facing explanation for business choices such as a
+    # managed AWS replacement.  Keep this separate from the label so the UI
+    # can show the product, its role and the important difference without
+    # turning a select option into an unreadable paragraph.
+    description: str | None = None
     model: str | None = None
     specifications: dict[str, Any] = Field(default_factory=dict)
     monthly_catalog_cost: float | None = None
@@ -527,6 +532,12 @@ class PricingScenario(BaseModel):
     # infer ownership from row position or a partial string prefix such as
     # ``s1`` (which also matches ``s10`` and ``s11``).
     component_costs: dict[str, float] = Field(default_factory=dict)
+    # Stable component-id -> price source for this scenario.  A reserved
+    # comparison must never silently display an on-demand fallback as though
+    # it were an official commitment discount.
+    component_pricing_basis: dict[
+        str, Literal["on_demand", "reserved", "on_demand_fallback"]
+    ] = Field(default_factory=dict)
     is_partial: bool = False
     incomplete_component_ids: list[str] = Field(default_factory=list)
 

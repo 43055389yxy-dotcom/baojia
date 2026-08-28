@@ -49,14 +49,14 @@ test("client uses the live quote job API and keeps official-source copy", async 
   assert.match(page, /createPortal/);
   assert.match(page, /document\.body/);
   assert.match(page, /global-requote-button/);
+  assert.doesNotMatch(page, />Microsoft Azure 报价</);
   assert.match(page, /请由销售确认客户部署地区/);
   assert.match(page, /不会把地区问题发给客户/);
   assert.match(page, /销售确认地区并开始整理/);
-  assert.match(page, /SALES_REGION_CONTEXT_KEYS/);
+  assert.match(page, /SALES_REGION_CONTEXT_KEY/);
   assert.match(page, /astraquote\.aws\.current-sales-region\.v2/);
-  assert.match(page, /astraquote\.azure\.current-sales-region\.v2/);
-  assert.match(page, /\/api\/azure\/quotes\/region-preflight/);
-  assert.match(page, /provider === "azure"/);
+  assert.doesNotMatch(page, /astraquote\.azure\.current-sales-region\.v2/);
+  assert.doesNotMatch(page, /\/api\/azure\/quotes\/region-preflight/);
   assert.match(page, /sales_region: currentSalesRegion/);
   assert.match(page, /line\.key === "rdsstg" \|\| line\.group === "rds-storage"/);
   assert.match(page, /展开记录/);

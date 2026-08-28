@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.domain.models import ServiceRequirement
+from app.domain.models import ServiceKind, ServiceRequirement
 
 
 # Runtime extraction contracts.  These are deliberately separate from the
@@ -81,7 +81,8 @@ SERVICE_TEMPLATE_FIELDS: dict[str, tuple[str, ...]] = {
     ),
     "backup": (
         "backup_storage_gib", "warm_storage_gib", "cold_storage_gib",
-        "restore_gib", "backup_frequency", "backup_retention_days", "protected_service",
+        "restore_gib", "cross_region_copy_gib", "backup_frequency",
+        "backup_retention_days", "protected_service",
     ),
     "ebs": (
         "storage_gib", "total_storage_gib", "volume_type", "iops",
@@ -89,7 +90,8 @@ SERVICE_TEMPLATE_FIELDS: dict[str, tuple[str, ...]] = {
     ),
     "data_transfer": ("data_transfer_out_gib", "source_regions", "destination"),
     "global_accelerator": (
-        "accelerators", "data_transfer_out_gib", "source_regions",
+        "accelerators", "listener_count", "endpoint_count",
+        "data_transfer_out_gib", "source_regions",
         "destination_geography",
     ),
     "msk": (
@@ -117,8 +119,9 @@ SERVICE_TEMPLATE_FIELDS: dict[str, tuple[str, ...]] = {
     "secrets_manager": ("secret_count", "api_calls", "rotation_enabled"),
     "vpc": ("vpc_count", "public_subnets", "private_subnets", "availability_zones"),
     "dms": (
-        "requested_model", "replication_instances", "hours_per_month", "multi_az",
-        "storage_gib", "data_processed_gib",
+        "requested_model", "vcpu", "memory_gib", "replication_instances",
+        "task_count", "hours_per_month", "multi_az", "storage_gib",
+        "data_processed_gib",
     ),
     "kms": ("key_count", "requests", "key_type"),
     "xray": ("traces_recorded", "traces_retrieved", "traces_stored"),
@@ -139,11 +142,13 @@ SERVICE_TEMPLATE_FIELDS: dict[str, tuple[str, ...]] = {
         "streams_read_requests", "backup_storage_gib", "restore_gib",
     ),
     "efs": (
-        "storage_gib", "storage_class", "throughput_mode",
-        "provisioned_throughput_mibps", "lifecycle_policy",
+        "storage_gib", "storage_class", "deployment_type", "throughput_mode",
+        "provisioned_throughput_mibps", "data_in_gib", "data_out_gib",
+        "lifecycle_policy",
     ),
     "fsx": (
-        "file_system_type", "storage_gib", "throughput_mbps",
+        "file_system_type", "deployment_type", "storage_type",
+        "storage_gib", "throughput_mbps",
         "throughput_mbps_per_tib", "iops", "backup_storage_gib",
     ),
     "sns": ("requests", "deliveries", "delivery_type", "data_transfer_out_gib"),
@@ -218,12 +223,36 @@ SERVICE_ALIASES = {
 
 
 GENERIC_TEMPLATE_FIELDS = (
-    "requested_model", "vcpu", "memory_gib", "storage_gib", "quantity_detail",
-    "instance_count", "writer_nodes", "reader_nodes",
-    "user_count", "hours_per_user_per_day", "hours_per_month",
-    "system_disk_gib", "user_volume_gib",
-    "requests", "data_transfer_out_gib", "purpose",
+    "requested_model", "product_variant", "vcpu", "memory_gib",
+    "storage_gib", "storage_gib_per_node", "total_storage_gib",
+    "backup_storage_gib", "snapshot_storage_gib", "quantity_detail",
+    "cluster_count", "instance_count", "node_count", "broker_count",
+    "listener_count", "endpoint_count", "task_count", "shards", "replica_count",
+    "writer_nodes", "reader_nodes", "user_count",
+    "hours_per_user_per_day", "hours_per_month", "system_disk_gib",
+    "user_volume_gib", "requests", "messages", "write_records",
+    "data_in_gib", "data_out_gib", "data_processed_gib",
+    "data_scanned_gib", "data_transfer_out_gib", "throughput_mbps",
+    "memory_retention_hours", "magnetic_retention_days",
+    "kpu_count", "kpu_hours",
 )
+
+# These services have purpose-built pricing adapters.  Every other current or
+# future AWS service is handled by ``GenericOfficialPlugin`` and must enrich
+# its extraction template from the same official Price List profile used for
+# pricing.  Derive the set from the routing enum so adding a dedicated plugin
+# cannot silently leave a second, hand-maintained list stale.  ``redis`` is the
+# adapter route while the customer-facing extraction contract is
+# ``elasticache``.
+DEDICATED_TEMPLATE_SERVICES = frozenset(
+    "elasticache" if kind.value == "redis" else kind.value for kind in ServiceKind
+)
+
+
+def requires_official_field_profile(service: str) -> bool:
+    """Return whether this component needs a Price List generated field layer."""
+
+    return normalized_service_key(service) not in DEDICATED_TEMPLATE_SERVICES
 
 COMMON_TEMPLATE_FIELDS = ("system_default_assumption",)
 
@@ -285,9 +314,36 @@ BILLING_DIMENSION_FIELDS = {
     "storage_throughput_mbps", "experiment_hours",
     "total_storage_gib", "user_count", "hours_per_user_per_day",
     "messages", "connection_minutes", "throughput_mbps_per_tib",
-    "deployment_updates",
+    "deployment_updates", "endpoint_count", "task_count", "write_records",
+    "memory_retention_hours", "magnetic_retention_days",
+    "kpu_count", "kpu_hours",
     "user_volume_gib", "write_request_units",
+    # Less common official units discovered from AWS offer files.  These used
+    # to exist only inside a generated profile, so an AI extraction could fill
+    # them but the review UI and generic pricing contract would subsequently
+    # treat them as unknown.
+    "author_users", "bucket_count", "deployment_updates", "dpu_hours",
+    "endpoint_hours", "flow_runs", "magnetic_store_gib_months",
+    "memory_store_gib_hours", "object_count", "reader_users",
+    "resource_count", "session_capacity", "provisioned_throughput_mibps",
+    "throughput_mbps", "warm_storage_gib", "cold_storage_gib",
+    "cross_region_copy_gib", "traces_recorded", "traces_retrieved",
+    "traces_stored", "monthly_active_users", "machine_to_machine_tokens",
+    "provisioned_throughput_units", "crawler_dpu_hours",
+    "interactive_session_dpu_hours", "data_catalog_objects", "spice_gib",
+    "task_hours", "instance_hours", "shard_hours", "put_payload_units",
+    "extended_retention_hours", "deliveries",
 }
+
+# Official Price List rows expose billed units, but many customer inputs are
+# configuration facts that must first be converted into those units.  Every
+# dynamically profiled AWS product receives the complete stable semantic
+# vocabulary plus its exact generated ``official_usage_*`` fields.  Keeping
+# this as a union prevents a newly learned field from being accepted during
+# discovery and then removed by the generic extraction allow-list.
+DYNAMIC_SEMANTIC_TEMPLATE_FIELDS = tuple(
+    dict.fromkeys((*GENERIC_TEMPLATE_FIELDS, *sorted(BILLING_DIMENSION_FIELDS)))
+)
 
 
 def normalized_service_key(service: str) -> str:
@@ -297,7 +353,7 @@ def normalized_service_key(service: str) -> str:
 
 def requirement_fields(service: str) -> tuple[str, ...]:
     fields = SERVICE_TEMPLATE_FIELDS.get(
-        normalized_service_key(service), GENERIC_TEMPLATE_FIELDS
+        normalized_service_key(service), DYNAMIC_SEMANTIC_TEMPLATE_FIELDS
     )
     return tuple(dict.fromkeys((*fields, *COMMON_TEMPLATE_FIELDS)))
 

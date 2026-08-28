@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -9,6 +10,9 @@ from typing import Any, Literal
 from app.core.errors import QuoteError
 from app.domain.models import QuoteRequest
 from app.services.quote_service import QuoteService
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -90,6 +94,7 @@ class QuoteJobManager:
             }
             await self._event(job, "error", exc.message)
         except Exception as exc:  # pragma: no cover - protected by API-level logging
+            logger.exception("Unhandled exception while executing quote job %s", job.job_id)
             job.status = "failed"
             job.error = {
                 "status": "manual_confirmation",
@@ -122,6 +127,7 @@ class QuoteJobManager:
             }
             await self._event(job, "error", exc.message)
         except Exception as exc:  # pragma: no cover - API safety boundary
+            logger.exception("Unhandled exception while previewing quote job %s", job.job_id)
             self._recover_configuration_review(request)
             job.status = "failed"
             job.error = {
@@ -137,7 +143,7 @@ class QuoteJobManager:
             self._quote_service, "recover_configuration_review_after_failure", None
         )
         if callable(recover):
-            recover(request.draft_id)
+            recover(request.draft_id, request.customer_request)
 
     @staticmethod
     async def _event(job: QuoteJob, stage: str, message: str) -> None:

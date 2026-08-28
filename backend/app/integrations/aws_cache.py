@@ -5,9 +5,9 @@ import json
 import sqlite3
 import threading
 import time
-from pathlib import Path
 from typing import Any
 
+from app.core.data_paths import AWS_DATA_ROOT
 
 OFFICIAL_CATALOG_TTL_SECONDS = 10 * 24 * 60 * 60
 
@@ -21,7 +21,7 @@ class PersistentAwsCache:
 
     def __init__(self, ttl_seconds: int = OFFICIAL_CATALOG_TTL_SECONDS):
         self._ttl_seconds = ttl_seconds
-        self._path = Path(__file__).resolve().parents[2] / ".cache" / "aws_catalog.sqlite3"
+        self._path = AWS_DATA_ROOT / "aws_catalog.sqlite3"
         self._lock = threading.RLock()
 
     @staticmethod

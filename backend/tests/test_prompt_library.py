@@ -14,7 +14,13 @@ from app.integrations.prompt_library import (
     prompt_keys_for_request,
     prompt_size_for_request,
 )
-from app.integrations.service_templates import SERVICE_TEMPLATE_FIELDS, component_template
+from app.integrations.service_templates import (
+    BILLING_DIMENSION_FIELDS,
+    DYNAMIC_SEMANTIC_TEMPLATE_FIELDS,
+    SERVICE_TEMPLATE_FIELDS,
+    component_template,
+    requires_official_field_profile,
+)
 
 
 def test_intake_and_component_prompts_are_physically_separated() -> None:
@@ -189,6 +195,22 @@ def test_every_supported_service_has_inventory_prompt_keywords_and_full_template
         assert {
             f"requirements.{field}" for field in fields
         } <= set(template["field_evidence"])
+
+
+def test_every_runtime_template_field_is_present_in_effective_component_prompt() -> None:
+    """The editable prose and executable allow-list may never drift apart."""
+
+    for service, fields in SERVICE_TEMPLATE_FIELDS.items():
+        prompt = build_service_prompt(service)
+        assert set(fields) <= {field for field in fields if field in prompt}
+
+
+def test_generic_services_receive_complete_dynamic_billing_vocabulary() -> None:
+    assert BILLING_DIMENSION_FIELDS <= set(DYNAMIC_SEMANTIC_TEMPLATE_FIELDS)
+    assert requires_official_field_profile("lambda") is True
+    assert requires_official_field_profile("step_functions") is True
+    assert requires_official_field_profile("ec2") is False
+    assert requires_official_field_profile("elasticache") is False
 
 
 def test_every_component_template_uses_only_canonical_pricing_field_names() -> None:

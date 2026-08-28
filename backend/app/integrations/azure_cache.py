@@ -8,14 +8,14 @@ import time
 from pathlib import Path
 from typing import Any
 
+from app.core.data_paths import AZURE_DATA_ROOT
+
 
 class PersistentAzureCache:
     """Provider-isolated persistent cache for Microsoft read-only catalogs."""
 
     def __init__(self, database_path: Path | None = None):
-        self._path = database_path or (
-            Path(__file__).resolve().parents[2] / ".cache" / "azure_catalog.sqlite3"
-        )
+        self._path = database_path or AZURE_DATA_ROOT / "azure_catalog.sqlite3"
         self._lock = threading.RLock()
 
     @staticmethod

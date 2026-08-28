@@ -5,14 +5,18 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
+from app.core.data_paths import AWS_DATA_ROOT
 from app.integrations.aws_public_catalog import PublicAwsPriceCatalog
+from app.integrations.service_templates import DYNAMIC_SEMANTIC_TEMPLATE_FIELDS
 
-PRODUCT_REGISTRY_SCHEMA_VERSION = 2
+PRODUCT_REGISTRY_SCHEMA_VERSION = 3
 
 
 def _service_key(service_code: str) -> str:
@@ -44,7 +48,44 @@ def _aliases(service_code: str) -> list[str]:
 
 
 def _canonical(value: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", value.casefold())
+    # Learned aliases come from real customer wording and are not limited to
+    # ASCII.  The previous normalizer deleted every Chinese character, so an
+    # alias such as ``共享文件存储`` could be successfully persisted yet could
+    # never be read back.  Keep every Unicode letter/number after compatibility
+    # normalization; English offer codes retain their existing canonical form.
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return "".join(character for character in normalized if character.isalnum())
+
+
+_IDENTITY_STOP_WORDS = frozenset(
+    {
+        "amazon",
+        "aws",
+        "service",
+        "services",
+        "managed",
+        "for",
+        "the",
+        "data",
+    }
+)
+
+
+def _identity_words(value: str) -> set[str]:
+    """Return useful product-name words without provider boilerplate.
+
+    This is used only to retrieve a short list of official candidates.  It is
+    deliberately not an identity decision: a candidate still has to be chosen
+    by the isolated service classifier and validated against the registry.
+    """
+
+    split = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(value or ""))
+    split = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", split)
+    return {
+        word
+        for word in re.findall(r"[a-z0-9]+", split.casefold())
+        if len(word) >= 3 and word not in _IDENTITY_STOP_WORDS
+    }
 
 
 def _identity_targets(value: str) -> set[str]:
@@ -85,11 +126,7 @@ class AwsProductRegistry:
         database_path: Path | None = None,
     ) -> None:
         self.public_catalog = public_catalog or PublicAwsPriceCatalog()
-        self._database_path = database_path or (
-            Path(__file__).resolve().parents[2]
-            / ".cache"
-            / "aws_product_registry.sqlite3"
-        )
+        self._database_path = database_path or AWS_DATA_ROOT / "aws_product_registry.sqlite3"
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._initialize()
@@ -125,9 +162,7 @@ class AwsProductRegistry:
             )
             columns = {
                 str(row[1])
-                for row in connection.execute(
-                    "PRAGMA table_info(aws_product_registry)"
-                ).fetchall()
+                for row in connection.execute("PRAGMA table_info(aws_product_registry)").fetchall()
             }
             if "field_template_json" not in columns:
                 connection.execute(
@@ -144,7 +179,8 @@ class AwsProductRegistry:
             # sessions.  It lets the local catalog immediately recognize all
             # existing official services without waiting for a network sync.
             rows = connection.execute(
-                "SELECT service_code, aliases_json FROM aws_product_registry"
+                "SELECT service_code, aliases_json, field_template_json "
+                "FROM aws_product_registry"
             ).fetchall()
             for row in rows:
                 service_code = str(row["service_code"])
@@ -157,12 +193,32 @@ class AwsProductRegistry:
                 except (TypeError, json.JSONDecodeError):
                     aliases = set()
                 aliases.update(_aliases(service_code))
+                try:
+                    field_template = json.loads(str(row["field_template_json"]))
+                except (TypeError, json.JSONDecodeError):
+                    field_template = {}
+                if not isinstance(field_template, dict):
+                    field_template = {}
+                field_template["service_code"] = service_code
+                field_template["fields"] = sorted(
+                    set(DYNAMIC_SEMANTIC_TEMPLATE_FIELDS)
+                    | {
+                        str(field)
+                        for field in field_template.get("fields", [])
+                        if isinstance(field, str) and field
+                    }
+                )
+                field_template.setdefault("source", "official_dimensions_on_first_use")
+                field_template["isolation"] = "strict_component_boundary"
                 connection.execute(
-                    "UPDATE aws_product_registry SET service_key = ?, aliases_json = ? "
+                    "UPDATE aws_product_registry SET service_key = ?, aliases_json = ?, "
+                    "field_template_json = ?, schema_version = ? "
                     "WHERE service_code = ?",
                     (
                         _service_key(service_code),
                         json.dumps(sorted(aliases), ensure_ascii=False),
+                        json.dumps(field_template, ensure_ascii=False, separators=(",", ":")),
+                        PRODUCT_REGISTRY_SCHEMA_VERSION,
                         service_code,
                     ),
                 )
@@ -177,12 +233,13 @@ class AwsProductRegistry:
             existing = {
                 str(row["service_code"]): {
                     "profile_status": str(row["profile_status"]),
+                    "aliases": json.loads(str(row["aliases_json"])),
                     "offer": json.loads(str(row["offer_json"])),
                     "field_template": json.loads(str(row["field_template_json"])),
                     "policy": json.loads(str(row["policy_json"])),
                 }
                 for row in connection.execute(
-                    "SELECT service_code, profile_status, offer_json, "
+                    "SELECT service_code, profile_status, aliases_json, offer_json, "
                     "field_template_json, policy_json "
                     "FROM aws_product_registry"
                 ).fetchall()
@@ -198,24 +255,35 @@ class AwsProductRegistry:
                     ):
                         if previous["offer"].get(key) is not None:
                             payload[key] = previous["offer"][key]
-                profile_status = (
-                    str(previous["profile_status"])
-                    if previous
-                    else "identity_ready"
-                )
+                profile_status = str(previous["profile_status"]) if previous else "identity_ready"
                 field_template = (
                     previous.get("field_template")
                     if previous and previous.get("field_template")
                     else {
                         "service_code": offer.service_code,
-                        "fields": [],
+                        "fields": list(DYNAMIC_SEMANTIC_TEMPLATE_FIELDS),
                         "source": "official_dimensions_on_first_use",
                         "isolation": "strict_component_boundary",
+                    }
+                )
+                field_template["fields"] = sorted(
+                    set(DYNAMIC_SEMANTIC_TEMPLATE_FIELDS)
+                    | {
+                        str(field)
+                        for field in field_template.get("fields", [])
+                        if isinstance(field, str) and field
                     }
                 )
                 policy = self._base_policy(offer.service_code)
                 if previous and isinstance(previous.get("policy"), dict):
                     policy.update(previous["policy"])
+                aliases = set(_aliases(offer.service_code))
+                if previous and isinstance(previous.get("aliases"), list):
+                    aliases.update(
+                        str(alias).strip()
+                        for alias in previous["aliases"]
+                        if str(alias).strip()
+                    )
                 connection.execute(
                     """
                     INSERT OR REPLACE INTO aws_product_registry (
@@ -229,7 +297,7 @@ class AwsProductRegistry:
                         offer.service_code,
                         _service_key(offer.service_code),
                         offer.service_code,
-                        json.dumps(_aliases(offer.service_code), ensure_ascii=False),
+                        json.dumps(sorted(aliases), ensure_ascii=False),
                         json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
                         json.dumps(field_template, ensure_ascii=False, separators=(",", ":")),
                         json.dumps(policy, ensure_ascii=False, separators=(",", ":")),
@@ -255,10 +323,43 @@ class AwsProductRegistry:
             "inserted": inserted,
             "updated": updated,
             "schema_version": PRODUCT_REGISTRY_SCHEMA_VERSION,
-            "publication_date": (
-                offers[0].publication_date if offers else None
-            ),
+            "publication_date": (offers[0].publication_date if offers else None),
         }
+
+    def add_alias(self, service_code: str, alias: str) -> None:
+        """Remember one AI-confirmed marketing name for an official product.
+
+        The alias never creates or selects a product. It is accepted only for
+        an exact service code already present in the AWS directory, after the
+        closed-choice classifier has selected that code.
+        """
+
+        clean_alias = re.sub(r"\s+", " ", str(alias or "")).strip()
+        if not clean_alias:
+            return
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT aliases_json, identity_status FROM aws_product_registry "
+                "WHERE service_code = ?",
+                (service_code,),
+            ).fetchone()
+            if row is None or str(row["identity_status"]) != "official":
+                return
+            aliases = {
+                str(value).strip()
+                for value in json.loads(str(row["aliases_json"]))
+                if str(value).strip()
+            }
+            aliases.add(clean_alias)
+            connection.execute(
+                "UPDATE aws_product_registry SET aliases_json = ?, updated_at = ? "
+                "WHERE service_code = ?",
+                (
+                    json.dumps(sorted(aliases), ensure_ascii=False),
+                    time.time(),
+                    service_code,
+                ),
+            )
 
     @staticmethod
     def _base_policy(service_code: str) -> dict[str, Any]:
@@ -291,11 +392,14 @@ class AwsProductRegistry:
     ) -> None:
         """Attach one verified official field contract to its own product row."""
 
-        fields = [
-            str(field)
-            for field in profile.get("fields", [])
-            if isinstance(field, str) and field
-        ]
+        fields = sorted(
+            set(DYNAMIC_SEMANTIC_TEMPLATE_FIELDS)
+            | {
+                str(field)
+                for field in profile.get("fields", [])
+                if isinstance(field, str) and field
+            }
+        )
         bindings = [
             dict(binding)
             for binding in profile.get("field_bindings", [])
@@ -372,8 +476,7 @@ class AwsProductRegistry:
                     continue
                 with self._lock, self._connect() as connection:
                     row = connection.execute(
-                        "SELECT offer_json FROM aws_product_registry "
-                        "WHERE service_code = ?",
+                        "SELECT offer_json FROM aws_product_registry WHERE service_code = ?",
                         (service_code,),
                     ).fetchone()
                     if row is None:
@@ -387,9 +490,7 @@ class AwsProductRegistry:
                         "UPDATE aws_product_registry SET offer_json = ?, updated_at = ? "
                         "WHERE service_code = ?",
                         (
-                            json.dumps(
-                                offer, ensure_ascii=False, separators=(",", ":")
-                            ),
+                            json.dumps(offer, ensure_ascii=False, separators=(",", ":")),
                             time.time(),
                             service_code,
                         ),
@@ -447,11 +548,7 @@ class AwsProductRegistry:
         workload cannot be silently converted into an unrelated AWS service.
         """
 
-        targets = {
-            target
-            for label in labels
-            for target in _identity_targets(label)
-        }
+        targets = {target for label in labels for target in _identity_targets(label)}
         if not targets:
             return None
         matches: list[dict[str, Any]] = []
@@ -468,6 +565,87 @@ class AwsProductRegistry:
                 matches.append(product)
         return matches[0] if len(matches) == 1 else None
 
+    def candidate_products(
+        self,
+        *labels: str,
+        limit: int = 12,
+    ) -> list[dict[str, Any]]:
+        """Retrieve likely official identities without silently choosing one.
+
+        AWS marketing names can change while the Price List offer code keeps
+        its older name (for example Data Firehose/Kinesis Firehose). Exact
+        matching remains the automatic path. This broader lookup merely gives
+        the AI classifier a small provider-owned candidate set; its selected
+        service code is validated again before it can change a component.
+        """
+
+        query_values = [str(label).strip() for label in labels if str(label).strip()]
+        if not query_values:
+            return []
+        query_targets = {
+            target for label in query_values for target in _identity_targets(label)
+        }
+        query_word_sets = [_identity_words(label) for label in query_values]
+        query_words = set().union(*query_word_sets) if query_word_sets else set()
+        ranked: list[tuple[float, str, dict[str, Any]]] = []
+        for product in self.list_products():
+            if str(product.get("identity_status") or "") != "official":
+                continue
+            identities = [
+                str(product.get("service_code") or ""),
+                str(product.get("service_key") or ""),
+                str(product.get("display_name") or ""),
+                *(str(alias) for alias in product.get("aliases", [])),
+            ]
+            identity_targets = {_canonical(value) for value in identities if value}
+            if query_targets & identity_targets:
+                score = 100.0
+            else:
+                identity_word_sets = [_identity_words(value) for value in identities]
+                identity_words = (
+                    set().union(*identity_word_sets) if identity_word_sets else set()
+                )
+                sequence = max(
+                    (
+                        SequenceMatcher(
+                            None,
+                            _canonical(label),
+                            _canonical(identity),
+                        ).ratio()
+                        for label in query_values
+                        for identity in identities
+                        if identity
+                    ),
+                    default=0.0,
+                )
+                overlap = query_words & identity_words
+                if not overlap:
+                    # Marketing names can contain a qualifier absent from the
+                    # long-lived Price List code (AWS IoT Core -> AWSIoT).
+                    # Keep a sufficiently similar official identity in the AI
+                    # candidate set; this is retrieval only, never an automatic
+                    # product decision, and the selected code is validated
+                    # against this registry before it can be applied.
+                    if sequence < 0.62:
+                        continue
+                    score = sequence
+                else:
+                    coverage = len(overlap) / max(len(query_words), 1)
+                    specificity = len(overlap) / max(len(identity_words), 1)
+                    score = (coverage * 5.0) + (specificity * 3.0) + sequence
+            ranked.append((score, str(product.get("service_code") or ""), product))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return [product for _score, _code, product in ranked[: max(1, limit)]]
+
+    def official_products(self, *, limit: int = 500) -> list[dict[str, Any]]:
+        """Return the current provider directory for AI-only identity fallback."""
+
+        return [
+            product
+            for product in self.list_products()
+            if str(product.get("identity_status") or "") == "official"
+        ][: max(1, limit)]
+
     def resolve_service_code(self, *labels: str) -> str | None:
         product = self.resolve_product(*labels)
         return str(product["service_code"]) if product is not None else None
@@ -480,11 +658,7 @@ class AwsProductRegistry:
             status_counts[status] = status_counts.get(status, 0) + 1
         return {
             "total": len(products),
-            "official": sum(
-                1 for item in products if item["identity_status"] == "official"
-            ),
-            "retired": sum(
-                1 for item in products if item["identity_status"] == "retired"
-            ),
+            "official": sum(1 for item in products if item["identity_status"] == "official"),
+            "retired": sum(1 for item in products if item["identity_status"] == "retired"),
             "profile_status": status_counts,
         }

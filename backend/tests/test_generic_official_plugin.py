@@ -97,6 +97,177 @@ def test_generic_plugin_without_usage_exposes_reference_rate_only() -> None:
     assert selected.reference_rates[0].unit_price == 0.0000002
 
 
+def test_curated_generic_service_uses_official_profile_field_bindings() -> None:
+    product = priced_product(
+        "AWSCloudMap",
+        "APS1-ServiceInstance",
+        "Resources",
+        0.10,
+        operation="RegisterInstance",
+    )
+
+    class CloudMapCatalog:
+        @staticmethod
+        def service_codes() -> list[str]:
+            return ["AWSCloudMap"]
+
+        @staticmethod
+        def products(
+            service_code: str,
+            filters: dict[str, str],
+            *,
+            max_pages: int = 20,
+            refresh: bool = False,
+        ) -> list[dict]:
+            assert service_code == "AWSCloudMap"
+            return [product]
+
+    class CloudMapDiscovery:
+        calls = 0
+
+        @classmethod
+        def ensure_profile(cls, **_: object) -> dict[str, object]:
+            cls.calls += 1
+            return {
+                "status": "verified",
+                "service_code": "AWSCloudMap",
+                "fields": ["service_instances"],
+                "field_bindings": [
+                    {
+                        "field": "service_instances",
+                        "label": "服务实例数量",
+                        "usage_type": "APS1-ServiceInstance",
+                        "operation": "RegisterInstance",
+                        "unit": "Resources",
+                    }
+                ],
+                "dimensions": [],
+            }
+
+    selected = GenericOfficialPlugin(
+        None,  # type: ignore[arg-type]
+        CloudMapCatalog(),  # type: ignore[arg-type]
+        CloudMapDiscovery(),  # type: ignore[arg-type]
+    ).select(
+        ServiceRequirement(
+            service="cloud_map",
+            calculator_service_name="AWS Cloud Map",
+            region="ap-southeast-1",
+            requirements={"service_instances": 12},
+        ),
+        "ap-southeast-1",
+    )
+
+    assert CloudMapDiscovery.calls == 1
+    assert selected.usage_lines[0].amount == 12
+    assert selected.reference_rates == []
+
+
+def test_profile_customer_amount_replaces_same_dimension_reference_row() -> None:
+    product = priced_product(
+        "AmazonCognito",
+        "APS1-CognitoUserPoolsMAU",
+        "Users",
+        0.0055,
+        group="CognitoUserPoolsOperation",
+    )
+
+    class CognitoCatalog:
+        @staticmethod
+        def service_codes() -> list[str]:
+            return ["AmazonCognito"]
+
+        @staticmethod
+        def products(
+            service_code: str,
+            filters: dict[str, str],
+            *,
+            max_pages: int = 20,
+            refresh: bool = False,
+        ) -> list[dict]:
+            return [product]
+
+    class CognitoDiscovery:
+        @staticmethod
+        def ensure_profile(**_: object) -> dict[str, object]:
+            return {
+                "status": "verified",
+                "service_code": "AmazonCognito",
+                "fields": ["monthly_active_users"],
+                "field_bindings": [
+                    {
+                        "field": "monthly_active_users",
+                        "label": "每月活跃用户数",
+                        "usage_type": "APS1-CognitoUserPoolsMAU",
+                        "operation": "",
+                        "unit": "Users",
+                    }
+                ],
+                "dimensions": [],
+            }
+
+    selected = GenericOfficialPlugin(
+        None,  # type: ignore[arg-type]
+        CognitoCatalog(),  # type: ignore[arg-type]
+        CognitoDiscovery(),  # type: ignore[arg-type]
+    ).select(
+        ServiceRequirement(
+            service="cognito",
+            region="ap-southeast-1",
+            requirements={"monthly_active_users": 20_000},
+        ),
+        "ap-southeast-1",
+    )
+
+    assert selected.usage_lines[0].amount == 20_000
+    assert selected.reference_rates == []
+
+
+def test_efs_standard_regional_never_uses_archive_early_delete_rate() -> None:
+    products = [
+        priced_product(
+            "AmazonEFS",
+            "APS1-ArchiveEarlyDelete-SmallFiles",
+            "GB-Mo",
+            0.01,
+            operation="Delete",
+        ),
+        priced_product(
+            "AmazonEFS", "APS1-TimedStorage-ByteHrs", "GB-Mo", 0.36
+        ),
+        priced_product(
+            "AmazonEFS", "APS1-IATimedStorage-ET-ByteHrs", "GB-Mo", 0.02
+        ),
+    ]
+    products[0]["product"]["attributes"]["storageClass"] = (
+        "Archive-EarlyDelete-SmallFiles"
+    )
+    products[1]["product"]["attributes"]["storageClass"] = "General Purpose"
+    products[2]["product"]["attributes"]["storageClass"] = "Infrequent Access-ET"
+    rates = []
+    for product in products:
+        price, unit = PricingCatalog.on_demand_unit_rate(product)
+        _, usage_type, operation = PricingCatalog.billing_identity(product)
+        rates.append((price, unit, usage_type, operation, product))
+    requirement = ServiceRequirement(
+        service="efs",
+        quantity=1,
+        requirements={
+            "storage_gib": 6144,
+            "storage_class": "standard",
+            "deployment_type": "regional",
+        },
+    )
+
+    selected = GenericOfficialPlugin._semantic_rates(requirement, rates)
+
+    assert len(selected) == 1
+    assert selected[0][1] == 6144
+    assert selected[0][2][0] == 0.36
+    assert selected[0][2][2] == "APS1-TimedStorage-ByteHrs"
+    assert selected[0][1] * selected[0][2][0] == pytest.approx(2211.84)
+
+
 def test_discovered_daily_inventory_and_top_level_hours_use_monthly_amounts() -> None:
     bucket_product = priced_product(
         "AmazonMacie",
@@ -161,6 +332,180 @@ def test_discovered_daily_inventory_and_top_level_hours_use_monthly_amounts() ->
     assert hour_result[0][1] == 2 * 730
 
 
+def test_network_firewall_endpoint_count_derives_endpoint_hours() -> None:
+    product = priced_product(
+        "AWSNetworkFirewall",
+        "APN2-FirewallEndpoint-Hours",
+        "Hourly",
+        0.395,
+        operation="Operation:Metering",
+    )
+    price, unit = PricingCatalog.on_demand_unit_rate(product)
+    _, usage_type, operation = PricingCatalog.billing_identity(product)
+
+    result = GenericOfficialPlugin._auto_semantic_rates(
+        ServiceRequirement(
+            service="network_firewall",
+            hours_per_month=730,
+            requirements={"endpoint_count": 2},
+        ),
+        [(price, unit, usage_type, operation, product)],
+        profile={
+            "field_bindings": [
+                {
+                    "field": "endpoint_hours",
+                    "label": "端点运行时长",
+                    "usage_type": usage_type,
+                    "operation": operation,
+                    "unit": unit,
+                }
+            ]
+        },
+    )
+
+    assert result[0][1] == 2 * 730
+
+
+def test_timestream_liveanalytics_excludes_influx_and_derives_storage_usage() -> None:
+    live_products = (
+        priced_product("AmazonTimestream", "EUC1-DataIngestion-Bytes", "GB", 0.6),
+        priced_product("AmazonTimestream", "EUC1-MemoryStore-ByteHrs", "GB-Hours", 0.04),
+        priced_product("AmazonTimestream", "EUC1-MagneticStore-ByteHrs", "GB-Mo", 0.03),
+    )
+    influx = priced_product(
+        "AmazonTimestream", "EUC1-InstanceUsage-Db.influx.medium", "Hrs", 0.1
+    )
+    influx["product"]["attributes"].update(
+        {"instanceType": "db.influx.medium", "vcpu": "1", "memory": "8 GiB"}
+    )
+    rates = []
+    for product in (*live_products, influx):
+        price, unit = PricingCatalog.on_demand_unit_rate(product)
+        _, usage_type, operation = PricingCatalog.billing_identity(product)
+        rates.append((price, unit, usage_type, operation, product))
+    profile = {
+        "field_bindings": [
+            {
+                "field": field,
+                "label": field,
+                "usage_type": usage_type,
+                "operation": "",
+                "unit": unit,
+            }
+            for field, usage_type, unit in (
+                ("data_in_gib", "EUC1-DataIngestion-Bytes", "GB"),
+                ("memory_store_gib_hours", "EUC1-MemoryStore-ByteHrs", "GB-Hours"),
+                ("magnetic_store_gib_months", "EUC1-MagneticStore-ByteHrs", "GB-Mo"),
+            )
+        ]
+    }
+    requirement = ServiceRequirement(
+        service="timestream",
+        requirements={
+            "product_variant": "live_analytics",
+            "write_records": 400_000_000,
+            "memory_retention_hours": 24,
+            "magnetic_retention_days": 180,
+        },
+    )
+
+    result = GenericOfficialPlugin._auto_semantic_rates(
+        requirement,
+        rates,
+        profile=profile,
+    )
+
+    amounts = {item[2][2]: item[1] for item in result}
+    monthly_ingest_gib = 400_000_000 / 1_048_576
+    assert amounts["EUC1-DataIngestion-Bytes"] == pytest.approx(monthly_ingest_gib)
+    assert amounts["EUC1-MemoryStore-ByteHrs"] == pytest.approx(
+        monthly_ingest_gib * 24
+    )
+    assert amounts["EUC1-MagneticStore-ByteHrs"] == pytest.approx(
+        monthly_ingest_gib * 180 / 30
+    )
+    assert all("influx" not in item[2][2].casefold() for item in result)
+
+
+def test_dms_shape_constraints_do_not_turn_task_count_into_instance_count() -> None:
+    tiny = priced_product(
+        "AWSDatabaseMigrationSvc", "APS3-InstanceUsg:dms.t2.micro", "Hrs", 0.02
+    )
+    tiny["product"]["attributes"].update(
+        {"instanceType": "t2.micro", "vcpu": "1", "memory": "1 GiB"}
+    )
+    matching = priced_product(
+        "AWSDatabaseMigrationSvc", "APS3-InstanceUsg:dms.r5.xlarge", "Hrs", 0.5
+    )
+    matching["product"]["attributes"].update(
+        {"instanceType": "r5.xlarge", "vcpu": "4", "memory": "32 GiB"}
+    )
+    rates = []
+    for product in (tiny, matching):
+        price, unit = PricingCatalog.on_demand_unit_rate(product)
+        _, usage_type, operation = PricingCatalog.billing_identity(product)
+        rates.append((price, unit, usage_type, operation, product))
+
+    result = GenericOfficialPlugin._semantic_rates(
+        ServiceRequirement(
+            service="dms",
+            hours_per_month=730,
+            requirements={"vcpu": 4, "memory_gib": 16, "task_count": 3},
+        ),
+        rates,
+    )
+
+    assert result[0][2][2].endswith("dms.r5.xlarge")
+    assert result[0][1] == 730
+
+
+def test_managed_instance_shape_is_enriched_from_official_ec2_specification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    product = priced_product(
+        "ElasticMapReduce",
+        "APS1-BoxUsage:m6g.xlarge",
+        "Hrs",
+        0.05,
+    )
+    product["product"]["attributes"]["instanceType"] = "m6g.xlarge"
+    rate = (0.05, "Hrs", "APS1-BoxUsage:m6g.xlarge", "", product)
+
+    class FakeExecutor:
+        def __init__(self, clients: object) -> None:
+            pass
+
+        def execute(self, **_: object) -> dict:
+            return {
+                "InstanceTypes": [
+                    {
+                        "InstanceType": "m6g.xlarge",
+                        "VCpuInfo": {"DefaultVCpus": 4},
+                        "MemoryInfo": {"SizeInMiB": 16384},
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(
+        "app.services.plugins.generic_official.ReadOnlyAwsQueryExecutor",
+        FakeExecutor,
+    )
+    plugin = GenericOfficialPlugin(object(), object())  # type: ignore[arg-type]
+
+    enriched = plugin._enrich_missing_instance_shapes(
+        ServiceRequirement(
+            service="emr",
+            requirements={"master_vcpu": 4, "master_memory_gib": 16},
+        ),
+        [rate],
+        "ap-southeast-1",
+    )
+
+    attrs = PricingCatalog.attributes(enriched[0][4])
+    assert attrs["vcpu"] == "4.0"
+    assert attrs["memory"] == "16 GiB"
+
+
 def test_fsx_lustre_uses_exact_official_throughput_tier() -> None:
     products = []
     for tier, price in ((125, 0.14), (250, 0.19), (500, 0.27)):
@@ -201,6 +546,101 @@ def test_fsx_lustre_uses_exact_official_throughput_tier() -> None:
     assert len(selected) == 1
     assert selected[0][1] == 6144
     assert selected[0][2][2].endswith("Storage.SSD.250")
+
+
+def test_fsx_openzfs_prices_storage_throughput_and_backup_not_monitoring() -> None:
+    monitoring = priced_product(
+        "AmazonFSx",
+        "EUC1-Storage.MAZ:INT_Monitoring",
+        "GB-Mo",
+        0.0006,
+        operation="CreateFileSystem:OpenZFS",
+    )
+    storage = priced_product(
+        "AmazonFSx",
+        "EUC1-Storage.SAZ2:SSD",
+        "GB-Mo",
+        0.107,
+        operation="CreateFileSystem:OpenZFS",
+    )
+    throughput = priced_product(
+        "AmazonFSx",
+        "EUC1-ThroughputCapacity.SAZ2",
+        "MiBps-Mo",
+        0.35,
+        operation="CreateFileSystem:OpenZFS",
+    )
+    backup = priced_product(
+        "AmazonFSx",
+        "EUC1-BackupUsage",
+        "GB-Mo",
+        0.054,
+        operation="CreateFileSystem:OpenZFS",
+    )
+    for item, attributes in (
+        (
+            monitoring,
+            {
+                "fileSystemType": "OpenZFS",
+                "storageType": "INT",
+                "storageTier": "Monitoring",
+                "deploymentOption": "Multi-AZ",
+            },
+        ),
+        (
+            storage,
+            {
+                "fileSystemType": "OpenZFS",
+                "storageType": "SSD",
+                "storageTier": "N/A",
+                "deploymentOption": "Single-AZ_2",
+            },
+        ),
+        (
+            throughput,
+            {
+                "fileSystemType": "OpenZFS",
+                "storageType": "N/A",
+                "storageTier": "N/A",
+                "deploymentOption": "Single-AZ_2",
+            },
+        ),
+        (
+            backup,
+            {
+                "fileSystemType": "OpenZFS",
+                "storageType": "N/A",
+                "storageTier": "Backup",
+                "deploymentOption": "N/A",
+            },
+        ),
+    ):
+        item["product"]["attributes"].update(attributes)
+
+    rates = []
+    for item in (monitoring, storage, throughput, backup):
+        price, unit = PricingCatalog.on_demand_unit_rate(item)
+        _, usage_type, operation = PricingCatalog.billing_identity(item)
+        rates.append((price, unit, usage_type, operation, item))
+
+    selected = GenericOfficialPlugin._semantic_rates(
+        ServiceRequirement(
+            service="fsx",
+            requirements={
+                "file_system_type": "openzfs",
+                "storage_gib": 12288,
+                "throughput_mbps": 512,
+                "backup_storage_gib": 2048,
+            },
+        ),
+        rates,
+    )
+
+    assert [item[1] for item in selected] == [12288, 512, 2048]
+    assert all("Monitoring" not in item[2][2] for item in selected)
+    assert sum(float(amount) * rate[0] for _, amount, rate in selected) == pytest.approx(
+        1604.608
+    )
 
 
 def test_codedeploy_to_ec2_is_a_valid_zero_cost_official_result() -> None:
@@ -1703,6 +2143,106 @@ def test_confirmed_billing_variant_is_reused_instead_of_selecting_the_cheapest_r
     assert len(selected) == 1
     assert selected[0][2][2] == normal_usage
     assert selected[0][2][0] == 0.065
+
+
+def test_flink_kpu_and_running_storage_are_derived_from_customer_kpu_count() -> None:
+    products = [
+        priced_product(
+            "AmazonKinesisAnalytics",
+            "EUW1-KPU-Hour-Java",
+            "KPU-Hour",
+            0.12,
+            operation="StartApplication",
+        ),
+        priced_product(
+            "AmazonKinesisAnalytics",
+            "EUW1-KPU-Hour-Interactive",
+            "KPU-Hour",
+            0.05,
+            operation="StartApplication",
+        ),
+        priced_product(
+            "AmazonKinesisAnalytics",
+            "EUW1-RunningApplicationStorage",
+            "GB-month",
+            0.11,
+            operation="StartApplication",
+        ),
+        priced_product(
+            "AmazonKinesisAnalytics",
+            "EUW1-RunningApplicationStorage-Interactive",
+            "GB-month",
+            0.02,
+            operation="StartApplication",
+        ),
+    ]
+    rates = []
+    for product in products:
+        price, unit = PricingCatalog.on_demand_unit_rate(product)
+        _, usage_type, operation = PricingCatalog.billing_identity(product)
+        rates.append((price, unit, usage_type, operation, product))
+    profile = {
+        "field_bindings": [
+            {
+                "field": "kpu_hours",
+                "label": "KPU 小时",
+                "usage_type": product["product"]["attributes"]["usagetype"],
+                "operation": "StartApplication",
+                "unit": "KPU-Hour",
+            }
+            for product in products[:2]
+        ]
+        + [
+            {
+                "field": "storage_gib",
+                "label": "运行应用存储",
+                "usage_type": product["product"]["attributes"]["usagetype"],
+                "operation": "StartApplication",
+                "unit": "GB-month",
+            }
+            for product in products[2:]
+        ]
+    }
+    requirement = ServiceRequirement(
+        service="kinesis_analytics",
+        calculator_service_name="Amazon Managed Service for Apache Flink",
+        source_text="持续运行，配置4个KPU",
+        quantity=1,
+        hours_per_month=730,
+        requirements={"kpu_count": 4, "data_processed_gib": 6144},
+    )
+
+    selected = GenericOfficialPlugin._auto_semantic_rates(
+        requirement,
+        rates,
+        profile=profile,
+    )
+
+    assert [(item[1], item[2][2]) for item in selected] == [
+        (3650.0, "EUW1-KPU-Hour-Java"),
+        (200.0, "EUW1-RunningApplicationStorage"),
+    ]
+
+    node_shaped_requirement = ServiceRequirement(
+        service="kinesis_analytics",
+        calculator_service_name="Amazon Managed Service for Apache Flink",
+        source_text="3个计算节点，单节点8核32GB，持续运行",
+        quantity=1,
+        hours_per_month=730,
+        requirements={"node_count": 3, "vcpu": 8, "memory_gib": 32},
+    )
+
+    node_shaped_selected = GenericOfficialPlugin._auto_semantic_rates(
+        node_shaped_requirement,
+        rates,
+        profile=profile,
+    )
+
+    assert node_shaped_requirement.requirements["kpu_count"] == 24
+    assert [(item[1], item[2][2]) for item in node_shaped_selected] == [
+        (18_250.0, "EUW1-KPU-Hour-Java"),
+        (1200.0, "EUW1-RunningApplicationStorage"),
+    ]
 
 
 def test_explicit_customer_billing_words_resolve_the_variant_without_reasking() -> None:

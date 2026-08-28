@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import secrets
@@ -237,8 +238,17 @@ class ConfirmationSessionStore:
                     customer_summary=excluded.customer_summary,
                     intent_json=excluded.intent_json,
                     confirmation_text=excluded.confirmation_text,
-                    items_json=excluded.items_json,
-                    answers_json='{}', status='pending', submitted_at=NULL,
+                    items_json=CASE
+                        WHEN excluded.items_json = '[]'
+                        THEN confirmation_sessions.items_json
+                        ELSE excluded.items_json
+                    END,
+                    answers_json=CASE
+                        WHEN excluded.items_json = '[]'
+                        THEN confirmation_sessions.answers_json
+                        ELSE '{}'
+                    END,
+                    status='pending', submitted_at=NULL,
                     asked_questions_json=excluded.asked_questions_json,
                     request_json=CASE
                         WHEN excluded.request_json = '{}' THEN confirmation_sessions.request_json
@@ -602,7 +612,7 @@ class ConfirmationSessionStore:
             connection.execute(
                 """
                 UPDATE confirmation_sessions
-                SET intent_json = ?, confirmation_text = ?, items_json = '[]',
+                SET intent_json = ?, confirmation_text = ?,
                     status = 'configuration_review', submitted_at = ?
                 WHERE draft_id = ?
                 """,
@@ -790,6 +800,105 @@ class ConfirmationSessionStore:
             DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
             DeepSeekIntentParser._split_eks_worker_nodes(intent)
         return str(row["customer_request"]), intent
+
+    def historical_answers_by_component(
+        self,
+        draft_id: str,
+    ) -> tuple[dict[int, dict[str, str]], dict[str, str]]:
+        """Restore exact question/component bindings after final review.
+
+        Final configuration review must not forget the decisions that produced
+        that configuration. New sessions retain their questions and answers;
+        older sessions are recovered from the self-contained request snapshot.
+        """
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT items_json, answers_json, asked_questions_json, request_json "
+                "FROM confirmation_sessions WHERE draft_id = ?",
+                (draft_id,),
+            ).fetchone()
+        if row is None:
+            return {}, {}
+
+        answers: dict[str, str] = {}
+        try:
+            request_payload = json.loads(str(row["request_json"] or "{}"))
+        except json.JSONDecodeError:
+            request_payload = {}
+        if isinstance(request_payload, dict):
+            request_answers = request_payload.get("confirmation_responses")
+            if isinstance(request_answers, dict):
+                answers.update(
+                    {
+                        str(key): str(value)
+                        for key, value in request_answers.items()
+                        if str(value).strip()
+                    }
+                )
+        try:
+            stored_answers = json.loads(str(row["answers_json"] or "{}"))
+        except json.JSONDecodeError:
+            stored_answers = {}
+        if isinstance(stored_answers, dict):
+            answers.update(
+                {
+                    str(key): str(value)
+                    for key, value in stored_answers.items()
+                    if str(value).strip()
+                }
+            )
+        if not answers:
+            return {}, {}
+
+        answer_bindings: dict[str, tuple[str, str | None]] = {}
+        try:
+            raw_items = json.loads(str(row["items_json"] or "[]"))
+        except json.JSONDecodeError:
+            raw_items = []
+        if isinstance(raw_items, list):
+            for item in raw_items:
+                if not isinstance(item, dict) or not item.get("question"):
+                    continue
+                question = str(item["question"])
+                component_id = (
+                    str(item["component_id"])
+                    if item.get("component_id") is not None
+                    else None
+                )
+                answer_key = str(item.get("answer_key") or question)
+                answer_bindings[answer_key] = (question, component_id)
+                answer_bindings.setdefault(question, (question, component_id))
+
+        try:
+            asked_questions = json.loads(str(row["asked_questions_json"] or "[]"))
+        except json.JSONDecodeError:
+            asked_questions = []
+        questions_by_digest = {
+            hashlib.sha256(str(question).encode("utf-8")).hexdigest()[:16]: str(question)
+            for question in asked_questions
+            if str(question).strip()
+        }
+
+        component_answers: dict[int, dict[str, str]] = {}
+        global_answers: dict[str, str] = {}
+        opaque_key = re.compile(r"^component-(\d+):([0-9a-f]{16})$")
+        scoped_key = re.compile(r"^__component_answer__(\d+)::([\s\S]+)$")
+        for answer_key, answer in answers.items():
+            question, component_id = answer_bindings.get(answer_key, (answer_key, None))
+            opaque_match = opaque_key.fullmatch(answer_key)
+            if opaque_match:
+                component_id = opaque_match.group(1)
+                question = questions_by_digest.get(opaque_match.group(2), question)
+            scoped_match = scoped_key.fullmatch(answer_key)
+            if scoped_match:
+                component_id = scoped_match.group(1)
+                question = scoped_match.group(2)
+            if component_id is not None and component_id.isdigit():
+                component_answers.setdefault(int(component_id), {})[question] = answer
+            else:
+                global_answers[question] = answer
+        return component_answers, global_answers
 
     def partition_answers_by_component(
         self,
