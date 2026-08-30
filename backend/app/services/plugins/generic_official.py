@@ -5,6 +5,10 @@ import re
 
 from app.core.errors import ManualConfirmationRequired
 from app.domain.customer_facts import scoped_amount
+from app.domain.service_billing_policies import (
+    SERVICE_BILLING_POLICY_VERSION,
+    no_additional_charge_decision,
+)
 from app.domain.models import (
     CandidateOption,
     PreviewSelection,
@@ -88,6 +92,31 @@ _SUPPLEMENT_FIELD_ALIASES = {
     "storage_throughput_mbps": "throughput_mbps",
     "log_storage_gib": "storage_gib",
     "snapshot_changed_gib": "backup_storage_gib",
+}
+
+# Some customer facts belong to the workload component, but AWS publishes the
+# corresponding price in a shared offer rather than in that component's offer.
+# For example, API Gateway request charges live in ``AmazonApiGateway`` while
+# ordinary public egress is billed from ``AWSDataTransfer``.  Treat these as
+# cross-offer dimensions so every dedicated and auto-discovered adapter gets
+# the same safe fallback instead of teaching each product about every shared
+# AWS charge separately.
+_SHARED_OFFER_DIMENSIONS: dict[str, str] = {
+    "data_transfer_out_gib": "AWSDataTransfer",
+}
+
+# These values select or document an AWS configuration but are not a second
+# billable amount once the component already supplies the metered usage.  Keep
+# this contract beside the generic adapter so the fact ledger can distinguish
+# "not charged separately" from "forgotten" without asking AI every time.
+_CONFIGURATION_CONTEXT_FIELDS: dict[str, frozenset[str]] = {
+    "backup": frozenset(
+        {
+            "backup_frequency",
+            "backup_retention_days",
+            "protected_service",
+        }
+    ),
 }
 
 
@@ -1046,6 +1075,7 @@ class GenericOfficialPlugin:
 
     def select(self, requirement: ServiceRequirement, default_region: str) -> SelectedResource:
         region = requirement.region or default_region
+        service_stem = _stem(requirement.service)
         retired_profile = self._retired_profile(requirement)
         if retired_profile is not None:
             replacements = retired_profile.get("replacements")
@@ -1068,6 +1098,52 @@ class GenericOfficialPlugin:
                 retired_on=retired_profile.get("retired_on"),
                 nearby_candidates=nearby_candidates,
             )
+        # Service billing semantics are stronger than catalog presence. Some
+        # no-additional-charge control planes publish paid optional features
+        # in the same AWS offer (ECS Managed Instances and CloudFormation
+        # third-party handlers are examples).  Resolve the reviewed base-mode
+        # contract before any generic rate lookup so an optional feature can
+        # never become a fake service price.
+        free_decision = no_additional_charge_decision(requirement)
+        if free_decision is not None:
+            specifications = dict(requirement.requirements)
+            if service_stem == "ecs":
+                cluster_count = int(
+                    requirement.requirements.get("cluster_count")
+                    or requirement.quantity
+                    or 1
+                )
+                specifications.update(
+                    {
+                        "cluster_count": max(cluster_count, 1),
+                        "launch_type": "EC2",
+                    }
+                )
+                quantity = max(cluster_count, 1)
+            else:
+                quantity = max(requirement.quantity, 1)
+            return SelectedResource(
+                service=requirement.service,
+                display_name=(
+                    requirement.calculator_service_name or requirement.service
+                ),
+                region=region,
+                model=free_decision.model,
+                quantity=quantity,
+                architecture=free_decision.architecture,
+                specifications=specifications,
+                official_product={
+                    "source": free_decision.source_url,
+                    "pricingMode": free_decision.pricing_mode,
+                    "policyVersion": SERVICE_BILLING_POLICY_VERSION,
+                },
+                rationale=free_decision.rationale,
+                substitution_notice=free_decision.notice,
+                pricing_status="free",
+                usage_lines=[],
+                reference_rates=[],
+                applied_requirement_fields=list(free_decision.applied_fields),
+            )
         # Region availability is an endpoint capability question, not a price
         # search. Botocore ships AWS's signed endpoint catalogue locally, so a
         # service that is not offered in the selected region can be rejected
@@ -1084,33 +1160,6 @@ class GenericOfficialPlugin:
                 region=region,
                 nearby_candidates=self._region_candidates(requirement, region),
             )
-        # CodeDeploy does not add a service charge for deployments to EC2.
-        # Treat that as a valid zero-cost official result instead of forcing a
-        # pricing-catalog lookup that has no positive dimension to return.
-        if _stem(requirement.service) == "codedeploy":
-            source = (requirement.source_text or "").casefold()
-            is_on_premises = any(
-                marker in source
-                for marker in ("on-prem", "on premises", "本地实例", "本地服务器")
-            )
-            if not is_on_premises:
-                return SelectedResource(
-                    service=requirement.service,
-                    display_name=requirement.calculator_service_name or "AWS CodeDeploy",
-                    region=region,
-                    model="EC2 部署（无额外服务费）",
-                    architecture="使用 AWS CodeDeploy 部署到 Amazon EC2",
-                    specifications=dict(requirement.requirements),
-                    official_product={
-                        "source": "AWS CodeDeploy Pricing",
-                        "pricingMode": "no-additional-charge-for-ec2",
-                    },
-                    rationale="部署到 Amazon EC2 的 CodeDeploy 服务不收取额外服务费。",
-                    substitution_notice=None,
-                    usage_lines=[],
-                    reference_rates=[],
-                    applied_requirement_fields=list(requirement.requirements),
-                )
         is_unknown_service = requirement.service not in SERVICE_TEMPLATE_FIELDS
         profile = None
         # A stable service-code alias is enough to query the official catalog,
@@ -1158,24 +1207,6 @@ class GenericOfficialPlugin:
                 region=region,
                 nearby_candidates=self._region_candidates(requirement, region),
             )
-        if _stem(requirement.service) == "vpc":
-            return SelectedResource(
-                service=requirement.service,
-                display_name=requirement.calculator_service_name or "Amazon VPC",
-                region=region,
-                model="VPC + Subnets",
-                architecture=f"{requirement.quantity} 套 VPC 基础网络",
-                specifications=dict(requirement.requirements),
-                official_product={"source": "AWS Price List", "serviceCode": service_code},
-                rationale="Amazon VPC 与子网本身没有基础小时费。",
-                substitution_notice=(
-                    "VPC 与子网本身不收取基础费用；NAT Gateway、公网 IPv4、流量等"
-                    "独立资源按实际配置另行计费。"
-                ),
-                usage_lines=[],
-                reference_rates=[],
-                applied_requirement_fields=list(requirement.requirements),
-            )
         rates = self._profile_rates(profile) if is_unknown_service else []
         if not rates:
             rates = self._catalog_rates(service_code, region)
@@ -1184,7 +1215,15 @@ class GenericOfficialPlugin:
         self._require_billing_variant_choice(requirement, profile)
         semantic_rates = self._semantic_rates(requirement, rates)
         confirmed_billing_variants = any(
-            key.startswith("_billing_variant_") and bool(value)
+            key.startswith("_billing_variant_")
+            and bool(value)
+            and requirement.field_sources.get(f"requirements.{key}")
+            in {
+                "customer_text",
+                "customer_confirmation",
+                "customer_correction",
+                "sales_confirmation",
+            }
             for key, value in requirement.requirements.items()
         )
         profile_bound_rates = (
@@ -1213,12 +1252,75 @@ class GenericOfficialPlugin:
             (rate[1], rate[2], rate[3]): index
             for index, (_label, _amount, rate) in enumerate(selected_rates)
         }
+
+        def exclusive_capacity_role(item: tuple) -> str | None:
+            """Classify mutually exclusive variants of one billable capacity.
+
+            AWS publishes product variants as separate official rows.  A
+            purpose-built selector may choose the customer's ONTAP storage or
+            RabbitMQ topology while the generic profile independently chooses
+            a cheaper OpenZFS or ActiveMQ row for the same input.  Different
+            UsageTypes and instance models do not make those charges additive.
+            Merge by billing role, while leaving genuinely additive dimensions
+            such as backup storage distinct.
+            """
+
+            _label, _amount, rate = item
+            attrs = PricingCatalog.attributes(rate[4])
+            unit = str(rate[1]).casefold()
+            identity_text = " ".join(
+                str(value)
+                for value in (
+                    rate[2],
+                    rate[3],
+                    attrs.get("productFamily"),
+                    attrs.get("storageTier"),
+                    attrs.get("storageType"),
+                    rate[4].get("officialDimensionDescription"),
+                )
+                if value
+            ).casefold()
+            if any(token in unit for token in ("hrs", "hour")) and (
+                attrs.get("instanceType")
+                or any(
+                    token in _canonical(identity_text)
+                    for token in (
+                        "instanceusage",
+                        "instanceusg",
+                        "createdmsinstance",
+                        "singleazusage",
+                        "multiazusage",
+                    )
+                )
+            ):
+                return "instance_hours"
+            if any(
+                token in unit
+                for token in ("mibps-mo", "mbps-mo", "mb/s-month")
+            ):
+                return "throughput_capacity"
+            if any(
+                token in unit for token in ("gb-mo", "gb-month", "gib-month")
+            ) and not any(
+                token in identity_text for token in ("backup", "snapshot")
+            ):
+                return "primary_storage_capacity"
+            return None
+
+        occupied_capacity_roles = {
+            role for item in selected_rates if (role := exclusive_capacity_role(item))
+        }
         for item in secondary_rates:
+            role = exclusive_capacity_role(item)
+            if role is not None and role in occupied_capacity_roles:
+                continue
             identity = (item[2][1], item[2][2], item[2][3])
             position = identity_positions.get(identity)
             if position is None:
                 identity_positions[identity] = len(selected_rates)
                 selected_rates.append(item)
+                if role is not None:
+                    occupied_capacity_roles.add(role)
                 continue
             # A field-bound customer amount is stronger than a reference-only
             # semantic row for the exact same AWS dimension.
@@ -1540,6 +1642,17 @@ class GenericOfficialPlugin:
 
             _price, unit, usage_type, operation, product = candidate
             fields: set[str] = set()
+            # Semantic adapters calculate an AWS usage amount from typed
+            # customer fields before a catalog row is selected.  Keep that
+            # lineage on the selected row so the universal fact ledger can
+            # prove the value was used without re-reading customer prose.
+            declared_fields = product.get("_astra_source_fields")
+            if isinstance(declared_fields, (list, tuple, set)):
+                fields.update(
+                    str(field)
+                    for field in declared_fields
+                    if isinstance(field, str) and field
+                )
             raw_bindings = (profile or {}).get("field_bindings")
             if isinstance(raw_bindings, list):
                 for binding in raw_bindings:
@@ -1565,14 +1678,35 @@ class GenericOfficialPlugin:
                             "data_in_gib",
                             "write_records",
                             "magnetic_retention_days",
+                            "storage_gib",
                         },
                         "kpu_hours": {"kpu_count", "kpu_hours", "hours_per_month"},
+                        "data_in_gib": {"data_in_gib", "write_records"},
                     }.get(field)
                     if derived_sources:
                         fields.update(derived_sources)
                     else:
                         fields.add(field)
             attrs = PricingCatalog.attributes(product)
+            # Some official dimensions are calculated from several customer
+            # inputs before they reach the AWS catalog.  The catalog row only
+            # names the derived unit (for example Lambda GB-seconds), so keep
+            # the complete input lineage here.  Otherwise the final fact
+            # ledger sees the correct calculated amount but incorrectly
+            # reports the original memory/duration fields as missing.
+            if service_stem == "lambda":
+                lambda_group = str(attrs.get("group") or "")
+                if lambda_group == "AWS-Lambda-Requests":
+                    fields.add("requests")
+                elif lambda_group in {
+                    "AWS-Lambda-Duration",
+                    "AWS-Lambda-Duration-ARM",
+                }:
+                    fields.update({"requests", "memory_mb", "duration_ms"})
+            elif service_stem == "eks" and "amazoneks-hours:percluster" in str(
+                usage_type
+            ).casefold():
+                fields.update({"quantity", "cluster_count", "hours_per_month"})
             if service_stem == "dynamodb":
                 fields.update(
                     {
@@ -1597,7 +1731,14 @@ class GenericOfficialPlugin:
                 )
             return sorted(fields)
 
-        applied_fields: set[str] = set()
+        applied_fields: set[str] = {
+            field
+            for field in _CONFIGURATION_CONTEXT_FIELDS.get(
+                service_stem,
+                frozenset(),
+            )
+            if requirement.requirements.get(field) not in (None, "", [], {})
+        }
         for index, (description, amount, rate) in enumerate(selected_rates, start=1):
             price, unit, usage_type, operation, _ = rate
             if rate[1:4] in reserved_rate_identities:
@@ -1695,6 +1836,13 @@ class GenericOfficialPlugin:
                 "未提供完整用量的部分仅展示对应官方单位价，不计入月费合计。"
             )
         specifications = dict(requirement.requirements)
+        if service_stem == "lambda":
+            # The customer may give an aggregate invocation count for several
+            # functions. Function count is then deployment metadata, not a
+            # price multiplier. Preserve it in the selected configuration so
+            # the number remains auditable without multiplying total requests.
+            specifications["function_count"] = requirement.quantity
+            applied_fields.add("quantity")
         if reserved_capacity_units:
             specifications["reservedCapacityBilling"] = (
                 "DynamoDB Reserved Provisioned Capacity (Heavy Utilization)"
@@ -1792,14 +1940,30 @@ class GenericOfficialPlugin:
 
         supplemental_requirement = requirement.model_copy(deep=True)
         reverse_aliases: dict[str, str] = {}
+        learned_aliases = {
+            key.removeprefix("_fact_purpose_alias."): value
+            for key, value in requirement.field_sources.items()
+            if key.startswith("_fact_purpose_alias.")
+            and isinstance(value, str)
+            and re.fullmatch(r"[a-z][a-z0-9_]{1,62}", value)
+        }
         for field in sorted(target_fields):
-            alias = _SUPPLEMENT_FIELD_ALIASES.get(field)
+            alias = learned_aliases.get(field) or _SUPPLEMENT_FIELD_ALIASES.get(field)
             if not alias or field not in supplemental_requirement.requirements:
+                continue
+            if alias == field:
+                reverse_aliases[alias] = field
                 continue
             # Never overwrite another explicit customer value. A disagreement
             # between two real fields must stay visible to the ledger.
             if alias in supplemental_requirement.requirements:
+                if (
+                    supplemental_requirement.requirements[alias]
+                    == supplemental_requirement.requirements[field]
+                ):
+                    reverse_aliases[alias] = field
                 continue
+            reverse_aliases[alias] = field
             supplemental_requirement.requirements[alias] = (
                 supplemental_requirement.requirements[field]
             )
@@ -1817,7 +1981,6 @@ class GenericOfficialPlugin:
                 supplemental_requirement.field_scopes[alias_path] = (
                     supplemental_requirement.field_scopes[source_path]
                 )
-            reverse_aliases[alias] = field
 
         supplemental = self.select(supplemental_requirement, default_region)
         normalized_targets = set(target_fields)
@@ -1876,11 +2039,186 @@ class GenericOfficialPlugin:
                 )
             )
 
+        # The component's own official profile cannot expose dimensions that
+        # AWS publishes in another offer.  Resolve those only after the normal
+        # supplement pass and only for facts that are still unconsumed.  The
+        # returned rows retain the original fact path, so the global ledger
+        # still prevents both omission and double billing.
+        consumed = {
+            field.split(".", 1)[1]
+            if field.startswith("requirements.")
+            else field
+            for line in merged_lines
+            for field in line.source_fields
+        }
+        shared_targets = normalized_targets - consumed
+        shared_lines = self._shared_offer_usage_lines(
+            requirement,
+            shared_targets,
+            default_region,
+        )
+        for index, line in enumerate(shared_lines, start=1):
+            applied.update(
+                field.split(".", 1)[1]
+                if field.startswith("requirements.")
+                else field
+                for field in line.source_fields
+            )
+            identity = (
+                line.service_code,
+                line.usage_type,
+                line.operation,
+                float(line.amount),
+            )
+            existing = next(
+                (
+                    item
+                    for item in merged_lines
+                    if (
+                        item.service_code,
+                        item.usage_type,
+                        item.operation,
+                        float(item.amount),
+                    )
+                    == identity
+                ),
+                None,
+            )
+            if existing is not None:
+                existing.source_fields = sorted(
+                    set(existing.source_fields) | set(line.source_fields)
+                )
+                continue
+            merged_lines.append(
+                line.model_copy(update={"key": f"shr{index}{line.key}"[:10]})
+            )
+
         return selection.model_copy(
             update={
                 "usage_lines": merged_lines,
                 "applied_requirement_fields": sorted(applied),
             }
+        )
+
+    def _shared_offer_usage_lines(
+        self,
+        requirement: ServiceRequirement,
+        target_fields: set[str],
+        default_region: str,
+    ) -> list[UsageLine]:
+        """Resolve globally shared AWS charges without changing product identity."""
+
+        lines: list[UsageLine] = []
+        if "data_transfer_out_gib" not in target_fields:
+            return lines
+        raw_amount = requirement.requirements.get("data_transfer_out_gib")
+        if isinstance(raw_amount, bool):
+            return lines
+        try:
+            numeric_amount = float(raw_amount)
+        except (TypeError, ValueError):
+            return lines
+        if numeric_amount <= 0:
+            return lines
+        amount = scoped_amount(
+            requirement,
+            "data_transfer_out_gib",
+            numeric_amount,
+            resource_count=float(
+                requirement.requirements.get("instance_count")
+                or requirement.requirements.get("node_count")
+                or requirement.requirements.get("nodes")
+                or requirement.quantity
+                or 1
+            ),
+        )
+
+        region = requirement.region or default_region
+        service_code = _SHARED_OFFER_DIMENSIONS["data_transfer_out_gib"]
+        filters = {
+            "fromLocation": self.catalog.location(region),
+            "toLocation": "External",
+            "transferType": "AWS Outbound",
+        }
+        products = self.catalog.products(service_code, filters, max_pages=3)
+        if not products:
+            products = self.catalog.products(
+                service_code,
+                filters,
+                max_pages=3,
+                refresh=True,
+            )
+        priced = [
+            (rate[0], product)
+            for product in products
+            if (rate := PricingCatalog.on_demand_unit_rate(product)) is not None
+        ]
+        if not priced:
+            return lines
+        _, product = min(priced, key=lambda item: item[0])
+        resolved_service, usage_type, operation = PricingCatalog.billing_identity(product)
+        lines.append(
+            UsageLine(
+                key="dto",
+                service_code=resolved_service,
+                usage_type=usage_type,
+                operation=operation,
+                amount=float(amount),
+                group="data-transfer",
+                source_fields=["data_transfer_out_gib"],
+            )
+        )
+        return lines
+
+    def official_field_candidates(
+        self,
+        requirement: ServiceRequirement,
+        default_region: str,
+    ) -> list[dict[str, str]]:
+        """Return human-readable, officially discovered field destinations.
+
+        The AI resolver is allowed to choose only one of these field names. It
+        never sees a writable price, UsageType or formula, and the selected
+        field is still re-run through ``select`` before it can affect a quote.
+        """
+
+        if self.auto_discovery is None:
+            return []
+        profile = self.auto_discovery.ensure_profile(
+            service_key=requirement.service,
+            display_name=(
+                requirement.calculator_service_name or requirement.service
+            ),
+            region=requirement.region or default_region,
+        )
+        if not profile or profile.get("status") != "verified":
+            return []
+        raw_bindings = profile.get("field_bindings")
+        if not isinstance(raw_bindings, list):
+            return []
+        candidates: dict[tuple[str, str, str], dict[str, str]] = {}
+        for binding in raw_bindings:
+            if not isinstance(binding, dict):
+                continue
+            field = str(binding.get("field") or "").strip()
+            if not re.fullmatch(r"[a-z][a-z0-9_]{1,62}", field):
+                continue
+            label = str(binding.get("label") or field).strip()
+            unit = str(binding.get("unit") or "unit").strip()
+            description = str(binding.get("description") or "").strip()
+            identity = (field, label, unit)
+            candidates.setdefault(
+                identity,
+                {
+                    "field": field,
+                    "label": label,
+                    "unit": unit,
+                    "description": description,
+                },
+            )
+        return sorted(
+            candidates.values(),
+            key=lambda item: (item["field"], item["label"], item["unit"]),
         )
 
     @staticmethod
@@ -2020,10 +2358,15 @@ class GenericOfficialPlugin:
             result: list,
             description: str,
             amount: float | None,
+            source_fields: tuple[str, ...] = (),
             **filters,
         ) -> None:
             rate = matching(**filters)
             if rate is not None:
+                if source_fields:
+                    product = dict(rate[4])
+                    product["_astra_source_fields"] = list(source_fields)
+                    rate = (rate[0], rate[1], rate[2], rate[3], product)
                 result.append((description, amount, rate))
 
         result: list[
@@ -2329,6 +2672,16 @@ class GenericOfficialPlugin:
                     )
                 return result
 
+            requested_deployment = _canonical(
+                str(
+                    requested.get("deployment_type")
+                    or requested.get("deployment_option")
+                    or ""
+                )
+            )
+            requested_storage_type = _canonical(
+                str(requested.get("storage_type") or "")
+            )
             candidates = []
             for rate in rates:
                 attrs = PricingCatalog.attributes(rate[4])
@@ -2349,6 +2702,22 @@ class GenericOfficialPlugin:
                 official_type = str(attrs.get("fileSystemType") or "").casefold()
                 if file_system_type and official_type != file_system_type:
                     continue
+                official_deployment = _canonical(
+                    str(attrs.get("deploymentOption") or "")
+                )
+                if (
+                    requested_deployment
+                    and official_deployment != requested_deployment
+                ):
+                    continue
+                official_storage_type = _canonical(
+                    str(attrs.get("storageType") or "")
+                )
+                if (
+                    requested_storage_type
+                    and official_storage_type != requested_storage_type
+                ):
+                    continue
                 if throughput_tier is not None:
                     official_tier = str(attrs.get("throughputCapacity") or "")
                     tier_match = re.search(r"\d+(?:\.\d+)?", official_tier)
@@ -2363,7 +2732,7 @@ class GenericOfficialPlugin:
             selected = min(positive, key=lambda rate: (rate[0], rate[2], rate[3]))
             result.append(
                 (
-                    "FSx 官方存储与吞吐档位单价",
+                    "FSx 官方存储单价",
                     (
                         scoped_amount(requirement, "storage_gib", float(storage))
                         if storage
@@ -2372,6 +2741,49 @@ class GenericOfficialPlugin:
                     selected,
                 )
             )
+            throughput = requested.get("throughput_mbps")
+            if throughput not in (None, ""):
+                throughput_candidates = []
+                for rate in rates:
+                    attrs = PricingCatalog.attributes(rate[4])
+                    unit = str(rate[1]).casefold()
+                    if not any(
+                        token in unit
+                        for token in ("mibps-mo", "mbps-mo", "mb/s-month")
+                    ):
+                        continue
+                    official_type = str(
+                        attrs.get("fileSystemType") or ""
+                    ).casefold()
+                    if file_system_type and official_type != file_system_type:
+                        continue
+                    official_deployment = _canonical(
+                        str(attrs.get("deploymentOption") or "")
+                    )
+                    if (
+                        requested_deployment
+                        and official_deployment != requested_deployment
+                    ):
+                        continue
+                    throughput_candidates.append(rate)
+                if not throughput_candidates:
+                    return []
+                selected_throughput = min(
+                    [rate for rate in throughput_candidates if rate[0] > 0]
+                    or throughput_candidates,
+                    key=lambda rate: (rate[0], rate[2], rate[3]),
+                )
+                result.append(
+                    (
+                        "FSx 官方吞吐量单价",
+                        scoped_amount(
+                            requirement,
+                            "throughput_mbps",
+                            float(throughput),
+                        ),
+                        selected_throughput,
+                    )
+                )
         elif service == "kinesis":
             # A provisioned Kinesis stream is billed by shard-hour.  Treat an
             # explicit shard count as workload evidence instead of falling
@@ -2690,10 +3102,13 @@ class GenericOfficialPlugin:
                 exclude=("ia-", "backup", "restore", "change", "capture"),
             )
         elif service == "eks":
+            cluster_count = float(
+                requested.get("cluster_count") or requirement.quantity
+            )
             add(
                 result,
                 "EKS 标准控制面小时价",
-                requirement.quantity * requirement.hours_per_month,
+                cluster_count * requirement.hours_per_month,
                 include=("amazoneks-hours:percluster",),
                 exclude=("local", "extended", "provisioned"),
             )
@@ -2925,6 +3340,13 @@ class GenericOfficialPlugin:
                 result,
                 f"Amazon MQ {model or 'Broker'} 小时价",
                 requirement.quantity * requirement.hours_per_month,
+                source_fields=(
+                    "quantity",
+                    "hours_per_month",
+                    "broker_count",
+                    "vcpu",
+                    "memory_gib",
+                ),
                 include=compute_include,
                 exclude=compute_exclude,
                 model=model or None,
@@ -2941,6 +3363,13 @@ class GenericOfficialPlugin:
                     result,
                     "Amazon MQ Broker 存储单价",
                     requirement.quantity * broker_count * float(storage),
+                    source_fields=(
+                        "quantity",
+                        "broker_count",
+                        "storage_gib_per_broker",
+                        "storage_gib",
+                        "total_storage_gib",
+                    ),
                     include=("storage",),
                     exclude=(
                         "backup", "snapshot",
@@ -2998,6 +3427,7 @@ class GenericOfficialPlugin:
                 replication_instances * requirement.hours_per_month,
                 include_any=("instanceusg", "createdmsinstance"),
                 exclude=("multi-az", "serverless"),
+                unit_contains=("hrs", "hour"),
                 model=model or None,
                 min_vcpu=float(requested["vcpu"]) if requested.get("vcpu") else None,
                 min_memory_gib=(
@@ -3011,7 +3441,12 @@ class GenericOfficialPlugin:
                 add(
                     result,
                     "AWS DMS 额外日志存储单价",
-                    scoped_amount(requirement, "storage_gib", float(storage)),
+                    scoped_amount(
+                        requirement,
+                        "storage_gib",
+                        float(storage),
+                        resource_count=replication_instances,
+                    ),
                     include=("storage",),
                     exclude=("snapshot", "backup", "s3"),
                     unit_contains=("gb",),
@@ -3299,6 +3734,10 @@ class GenericOfficialPlugin:
             instance_count = float(
                 requested.get("instance_count")
                 or requested.get("node_count")
+                or requested.get("nodes")
+                or requested.get("data_nodes")
+                or requested.get("broker_count")
+                or requested.get("replication_instances")
                 or (
                     float(requested.get("shards") or 1)
                     * (1 + float(requested.get("replicas_per_shard") or 0))
@@ -3386,12 +3825,25 @@ class GenericOfficialPlugin:
                     monthly_ingest_gib = requested.get("data_in_gib")
                     if monthly_ingest_gib in (None, "") and requested.get("write_records"):
                         monthly_ingest_gib = float(requested["write_records"]) / 1_048_576
-                    value = (
-                        max(100.0, float(monthly_ingest_gib) * float(retention_days) / 30.0)
-                        if monthly_ingest_gib not in (None, "")
-                        and retention_days not in (None, "")
-                        else None
-                    )
+                    # A customer can provide either current/expected stored
+                    # capacity directly or an ingest volume plus retention.
+                    # Both describe the same official GB-month dimension.  A
+                    # direct capacity is more authoritative and avoids asking
+                    # the customer to invent retention settings merely to
+                    # quote an already known 2 TiB magnetic-store footprint.
+                    value = requested.get("storage_gib")
+                    if value in (None, ""):
+                        value = (
+                            max(
+                                100.0,
+                                float(monthly_ingest_gib)
+                                * float(retention_days)
+                                / 30.0,
+                            )
+                            if monthly_ingest_gib not in (None, "")
+                            and retention_days not in (None, "")
+                            else None
+                        )
                 elif field == "data_in_gib" and requested.get("write_records"):
                     value = requested.get("data_in_gib")
                     if value in (None, ""):
@@ -3407,7 +3859,52 @@ class GenericOfficialPlugin:
                             float(kpu_count) + float(requirement.quantity)
                         ) * float(requirement.hours_per_month)
                 elif field == "storage_gib":
-                    value = requested.get("storage_gib")
+                    storage_source_fields: list[str] = []
+                    value = None
+                    per_node_storage = requested.get("storage_gib_per_node")
+                    topology_field = next(
+                        (
+                            key
+                            for key in (
+                                "instance_count",
+                                "node_count",
+                                "nodes",
+                                "data_nodes",
+                                "broker_count",
+                                "replication_instances",
+                            )
+                            if isinstance(requested.get(key), (int, float))
+                            and not isinstance(requested.get(key), bool)
+                            and float(requested[key]) > 0
+                        ),
+                        "",
+                    )
+                    if (
+                        isinstance(per_node_storage, (int, float))
+                        and not isinstance(per_node_storage, bool)
+                        and float(per_node_storage) > 0
+                        and topology_field
+                    ):
+                        # Explicit scope outranks a generic duplicate produced
+                        # during normalization.  AWS managed products commonly
+                        # expose storage as aggregate GB-month while customers
+                        # describe it per node.
+                        value = (
+                            float(per_node_storage)
+                            * float(requested[topology_field])
+                            * float(requirement.quantity)
+                        )
+                        storage_source_fields.extend(
+                            ("storage_gib_per_node", topology_field)
+                        )
+                    if value in (None, ""):
+                        value = requested.get("total_storage_gib")
+                        if value not in (None, ""):
+                            storage_source_fields.append("total_storage_gib")
+                    if value in (None, ""):
+                        value = requested.get("storage_gib")
+                        if value not in (None, ""):
+                            storage_source_fields.append("storage_gib")
                     kpu_count = requested.get("kpu_count")
                     is_flink_storage = any(
                         "runningapplicationstorage" in str(binding.get("usage_type") or "").casefold()
@@ -3487,6 +3984,11 @@ class GenericOfficialPlugin:
                     return False
 
                 amount = float(value)
+                if field == "processing_hours" and any(
+                    "minute" in str(binding.get("unit") or "").casefold()
+                    for binding in bindings
+                ):
+                    amount *= 60.0
                 if field == "hours_per_month":
                     amount *= requirement.quantity
                 elif field in {"bucket_count", "object_count"} and any(
@@ -3509,6 +4011,30 @@ class GenericOfficialPlugin:
                 result_count = len(result)
                 choose(f"AWS 官方{label}单价", amount, bound_rate)
                 if len(result) > result_count:
+                    if field == "storage_gib" and storage_source_fields:
+                        description, selected_amount, selected_rate = result[-1]
+                        selected_product = dict(selected_rate[4])
+                        declared = selected_product.get("_astra_source_fields")
+                        declared_values = (
+                            declared
+                            if isinstance(declared, (list, tuple, set))
+                            else ()
+                        )
+                        selected_product["_astra_source_fields"] = sorted(
+                            {
+                                *(
+                                    str(item)
+                                    for item in declared_values
+                                    if isinstance(item, str) and item
+                                ),
+                                *storage_source_fields,
+                            }
+                        )
+                        result[-1] = (
+                            description,
+                            selected_amount,
+                            (*selected_rate[:4], selected_product),
+                        )
                     # A profile binding is authoritative.  The broad fallback
                     # below must not bill the same customer quantity again
                     # against a second dimension that happens to share a unit.

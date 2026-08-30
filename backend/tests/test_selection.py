@@ -80,6 +80,83 @@ def test_ec2_exact_model_query_falls_back_to_reviewed_shape_catalog(
     assert candidates[0]["memory_gib"] == 96
 
 
+def test_ec2_configuration_picker_uses_complete_regional_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = Ec2Plugin(None, None)  # type: ignore[arg-type]
+    captured: dict[str, object] = {}
+
+    def official_candidates(
+        region: str,
+        requested_model: str | None,
+        requested_vcpu: float | None = None,
+        requested_memory: float | None = None,
+        *,
+        include_all_models: bool = False,
+    ) -> list[dict[str, object]]:
+        captured.update(
+            {
+                "region": region,
+                "requested_model": requested_model,
+                "requested_vcpu": requested_vcpu,
+                "requested_memory": requested_memory,
+                "include_all_models": include_all_models,
+            }
+        )
+        return [
+            {
+                "model": "m7g.large",
+                "vcpu": 2,
+                "memory_gib": 8,
+                "current_generation": True,
+                "family": "general_purpose",
+                "architectures": ["arm64"],
+            },
+            {
+                "model": "m6i.large",
+                "vcpu": 2,
+                "memory_gib": 8,
+                "current_generation": True,
+                "family": "general_purpose",
+                "architectures": ["x86_64"],
+            },
+            {
+                "model": "m4.large",
+                "vcpu": 2,
+                "memory_gib": 8,
+                "current_generation": False,
+                "family": "general_purpose",
+                "architectures": ["x86_64"],
+            },
+        ]
+
+    monkeypatch.setattr(plugin, "_official_candidates", official_candidates)
+    choices = plugin.configuration_candidates(
+        ServiceRequirement(
+            service="ec2",
+            region="ap-south-1",
+            requirements={"vcpu": 16, "memory_gib": 64},
+        ),
+        "ap-southeast-1",
+    )
+
+    assert captured == {
+        "region": "ap-south-1",
+        "requested_model": None,
+        "requested_vcpu": None,
+        "requested_memory": None,
+        "include_all_models": True,
+    }
+    assert [choice.model for choice in choices] == [
+        "m7g.large",
+        "m6i.large",
+        "m4.large",
+    ]
+    assert choices[0].specifications["processorArchitectures"] == ["arm64"]
+    assert choices[0].specifications["instanceFamily"] == "general_purpose"
+    assert choices[0].specifications["currentGeneration"] is True
+
+
 def test_generic_rds_ssd_defaults_to_official_gp3_value() -> None:
     values = [
         "General Purpose (SSD)",
@@ -150,6 +227,82 @@ def test_rds_unavailable_legacy_model_falls_back_to_orderable_engine_catalog(
         {"Engine": "mysql", "DBInstanceClass": "db.m4.xlarge"},
         {"Engine": "mysql"},
     ]
+
+
+def test_rds_configuration_picker_uses_complete_orderable_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    first_product = {
+        "rate": 0.4,
+        "product": {"sku": "arm", "attributes": {"regionCode": "ap-south-1"}},
+    }
+    second_product = {
+        "rate": 0.5,
+        "product": {"sku": "x86", "attributes": {"regionCode": "ap-south-1"}},
+    }
+
+    class Catalog:
+        def products(
+            self,
+            service_code: str,
+            filters: dict[str, str],
+            *,
+            max_pages: int,
+        ) -> list[dict[str, object]]:
+            captured.update(
+                {
+                    "service_code": service_code,
+                    "filters": filters,
+                    "max_pages": max_pages,
+                }
+            )
+            return [first_product, second_product]
+
+    plugin = RdsPlugin(None, Catalog())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        plugin,
+        "_orderable_classes",
+        lambda *_args, **_kwargs: {"db.m7g.large", "db.m7i.large"},
+    )
+    monkeypatch.setattr(
+        rds_module,
+        "_rds_candidates",
+        lambda *_args, **_kwargs: [
+            {
+                "model": "db.m7g.large",
+                "vcpu": 2.0,
+                "memory_gib": 8.0,
+                "products": [first_product],
+            },
+            {
+                "model": "db.m7i.large",
+                "vcpu": 2.0,
+                "memory_gib": 8.0,
+                "products": [second_product],
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        rds_module.PricingCatalog,
+        "on_demand_rate",
+        staticmethod(lambda product: float(product["rate"])),
+    )
+
+    choices = plugin.configuration_candidates(
+        ServiceRequirement(
+            service="rds",
+            region="ap-south-1",
+            quantity=2,
+            requirements={"engine": "mysql", "deployment": "multi_az"},
+        ),
+        "ap-southeast-1",
+    )
+
+    assert captured["service_code"] == "AmazonRDS"
+    assert captured["max_pages"] == 50
+    assert [choice.model for choice in choices] == ["db.m7g.large", "db.m7i.large"]
+    assert choices[0].monthly_catalog_cost == pytest.approx(0.4 * 730 * 2)
 
 
 def test_aurora_cluster_uses_member_instance_pricing_dimension() -> None:

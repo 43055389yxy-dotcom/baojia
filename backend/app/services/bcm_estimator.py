@@ -384,14 +384,20 @@ class BcmWorkloadEstimator:
             )
 
         priced: list[PricedLine] = []
+        # BCM may omit every caller-provided key. Match against a shrinking
+        # pool so two otherwise identical rows cannot both bind to the first
+        # request line. This is especially common when one EC2 component has
+        # a system gp3 volume and an additional gp3 data volume.
+        unmatched_lines = list(requested_lines)
         for item in items:
-            source = _match_source_line(item, requested_lines)
+            source = _match_source_line(item, unmatched_lines)
             if source is None or item.get("cost") is None:
                 raise ManualConfirmationRequired(
                     "AWS BCM 返回的报价行不完整",
                     code="bcm_incomplete_line_result",
                     key=item.get("key"),
                 )
+            unmatched_lines.remove(source)
             quantity = item.get("quantity", {})
             priced.append(
                 PricedLine(
@@ -405,7 +411,7 @@ class BcmWorkloadEstimator:
                     currency=item.get("currency", "USD"),
                 )
             )
-        if len(priced) != len(requested_lines) or last.get("totalCost") is None:
+        if unmatched_lines or len(priced) != len(requested_lines) or last.get("totalCost") is None:
             raise ManualConfirmationRequired(
                 "AWS BCM 返回的总价或行项目数量不完整",
                 code="bcm_incomplete_result",
@@ -446,4 +452,32 @@ def _match_source_line(item: dict[str, Any], requested_lines: list[UsageLine]) -
         and line.usage_type == item.get("usageType")
         and line.operation == item.get("operation")
     ]
-    return dimensioned[0] if len(dimensioned) == 1 else None
+    if len(dimensioned) == 1:
+        return dimensioned[0]
+    if not dimensioned:
+        return None
+
+    # BCM currently drops ``key`` on some valid rows but retains the official
+    # quantity. Use that quantity to distinguish duplicate dimensions such as
+    # 600 GiB of system gp3 and 1,800 GiB of data gp3. Comparing only service,
+    # UsageType and operation incorrectly makes the whole component unpriced.
+    quantity = item.get("quantity")
+    returned_amount = quantity.get("amount") if isinstance(quantity, dict) else None
+    try:
+        numeric_amount = float(returned_amount)
+    except (TypeError, ValueError):
+        numeric_amount = None
+    if numeric_amount is not None:
+        amount_matches = [
+            line
+            for line in dimensioned
+            if abs(float(line.amount) - numeric_amount) < 1e-9
+        ]
+        if len(amount_matches) == 1:
+            return amount_matches[0]
+        if amount_matches:
+            # Same group + same official dimension + same amount is
+            # commercially indistinguishable. The caller consumes returned
+            # matches one by one, so choosing the first remaining row is safe.
+            return amount_matches[0]
+    return None

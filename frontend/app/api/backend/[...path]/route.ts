@@ -45,18 +45,36 @@ async function forward(request: NextRequest, context: RouteContext) {
       headers,
       body,
       redirect: "manual",
+      cache: "no-store",
     });
     const responseHeaders = new Headers(response.headers);
     responseHeaders.delete("access-control-allow-origin");
     responseHeaders.delete("access-control-allow-credentials");
+    // Job, draft and confirmation endpoints are live session state. Never let
+    // a browser, framework layer or intermediary replay an older response.
+    responseHeaders.set("cache-control", "no-store, no-cache, must-revalidate");
+    responseHeaders.set("pragma", "no-cache");
+    responseHeaders.set("expires", "0");
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
       headers: responseHeaders,
     });
-  } catch {
+  } catch (error) {
+    const debugDetails = process.env.NODE_ENV !== "production"
+      ? {
+          error_type: error instanceof Error ? error.name : typeof error,
+          raw_error: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+          backend_target: `${target.origin}/${joinedPath}`,
+        }
+      : undefined;
     return Response.json(
-      { code: "backend_unavailable", message: "报价服务暂时不可用，请稍后重试。" },
+      {
+        code: "backend_unavailable",
+        message: "报价服务暂时不可用，请稍后重试。",
+        ...(debugDetails ? { details: debugDetails } : {}),
+      },
       { status: 503 },
     );
   }

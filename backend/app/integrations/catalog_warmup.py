@@ -271,6 +271,25 @@ class CommonCatalogWarmer:
                 max_pages=2,
             ),
         )
+        self._run(
+            f"{region}/cloudwatch-log-storage",
+            lambda: self._catalog.products(
+                "AmazonCloudWatch",
+                {
+                    "location": location,
+                    "group": "Amazon CloudWatch Standard Storage pricing current",
+                },
+                max_pages=2,
+            ),
+        )
+        self._run(
+            f"{region}/cloudwatch-alarms",
+            lambda: self._catalog.products(
+                "AmazonCloudWatch",
+                {"location": location, "group": "Alarm"},
+                max_pages=2,
+            ),
+        )
 
     def _warm_cloudfront(self) -> None:
         for geography, prefix in (

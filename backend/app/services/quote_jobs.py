@@ -7,10 +7,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from app.core.diagnostics import diagnostic_log
 from app.core.errors import QuoteError
 from app.domain.models import QuoteRequest
 from app.services.quote_service import QuoteService
-
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +48,33 @@ class QuoteJobManager:
         self._provider_name = provider_name
         self._provider_key = provider_key
         self._jobs: dict[str, QuoteJob] = {}
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+
+    def _start_task(self, job: QuoteJob, coroutine: Any) -> None:
+        task = asyncio.create_task(coroutine)
+        self._tasks[job.job_id] = task
+
+        def forget(completed: asyncio.Task[None]) -> None:
+            if self._tasks.get(job.job_id) is completed:
+                self._tasks.pop(job.job_id, None)
+
+        task.add_done_callback(forget)
 
     def start(self, request: QuoteRequest) -> QuoteJob:
         job = QuoteJob(job_id=f"{self._provider_key}-{uuid.uuid4().hex[:12]}")
         self._jobs[job.job_id] = job
-        asyncio.create_task(self._run(job, request))
+        diagnostic_log.record(
+            "quote_job_started",
+            message=f"{self._provider_name} 正式报价任务已创建",
+            context={
+                "job_id": job.job_id,
+                "provider": self._provider_key,
+                "draft_id": request.draft_id,
+                "sales_region": request.sales_region,
+                "request_length": len(request.customer_request),
+            },
+        )
+        self._start_task(job, self._run(job, request))
         return job
 
     def start_preview(self, request: QuoteRequest) -> QuoteJob:
@@ -60,11 +82,44 @@ class QuoteJobManager:
 
         job = QuoteJob(job_id=f"{self._provider_key}-{uuid.uuid4().hex[:12]}")
         self._jobs[job.job_id] = job
-        asyncio.create_task(self._run_preview(job, request))
+        diagnostic_log.record(
+            "preview_job_started",
+            message=f"{self._provider_name} 配置核验任务已创建",
+            context={
+                "job_id": job.job_id,
+                "provider": self._provider_key,
+                "draft_id": request.draft_id,
+                "sales_region": request.sales_region,
+                "request_length": len(request.customer_request),
+            },
+        )
+        self._start_task(job, self._run_preview(job, request))
         return job
 
     def get(self, job_id: str) -> QuoteJob | None:
         return self._jobs.get(job_id)
+
+    async def cancel(self, job_id: str) -> bool:
+        """Stop one live job before a browser starts a clean quote session."""
+
+        task = self._tasks.get(job_id)
+        job = self._jobs.get(job_id)
+        if task is None or job is None or task.done():
+            return False
+        job.status = "failed"
+        job.error = {
+            "status": "cancelled",
+            "code": "quote_session_reset",
+            "message": "该任务已由重新报价操作终止。",
+            "details": {},
+        }
+        job.updated_at = datetime.now(UTC).isoformat()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return True
 
     async def _run(self, job: QuoteJob, request: QuoteRequest) -> None:
         job.status = "running"
@@ -85,22 +140,49 @@ class QuoteJobManager:
             job.status = "completed"
             await self._event(job, "done", f"{self._provider_name} 官方报价已生成")
         except QuoteError as exc:
+            diagnostic_id = diagnostic_log.record_exception(
+                "quote_job_failed",
+                exc,
+                level="warning" if exc.http_status < 500 else "error",
+                context={
+                    "job_id": job.job_id,
+                    "draft_id": request.draft_id,
+                    "error_code": exc.code,
+                    "details": exc.details,
+                    "events": job.events,
+                },
+            )
             job.status = "failed"
             job.error = {
                 "status": "manual_confirmation",
                 "code": exc.code,
                 "message": exc.message,
-                "details": exc.details,
+                "details": {
+                    **exc.details,
+                    **({"diagnostic_id": diagnostic_id} if diagnostic_id else {}),
+                },
             }
             await self._event(job, "error", exc.message)
         except Exception as exc:  # pragma: no cover - protected by API-level logging
             logger.exception("Unhandled exception while executing quote job %s", job.job_id)
+            diagnostic_id = diagnostic_log.record_exception(
+                "quote_job_unhandled_exception",
+                exc,
+                context={
+                    "job_id": job.job_id,
+                    "draft_id": request.draft_id,
+                    "events": job.events,
+                },
+            )
             job.status = "failed"
             job.error = {
                 "status": "manual_confirmation",
                 "code": "internal_error",
                 "message": "报价执行发生内部错误，本次没有生成价格。",
-                "details": {"error_type": type(exc).__name__},
+                "details": {
+                    "error_type": type(exc).__name__,
+                    **({"diagnostic_id": diagnostic_id} if diagnostic_id else {}),
+                },
             }
             await self._event(job, "error", "报价执行发生内部错误")
 
@@ -117,24 +199,51 @@ class QuoteJobManager:
             job.status = "completed"
             await self._event(job, "done", "全部组件已完成配置核验")
         except QuoteError as exc:
+            diagnostic_id = diagnostic_log.record_exception(
+                "preview_job_failed",
+                exc,
+                level="warning" if exc.http_status < 500 else "error",
+                context={
+                    "job_id": job.job_id,
+                    "draft_id": request.draft_id,
+                    "error_code": exc.code,
+                    "details": exc.details,
+                    "events": job.events,
+                },
+            )
             self._recover_configuration_review(request)
             job.status = "failed"
             job.error = {
                 "status": "manual_confirmation",
                 "code": exc.code,
                 "message": exc.message,
-                "details": exc.details,
+                "details": {
+                    **exc.details,
+                    **({"diagnostic_id": diagnostic_id} if diagnostic_id else {}),
+                },
             }
             await self._event(job, "error", exc.message)
         except Exception as exc:  # pragma: no cover - API safety boundary
             logger.exception("Unhandled exception while previewing quote job %s", job.job_id)
+            diagnostic_id = diagnostic_log.record_exception(
+                "preview_job_unhandled_exception",
+                exc,
+                context={
+                    "job_id": job.job_id,
+                    "draft_id": request.draft_id,
+                    "events": job.events,
+                },
+            )
             self._recover_configuration_review(request)
             job.status = "failed"
             job.error = {
                 "status": "manual_confirmation",
                 "code": "internal_error",
                 "message": "配置核验发生内部错误，请稍后重试。",
-                "details": {"error_type": type(exc).__name__},
+                "details": {
+                    "error_type": type(exc).__name__,
+                    **({"diagnostic_id": diagnostic_id} if diagnostic_id else {}),
+                },
             }
             await self._event(job, "error", "配置核验发生内部错误")
 
@@ -161,4 +270,14 @@ class QuoteJobManager:
             }
         )
         job.updated_at = datetime.now(UTC).isoformat()
+        diagnostic_log.record(
+            "quote_job_event",
+            level="error" if stage == "error" else "info",
+            message=message,
+            context={
+                "job_id": job.job_id,
+                "job_status": job.status,
+                "stage": stage,
+            },
+        )
         await asyncio.sleep(0)

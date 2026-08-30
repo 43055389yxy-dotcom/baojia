@@ -152,7 +152,41 @@ def record_customer_fact_metadata(
     """Persist pricing semantics beside a customer-owned requirement field."""
 
     requirement.field_match_policies[field] = policy or infer_match_policy(evidence)
-    requirement.field_scopes[field] = scope or infer_field_scope(evidence)
+    inferred_scope = scope or infer_field_scope(evidence)
+    if scope is None and inferred_scope == "component_total":
+        # Models often return the shortest evidence token (``磁盘200G``),
+        # dropping the immediately preceding scope clause
+        # (``单实例4核16G，磁盘200G``). Recover only that adjacent clause from
+        # the immutable component source. This is grammar-level scope
+        # preservation, not service vocabulary, so it works for any present
+        # or future product without turning the whole sentence into a guess.
+        source = str(
+            requirement.original_source_text or requirement.source_text or ""
+        )
+        token = str(evidence or "").strip()
+        position = source.casefold().find(token.casefold()) if token else -1
+        if position >= 0:
+            separators = "，,；;。\n"
+            immediate_left = max(
+                (source.rfind(separator, 0, position) for separator in separators),
+                default=-1,
+            )
+            previous_left = (
+                max(
+                    (
+                        source.rfind(separator, 0, immediate_left)
+                        for separator in separators
+                    ),
+                    default=-1,
+                )
+                if immediate_left >= 0
+                else -1
+            )
+            context = source[previous_left + 1 : position + len(token)]
+            contextual_scope = infer_field_scope(context)
+            if contextual_scope != "component_total":
+                inferred_scope = contextual_scope
+    requirement.field_scopes[field] = inferred_scope
 
 
 def customer_match_policy(

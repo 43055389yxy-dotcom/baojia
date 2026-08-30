@@ -1,5 +1,5 @@
-from datetime import UTC, datetime, timedelta
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -16,8 +16,74 @@ from app.services.confirmation_sessions import (
     CONFIGURATION_COMPONENT_FEEDBACK_PREFIX,
     CONFIGURATION_COMPONENT_UPDATE_PREFIX,
     CONFIGURATION_FEEDBACK_QUESTION,
+    PROCESSOR_ARCHITECTURE_ANSWER_KEY,
     ConfirmationSessionStore,
 )
+
+
+def test_processor_architecture_is_validated_and_survives_the_next_round(
+    tmp_path: Path,
+) -> None:
+    store = ConfirmationSessionStore(tmp_path / "architecture.sqlite3")
+    intent = ParsedIntent(
+        customer_summary="EC2",
+        services=[ServiceRequirement(service="ec2")],
+    )
+    item = ConfirmationItem(
+        question="请选择 EC2 型号",
+        answer_key="component-0:model",
+        component_id="0",
+        service="ec2",
+        options=[
+            ConfirmationOption(
+                label="m7g.xlarge",
+                value="选择 m7g.xlarge",
+                model="m7g.xlarge",
+                specifications={"processorArchitecture": "arm64"},
+            ),
+            ConfirmationOption(
+                label="m7i.xlarge",
+                value="选择 m7i.xlarge",
+                model="m7i.xlarge",
+                specifications={"processorArchitecture": "x86_64"},
+            ),
+        ],
+    )
+    token = store.create_or_replace(
+        draft_id="draft-architecture",
+        customer_request="EC2",
+        customer_summary="EC2",
+        intent=intent,
+        confirmation_text="请选择",
+        items=[item],
+    )
+
+    with pytest.raises(ValueError, match="处理器架构不一致"):
+        store.submit(
+            token,
+            {item.answer_key or "": "选择 m7i.xlarge"},
+            processor_architecture="arm64",
+        )
+
+    submitted = store.submit(
+        token,
+        {item.answer_key or "": "选择 m7i.xlarge"},
+        processor_architecture="x86_64",
+    )
+    assert submitted is not None
+    assert submitted.answers[PROCESSOR_ARCHITECTURE_ANSWER_KEY] == "x86_64"
+
+    store.create_or_replace(
+        draft_id="draft-architecture",
+        customer_request="EC2",
+        customer_summary="EC2",
+        intent=intent,
+        confirmation_text="再确认一次",
+        items=[item],
+    )
+    next_round = store.get(token)
+    assert next_round is not None
+    assert next_round.answers == {PROCESSOR_ARCHITECTURE_ANSWER_KEY: "x86_64"}
 
 
 def test_confirmation_session_round_trip(tmp_path: Path) -> None:

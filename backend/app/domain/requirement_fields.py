@@ -75,8 +75,10 @@ REQUIREMENT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
         "data_transfer_gib",
         "transfer_gib",
         "cdn_egress_gib",
+        "monthly_accelerated_traffic_gb",
     ),
     "data_transfer_in_gib": ("inbound_transfer_gib", "ingress_gib"),
+    "processed_bytes_gib": ("data_processed_gib",),
     "backup_retention_days": ("backup_days", "retention_days"),
     "replicas_per_shard": ("replicas", "replica_count", "read_replicas"),
     "shards": ("shard_count",),
@@ -87,6 +89,64 @@ REQUIREMENT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "purchase_option": ("pricing_model", "purchase_type", "billing_option"),
     "engine": ("database_engine", "cache_engine"),
 }
+
+
+# Some model-facing count words are intentionally generic (``node_count``),
+# while the pricing contract must name the role that AWS actually bills.  The
+# destination is only unambiguous after product identity is known, so keep the
+# routing here instead of teaching every parser/prompt the same aliases.  This
+# map is deliberately limited to one-to-one meanings; ambiguous words stay in
+# ``unmapped_pricing_facts`` for customer/AI clarification.
+SERVICE_REQUIREMENT_FIELD_ALIASES: dict[str, dict[str, str]] = {
+    "rds": {
+        "node_count": "instance_count",
+        "nodes": "instance_count",
+        "db_instance_count": "instance_count",
+        "database_instance_count": "instance_count",
+    },
+    "documentdb": {
+        "node_count": "instance_count",
+        "nodes": "instance_count",
+    },
+    "opensearch": {
+        "node_count": "data_nodes",
+        "nodes": "data_nodes",
+    },
+    "msk": {
+        "node_count": "broker_count",
+        "nodes": "broker_count",
+    },
+    "mq": {
+        "node_count": "broker_count",
+        "nodes": "broker_count",
+    },
+    "eks": {
+        "node_count": "worker_node_count",
+        "nodes": "worker_node_count",
+    },
+    "redshift": {
+        "node_count": "nodes",
+    },
+    "sagemaker": {
+        "node_count": "instance_count",
+        "nodes": "instance_count",
+    },
+}
+
+
+def _normalized_service_key(service: str | None) -> str:
+    key = (service or "").strip().casefold().replace("-", "_")
+    return {
+        "amazon_rds": "rds",
+        "aurora": "rds",
+        "amazon_opensearch": "opensearch",
+        "amazon_msk": "msk",
+        "amazon_mq": "mq",
+        "amazon_eks": "eks",
+        "amazon_documentdb": "documentdb",
+        "amazon_redshift": "redshift",
+        "amazon_sagemaker": "sagemaker",
+    }.get(key, key)
 
 
 def pricing_directive_from_text(
@@ -175,6 +235,13 @@ def pricing_directive_from_text(
 
 
 def _alias_applies(canonical: str, service_key: str) -> bool:
+    if canonical == "processed_bytes_gib" and service_key not in {
+        "elb",
+        "elbv2",
+        "alb",
+        "elastic_load_balancing",
+    }:
+        return False
     if canonical == "system_disk_gib" and service_key not in {
             "ec2",
             "amazon_ec2",
@@ -197,7 +264,10 @@ def _alias_applies(canonical: str, service_key: str) -> bool:
 def canonical_requirement_field_name(field: str, *, service: str | None = None) -> str:
     """Return the pricing-contract name for one model-facing field."""
 
-    service_key = (service or "").casefold()
+    service_key = _normalized_service_key(service)
+    routed = SERVICE_REQUIREMENT_FIELD_ALIASES.get(service_key, {}).get(field)
+    if routed is not None:
+        return routed
     for canonical, aliases in REQUIREMENT_FIELD_ALIASES.items():
         if _alias_applies(canonical, service_key) and field in aliases:
             return canonical
@@ -215,7 +285,13 @@ def canonicalize_requirement_fields(
     """
 
     normalized = dict(requirements)
-    service_key = (service or "").casefold()
+    service_key = _normalized_service_key(service)
+    for alias, canonical in SERVICE_REQUIREMENT_FIELD_ALIASES.get(
+        service_key, {}
+    ).items():
+        if canonical not in normalized and alias in normalized:
+            normalized[canonical] = normalized[alias]
+        normalized.pop(alias, None)
     for canonical, aliases in REQUIREMENT_FIELD_ALIASES.items():
         if not _alias_applies(canonical, service_key):
             continue
@@ -278,11 +354,12 @@ _NUMERIC_REQUIREMENT_FIELDS = {
     "storage_gib_per_broker", "source_storage_gib_per_node",
     "storage_iops", "storage_throughput_mbps",
     "ebs_iops", "ebs_throughput_mbps", "hours_per_month", "broker_hours",
-    "instance_hours", "task_hours", "control_plane_hours", "shard_hours",
+    "instance_hours", "task_hours", "processing_hours", "control_plane_hours", "shard_hours",
     "data_transfer_in_gib", "data_transfer_regional_gib",
     "data_transfer_out_gib", "data_transfer_gib", "data_processed_gib",
     "processed_bytes_gib", "processed_bytes_ec2_ip_gib_per_hour",
     "requests", "request_count", "https_requests", "dns_queries",
+    "read_request_units", "write_request_units",
     "api_calls", "io_requests", "put_payload_units", "data_in_gib",
     "data_out_gib", "data_scanned_gib", "duration_ms", "input_tokens",
     "output_tokens", "images", "custom_metrics", "alarms",
@@ -314,6 +391,7 @@ _INTEGER_REQUIREMENT_FIELDS = {
     "private_subnets", "availability_zones", "gateway_count", "accelerators",
     "schedules", "scheduled_invocations", "read_replica_count",
     "backup_retention_days", "snapshot_retention_days", "retention_days",
+    "log_retention_days",
     "outbound_messages", "inbound_messages", "image_scans", "queue_count",
     "event_buses", "namespaces", "service_instances", "nodes",
     "master_nodes", "core_nodes", "task_nodes", "provisioned_throughput_units",
@@ -566,6 +644,10 @@ def _canonicalize_values(requirements: dict[str, Any], service: str) -> dict[str
                 cleaned_volumes.append(volume)
                 continue
             cleaned = dict(volume)
+            cleaned.setdefault(
+                "volume_type",
+                normalized.get("volume_type") or "gp3",
+            )
             token = _token(cleaned.get("volume_type"))
             compact = (token or "").replace("_", "")
             for volume_type in ("gp3", "gp2", "io2", "io1", "st1", "sc1"):

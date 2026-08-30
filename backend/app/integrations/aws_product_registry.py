@@ -557,7 +557,11 @@ class AwsProductRegistry:
         targets = {target for label in labels for target in _identity_targets(label)}
         if not targets:
             return None
+        query_word_sets = [
+            words for label in labels if (words := _identity_words(label))
+        ]
         provider_matches: list[dict[str, Any]] = []
+        provider_word_matches: list[dict[str, Any]] = []
         learned_matches: list[dict[str, Any]] = []
         for product in self.list_products():
             if str(product.get("identity_status") or "") != "official":
@@ -572,6 +576,26 @@ class AwsProductRegistry:
             if provider_identities & targets:
                 provider_matches.append(product)
                 continue
+            # Salespeople commonly append a Chinese role qualifier to an exact
+            # AWS name (``Neptune 图数据库`` or ``Timestream 时序数据库``).
+            # Unicode canonical equality no longer holds, but the provider's
+            # complete meaningful ASCII word set still does.  Treat this as an
+            # exact provider-name match only when the sets are identical and
+            # only one official product qualifies.  This is not substring or
+            # fuzzy product guessing; extra English product words keep the
+            # component on the closed-candidate AI path.
+            provider_word_sets = [
+                words
+                for identity in provider_identities
+                if (words := _identity_words(identity))
+            ]
+            if any(
+                query_words == provider_words
+                for query_words in query_word_sets
+                for provider_words in provider_word_sets
+            ):
+                provider_word_matches.append(product)
+                continue
             learned_identities = {
                 _canonical(str(alias))
                 for alias in product["aliases"]
@@ -582,6 +606,13 @@ class AwsProductRegistry:
         if len(provider_matches) == 1:
             return {**provider_matches[0], "identity_match_source": "provider"}
         if provider_matches:
+            return None
+        if len(provider_word_matches) == 1:
+            return {
+                **provider_word_matches[0],
+                "identity_match_source": "provider_word_identity",
+            }
+        if provider_word_matches:
             return None
         if len(learned_matches) == 1:
             return {**learned_matches[0], "identity_match_source": "learned_alias"}

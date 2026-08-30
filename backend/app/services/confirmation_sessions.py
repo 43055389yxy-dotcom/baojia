@@ -32,6 +32,7 @@ CONFIGURATION_FEEDBACK_QUESTION = "【客户对最终配置表的修改意见】
 CONFIGURATION_COMPONENT_FEEDBACK_PREFIX = "【组件修改】"
 CONFIGURATION_COMPONENT_UPDATE_PREFIX = "【组件字段修改】"
 CONFIGURATION_COMPONENT_DELETE = "__DELETE_COMPONENT__"
+PROCESSOR_ARCHITECTURE_ANSWER_KEY = "__processor_architecture__"
 # A large, fully independent component set can legitimately need 2-5 minutes.
 # The job runner restores the table immediately on a known failure, so this is
 # only a crash-recovery ceiling and must never interrupt a healthy quote.
@@ -224,10 +225,19 @@ class ConfirmationSessionStore:
         quote_request: QuoteRequest | None = None,
     ) -> str:
         ensure_component_keys(intent)
+        if self.cloud_provider == "aws":
+            # Persist the same finalized fact ledger that restore/submit will
+            # later consume.  Saving a pre-ledger object and upgrading only on
+            # read made an otherwise lossless round trip change meaning and
+            # reopened prose interpretation after a customer link was created.
+            from app.integrations.deepseek import DeepSeekIntentParser
+
+            preserve_customer_configuration(intent)
+            DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
         now = datetime.now(UTC).isoformat()
         with self._lock, self._connect() as connection:
             existing = connection.execute(
-                "SELECT token, asked_questions_json FROM confirmation_sessions "
+                "SELECT token, asked_questions_json, answers_json FROM confirmation_sessions "
                 "WHERE draft_id = ?",
                 (draft_id,),
             ).fetchone()
@@ -249,6 +259,20 @@ class ConfirmationSessionStore:
                     ]
                 )
             )
+            preserved_answers: dict[str, str] = {}
+            if existing and existing["answers_json"]:
+                try:
+                    previous_answers = json.loads(str(existing["answers_json"]))
+                except json.JSONDecodeError:
+                    previous_answers = {}
+                architecture = (
+                    previous_answers.get(PROCESSOR_ARCHITECTURE_ANSWER_KEY)
+                    if isinstance(previous_answers, dict)
+                    else None
+                )
+                if architecture in {"arm64", "x86_64"}:
+                    preserved_answers[PROCESSOR_ARCHITECTURE_ANSWER_KEY] = architecture
+            preserved_answers_json = json.dumps(preserved_answers, ensure_ascii=False)
             connection.execute(
                 """
                 INSERT INTO confirmation_sessions (
@@ -256,7 +280,7 @@ class ConfirmationSessionStore:
                     confirmation_text, items_json, answers_json, status, created_at,
                     submitted_at, asked_questions_json
                     , request_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 'pending', ?, NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?, ?)
                 ON CONFLICT(draft_id) DO UPDATE SET
                     customer_request=excluded.customer_request,
                     customer_summary=excluded.customer_summary,
@@ -270,7 +294,7 @@ class ConfirmationSessionStore:
                     answers_json=CASE
                         WHEN excluded.items_json = '[]'
                         THEN confirmation_sessions.answers_json
-                        ELSE '{}'
+                        ELSE excluded.answers_json
                     END,
                     status='pending', submitted_at=NULL,
                     asked_questions_json=excluded.asked_questions_json,
@@ -290,6 +314,7 @@ class ConfirmationSessionStore:
                         [item.model_dump(mode="json") for item in items],
                         ensure_ascii=False,
                     ),
+                    preserved_answers_json,
                     now,
                     json.dumps(asked_questions, ensure_ascii=False),
                     quote_request.model_dump_json() if quote_request is not None else "{}",
@@ -532,7 +557,96 @@ class ConfirmationSessionStore:
                 ),
             )
 
-    def submit(self, token: str, answers: dict[str, str]) -> ConfirmationSessionResponse | None:
+    @staticmethod
+    def _option_processor_architecture(option: dict[str, object]) -> str | None:
+        specifications = option.get("specifications")
+        specs = specifications if isinstance(specifications, dict) else {}
+        declared = specs.get("processorArchitecture") or specs.get(
+            "processor_architecture"
+        )
+        if isinstance(declared, str):
+            normalized = declared.strip().casefold()
+            if normalized in {"arm", "arm64", "aarch64", "graviton"}:
+                return "arm64"
+            if normalized in {"x86", "x86_64", "amd64", "i386"}:
+                return "x86_64"
+        model = str(option.get("model") or "").strip().casefold()
+        if not model or "." not in model:
+            return None
+        segments = [segment for segment in model.split(".") if segment]
+        if any(
+            segment == "a1"
+            or segment == "mac2"
+            or segment.startswith("mac2-")
+            or re.search(r"\d+g(?:[a-z]*)$", segment)
+            for segment in segments
+        ):
+            return "arm64"
+        return "x86_64"
+
+    @classmethod
+    def _validate_processor_architecture(
+        cls,
+        items: list[dict[str, object]],
+        answers: dict[str, str],
+        architecture: str,
+    ) -> None:
+        """Reject a mixed model answer before it can mutate the saved draft."""
+
+        for item in items:
+            question = str(item.get("question") or "")
+            answer_key = str(item.get("answer_key") or question)
+            answer = answers.get(answer_key)
+            if answer is None:
+                answer = answers.get(question)
+            if not answer:
+                continue
+            options = [
+                option
+                for option in [
+                    *(item.get("options") or []),
+                    *(item.get("dependent_options") or []),
+                ]
+                if isinstance(option, dict) and option.get("model")
+            ]
+            supported = {
+                candidate_architecture
+                for option in options
+                if (
+                    candidate_architecture := cls._option_processor_architecture(option)
+                )
+            }
+            selected_segments = {part.strip() for part in str(answer).split("；")}
+            selected = next(
+                (
+                    option
+                    for option in options
+                    if str(option.get("value") or "").strip() in selected_segments
+                ),
+                None,
+            )
+            if selected is None:
+                continue
+            selected_architecture = cls._option_processor_architecture(selected)
+            # ARM may legitimately fall back for a product whose official
+            # catalogue is x86-only.  Whenever the requested family exists,
+            # mixing another family is never accepted silently.
+            if (
+                selected_architecture
+                and selected_architecture != architecture
+                and architecture in supported
+            ):
+                raise ValueError(
+                    "所选型号与整份报价的处理器架构不一致，请重新选择同一架构的型号"
+                )
+
+    def submit(
+        self,
+        token: str,
+        answers: dict[str, str],
+        *,
+        processor_architecture: str | None = None,
+    ) -> ConfirmationSessionResponse | None:
         row = self._row(token)
         if row is None:
             return None
@@ -564,6 +678,13 @@ class ConfirmationSessionStore:
             cleaned[answer_key] = answer
         if missing:
             raise ValueError(f"尚有 {missing} 项未填写")
+        if processor_architecture in {"arm64", "x86_64"}:
+            self._validate_processor_architecture(
+                items,
+                cleaned,
+                processor_architecture,
+            )
+            cleaned[PROCESSOR_ARCHITECTURE_ANSWER_KEY] = processor_architecture
         submitted_at = datetime.now(UTC).isoformat()
         with self._lock, self._connect() as connection:
             connection.execute(

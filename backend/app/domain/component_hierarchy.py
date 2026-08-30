@@ -71,7 +71,8 @@ def component_hierarchy(
             continue
         relation_only = bool(source and _RELATION_ONLY.match(source))
         likely_worker = any(
-            marker in display for marker in ("worker", "工作节点", "自建")
+            marker in f"{display} {source.casefold()}"
+            for marker in ("worker", "工作节点", "自建")
         )
         if not relation_only and not likely_worker:
             continue
@@ -91,12 +92,12 @@ def component_hierarchy(
         previous_index = index - 1
         previous_is_parent = previous_index >= 0 and services[
             previous_index
-        ].service.casefold() in {"eks", "vpc"}
+        ].service.casefold() in {"eks", "ecs", "vpc"}
         nearby_parent = next(
             (
                 candidate_index
                 for candidate_index in range(index - 1, max(-1, index - 4), -1)
-                if services[candidate_index].service.casefold() in {"eks", "vpc"}
+                if services[candidate_index].service.casefold() in {"eks", "ecs", "vpc"}
             ),
             None,
         )

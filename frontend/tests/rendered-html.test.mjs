@@ -59,33 +59,75 @@ test("client uses the live quote job API and keeps official-source copy", async 
   assert.doesNotMatch(page, /\/api\/azure\/quotes\/region-preflight/);
   assert.match(page, /sales_region: currentSalesRegion/);
   assert.match(page, /line\.key === "rdsstg" \|\| line\.group === "rds-storage"/);
+  assert.match(page, /\["elb", "alb", "nlb", "gwlb"\]\.includes\(selection\.service\)/);
+  assert.match(page, /load\\s\*balancer\|负载均衡/);
   assert.match(page, /展开记录/);
   assert.doesNotMatch(page, /AI 浏览器正在工作/);
   assert.doesNotMatch(page, /报价记录|插件中心|查看 AWS 技术计费字段/);
   assert.match(layout, /AWS 智能报价/);
+  assert.match(layout, /DevDiagnostics/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
 });
 
-test("configuration selection follows processor then memory without search", async () => {
+test("local diagnostics are global, copyable, detailed and credential-safe", async () => {
+  const diagnostics = await readFile(
+    new URL("../app/components/dev-diagnostics.tsx", import.meta.url),
+    "utf8",
+  );
+  assert.match(diagnostics, /调试日志/);
+  assert.match(diagnostics, /一键复制异常/);
+  assert.match(diagnostics, /exceptions_only/);
+  assert.match(diagnostics, /normal_entries_omitted/);
+  assert.match(diagnostics, /复制全部日志/);
+  assert.match(diagnostics, /下载 JSON/);
+  assert.match(diagnostics, /browser_unhandled_rejection/);
+  assert.match(diagnostics, /browser_fetch_exception/);
+  assert.match(diagnostics, /\/api\/debug\/logs\?limit=1000/);
+  assert.match(diagnostics, /REDACTED_AWS_ACCESS_KEY/);
+  assert.match(diagnostics, /REDACTED_CONFIRMATION_TOKEN/);
+});
+
+test("configuration selection shows ten nearby official models directly", async () => {
   const picker = await readFile(
     new URL("../app/components/configuration-option-picker.tsx", import.meta.url),
     "utf8",
   );
-  const memoryHandler = picker.slice(
-    picker.indexOf("const handleMemoryChange"),
-    picker.indexOf("if (!catalog)"),
-  );
-
-  assert.match(picker, /处理器/);
-  assert.match(picker, /内存/);
-  assert.match(picker, /请先选择处理器/);
-  assert.match(picker, /disabled={!vcpu \|\| memoryValues\.length === 0}/);
-  assert.doesNotMatch(picker, /vcpu && memoryValues\.length > 0 && <label>/);
-  assert.match(memoryHandler, /monthly_catalog_cost/);
-  assert.match(memoryHandler, /emitSelection\(cheapest\?\.option\.value \?\? ""\)/);
+  assert.match(picker, /lowerRanked\.slice\(0, 5\)/);
+  assert.match(picker, /upperRanked\.slice\(0, 5\)/);
+  assert.match(picker, /selectedValues\.size >= 10/);
+  assert.match(picker, /modelConfigurationLabel\(option\)/);
+  assert.match(picker, /`\$\{vcpu\} vCPU`/);
+  assert.match(picker, /`\$\{memory\} GiB`/);
+  assert.match(picker, /left\.vcpu \?\? Number\.POSITIVE_INFINITY/);
+  assert.doesNotMatch(picker, /等于或高于客户填写规格/);
+  assert.doesNotMatch(picker, /低于客户填写规格（由客户决定）/);
+  assert.doesNotMatch(picker, /型号、CPU和内存均来自同一条AWS官方记录/);
+  assert.doesNotMatch(picker, /选择处理器|选择内存|请先选择处理器/);
   assert.doesNotMatch(picker, /搜索型号或配置|搜索可用项/);
   assert.doesNotMatch(picker, /configuration-picker-hint/);
-  assert.doesNotMatch(memoryHandler, /setVcpu/);
+});
+
+test("processor architecture is one quote-wide filter with ARM as the default", async () => {
+  const picker = await readFile(
+    new URL("../app/components/configuration-option-picker.tsx", import.meta.url),
+    "utf8",
+  );
+  const confirmationPage = await readFile(
+    new URL("../app/confirm/[token]/page.tsx", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(confirmationPage, /useState<ProcessorArchitecture>\("arm64"\)/);
+  assert.match(confirmationPage, /下面所有组件只显示x86型号/);
+  assert.match(confirmationPage, /processorArchitecture === "x86_64"/);
+  assert.match(confirmationPage, /processor_architecture: processorArchitecture/);
+  assert.match(confirmationPage, /PROCESSOR_ARCHITECTURE_ANSWER_KEY/);
+  assert.match(confirmationPage, /session\.confirmation_items\.filter\(itemHasModelChoices\)/);
+  assert.match(picker, /architecturePreference === "arm64"/);
+  assert.match(picker, /architectureMatches\.length === 0/);
+  assert.match(picker, /richOptions\.filter\(\(item\) => item\.architecture === architecturePreference\)/);
+  assert.match(picker, /const architectureCatalog = architectureFallback/);
+  assert.match(picker, /ranked\.slice\(0, 10\)/);
 });
 
 test("final customer review keeps the instruction concise", async () => {
@@ -116,6 +158,8 @@ test("final customer review keeps the instruction concise", async () => {
   assert.match(confirmationPage, /updateTransientNumericField/);
   assert.match(confirmationPage, /rawValue !== ""/);
   assert.match(confirmationPage, /hierarchyOrderedConfigurationItems/);
+  assert.match(confirmationPage, /\["elb", "alb", "nlb", "gwlb"\]\.includes\(item\.service\)/);
+  assert.match(confirmationPage, /"Network Load Balancer": "网络型负载均衡器"/);
   assert.match(confirmationPage, /customer-transient-toast/);
   assert.match(confirmationPage, /最终确认并开始报价/);
   assert.doesNotMatch(confirmationPage, /系统已更新该服务的官方报价映射/);
@@ -131,6 +175,9 @@ test("final customer review keeps the instruction concise", async () => {
   assert.doesNotMatch(salesPage, /组件处理日志/);
   assert.match(salesPage, /componentRetryStatus/);
   assert.match(salesPage, /本轮尚未通过/);
+  assert.match(salesPage, /internalValidationBlocked/);
+  assert.match(salesPage, /组件校验未通过/);
+  assert.match(salesPage, /本轮校验已停止，未生成客户链接/);
   assert.match(salesPage, /获取客户确认链接/);
   assert.match(salesPage, /openedCustomerLinkVersion/);
   assert.doesNotMatch(salesPage, /系统正在独立处理该组件/);
@@ -158,6 +205,24 @@ test("internal validation retries failed components automatically without exposi
   assert.match(salesPage, /系统正在自动完成组件核验/);
   assert.match(salesPage, /retry_component_ids/);
   assert.match(salesPage, /failedComponentIds/);
+  assert.match(salesPage, /previewSelectionNextAction/);
+  assert.match(salesPage, /retry_component/);
+  assert.match(salesPage, /internal_block/);
+  assert.match(salesPage, /previewHasUnfinishedComponents/);
+  assert.match(salesPage, /salesReview && !internalValidationPending/);
+  assert.match(salesPage, /正在完成全部组件校验/);
+  assert.match(salesPage, /salesReview\?\.confirmation_token && !internalValidationPending/);
   assert.doesNotMatch(salesPage, /重新执行内部核验/);
   assert.doesNotMatch(salesPage, /确认配置可用并生成客户链接/);
+});
+
+test("failed component details preserve names from old and new backend payloads", async () => {
+  const salesPage = await readFile(
+    new URL("../app/page.tsx", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(salesPage, /typeof rawComponent === "string"/);
+  assert.match(salesPage, /\? \{ display_name: rawComponent \}/);
+  assert.match(salesPage, /component\.source_text/);
 });

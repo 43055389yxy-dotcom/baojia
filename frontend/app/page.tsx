@@ -11,7 +11,7 @@ type ActivityChannel = {
   name: string;
   message: string;
   history: string[];
-  state: "running" | "repair" | "done";
+  state: "running" | "repair" | "blocked" | "done";
   order: number;
   updatedAt: string;
 };
@@ -58,6 +58,13 @@ function activityLogStream(channel: ActivityChannel): string[] {
     "检查零价格与缺失维度",
     "写入组件级报价结果",
   ] : [];
+  if (channel.state === "blocked") {
+    return [
+      `${channel.name} 独立核验任务`,
+      ...channel.history.slice(-5),
+      "本轮校验已停止，未生成客户链接",
+    ];
+  }
   if (channel.state === "done") {
     return [
       `${channel.name} 独立核验任务`,
@@ -94,6 +101,20 @@ type Preview = {
   execution_trace?: { stage: string; message: string; status?: string }[];
   expert_review?: ExpertReview | null;
 };
+
+function previewHasUnfinishedComponents(preview: Preview | null): boolean {
+  if (!preview) return false;
+  return Boolean(
+    preview.sales_validation_required
+    || (preview.selections ?? []).some(
+      (selection) => {
+        const action = previewSelectionNextAction(selection);
+        return action === "retry_component" || action === "internal_block";
+      },
+    )
+  );
+}
+
 type ExpertReview = {
   run_id: string;
   provider: string;
@@ -133,7 +154,25 @@ type PreviewSelection = {
   issue_message?: string | null;
   issue_code?: string | null;
   issue_category?: "retryable" | "compatibility" | "catalog_mapping" | "system_configuration" | "unsupported" | null;
+  next_action?: PreviewNextAction;
 };
+type PreviewNextAction = "none" | "retry_component" | "request_customer" | "internal_block";
+
+function previewSelectionNextAction(selection: PreviewSelection): PreviewNextAction {
+  // ``next_action`` is authoritative for new responses.  The fallback keeps
+  // old confirmation sessions readable while they age out of local storage.
+  if (selection.next_action) return selection.next_action;
+  if (selection.requires_confirmation || selection.status === "customer_issue") {
+    return "request_customer";
+  }
+  if (selection.status === "technical_issue" && selection.issue_category === "retryable") {
+    return "retry_component";
+  }
+  if (selection.status === "technical_issue" || selection.status === "unsupported") {
+    return "internal_block";
+  }
+  return "none";
+}
 type ConfirmationItem = {
   question: string;
   answer_key?: string | null;
@@ -274,6 +313,21 @@ const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "/api/backend";
 const CONFIRMATION_CONTEXT_KEY = "astraquote.aws.pending-confirmation.v1";
 const QUOTE_JOB_CONTEXT_KEY = "astraquote.aws.pending-quote.v1";
 const SALES_REGION_CONTEXT_KEY = "astraquote.aws.current-sales-region.v2";
+const QUOTE_SESSION_STORAGE_PREFIXES = [
+  "astraquote.aws.pending-",
+  "astraquote.aws.current-sales-region",
+  "astraquote:aws:addition:",
+  "astraquote:aws:region-confirmation:",
+];
+
+function clearQuoteSessionStorage() {
+  for (let index = window.sessionStorage.length - 1; index >= 0; index -= 1) {
+    const key = window.sessionStorage.key(index);
+    if (key && QUOTE_SESSION_STORAGE_PREFIXES.some((prefix) => key.startsWith(prefix))) {
+      window.sessionStorage.removeItem(key);
+    }
+  }
+}
 
 function readSalesRegionContext(_provider: CloudProvider): string | null {
   void _provider;
@@ -307,6 +361,8 @@ const serviceNames: Record<string, string> = {
   elasticache: "ElastiCache",
   elb: "应用负载均衡",
   alb: "应用负载均衡",
+  nlb: "网络负载均衡",
+  gwlb: "网关负载均衡",
   s3: "S3 对象存储",
   cloudfront: "CloudFront CDN",
   route53: "Route 53 DNS",
@@ -331,6 +387,10 @@ const serviceNames: Record<string, string> = {
 
 function serviceDisplayName(selection: { service: string; display_name: string }): string {
   if (/\baurora\b/i.test(selection.display_name)) return selection.display_name;
+  if (
+    ["elb", "alb", "nlb", "gwlb"].includes(selection.service)
+    && /load\s*balancer|负载均衡/i.test(selection.display_name)
+  ) return selection.display_name;
   if (
     selection.service === "ec2"
     && /(?:自建|用于|工作节点|worker\s*nodes?)/i.test(selection.display_name)
@@ -419,6 +479,8 @@ function previewRequirementTags(selection: PreviewSelection): { label: string; v
   const ignored = new Set([
     "requested_model", "usage_lines", "reference_only", "reference_unit_only",
     "reference_lcu_unit_only", "system_default_assumption",
+    "purchase_option", "reserved_term_years", "payment_option",
+    "utilization_percent",
   ]);
   const selectedSpecifications = selection.candidates.find(
     (candidate) => candidate.model === selection.selected_model,
@@ -482,6 +544,18 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 9000
     return await fetch(url, { ...init, signal: controller.signal });
   } finally {
     window.clearTimeout(timeout);
+  }
+}
+
+async function cancelQuoteJob(jobId: string) {
+  if (!/^aws-[a-z0-9]+$/i.test(jobId)) return;
+  try {
+    await fetchWithTimeout(`${API_BASE}/api/quote-jobs/${jobId}/cancel`, {
+      method: "POST",
+      cache: "no-store",
+    }, 5000);
+  } catch {
+    // The generation guard still prevents a late response from touching the UI.
   }
 }
 
@@ -738,11 +812,12 @@ export default function Home() {
   const [salesRegionOptions, setSalesRegionOptions] = useState<SalesRegionOption[]>([]);
   const [salesRegionPromptOpen, setSalesRegionPromptOpen] = useState(false);
   const [salesRegionChecking, setSalesRegionChecking] = useState(false);
+  const [quoteResetting, setQuoteResetting] = useState(false);
   const [componentRetryStatus, setComponentRetryStatus] = useState<ComponentRetryStatus | null>(null);
   const [receivedCustomerAnswers, setReceivedCustomerAnswers] = useState<Record<string, string>>({});
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const confirmationTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const confirmationPollInFlight = useRef(false);
+  const confirmationPollGeneration = useRef<number | null>(null);
   const confirmationRecoveryStarted = useRef(false);
   const quoteRecoveryStarted = useRef(false);
   const lateConfirmationTokenStarted = useRef<string | null>(null);
@@ -753,6 +828,10 @@ export default function Home() {
   const componentRetryAttempts = useRef<Map<string, number>>(new Map());
   const componentRetryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const openedCustomerLinkVersion = useRef<string | null>(null);
+  // Every asynchronous response belongs to the generation that created it.
+  // "重新报价" advances the generation, so a late response from an older
+  // preview, confirmation poll or pricing job can no longer restore stale data.
+  const quoteRunGeneration = useRef(0);
   // Async preview, customer-confirmation polling and official pricing can all
   // finish out of order. Keep the workflow monotonic so an older response can
   // never replace a newer official-pricing screen.
@@ -801,6 +880,7 @@ export default function Home() {
     if (confirmationRecoveryStarted.current) return;
     confirmationRecoveryStarted.current = true;
     try {
+      const recoveryGeneration = quoteRunGeneration.current;
       const saved = window.sessionStorage.getItem(CONFIRMATION_CONTEXT_KEY);
       if (!saved) return;
       const context = JSON.parse(saved) as PendingConfirmationContext;
@@ -826,6 +906,7 @@ export default function Home() {
           context.draftId,
           context.customerRequest,
           context.cloudProvider,
+          recoveryGeneration,
         ),
         250,
       );
@@ -840,6 +921,7 @@ export default function Home() {
     if (quoteRecoveryStarted.current) return;
     quoteRecoveryStarted.current = true;
     try {
+      const recoveryGeneration = quoteRunGeneration.current;
       if (window.sessionStorage.getItem(CONFIRMATION_CONTEXT_KEY)) return;
       const saved = window.sessionStorage.getItem(QUOTE_JOB_CONTEXT_KEY);
       if (!saved) return;
@@ -864,7 +946,7 @@ export default function Home() {
       });
       void poll(context.jobId, [
         { stage: "recovery", message: "正在恢复报价进度", time: "刚刚" },
-      ]);
+      ], recoveryGeneration);
     } catch {
       window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY);
     }
@@ -874,6 +956,7 @@ export default function Home() {
 
   useEffect(() => {
     if (!confirmationToken || !previewDraftId) return;
+    const pollingGeneration = quoteRunGeneration.current;
     const checkConfirmation = () => {
       if (document.visibilityState === "hidden" || workflowPhase.current === "quote") return;
       void pollConfirmation(
@@ -881,6 +964,7 @@ export default function Home() {
         previewDraftId,
         requirement,
         cloudProvider,
+        pollingGeneration,
       );
     };
     const handleVisibility = () => {
@@ -902,6 +986,7 @@ export default function Home() {
 
   const running = job?.status === "queued" || job?.status === "running";
   const retryActivityVisible = Boolean(componentRetryStatus);
+  const internalValidationPending = previewHasUnfinishedComponents(salesReview);
   const latest = useMemo(() => job?.events.at(-1), [job]);
   const liveComponentActivity = useMemo(() => {
     const channels = new Map<string, ActivityChannel>();
@@ -937,6 +1022,7 @@ export default function Home() {
       });
     }
     const statePriority: Record<ActivityChannel["state"], number> = {
+      blocked: 0,
       repair: 0,
       running: 1,
       done: 2,
@@ -952,7 +1038,22 @@ export default function Home() {
     };
   }, [job?.events]);
   const channelNodes = useRef(new Map<string, HTMLDivElement>());
-  const retryingChannelIds = new Set(
+  const systemIssueSelections = (salesReview?.selections ?? []).filter(
+    (selection) => {
+      const action = previewSelectionNextAction(selection);
+      return action === "retry_component" || action === "internal_block";
+    },
+  );
+  const internalValidationBlocked = Boolean(
+    internalValidationPending
+    && !running
+    && !componentRetryStatus
+    && systemIssueSelections.length,
+  );
+  const internalValidationBlockMessage = systemIssueSelections[0]
+    ? `${serviceDisplayName(systemIssueSelections[0])}：${systemIssueSelections[0].issue_message ?? "内部计费字段校验没有通过"}`
+    : "内部计费字段校验没有通过";
+  const processingChannelIds = new Set(
     (salesReview?.selections ?? []).flatMap((selection, index) => {
       const componentId = Number(selection.component_id);
       return componentRetryStatus?.componentIds.includes(componentId)
@@ -960,9 +1061,21 @@ export default function Home() {
         : [];
     }),
   );
+  const blockedChannelIds = new Set(
+    internalValidationBlocked
+      ? (salesReview?.selections ?? []).flatMap((selection, index) => (
+        selection.status === "technical_issue" || selection.status === "unsupported"
+          ? [String(index + 1)]
+          : []
+      ))
+      : [],
+  );
   const visibleCompletedComponents = Math.max(
     0,
-    liveComponentActivity.completed - retryingChannelIds.size,
+    liveComponentActivity.completed - new Set([
+      ...processingChannelIds,
+      ...blockedChannelIds,
+    ]).size,
   );
   const previousChannelPositions = useRef(new Map<string, DOMRect>());
   const channelLayoutSignature = liveComponentActivity.channels
@@ -1054,9 +1167,16 @@ export default function Home() {
         latePricingConfirmation: true,
       } satisfies PendingConfirmationContext),
     );
+    const pollingGeneration = quoteRunGeneration.current;
     if (confirmationTimer.current) clearTimeout(confirmationTimer.current);
     confirmationTimer.current = setTimeout(
-      () => pollConfirmation(token, draftId, requirement, cloudProvider),
+      () => pollConfirmation(
+        token,
+        draftId,
+        requirement,
+        cloudProvider,
+        pollingGeneration,
+      ),
       250,
     );
   // A late confirmation starts once per token; including pollConfirmation would restart this effect every render.
@@ -1110,6 +1230,8 @@ export default function Home() {
       false,
       cloudProvider,
       salesRegion ?? readSalesRegionContext(cloudProvider) ?? undefined,
+      [],
+      quoteRunGeneration.current,
     );
   // The recovery is deliberately limited to one attempt per entered request.
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1159,7 +1281,7 @@ export default function Home() {
       return;
     }
     const failedComponentIds = (salesReview.selections ?? [])
-      .filter((selection) => selection.issue_category === "retryable")
+      .filter((selection) => previewSelectionNextAction(selection) === "retry_component")
       .map((selection) => Number(selection.component_id))
       .filter((componentId) => Number.isInteger(componentId) && componentId >= 0);
     if (!failedComponentIds.length) {
@@ -1174,6 +1296,7 @@ export default function Home() {
     }
     const delays = [1500, 4000, 10000, 30000, 60000, 120000];
     const delay = delays[Math.min(attempt, delays.length - 1)];
+    const retryGeneration = quoteRunGeneration.current;
     setComponentRetryStatus({
       componentIds: failedComponentIds,
       attempt: attempt + 1,
@@ -1202,6 +1325,7 @@ export default function Home() {
         cloudProvider,
         undefined,
         failedComponentIds,
+        retryGeneration,
       );
     }, delay);
     return () => {
@@ -1218,8 +1342,12 @@ export default function Home() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }, [activeStep]);
 
-  async function poll(jobId: string, prefixEvents: JobEvent[] = []) {
-    if (workflowPhase.current !== "quote") return;
+  async function poll(
+    jobId: string,
+    prefixEvents: JobEvent[] = [],
+    runGeneration = quoteRunGeneration.current,
+  ) {
+    if (runGeneration !== quoteRunGeneration.current || workflowPhase.current !== "quote") return;
     try {
       const response = await fetchWithTimeout(`${API_BASE}/api/quote-jobs/${jobId}`, {
         cache: "no-store",
@@ -1237,14 +1365,14 @@ export default function Home() {
         );
       }
       const next = payload as Job;
-      if (workflowPhase.current !== "quote") return;
+      if (runGeneration !== quoteRunGeneration.current || workflowPhase.current !== "quote") return;
       const merged = { ...next, kind: "quote" as const, events: [...prefixEvents, ...next.events] };
       setJob(merged);
       if (next.status === "queued" || next.status === "running") {
-        timer.current = setTimeout(() => poll(jobId, prefixEvents), 1200);
+        timer.current = setTimeout(() => poll(jobId, prefixEvents, runGeneration), 1200);
       }
     } catch (error) {
-      if (workflowPhase.current !== "quote") return;
+      if (runGeneration !== quoteRunGeneration.current || workflowPhase.current !== "quote") return;
       setJob((current) => ({
         job_id: current?.job_id ?? jobId,
         kind: "quote",
@@ -1263,7 +1391,9 @@ export default function Home() {
     draftId?: string,
     prefixEvents: JobEvent[] = [],
     provider: CloudProvider = cloudProvider,
+    runGeneration = quoteRunGeneration.current,
   ) {
+    if (runGeneration !== quoteRunGeneration.current) return;
     const currentSalesRegion = salesRegion ?? readSalesRegionContext(provider);
     workflowPhase.current = "quote";
     if (timer.current) clearTimeout(timer.current);
@@ -1297,6 +1427,10 @@ export default function Home() {
         }),
       });
       const payload = await response.json();
+      if (runGeneration !== quoteRunGeneration.current) {
+        await cancelQuoteJob(String(payload.job_id ?? ""));
+        return;
+      }
       if (!response.ok) throw new Error(payload.message ?? "任务提交失败");
       if (!String(payload.job_id ?? "").startsWith(`${provider}-`)) {
         throw new Error("报价任务的云厂商标识不一致，系统已阻止继续处理。");
@@ -1311,8 +1445,9 @@ export default function Home() {
           salesRegion: currentSalesRegion,
         }),
       );
-      await poll(payload.job_id, prefixEvents);
+      await poll(payload.job_id, prefixEvents, runGeneration);
     } catch (error) {
+      if (runGeneration !== quoteRunGeneration.current) return;
       setJob({
         job_id: "failed",
         kind: "quote",
@@ -1331,9 +1466,14 @@ export default function Home() {
     draftId: string,
     customerRequest: string,
     provider: CloudProvider,
+    runGeneration = quoteRunGeneration.current,
   ) {
-    if (workflowPhase.current === "quote" || confirmationPollInFlight.current) return;
-    confirmationPollInFlight.current = true;
+    if (
+      runGeneration !== quoteRunGeneration.current
+      || workflowPhase.current === "quote"
+      || confirmationPollGeneration.current === runGeneration
+    ) return;
+    confirmationPollGeneration.current = runGeneration;
     try {
       const response = await fetch(`${API_BASE}/api/confirmation-sessions/${token}`, {
         cache: "no-store",
@@ -1344,6 +1484,7 @@ export default function Home() {
         cloud_provider?: CloudProvider;
         answers?: Record<string, string>;
       };
+      if (runGeneration !== quoteRunGeneration.current) return;
       if (session.cloud_provider !== provider) {
         setJob({
           job_id: "provider-boundary-violation",
@@ -1357,14 +1498,14 @@ export default function Home() {
         window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
         return;
       }
-      if (workflowPhase.current === "quote") return;
+      if (["quote"].includes(workflowPhase.current)) return;
       if (session.status === "approved") {
         setConfirmationToken(null);
         setSalesReview(null);
         window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
         await startQuote(customerRequest, draftId, [
           { stage: "customer", message: "客户已确认完整配置清单，开始官方报价", time: "刚刚" },
-        ], provider);
+        ], provider, runGeneration);
         return;
       }
       if ((session.status === "reviewing" || session.status === "submitted") && session.answers) {
@@ -1378,20 +1519,32 @@ export default function Home() {
           );
         }
         setConfirmationToken(null);
-        await runPreflight(customerRequest, draftId, session.answers, true, provider);
+        await runPreflight(
+          customerRequest,
+          draftId,
+          session.answers,
+          true,
+          provider,
+          undefined,
+          [],
+          runGeneration,
+        );
         return;
       }
       confirmationTimer.current = setTimeout(
-        () => pollConfirmation(token, draftId, customerRequest, provider),
+        () => pollConfirmation(token, draftId, customerRequest, provider, runGeneration),
         2500,
       );
     } catch {
+      if (runGeneration !== quoteRunGeneration.current) return;
       confirmationTimer.current = setTimeout(
-        () => pollConfirmation(token, draftId, customerRequest, provider),
+        () => pollConfirmation(token, draftId, customerRequest, provider, runGeneration),
         5000,
       );
     } finally {
-      confirmationPollInFlight.current = false;
+      if (confirmationPollGeneration.current === runGeneration) {
+        confirmationPollGeneration.current = null;
+      }
     }
   }
 
@@ -1402,8 +1555,9 @@ export default function Home() {
     stopForSalesReview: boolean,
     liveEvents: JobEvent[] = [],
     provider: CloudProvider = cloudProvider,
+    runGeneration = quoteRunGeneration.current,
   ) {
-    if (workflowPhase.current === "quote") return;
+    if (runGeneration !== quoteRunGeneration.current || workflowPhase.current === "quote") return;
     const expectedTokenPrefix = provider === "azure" ? "azure_" : "aws_";
     const expectedDraftPrefix = provider === "azure" ? "az" : "aw";
     if (
@@ -1432,6 +1586,21 @@ export default function Home() {
           time: "刚刚",
         }));
     setPreviewDraftId(preview.draft_id);
+    if (previewHasUnfinishedComponents(preview)) {
+      workflowPhase.current = "preview";
+      setConfirmationToken(null);
+      setCustomerLinkModalOpen(false);
+      setSalesReview(preview);
+      setJob({
+        job_id: "sales-validation-required",
+        kind: "preview",
+        status: "failed",
+        events: previewEvents,
+        error: null,
+      });
+      window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
+      return;
+    }
     if (preview.configuration_review_required && preview.confirmation_token) {
       workflowPhase.current = "confirmation";
       setConfirmationToken(preview.confirmation_token);
@@ -1458,6 +1627,7 @@ export default function Home() {
           preview.draft_id,
           requestText,
           provider,
+          runGeneration,
         ),
         1200,
       );
@@ -1525,6 +1695,7 @@ export default function Home() {
             preview.draft_id,
             requestText,
             provider,
+            runGeneration,
           ),
           1200,
         );
@@ -1541,7 +1712,7 @@ export default function Home() {
           message: "客户回复已合并并通过配置复核，开始官方报价",
           time: "刚刚",
         },
-      ], provider);
+      ], provider, runGeneration);
       return;
     }
     setSalesReview(preview);
@@ -1556,8 +1727,9 @@ export default function Home() {
     stopForSalesReview: boolean,
     provider: CloudProvider,
     retryComponentIds: number[] = [],
+    runGeneration = quoteRunGeneration.current,
   ) {
-    if (workflowPhase.current === "quote") return;
+    if (runGeneration !== quoteRunGeneration.current || workflowPhase.current === "quote") return;
     try {
       const response = await fetchWithTimeout(
         `${API_BASE}/api/quote-jobs/${jobId}`,
@@ -1565,7 +1737,7 @@ export default function Home() {
         10000,
       );
       const next = await response.json() as Job;
-      if (workflowPhase.current === "quote") return;
+      if (runGeneration !== quoteRunGeneration.current || ["quote"].includes(workflowPhase.current)) return;
       if (response.status === 404 && !previewRestartedJobs.current.has(jobId)) {
         previewRestartedJobs.current.add(jobId);
         previewPollFailures.current.delete(jobId);
@@ -1577,6 +1749,7 @@ export default function Home() {
           provider,
           undefined,
           retryComponentIds,
+          runGeneration,
         );
         return;
       }
@@ -1599,6 +1772,7 @@ export default function Home() {
             stopForSalesReview,
             provider,
             retryComponentIds,
+            runGeneration,
           ),
           700,
         );
@@ -1613,12 +1787,14 @@ export default function Home() {
           stopForSalesReview,
           next.events,
           provider,
+          runGeneration,
         );
       }
     } catch (error) {
+      if (runGeneration !== quoteRunGeneration.current) return;
       const failures = (previewPollFailures.current.get(jobId) ?? 0) + 1;
       previewPollFailures.current.set(jobId, failures);
-      if (failures <= 12 && workflowPhase.current !== "quote") {
+      if (failures <= 12 && !["quote"].includes(workflowPhase.current)) {
         setJob((current) => ({
           job_id: jobId,
           kind: "preview",
@@ -1635,6 +1811,7 @@ export default function Home() {
             stopForSalesReview,
             provider,
             retryComponentIds,
+            runGeneration,
           ),
           Math.min(5000, 1000 + failures * 500),
         );
@@ -1661,8 +1838,9 @@ export default function Home() {
     provider: CloudProvider = cloudProvider,
     salesRegionOverride?: string,
     retryComponentIds: number[] = [],
+    runGeneration = quoteRunGeneration.current,
   ) {
-    if (workflowPhase.current === "quote") return;
+    if (runGeneration !== quoteRunGeneration.current || workflowPhase.current === "quote") return;
     workflowPhase.current = "preview";
     setCopied(false);
     setElapsedSeconds(0);
@@ -1702,6 +1880,10 @@ export default function Home() {
           body: JSON.stringify(requestPayload),
         });
         const started = await startResponse.json() as { job_id?: string; message?: string };
+        if (runGeneration !== quoteRunGeneration.current) {
+          await cancelQuoteJob(String(started.job_id ?? ""));
+          return;
+        }
         if (!startResponse.ok || !started.job_id) {
           const fallbackResponse = await fetchWithTimeout(`${API_BASE}/api/quotes/preview`, {
             method: "POST",
@@ -1709,6 +1891,7 @@ export default function Home() {
             body: JSON.stringify(requestPayload),
           }, 180000);
           const fallback = await fallbackResponse.json();
+          if (runGeneration !== quoteRunGeneration.current) return;
           if (!fallbackResponse.ok) {
             throw new Error(fallback.message ?? started.message ?? "配置核验任务启动失败");
           }
@@ -1719,6 +1902,7 @@ export default function Home() {
             stopForSalesReview,
             [],
             provider,
+            runGeneration,
           );
           return;
         }
@@ -1734,10 +1918,12 @@ export default function Home() {
           stopForSalesReview,
           provider,
           retryComponentIds,
+          runGeneration,
         );
         return;
       }
     } catch (error) {
+      if (runGeneration !== quoteRunGeneration.current) return;
       setJob({
         job_id: "preflight-error",
         kind: "preview",
@@ -1757,7 +1943,9 @@ export default function Home() {
   }
 
   async function submitRequirement() {
-    if (running || salesRegionChecking || requirement.trim().length < 3) return;
+    if (running || salesRegionChecking || quoteResetting || requirement.trim().length < 3) return;
+    const runGeneration = quoteRunGeneration.current + 1;
+    quoteRunGeneration.current = runGeneration;
     identityRecoveryAttempted.current = false;
     workflowPhase.current = "idle";
     setConfirmationReply("");
@@ -1779,6 +1967,7 @@ export default function Home() {
         body: JSON.stringify({ customer_request: requirement }),
       });
       const result = await response.json() as SalesRegionPreflight & { message?: string };
+      if (runGeneration !== quoteRunGeneration.current) return;
       if (!response.ok) throw new Error(result.message ?? "地区识别失败");
       if (result.requires_confirmation) {
         setSalesRegionOptions(result.options);
@@ -1790,8 +1979,18 @@ export default function Home() {
       if (detectedRegion) {
         writeSalesRegionContext(provider, detectedRegion);
       }
-      await runPreflight(requirement, undefined, {}, false, provider, detectedRegion ?? undefined);
+      await runPreflight(
+        requirement,
+        undefined,
+        {},
+        false,
+        provider,
+        detectedRegion ?? undefined,
+        [],
+        runGeneration,
+      );
     } catch (error) {
+      if (runGeneration !== quoteRunGeneration.current) return;
       setJob({
         job_id: "region-preflight-error",
         kind: "preview",
@@ -1803,7 +2002,7 @@ export default function Home() {
         },
       });
     } finally {
-      setSalesRegionChecking(false);
+      if (runGeneration === quoteRunGeneration.current) setSalesRegionChecking(false);
     }
   }
 
@@ -1938,7 +2137,20 @@ export default function Home() {
     window.setTimeout(() => requirementInput.current?.focus(), 350);
   }
 
-  function returnToHome() {
+  async function returnToHome() {
+    if (quoteResetting) return;
+    setQuoteResetting(true);
+    const activeJobIds = new Set<string>();
+    if (job?.job_id?.startsWith("aws-")) activeJobIds.add(job.job_id);
+    try {
+      const persisted = JSON.parse(
+        window.sessionStorage.getItem(QUOTE_JOB_CONTEXT_KEY) ?? "{}",
+      ) as { jobId?: string };
+      if (persisted.jobId?.startsWith("aws-")) activeJobIds.add(persisted.jobId);
+    } catch {
+      // Invalid recovery data is removed with the rest of the quote session.
+    }
+    quoteRunGeneration.current += 1;
     if (timer.current) {
       clearTimeout(timer.current);
       timer.current = null;
@@ -1947,8 +2159,19 @@ export default function Home() {
       clearTimeout(confirmationTimer.current);
       confirmationTimer.current = null;
     }
+    if (componentRetryTimer.current) {
+      clearTimeout(componentRetryTimer.current);
+      componentRetryTimer.current = null;
+    }
     workflowPhase.current = "idle";
+    confirmationPollGeneration.current = null;
     lateConfirmationTokenStarted.current = null;
+    directQuotePreflightRecoveryStarted.current = null;
+    identityRecoveryAttempted.current = false;
+    previewPollFailures.current.clear();
+    previewRestartedJobs.current.clear();
+    componentRetryAttempts.current.clear();
+    openedCustomerLinkVersion.current = null;
     setRequirement("");
     setJob(null);
     setCopied(false);
@@ -1958,16 +2181,43 @@ export default function Home() {
     setLogExpanded(false);
     setExporting(false);
     setElapsedSeconds(0);
+    setActivityLogTick(0);
+    setPricingMode("standard_reserved");
+    setIncludeOnDemandScenario(true);
+    setReservedTermYears([1, 3]);
+    setPaymentOption("all_upfront");
+    setUtilizationPercent(100);
+    setAzurePricingMode("pay_as_you_go");
+    setAzureTermYears(1);
+    setAzurePaymentOption("monthly");
     setPreviewDraftId(null);
     setConfirmationToken(null);
     setSalesReview(null);
     setSalesRegion(null);
+    setSalesRegionOptions([]);
+    setSalesRegionPromptOpen(false);
+    setSalesRegionChecking(false);
+    setComponentRetryStatus(null);
     setReceivedCustomerAnswers({});
-    window.sessionStorage.removeItem(CONFIRMATION_CONTEXT_KEY);
-    window.sessionStorage.removeItem(QUOTE_JOB_CONTEXT_KEY);
-    clearSalesRegionContext(cloudProvider);
+    clearQuoteSessionStorage();
+    // Clear the visible/local log immediately. The backend log is cleared only
+    // after the previous job has acknowledged cancellation, so it cannot write
+    // another late entry into the new run.
+    window.dispatchEvent(new Event("astraquote:clear-diagnostics"));
     window.scrollTo({ top: 0, behavior: "smooth" });
     window.setTimeout(() => requirementInput.current?.focus(), 350);
+    try {
+      await Promise.all([...activeJobIds].map((jobId) => cancelQuoteJob(jobId)));
+      await fetchWithTimeout(`${API_BASE}/api/debug/logs/clear`, {
+        method: "POST",
+        cache: "no-store",
+      }, 5000);
+    } catch {
+      // Resetting the quote itself remains successful if diagnostics are disabled.
+    } finally {
+      window.dispatchEvent(new Event("astraquote:clear-diagnostics"));
+      setQuoteResetting(false);
+    }
   }
 
   return (
@@ -1978,7 +2228,12 @@ export default function Home() {
           <strong>AstraQuote</strong>
         </a>
         <div className="header-actions">
-          <button className="global-requote-button" type="button" onClick={returnToHome}>重新报价</button>
+          <button
+            className="global-requote-button"
+            type="button"
+            disabled={quoteResetting}
+            onClick={() => void returnToHome()}
+          >{quoteResetting ? "正在清理" : "重新报价"}</button>
           <div className={`health ${health?.status === "ok" ? "online" : ""}`}>
             <i />
             {health?.status === "ok"
@@ -2154,9 +2409,13 @@ export default function Home() {
             <button
               type="submit"
               className="primary"
-              disabled={running || salesRegionChecking || requirement.trim().length < 3}
+              disabled={running || salesRegionChecking || quoteResetting || requirement.trim().length < 3}
             >
-              {running || salesRegionChecking ? <><i className="spinner" aria-hidden="true" />正在提交</> : <>提交并生成配置 <span aria-hidden="true">→</span></>}
+              {quoteResetting
+                ? <><i className="spinner" aria-hidden="true" />正在清理上一轮</>
+                : running || salesRegionChecking
+                  ? <><i className="spinner" aria-hidden="true" />正在提交</>
+                  : <>提交并生成配置 <span aria-hidden="true">→</span></>}
             </button>
           </div>
         </form>
@@ -2214,7 +2473,7 @@ export default function Home() {
         </div>
       ), document.body)}
 
-      {salesReview && (
+      {salesReview && !internalValidationPending && (
         <section className="sales-review-card">
           {salesReview.confirmation_token && (
             <div className="customer-link-reminder">
@@ -2347,7 +2606,7 @@ export default function Home() {
         </section>
       )}
 
-      {portalReady && salesReview?.confirmation_token && customerLinkModalOpen && createPortal((
+      {portalReady && salesReview?.confirmation_token && !internalValidationPending && customerLinkModalOpen && createPortal((
         <div className="customer-link-modal-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget) setCustomerLinkModalOpen(false);
         }}>
@@ -2372,18 +2631,18 @@ export default function Home() {
         </div>
       ), document.body)}
 
-      {!salesReview && (running || componentRetryStatus) && (
+      {(!salesReview || internalValidationPending) && (running || componentRetryStatus || internalValidationPending) && (
         <section className="workbench running" aria-live="polite">
           <div className="workbench-head">
-            <div><p className="kicker">报价处理进度</p><h2>{componentRetryStatus ? "正在持续修复未通过组件" : checking ? "正在核验配置" : "正在生成报价"}</h2></div>
+            <div><p className="kicker">报价处理进度</p><h2>{internalValidationBlocked ? "组件校验未通过" : internalValidationPending ? "正在完成全部组件校验" : componentRetryStatus ? "正在持续修复未通过组件" : checking ? "正在核验配置" : "正在生成报价"}</h2></div>
             <div className="workbench-actions">
               <button type="button" className="log-toggle" onClick={() => setLogExpanded((value) => !value)}>
                 {logExpanded ? "收起记录" : "展开记录"}
               </button>
-              <span className="status-pill">{componentRetryStatus?.phase === "waiting" ? `${componentRetryStatus.remainingSeconds} 秒后继续` : "处理中"}</span>
+              <span className="status-pill">{internalValidationBlocked ? "已停止" : componentRetryStatus?.phase === "waiting" ? `${componentRetryStatus.remainingSeconds} 秒后继续` : "处理中"}</span>
             </div>
           </div>
-          {(running || componentRetryStatus) && <div className="current-step"><i /><span>{componentRetryStatus?.phase === "waiting" ? `未通过组件将在 ${componentRetryStatus.remainingSeconds} 秒后继续核验` : latest?.message ?? "正在准备组件级官方核验"}</span><b>{elapsedSeconds}s</b></div>}
+          {(running || componentRetryStatus || internalValidationBlocked) && <div className={`current-step ${internalValidationBlocked ? "blocked" : ""}`}><i /><span>{internalValidationBlocked ? internalValidationBlockMessage : componentRetryStatus?.phase === "waiting" ? `未通过组件将在 ${componentRetryStatus.remainingSeconds} 秒后继续核验` : latest?.message ?? "正在准备组件级官方核验"}</span><b>{internalValidationBlocked ? "未发布" : `${elapsedSeconds}s`}</b></div>}
           {liveComponentActivity.channels.length > 0 && (
             <div className="ai-channel-section">
               <div className="ai-channel-summary">
@@ -2392,7 +2651,9 @@ export default function Home() {
               </div>
               <div className="ai-channel-grid">
                 {liveComponentActivity.channels.map((channel, index) => {
-                  const visibleChannel: ActivityChannel = retryingChannelIds.has(channel.id)
+                  const visibleChannel: ActivityChannel = blockedChannelIds.has(channel.id)
+                    ? { ...channel, state: "blocked" }
+                    : processingChannelIds.has(channel.id)
                     ? { ...channel, state: "running" }
                     : channel;
                   return (
@@ -2570,13 +2831,18 @@ export default function Home() {
               <div className="error-component-list">
                 <strong>本次未通过的组件</strong>
                 <ul>
-                  {(job.error.details.components as Array<Record<string, unknown>>).map((component, index) => (
-                    <li key={`${String(component.component_id ?? index)}-${String(component.display_name ?? "")}`}>
-                      <b>组件 {String(component.component_id ?? index + 1)} · {String(component.display_name ?? "未识别组件")}</b>
-                      {component.reason && <span>{String(component.reason)}</span>}
-                      {component.source_text && <small>客户填写：{String(component.source_text)}</small>}
-                    </li>
-                  ))}
+                  {(job.error.details.components as Array<Record<string, unknown> | string>).map((rawComponent, index) => {
+                    const component = typeof rawComponent === "string"
+                      ? { display_name: rawComponent }
+                      : rawComponent;
+                    return (
+                      <li key={`${String(component.component_id ?? index)}-${String(component.display_name ?? "")}`}>
+                        <b>组件 {String(component.component_id ?? index + 1)} · {String(component.display_name ?? "未识别组件")}</b>
+                        {component.reason && <span>{String(component.reason)}</span>}
+                        {component.source_text && <small>客户填写：{String(component.source_text)}</small>}
+                      </li>
+                    );
+                  })}
                 </ul>
               </div>
             )}
@@ -2631,7 +2897,7 @@ export default function Home() {
                 ))}
               </div>
               <div className="result-action-buttons">
-                <button className="home-button" type="button" onClick={returnToHome}>返回首页</button>
+                <button className="home-button" type="button" onClick={() => void returnToHome()}>返回首页</button>
                 <button className="export-button" type="button" onClick={exportQuoteWorkbook} disabled={exporting}>
                   {exporting ? "正在生成…" : "导出 Excel"}
                 </button>

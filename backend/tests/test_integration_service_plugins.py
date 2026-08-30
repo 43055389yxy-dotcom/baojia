@@ -882,3 +882,30 @@ def test_nat_gateway_without_traffic_quotes_hours_and_returns_unit_rate() -> Non
 
     assert [(line.key, line.amount) for line in selected.usage_lines] == [("nathour", 1460)]
     assert selected.reference_rates[0].unit_price == 0.059
+
+
+def test_nat_gateway_legacy_gateway_count_cannot_be_underpriced() -> None:
+    hourly = product(
+        "AmazonEC2", "APS1-NatGateway-Hours", "NatGateway", 0.059, "Hrs",
+        location="Asia Pacific (Singapore)", productFamily="NAT Gateway",
+    )
+    processed = product(
+        "AmazonEC2", "APS1-NatGateway-Bytes", "NatGateway", 0.059, "GB",
+        location="Asia Pacific (Singapore)", productFamily="NAT Gateway",
+    )
+    plugin = NatGatewayPlugin(None, FakeCatalog({"AmazonEC2": [hourly, processed]}))  # type: ignore[arg-type]
+
+    selected = plugin.select(
+        ServiceRequirement(
+            service="nat_gateway",
+            region="ap-southeast-1",
+            quantity=1,
+            hours_per_month=730,
+            requirements={"gateway_count": 2, "data_processed_gib": 2048},
+        ),
+        "ap-southeast-1",
+    )
+
+    assert selected.quantity == 2
+    assert selected.usage_lines[0].amount == 1460
+    assert selected.usage_lines[1].amount == 2048

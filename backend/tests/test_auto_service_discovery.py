@@ -44,6 +44,26 @@ def appflow_product() -> dict:
     }
 
 
+def test_official_minute_processing_dimension_uses_aggregate_processing_hours() -> None:
+    assert _dimension_field(
+        {
+            "unit": "minutes",
+            "usage_type": "IAD-B-AVC-HD-S-30",
+            "description": "HD video transcoding per minute",
+        }
+    ) == ("processing_hours", "处理时长（小时）")
+
+
+def test_official_upload_and_download_rows_use_neutral_processed_data() -> None:
+    assert _dimension_field(
+        {
+            "unit": "GigaBytes",
+            "usage_type": "USE1-UploadBytes",
+            "description": "GigaByte uploaded over SFTP to S3",
+        }
+    ) == ("data_processed_gib", "处理或传输数据量（GiB）")
+
+
 class AppFlowCatalog:
     def __init__(self) -> None:
         self.product_calls = 0

@@ -423,11 +423,28 @@ class CloudWatchPlugin(_MinimumAssumptionPlugin):
     def select(self, requirement: ServiceRequirement, default_region: str) -> SelectedResource:
         region = requirement.region or default_region
         requested = requirement.requirements
-        include_logs = requested.get("include_logs") is not False
-        include_metrics = requested.get("include_metrics") is not False
+        has_log_usage = any(
+            requested.get(field) not in (None, "")
+            for field in ("log_ingestion_gib", "log_storage_gib", "log_retention_days")
+        )
+        has_metric_usage = any(
+            requested.get(field) not in (None, "")
+            for field in ("custom_metrics", "alarms")
+        )
+        include_logs = requested.get("include_logs") is not False and (
+            has_log_usage or not has_metric_usage
+        )
+        # A Logs-only request must not add an unrelated custom-metric unit
+        # price and then claim that the customer supplied no usage.
+        include_metrics = requested.get("include_metrics") is True or has_metric_usage
         lines: list[UsageLine] = []
         reference_rates: list[ReferenceRate] = []
         specs: dict[str, float] = {}
+        applied_fields: list[str] = []
+        log_retention_days = required_float(requested, "log_retention_days")
+        if log_retention_days is not None:
+            specs["logRetentionDays"] = log_retention_days
+            applied_fields.append("log_retention_days")
         if include_logs:
             logs = required_float(requested, "log_ingestion_gib")
             product = _one_matching(
@@ -451,6 +468,39 @@ class CloudWatchPlugin(_MinimumAssumptionPlugin):
                     )
                 )
                 specs["logIngestionGiB"] = logs
+            log_storage = required_float(requested, "log_storage_gib")
+            if log_storage is not None:
+                storage_product = _one_matching(
+                    self.catalog,
+                    "AmazonCloudWatch",
+                    {
+                        "regionCode": region,
+                        "group": "Amazon CloudWatch Standard Storage pricing current",
+                    },
+                    lambda attrs: attrs.get("usagetype", "").endswith(
+                        "-TimedStorage-ByteHrs"
+                    )
+                    or attrs.get("usagetype") == "TimedStorage-ByteHrs",
+                    f"CloudWatch Logs 标准存储 ({region})",
+                    fallback_filters={"regionCode": region},
+                    fallback_predicate=lambda attrs: (
+                        attrs.get("usagetype", "").endswith(
+                            "-TimedStorage-ByteHrs"
+                        )
+                        or attrs.get("usagetype") == "TimedStorage-ByteHrs"
+                    )
+                    and "current" in attrs.get("group", "").casefold(),
+                )
+                lines.append(
+                    _usage(
+                        storage_product,
+                        key="cwlogstore",
+                        amount=log_storage,
+                        group="cloudwatch",
+                        source_fields=("log_storage_gib", "include_logs"),
+                    )
+                )
+                specs["logStorageGiB"] = log_storage
         if include_metrics:
             metrics = required_float(requested, "custom_metrics")
             product = PricingCatalog.require_unique(
@@ -472,6 +522,33 @@ class CloudWatchPlugin(_MinimumAssumptionPlugin):
                     )
                 )
                 specs["customMetrics"] = metrics
+        alarms = required_float(requested, "alarms")
+        if alarms is not None:
+            alarm_product = _one_matching(
+                self.catalog,
+                "AmazonCloudWatch",
+                {"regionCode": region, "group": "Alarm"},
+                lambda attrs: attrs.get("usagetype", "").endswith(
+                    "CW:AlarmMonitorUsage"
+                )
+                and attrs.get("group") == "Alarm",
+                f"CloudWatch 标准指标告警 ({region})",
+                fallback_filters={"regionCode": region},
+                fallback_predicate=lambda attrs: attrs.get("usagetype", "").endswith(
+                    "CW:AlarmMonitorUsage"
+                )
+                and attrs.get("group") == "Alarm",
+            )
+            lines.append(
+                _usage(
+                    alarm_product,
+                    key="cwalarm",
+                    amount=alarms,
+                    group="cloudwatch",
+                    source_fields=("alarms",),
+                )
+            )
+            specs["standardAlarms"] = alarms
         if not lines and not reference_rates:
             raise ManualConfirmationRequired(
                 "CloudWatch 日志和指标均被关闭，无法形成报价",
@@ -485,7 +562,7 @@ class CloudWatchPlugin(_MinimumAssumptionPlugin):
             architecture=("按客户提供的日志与指标用量计费" if lines else "未提供用量，仅展示官方单位参考价"),
             specifications=specs,
             official_product={"source": "AWS Price List", "regionCode": region},
-            rationale="按 CloudWatch Logs 写入和自定义指标官方计费维度提交 BCM。",
+            rationale="按 CloudWatch Logs 写入、标准存储、自定义指标和标准告警官方计费维度提交 BCM。",
             substitution_notice=(
                 "客户未提供 CloudWatch 用量；仅展示 AWS 官方单位价，不计入月费合计。"
                 if reference_rates
@@ -493,4 +570,5 @@ class CloudWatchPlugin(_MinimumAssumptionPlugin):
             ),
             usage_lines=lines,
             reference_rates=reference_rates,
+            applied_requirement_fields=applied_fields,
         )

@@ -1,0 +1,72 @@
+[
+  {
+    "id": "commerce_mixed_units",
+    "name": "电商平台（常见中文表达与混合计费维度）",
+    "sales_region": "ap-southeast-1",
+    "minimum_components": 10,
+    "customer_request": "新加坡区，Linux 按需运行，每月730小时。\n1、Nginx Web节点共4台，每台8核32G，系统盘100G，另挂500G数据盘。\n2、RDS MySQL主备一套，两个数据库实例，单实例8核32G，数据库存储1TB。\n3、Redis缓存一主一从，总共2个节点，每节点4核16G。\n4、Kafka用MSK，3个Broker，每个8核32G、2TB存储。\n5、OpenSearch 3个数据节点，每节点8核64G和1TB gp3。\n6、S3 Standard放20TB，每月PUT类500万次、GET类5000万次。\n7、CloudFront月下行8TB，HTTPS请求8000万次，主要访问地区亚太。\n8、需要2个Application Load Balancer，月处理3TB。\n9、EFS通用型文件系统2TB。\n10、CloudWatch Logs每月写入500GB，日志存储1TB，保留30天。"
+  },
+  {
+    "id": "eks_parent_child",
+    "name": "容器与数据平台（父子资源及节点口径）",
+    "sales_region": "ap-southeast-2",
+    "minimum_components": 11,
+    "customer_request": "悉尼区域部署：\n1. 一套Amazon EKS控制面，下面有5台Worker，每台8 vCPU、32 GiB，系统盘100GiB并附加500GiB gp3数据盘。\n2. PostgreSQL走RDS Multi-AZ，2个实例，单实例8核32G，存储1.5T。\n3. ElastiCache Redis为1主2从，3节点，单节点8核32G。\n4. Amazon MQ RabbitMQ三节点，每节点4核16G，磁盘300G。\n5. OpenSearch三个数据节点，每台8核32G、800G存储。\n6. S3 Standard 30TB。\n7. CloudFront每月12TB下行、1.2亿次HTTPS请求，流量主要到澳大利亚。\n8. 两个ALB，每月总处理5TB。\n9. 两个NAT Gateway，每月合计处理2TB。\n10. AWS Backup保护6TB数据，每日备份，保留30天。"
+  },
+  {
+    "id": "iot_serverless",
+    "name": "物联网平台（消息、时序与无服务器）",
+    "sales_region": "ap-northeast-1",
+    "minimum_components": 10,
+    "customer_request": "东京区物联网业务，按月估算：\n1、AWS IoT Core连接50万台设备，每台每天发送200条、每条1KB的MQTT消息。\n2、Kinesis Data Streams使用按需模式，每月写入15TB、读取30TB。\n3、Timestream每月写入5亿条记录，查询扫描8TB，内存存储500GB，磁存储5TB。\n4、Lambda每月调用3亿次，平均512MB，单次执行250毫秒，arm64。\n5、DynamoDB按需，存储2TB，每月读取2亿次、写入5000万次。\n6、API Gateway HTTP API每月4亿次请求，平均每次传输20KB。\n7、SQS标准队列每月10亿次API请求。\n8、SNS每月发布2亿条消息，其中5000万条投递HTTP终端。\n9、S3 Standard 100TB，PUT请求2000万次，GET请求3亿次。\n10、CloudWatch Logs月写入3TB、归档存储10TB、保留90天。"
+  },
+  {
+    "id": "financial_high_availability",
+    "name": "金融交易系统（高可用、请求与网络）",
+    "sales_region": "ap-south-1",
+    "minimum_components": 10,
+    "customer_request": "孟买生产环境：\n1、Aurora MySQL兼容版一个集群，1个写实例加2个只读实例，单实例16 vCPU 64 GiB，数据库容量3TB，I/O优化模式。\n2、ElastiCache for Redis 3个节点，一主两从，单节点16核64G。\n3、MSK Provisioned 6个Broker，每节点8核32G、2TB EBS。\n4、Network Load Balancer数量2，每月处理10TB。\n5、AWS WAF每月检查15亿次Web请求，20条规则。\n6、DynamoDB按需表存储1TB，每月读8亿次、写3亿次。\n7、KMS维护100个密钥，每月API请求2000万次。\n8、Secrets Manager保存500个Secret，每月API调用1000万次。\n9、CloudTrail每月交付2TB管理与数据事件日志。\n10、AWS Backup备份20TB，每天一次，保留90天。"
+  },
+  {
+    "id": "media_delivery",
+    "name": "视频媒体平台（转码、直播和全球分发）",
+    "sales_region": "us-east-1",
+    "minimum_components": 10,
+    "customer_request": "美东媒体业务报价：\n1. S3 Standard源视频300TB，每月PUT 5000万、GET 2亿次。\n2. MediaConvert每月处理1080p视频12000小时、4K视频3000小时。\n3. MediaLive需要2条标准频道，每条每月运行730小时，1080p输出。\n4. MediaPackage每月输入60TB、输出180TB。\n5. CloudFront月下行200TB，HTTPS请求30亿次，观众分布北美60%、欧洲30%、亚太10%。\n6. Lambda@Edge每月执行5亿次，平均128MB、50毫秒。\n7. API Gateway REST API月请求1亿次，数据传输2TB。\n8. DynamoDB按需存储500GB，月读2亿、月写8000万次。\n9. CloudWatch Logs写入5TB/月，存储15TB，保留30天。\n10. Route 53托管10个域名，每月DNS查询20亿次。"
+  },
+  {
+    "id": "hybrid_migration",
+    "name": "混合云迁移（文件、数据库和传输）",
+    "sales_region": "eu-central-1",
+    "minimum_components": 10,
+    "customer_request": "法兰克福迁移项目：\n1、DMS数据迁移2个复制实例，单实例4核16G，附加200G存储，每月运行730小时。\n2、FSx for NetApp ONTAP共享文件存储8TB SSD，Multi-AZ，吞吐512MB/s。\n3、AWS DataSync每月从本地迁移120TB到S3。\n4、Transfer Family开2个SFTP端点，每月上传8TB、下载4TB。\n5、RDS for Oracle Multi-AZ一套，2实例，每实例16核64G，存储4TB。\n6、EC2 Windows应用迁移6台，每台8核32G，系统盘150G、数据盘1TB，每月730小时。\n7、S3 Standard 150TB。\n8、EFS Standard 10TB，每月读取20TB、写入8TB。\n9、Site-to-Site VPN两条连接，每月传输5TB。\n10、AWS Backup备份50TB，每日一次，保留35天。"
+  },
+  {
+    "id": "self_hosted_analytics",
+    "name": "自建大数据平台（第三方软件与普通EC2）",
+    "sales_region": "ap-southeast-1",
+    "minimum_components": 10,
+    "customer_request": "新加坡大数据平台，不采用功能不同的托管替代，下面软件全部保留原产品并在普通EC2上自建，磁盘没写类型的都用gp3：\n1、Doris三台，单机16核128G，每台4T盘。\n2、Flink四节点，单节点24核64G，500G盘。\n3、ClickHouse四节点，每个16核64G、3T盘。\n4、DolphinScheduler两个节点，8核32G、500G盘。\n5、Trino三个Worker，单机16核64G、500G磁盘。\n6、Hadoop HDFS五台DataNode，单台16核64G、4T磁盘。\n7、Hive两个节点，8核32G、500G盘。\n8、Prometheus两节点，4核16G、500G盘。\n9、Grafana两个节点，2核8G、100G盘。\n10、S3 Standard冷数据50TB。"
+  },
+  {
+    "id": "security_network_edge",
+    "name": "全球网络与安全（不同负载均衡器不混淆）",
+    "sales_region": "eu-west-1",
+    "minimum_components": 10,
+    "customer_request": "爱尔兰区域并服务全球客户。\n1、Application Load Balancer 3个，每月处理6TB。\n2、Network Load Balancer 2个，每月处理20TB，请不要当成ALB。\n3、Gateway Load Balancer 2个端点，每月处理8TB。\n4、NAT Gateway 4个，每月总处理12TB。\n5、AWS WAF 3个Web ACL、合计40条规则，每月请求25亿次。\n6、Shield Advanced启用1套。\n7、Global Accelerator使用2个加速器，每月传输30TB。\n8、Route 53有20个Hosted Zone，每月查询50亿次。\n9、CloudFront每月下行60TB、HTTPS请求10亿次，主要去欧洲。\n10、CloudWatch Logs每月摄入2TB，存储6TB，保留60天。"
+  },
+  {
+    "id": "saas_database_mix",
+    "name": "SaaS后台（多种数据库及队列）",
+    "sales_region": "ca-central-1",
+    "minimum_components": 10,
+    "customer_request": "加拿大SaaS后台：\n1、DocumentDB集群3个实例，每实例8 vCPU、32 GiB，存储2TB。\n2、RDS PostgreSQL Multi-AZ，两个实例，每台8核32G，1.5TB gp3。\n3、ElastiCache Valkey 3节点，单节点8核32G，一主两从。\n4、Amazon MQ for RabbitMQ三节点，每节点4核16G，300GB磁盘。\n5、ECS Fargate运行40个Task，每Task 2 vCPU、4GB内存，每月730小时。\n6、Application Load Balancer两个，月处理4TB。\n7、S3 Standard 40TB，每月GET 1亿次、PUT 1000万次。\n8、SES每月发送500万封邮件。\n9、SQS每月4亿次请求。\n10、CloudWatch Logs每月写700GB，存储2TB，保留30天。"
+  },
+  {
+    "id": "bilingual_compact_wording",
+    "name": "中英混写与口语表达（换句话仍保持字段一致）",
+    "sales_region": "ap-southeast-1",
+    "minimum_components": 10,
+    "customer_request": "Please quote in Singapore, on-demand Linux, 730h/month：\n① web tier / EC2：要六部机器，each 8c 32GB；boot 100GB + data volume 500GB gp3。\n② 数据库用 RDS MySQL，主备两台，16核/64G each，盘2T。\n③ cache.m4.4xlarge Redis，共仨节点，官方规格16 vCPU / 60.78 GiB。\n④ MSK：three brokers，each 8 vCPU, 32 GiB RAM and 2 TiB storage。\n⑤ OpenSearch 三节点，8c/32G/800GB per node。\n⑥ S3大约50TiB，monthly GET 200,000,000，PUT 20,000,000。\n⑦ CloudFront egress 20TB per month，HTTPS calls 200 million，traffic to Asia。\n⑧ 两只ALB，合计月流量8T。\n⑨ CloudWatch日志每个月灌进去1.5TB，在线放5TB，留60天。\n⑩ Backup：备份数据10T，天天备，留一个月。"
+  }
+]

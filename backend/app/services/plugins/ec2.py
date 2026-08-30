@@ -22,8 +22,56 @@ class Ec2Plugin(ServicePlugin):
     kind = ServiceKind.EC2
     display_name = "Amazon EC2"
     _candidate_cache: dict[
-        tuple[str, str | None, float | None, float | None], list[dict[str, Any]]
+        tuple[str, str | None, float | None, float | None, bool], list[dict[str, Any]]
     ] = {}
+
+    def configuration_candidates(
+        self, requirement: ServiceRequirement, default_region: str
+    ) -> list[CandidateOption]:
+        """Return every EC2 model currently exposed in the selected region.
+
+        Normal preview intentionally searches around the customer's requested
+        shape.  The customer model picker has a different job: it must expose
+        the complete official catalogue so choosing a different CPU, memory or
+        processor architecture never depends on a nearby-candidate shortlist.
+        Prices are resolved only after the exact model is selected; querying a
+        Price List product for hundreds of dropdown rows would make the first
+        confirmation page unnecessarily slow.
+        """
+
+        requested = canonicalize_requirement_fields(
+            requirement.requirements, service="ec2"
+        )
+        operating_system = _pricing_operating_system(
+            _optional_string(requested.get("operating_system"))
+        )
+        tenancy = _pricing_tenancy(_optional_string(requested.get("tenancy")))
+        candidates = self._official_candidates(
+            requirement.region or default_region,
+            None,
+            include_all_models=True,
+        )
+        return [
+            CandidateOption(
+                model=str(item["model"]),
+                family=str(item["family"]),
+                specifications={
+                    "vCPU": item["vcpu"],
+                    "memoryGiB": item["memory_gib"],
+                    "operatingSystem": operating_system,
+                    "tenancy": tenancy,
+                    "instanceFamily": item["family"],
+                    "currentGeneration": bool(item.get("current_generation")),
+                    "processorArchitectures": list(item.get("architectures", [])),
+                },
+                rationale="AWS 当前区域支持的完整 EC2 官方型号目录。",
+                official_product={
+                    "source": "EC2 DescribeInstanceTypes",
+                    "regionCode": requirement.region or default_region,
+                },
+            )
+            for item in candidates
+        ]
 
     def specified_model_compatibility_notice(
         self, requirement: ServiceRequirement, default_region: str
@@ -589,7 +637,13 @@ class Ec2Plugin(ServicePlugin):
             if descriptions:
                 storage_description = "每台额外数据盘：" + "；".join(descriptions)
         if not storage_description and disk_gib is not None:
-            storage_description = f"每台 {disk_gib:g} GiB 系统盘"
+            source_text = requirement.source_text or ""
+            storage_label = (
+                "系统盘"
+                if re.search(r"系统盘|启动盘|根卷", source_text, re.I)
+                else "EBS 存储"
+            )
+            storage_description = f"每台 {disk_gib:g} GiB {storage_label}"
 
         return SelectedResource(
             service=self.kind,
@@ -757,8 +811,16 @@ class Ec2Plugin(ServicePlugin):
         requested_model: str | None,
         requested_vcpu: float | None = None,
         requested_memory: float | None = None,
+        *,
+        include_all_models: bool = False,
     ) -> list[dict[str, Any]]:
-        cache_key = (region, requested_model, requested_vcpu, requested_memory)
+        cache_key = (
+            region,
+            requested_model,
+            requested_vcpu,
+            requested_memory,
+            include_all_models,
+        )
         cached = self._candidate_cache.get(cache_key)
         if cached is not None:
             return [dict(item) for item in cached]
@@ -836,11 +898,16 @@ class Ec2Plugin(ServicePlugin):
                 if exact_shapes:
                     return remember(exact_shapes)
 
-            # Only unusual, non-existent shapes need a broader current-generation
-            # scan to produce the lower and upper confirmation choices.
+            # Normal automatic matching prefers current-generation instances.
+            # The explicit customer model picker requests the complete regional
+            # catalogue, including older models that AWS still offers.
             response = query(
-                parameters={"Filters": [{"Name": "current-generation", "Values": ["true"]}]},
-                max_items=1000,
+                parameters=(
+                    {}
+                    if include_all_models
+                    else {"Filters": [{"Name": "current-generation", "Values": ["true"]}]}
+                ),
+                max_items=2000 if include_all_models else 1000,
             )
             candidates = parse(response) if response is not None else []
         except (ManualConfirmationRequired, KeyError) as exc:

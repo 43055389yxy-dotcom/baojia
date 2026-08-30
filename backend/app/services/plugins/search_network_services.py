@@ -526,7 +526,13 @@ class NatGatewayPlugin(_NoConfirmationPlugin):
                 "AWS 官方目录没有返回 NAT Gateway 标准计费项",
                 code="nat_gateway_pricing_not_found",
             )
-        quantity = requirement.quantity
+        # ``gateway_count`` is accepted for backward compatibility with old
+        # drafts. The pricing contract normalizes new requests to the shared
+        # top-level quantity before the immutable fact ledger is sealed.
+        quantity = int(
+            requirement.requirements.get("gateway_count")
+            or requirement.quantity
+        )
         data_gib = None
         for key in ("data_processed_gib", "processed_bytes_gib", "data_transfer_gib"):
             data_gib = required_float(requirement.requirements, key)
@@ -563,6 +569,7 @@ class NatGatewayPlugin(_NoConfirmationPlugin):
             display_name=self.display_name,
             region=region,
             model="NAT Gateway",
+            quantity=quantity,
             architecture=f"{quantity} 个 NAT Gateway",
             specifications={
                 "quantity": quantity,

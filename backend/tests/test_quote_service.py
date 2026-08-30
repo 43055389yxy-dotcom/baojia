@@ -40,8 +40,87 @@ from app.services.plugins.common import (
     S3Plugin,
     _normalize_s3_storage_class,
 )
+from app.services.plugins.generic_official import GenericOfficialPlugin
 from app.services.plugins.minimum_services import WafPlugin
 from app.services.quote_service import QuoteService
+
+
+def test_alb_processed_traffic_never_gets_reference_only_default() -> None:
+    source = "Application Load Balancer，2个ALB，每月处理流量5T"
+    component = ServiceRequirement(
+        service="elb",
+        calculator_service_name="Application Load Balancer",
+        source_text=source,
+        original_source_text=source,
+    )
+    intent = ParsedIntent(customer_summary=source, services=[component])
+
+    DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
+    notices = QuoteService._apply_calculator_minimum_defaults(intent)
+
+    assert component.quantity == 2
+    assert component.requirements["processed_bytes_gib"] == 5120
+    assert "reference_lcu_unit_only" not in component.requirements
+    assert not any("不计入月费合计" in notice for notice in notices)
+
+
+def test_literal_coverage_validates_service_owned_slice_not_sibling_numbers() -> None:
+    shared = (
+        "Amazon ECS，1套集群，EC2 Worker节点4台，"
+        "单台8核16G，磁盘300G"
+    )
+    intent = ParsedIntent(
+        customer_summary=shared,
+        services=[
+            ServiceRequirement(
+                service="ecs",
+                source_text="Amazon ECS，1套集群，",
+                original_source_text=shared,
+                requirements={"cluster_count": 1},
+                field_evidence={"requirements.cluster_count": "1套集群"},
+            ),
+            ServiceRequirement(
+                service="ec2",
+                quantity=4,
+                source_text="EC2 Worker节点4台，单台8核16G，磁盘300G",
+                original_source_text=shared,
+                requirements={"vcpu": 8, "memory_gib": 16, "system_disk_gib": 300},
+                field_evidence={
+                    "quantity": "4台",
+                    "requirements.vcpu": "8核16G",
+                    "requirements.memory_gib": "8核16G",
+                    "requirements.system_disk_gib": "磁盘300G",
+                },
+            ),
+        ],
+    )
+
+    QuoteService._require_complete_literal_fact_coverage(intent)
+
+
+def test_literal_coverage_failure_exposes_the_exact_unmapped_fact() -> None:
+    source = "Amazon MemoryDB for Redis，3个节点，单节点8核32G"
+    intent = ParsedIntent(
+        customer_summary=source,
+        services=[
+            ServiceRequirement(
+                service="memorydb",
+                source_text=source,
+                requirements={"node_count": 3, "memory_gib": 32},
+                field_evidence={
+                    "requirements.node_count": "3个节点",
+                    "requirements.memory_gib": "32G",
+                },
+            )
+        ],
+    )
+
+    with pytest.raises(ManualConfirmationRequired) as exc_info:
+        QuoteService._require_complete_literal_fact_coverage(intent)
+
+    component = exc_info.value.details["components"][0]
+    assert "8核" in component["reason"]
+    assert component["facts"]
 
 
 def test_non_pricing_context_is_removed_without_touching_customer_original() -> None:
@@ -78,6 +157,213 @@ def test_non_pricing_context_is_removed_without_touching_customer_original() -> 
     assert redis.field_match_policies == {"memory_gib": "approximate"}
     assert redis.field_scopes == {"memory_gib": "per_node"}
     assert database.requirements["engine_version"] == "8.0"
+
+
+@pytest.mark.asyncio
+async def test_unconsumed_fact_is_repaired_by_ai_meaning_plus_official_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PurposeParser:
+        async def resolve_unconsumed_fact_purposes(
+            self,
+            component: ServiceRequirement,
+            **kwargs: object,
+        ) -> dict[str, str]:
+            assert component.requirements["retained_logs_gib"] == 1024
+            assert kwargs["missing_paths"] == [
+                "requirements.retained_logs_gib"
+            ]
+            candidates = kwargs["official_candidates"]
+            assert isinstance(candidates, list)
+            assert candidates[0]["field"] == "storage_gib"
+            return {
+                "requirements.retained_logs_gib": "storage_gib",
+            }
+
+    generic = GenericOfficialPlugin(None, object())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        generic,
+        "official_field_candidates",
+        lambda requirement, default_region: [
+            {
+                "field": "storage_gib",
+                "label": "标准日志存储",
+                "unit": "GB-Mo",
+                "description": "official",
+            }
+        ],
+    )
+
+    def select(
+        requirement: ServiceRequirement,
+        default_region: str,
+    ) -> SelectedResource:
+        lines = []
+        if "storage_gib" in requirement.requirements:
+            lines.append(
+                UsageLine(
+                    key="storage",
+                    service_code="AmazonLogs",
+                    usage_type="TimedStorage-ByteHrs",
+                    operation="",
+                    amount=float(requirement.requirements["storage_gib"]),
+                    source_fields=["storage_gib"],
+                )
+            )
+        return SelectedResource(
+            service="future_logs",
+            display_name="Future Logs",
+            region=default_region,
+            model="official",
+            architecture="managed",
+            specifications={},
+            official_product={"source": "AWS Price List"},
+            rationale="official",
+            usage_lines=lines,
+        )
+
+    monkeypatch.setattr(generic, "select", select)
+    service = QuoteService(
+        PurposeParser(),  # type: ignore[arg-type]
+        PluginRegistry([]),
+        FailingEstimator(),  # type: ignore[arg-type]
+        generic_plugin=generic,
+    )
+    requirement = ServiceRequirement(
+        service="future_logs",
+        source_text="日志存储1T",
+        requirements={"retained_logs_gib": 1024},
+        field_sources={
+            "requirements.retained_logs_gib": "customer_text",
+        },
+        field_evidence={
+            "requirements.retained_logs_gib": "日志存储1T",
+        },
+        locked_fields=["requirements.retained_logs_gib"],
+    )
+    base = select(ServiceRequirement(service="future_logs"), "ap-southeast-1")
+
+    repaired, remaining = await service._reconcile_unconsumed_component_facts(
+        component=requirement,
+        requirement=requirement,
+        selection=base,
+        plugin=object(),
+        component_index=0,
+        reporter=None,
+    )
+
+    assert remaining == []
+    assert requirement.requirements == {"retained_logs_gib": 1024}
+    assert requirement.field_sources[
+        "_fact_purpose_alias.retained_logs_gib"
+    ] == "storage_gib"
+    assert repaired.usage_lines[0].source_fields == ["retained_logs_gib"]
+    assert repaired.usage_lines[0].amount == 1024
+
+
+@pytest.mark.asyncio
+async def test_early_fact_audit_keeps_structured_error_instead_of_internal_failure() -> None:
+    class Parser:
+        async def parse(self, _: str) -> ParsedIntent:
+            return ParsedIntent(
+                customer_summary="应用服务器",
+                services=[
+                    ServiceRequirement(
+                        service="ec2",
+                        region="ap-southeast-1",
+                        source_text="应用服务器",
+                    )
+                ],
+            )
+
+    class AuditFailurePlugin(ApiPlugin):
+        def preview(
+            self,
+            requirement: ServiceRequirement,
+            default_region: str,
+        ) -> PreviewSelection:
+            return PreviewSelection(
+                component_id="component",
+                service="ec2",
+                display_name="Amazon EC2",
+                region=requirement.region or default_region,
+                selected_model="m7g.large",
+                selection_reason="official",
+                candidates=[
+                    CandidateOption(
+                        model="m7g.large",
+                        family="m7g",
+                        specifications={"vCPU": 2, "memoryGiB": 8},
+                        rationale="official",
+                        is_default=True,
+                    )
+                ],
+            )
+
+        def select(
+            self,
+            requirement: ServiceRequirement,
+            default_region: str,
+        ) -> SelectedResource:
+            raise ManualConfirmationRequired(
+                "字段用途尚未完成对账",
+                code="unconsumed_customer_pricing_facts",
+                fields=["requirements.future_field"],
+            )
+
+    service = QuoteService(
+        Parser(),  # type: ignore[arg-type]
+        PluginRegistry([AuditFailurePlugin(ServiceKind.EC2, "m7g.large")]),
+        FailingEstimator(),  # type: ignore[arg-type]
+    )
+
+    preview = await service.preview(
+        QuoteRequest(
+            customer_request="应用服务器",
+            sales_region="ap-southeast-1",
+        )
+    )
+
+    assert preview.selections[0].status == "technical_issue"
+    assert (
+        preview.selections[0].issue_code
+        == "unconsumed_customer_pricing_facts"
+    )
+    assert (
+        preview.selections[0].issue_code
+        != "component_validation_backend_unavailable"
+    )
+
+
+def test_preview_next_action_is_derived_by_backend_for_every_terminal_state() -> None:
+    base = {
+        "component_id": "0",
+        "service": "ec2",
+        "display_name": "Amazon EC2",
+        "region": "ap-south-1",
+    }
+
+    assert PreviewSelection(**base).next_action == "none"
+    assert PreviewSelection(
+        **base,
+        status="customer_issue",
+        requires_confirmation=True,
+    ).next_action == "request_customer"
+    assert PreviewSelection(
+        **base,
+        status="technical_issue",
+        issue_category="retryable",
+    ).next_action == "retry_component"
+    assert PreviewSelection(
+        **base,
+        status="technical_issue",
+        issue_category="catalog_mapping",
+    ).next_action == "internal_block"
+    assert PreviewSelection(
+        **base,
+        status="unsupported",
+        issue_category="unsupported",
+    ).next_action == "internal_block"
 
 
 def test_redis_supported_versions_are_rendered_as_dropdown_options() -> None:
@@ -182,6 +468,119 @@ def test_global_catalog_sizing_invariant_preserves_exact_customer_shape() -> Non
     assert next(
         candidate for candidate in resolved.candidates if candidate.is_default
     ).model == "db.valid-expensive"
+
+
+def test_exact_shape_uses_the_quote_wide_processor_architecture() -> None:
+    requirement = ServiceRequirement(
+        service="future_database_plugin",
+        requirements={"vcpu": 8, "memory_gib": 32},
+        field_sources={
+            "requirements.vcpu": "customer_text",
+            "requirements.memory_gib": "customer_text",
+            "_processor_architecture_preference": "x86_64",
+        },
+    )
+    selection = PreviewSelection(
+        component_id="0",
+        service="future_database_plugin",
+        display_name="Future Database",
+        region="ap-southeast-1",
+        candidates=[
+            CandidateOption(
+                model="db.r7g.2xlarge",
+                family="db",
+                specifications={"vCPU": 8, "memoryGiB": 32},
+                monthly_catalog_cost=80,
+                rationale="cheaper ARM",
+            ),
+            CandidateOption(
+                model="db.m7i.2xlarge",
+                family="db",
+                specifications={"vCPU": 8, "memoryGiB": 32},
+                monthly_catalog_cost=100,
+                rationale="requested x86",
+            ),
+        ],
+    )
+
+    resolved = QuoteService._enforce_catalog_sizing_invariant(requirement, selection)
+
+    assert resolved.selected_model == "db.m7i.2xlarge"
+    assert resolved.requires_confirmation is False
+
+
+@pytest.mark.asyncio
+async def test_preview_does_not_ask_for_a_model_when_an_exact_shape_exists() -> None:
+    class ExactShapeParser:
+        async def parse(self, _: str) -> ParsedIntent:
+            return ParsedIntent(
+                customer_summary="应用服务器",
+                services=[
+                    ServiceRequirement(
+                        service="ec2",
+                        region="ap-southeast-1",
+                        quantity=3,
+                        requirements={"vcpu": 16, "memory_gib": 64},
+                    )
+                ],
+            )
+
+    class ExactShapePlugin(ApiPlugin):
+        def preview(
+            self,
+            requirement: ServiceRequirement,
+            default_region: str,
+        ) -> PreviewSelection:
+            return PreviewSelection(
+                component_id="component",
+                service="ec2",
+                display_name="Amazon EC2",
+                region=requirement.region or default_region,
+                candidates=[
+                    CandidateOption(
+                        model="m7g.4xlarge",
+                        family="m7g",
+                        specifications={"vCPU": 16, "memoryGiB": 64},
+                        monthly_catalog_cost=90,
+                        rationale="ARM exact",
+                    ),
+                    CandidateOption(
+                        model="m7i.4xlarge",
+                        family="m7i",
+                        specifications={"vCPU": 16, "memoryGiB": 64},
+                        monthly_catalog_cost=80,
+                        rationale="x86 exact",
+                    ),
+                    CandidateOption(
+                        model="m7g.8xlarge",
+                        family="m7g",
+                        specifications={"vCPU": 32, "memoryGiB": 128},
+                        monthly_catalog_cost=180,
+                        rationale="larger",
+                    ),
+                ],
+                requires_confirmation=True,
+                confirmation_reason="请选择型号",
+            )
+
+        def configuration_candidates(
+            self,
+            requirement: ServiceRequirement,
+            default_region: str,
+        ) -> list[CandidateOption]:
+            return self.preview(requirement, default_region).candidates
+
+    service = QuoteService(
+        ExactShapeParser(),  # type: ignore[arg-type]
+        PluginRegistry([ExactShapePlugin(ServiceKind.EC2, "m7g.4xlarge")]),
+        FailingEstimator(),  # type: ignore[arg-type]
+        None,
+    )
+
+    preview = await service.preview(QuoteRequest(customer_request="应用服务器16核64G"))
+
+    assert preview.confirmation_items == []
+    assert preview.selections[0].selected_model == "m7g.4xlarge"
 
 
 def test_global_catalog_sizing_invariant_asks_before_non_exact_substitution() -> None:
@@ -1666,8 +2065,15 @@ async def test_customer_must_approve_complete_configuration_before_pricing(tmp_p
     assert blocked.value.code == "configuration_review_required"
 
     store.approve_configuration(preview.confirmation_token)
+    # The draft, not presentation-layer text submitted after a refresh, is the
+    # source of truth.  A heading/whitespace change must not trigger a second AI
+    # parse and create a new fact ledger disconnected from the reviewed rows.
+    async def unexpected_reparse(_: str) -> ParsedIntent:
+        raise AssertionError("approved draft must not be reparsed")
+
+    service._parser.parse = unexpected_reparse  # type: ignore[method-assign]
     quote = await service.create_quote(
-        QuoteRequest(customer_request="混合报价", draft_id=preview.draft_id)
+        QuoteRequest(customer_request="### 混合报价\n", draft_id=preview.draft_id)
     )
     assert quote.total_cost == 300
     completed = store.get(preview.confirmation_token)
@@ -2726,7 +3132,9 @@ async def test_second_question_page_does_not_auto_select_non_exact_larger_model(
 
     assert preview.confirmation_items
     assert preview.selections[0].selected_model is None
-    assert "没有完全一样" in str(preview.selections[0].confirmation_reason)
+    assert "暂无 24 核、64 GB 的完全匹配型号" in str(
+        preview.selections[0].confirmation_reason
+    )
 
 
 def test_rephrased_shape_question_uses_the_same_confirmation_key() -> None:
@@ -3137,7 +3545,7 @@ def test_compact_candidate_options_exposes_the_full_supported_catalog() -> None:
     options = QuoteService._compact_candidate_options(candidates, requirement)
 
     assert len(options) == 4
-    assert options[0].value == "选择 db.large-b"
+    assert options[0].value == "选择 db.xlarge-a"
     assert {option.value for option in options} == {
         "选择 db.large-a",
         "选择 db.large-b",
@@ -3145,7 +3553,166 @@ def test_compact_candidate_options_exposes_the_full_supported_catalog() -> None:
         "选择 db.2xlarge",
     }
     assert all(option.model for option in options)
-    assert options[0].specifications == {"vCPU": 2, "memoryGiB": 10}
+    assert options[0].specifications["vCPU"] == 4
+    assert options[0].specifications["memoryGiB"] == 16
+    assert options[0].specifications["processorArchitecture"] == "x86_64"
+    assert options[0].specifications["belowRequestedMinimum"] is False
+    assert [option.specifications["belowRequestedMinimum"] for option in options] == [
+        False,
+        False,
+        True,
+        True,
+    ]
+
+
+def test_model_question_uses_the_final_catalogue_instead_of_stale_review_copy() -> None:
+    requirement = ServiceRequirement(
+        service="opensearch",
+        calculator_service_name="Amazon OpenSearch Service",
+        requirements={"vcpu": 16, "memory_gib": 128},
+    )
+    exact_selection = PreviewSelection(
+        component_id="0",
+        service="opensearch",
+        display_name="Amazon OpenSearch Service",
+        region="ap-south-1",
+        candidates=[
+            CandidateOption(
+                model="or2.4xlarge.search",
+                family="opensearch",
+                specifications={"vCPU": 16, "memoryGiB": 128},
+                rationale="exact",
+            )
+        ],
+    )
+
+    question = QuoteService._plain_model_selection_question(
+        exact_selection, requirement
+    )
+
+    assert question == "OpenSearch 每个节点 已自动匹配型号。"
+    assert "没有完全一样" not in question
+
+
+def test_model_question_offers_nearby_models_with_official_shapes() -> None:
+    requirement = ServiceRequirement(
+        service="msk",
+        calculator_service_name="Amazon MSK Provisioned",
+        requirements={"vcpu": 8, "memory_gib": 16},
+    )
+    selection = PreviewSelection(
+        component_id="0",
+        service="msk",
+        display_name="Amazon MSK Provisioned",
+        region="ap-south-1",
+        candidates=[
+            CandidateOption(
+                model="m5.xlarge",
+                family="msk",
+                specifications={"vCPU": 4, "memoryGiB": 16},
+                rationale="lower",
+            ),
+            CandidateOption(
+                model="m5.2xlarge",
+                family="msk",
+                specifications={"vCPU": 8, "memoryGiB": 32},
+                rationale="safe",
+            ),
+        ],
+    )
+
+    question = QuoteService._plain_model_selection_question(selection, requirement)
+
+    assert question == "MSK Provisioned 暂无 8 核、16 GB 的完全匹配型号，请选择其他型号。"
+
+
+def test_compact_candidate_options_show_model_and_official_configuration() -> None:
+    requirement = ServiceRequirement(service="msk", requirements={})
+    candidates = [
+        CandidateOption(
+            model="express.m7g.xlarge",
+            family="msk",
+            specifications={"vCPU": 4, "memoryGiB": 16},
+            rationale="arm",
+        ),
+        CandidateOption(
+            model="kafka.m7i.xlarge",
+            family="msk",
+            specifications={"vCPU": 4, "memoryGiB": 16},
+            rationale="x86",
+        ),
+        CandidateOption(
+            model="cache.r6gd.4xlarge",
+            family="redis",
+            specifications={"vCPU": 16, "memoryGiB": 104.81},
+            rationale="arm with local storage suffix",
+        ),
+    ]
+
+    options = QuoteService._compact_candidate_options(candidates, requirement)
+
+    by_model = {option.model: option for option in options}
+    assert by_model["express.m7g.xlarge"].specifications[
+        "processorArchitecture"
+    ] == "arm64"
+    assert "cache.r6gd.4xlarge" not in by_model
+    assert by_model["kafka.m7i.xlarge"].specifications[
+        "processorArchitecture"
+    ] == "x86_64"
+    assert by_model["express.m7g.xlarge"].label == (
+        "express.m7g.xlarge · 4 vCPU · 16 GiB"
+    )
+    assert by_model["kafka.m7i.xlarge"].label == (
+        "kafka.m7i.xlarge · 4 vCPU · 16 GiB"
+    )
+
+
+def test_special_instance_families_are_hidden_unless_customer_requests_them() -> None:
+    candidates = [
+        CandidateOption(
+            model="m6i.4xlarge",
+            family="general_purpose",
+            specifications={"vCPU": 16, "memoryGiB": 64},
+            rationale="ordinary",
+        ),
+        CandidateOption(
+            model="g6.4xlarge",
+            family="accelerated",
+            specifications={"vCPU": 16, "memoryGiB": 64},
+            rationale="GPU",
+        ),
+        CandidateOption(
+            model="i4i.4xlarge",
+            family="storage_optimized",
+            specifications={"vCPU": 16, "memoryGiB": 128},
+            rationale="local NVMe",
+        ),
+        CandidateOption(
+            model="r6gd.4xlarge",
+            family="memory_optimized",
+            specifications={"vCPU": 16, "memoryGiB": 128},
+            rationale="local NVMe suffix",
+        ),
+    ]
+    ordinary = ServiceRequirement(service="ec2", source_text="应用服务器 16核64G")
+    gpu = ServiceRequirement(service="ec2", source_text="GPU 推理服务器 16核64G")
+
+    ordinary_models = {
+        option.model
+        for option in QuoteService._compact_candidate_options(candidates, ordinary)
+    }
+    gpu_models = {
+        option.model
+        for option in QuoteService._compact_candidate_options(candidates, gpu)
+    }
+
+    assert ordinary_models == {"m6i.4xlarge"}
+    assert gpu_models == {
+        "m6i.4xlarge",
+        "g6.4xlarge",
+        "i4i.4xlarge",
+        "r6gd.4xlarge",
+    }
 
 
 def test_official_error_candidates_are_available_to_global_confirmation_flow() -> None:
@@ -3937,6 +4504,47 @@ def test_ec2_system_and_data_disks_remain_separate_pricing_facts() -> None:
     assert "ebs_storage_breakdown" not in normalized
 
 
+def test_ec2_capacity_only_disks_default_to_gp3() -> None:
+    intent = ParsedIntent(
+        customer_summary="普通应用服务器",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                requirements={
+                    "system_disk_gib": 100,
+                    "additional_ebs_volumes": [
+                        {"size_gib": 500, "count_per_instance": 1}
+                    ],
+                },
+            )
+        ],
+    )
+
+    QuoteService._apply_calculator_minimum_defaults(intent)
+    normalized = QuoteService._calculator_requirements(
+        intent.services[0].requirements,
+        1,
+        "ec2",
+    )
+
+    assert normalized["volume_type"] == "gp3"
+    assert normalized["additional_ebs_volumes"] == [
+        {"size_gib": 500, "count_per_instance": 1, "volume_type": "gp3"}
+    ]
+
+    explicit_io2 = QuoteService._calculator_requirements(
+        {
+            "volume_type": "io2",
+            "additional_ebs_volumes": [
+                {"size_gib": 500, "count_per_instance": 1}
+            ],
+        },
+        1,
+        "ec2",
+    )
+    assert explicit_io2["additional_ebs_volumes"][0]["volume_type"] == "io2"
+
+
 def test_legacy_ec2_disk_alias_is_preserved_for_calculator() -> None:
     normalized = QuoteService._calculator_requirements(
         {"system_disk_size_gib": 100, "volume_type": "gp3"}, 2, "ec2"
@@ -4379,8 +4987,8 @@ async def test_late_finite_choice_recovers_catalog_options_when_error_has_none(
     item = result.details["confirmation_items"][0]
     assert item["selection_mode"] == "catalog"
     assert [option["model"] for option in item["options"]] == [
-        "db.r6g.xlarge",
         "db.r6g.2xlarge",
+        "db.r6g.xlarge",
     ]
 
 
@@ -5072,6 +5680,29 @@ def test_self_hosted_ec2_note_explains_original_product_and_purpose() -> None:
     assert "不是 AWS 托管版服务" in notes[0]
 
 
+def test_direct_application_server_and_explicit_service_purpose_survive_to_remarks() -> None:
+    application = ServiceRequirement(
+        service="ec2",
+        source_text="应用服务器，3台，单台16核128G，磁盘1T",
+    )
+    s3 = ServiceRequirement(
+        service="s3",
+        source_text=(
+            "S3，容量15T，预估费用4608美元，"
+            "用于冷数据存储、Flink快照、业务设备图片"
+        ),
+    )
+
+    assert QuoteService._dependency_remarks(application, [application, s3]) == [
+        "本项用于部署客户所述的应用服务器；这里计算的是 EC2 实例与所列 EBS 存储资源。"
+    ]
+    assert QuoteService._dependency_remarks(s3, [application, s3]) == [
+        "客户说明本项用于冷数据存储、Flink快照、业务设备图片。",
+        "客户提供的预估费用 4608 美元未注明周期；"
+        "该金额仅作对比备注，不代替 AWS 官方计费结果。",
+    ]
+
+
 def test_missing_rds_deployment_question_has_customer_choices() -> None:
     options = QuoteService._default_confirmation_options(
         "Amazon RDS 数据库未说明部署方式，请选择单可用区还是主备高可用（Multi-AZ）。"
@@ -5081,6 +5712,83 @@ def test_missing_rds_deployment_question_has_customer_choices() -> None:
         ("单可用区", "single_az"),
         ("主备高可用（Multi-AZ）", "multi_az"),
     ]
+
+
+def test_ambiguous_rds_primary_replica_question_has_two_real_topologies() -> None:
+    options = QuoteService._default_confirmation_options(
+        "Amazon RDS MySQL：客户写了“主从部署”。请确认是主备高可用"
+        "（RDS Multi-AZ，备用库不用于只读），还是主库 + 1 个只读副本"
+        "（两个 Single-AZ 实例）？"
+    )
+
+    assert [(item.label, item.value) for item in options] == [
+        ("主备高可用（Multi-AZ）", "multi_az"),
+        ("主库 + 1 个只读副本", "primary_read_replica"),
+    ]
+
+
+def test_rds_read_replica_notice_is_not_bound_to_an_earlier_ec2_instance() -> None:
+    intent = ParsedIntent(
+        customer_summary="Doris and MySQL",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                calculator_service_name="Amazon EC2（自建 Doris）",
+                field_sources={"_third_party_product": "Doris"},
+            ),
+            ServiceRequirement(service="rds", calculator_service_name="Amazon RDS MySQL"),
+        ],
+    )
+    notice = (
+        "Amazon RDS MySQL：客户写了“主从部署”。请确认是主备高可用"
+        "（RDS Multi-AZ，备用库不用于只读），还是主库 + 1 个只读副本"
+        "（两个 Single-AZ 实例）？"
+    )
+
+    assert QuoteService._service_index_for_notice(intent, notice) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "expected_deployment", "expected_quantity", "expected_replicas"),
+    [
+        ("multi_az", "multi_az", 1, None),
+        ("primary_read_replica", "single_az", 2, 1),
+    ],
+)
+async def test_ambiguous_rds_primary_replica_answer_binds_correct_billing_topology(
+    answer: str,
+    expected_deployment: str,
+    expected_quantity: int,
+    expected_replicas: int | None,
+) -> None:
+    question = (
+        "Amazon RDS MySQL：客户写了“主从部署”。请确认是主备高可用"
+        "（RDS Multi-AZ，备用库不用于只读），还是主库 + 1 个只读副本"
+        "（两个 Single-AZ 实例）？"
+    )
+    intent = ParsedIntent(
+        customer_summary="MySQL 主从",
+        services=[
+            ServiceRequirement(
+                service="rds",
+                quantity=2,
+                requirements={"engine": "mysql", "instance_count": 2},
+            )
+        ],
+    )
+    service = QuoteService.__new__(QuoteService)
+
+    await service._apply_confirmation_responses(
+        intent,
+        {question: answer},
+        response_components={question: 0},
+    )
+
+    database = intent.services[0]
+    assert database.requirements["deployment"] == expected_deployment
+    assert database.quantity == expected_quantity
+    assert database.requirements.get("read_replica_count") == expected_replicas
 
 
 def test_missing_rds_engine_question_has_customer_choices() -> None:
@@ -5473,6 +6181,87 @@ def test_unknown_managed_alternative_is_not_published_as_a_blind_choice() -> Non
     assert options == []
 
 
+def test_unknown_managed_alternative_preserves_explicit_ec2_deployment() -> None:
+    """Future software names inherit the rule without a product allow-list."""
+
+    question = (
+        "EC2（自建 FutureProxy）：AWS 没有与 FutureProxy 完全等价的托管服务。"
+        "请选择采用 AWS 托管方案，还是按原配置在 EC2 上自建 FutureProxy？"
+    )
+    component = ServiceRequirement(
+        service="ec2",
+        calculator_service_name="Amazon EC2（自建 FutureProxy）",
+        quantity=2,
+        requirements={"vcpu": 4, "memory_gib": 8, "system_disk_gib": 100},
+        source_text="FutureProxy，2个节点，每节点4核8G，磁盘100G",
+        field_sources={"_pending_architecture_decision": "system_policy"},
+    )
+    intent = ParsedIntent(
+        customer_summary=component.source_text,
+        services=[component],
+        ambiguities=[question],
+    )
+
+    resolved = QuoteService._resolve_architecture_questions_without_managed_alternative(
+        intent
+    )
+
+    assert resolved == 1
+    assert intent.ambiguities == []
+    assert component.service == "ec2"
+    assert component.quantity == 2
+    assert component.requirements["vcpu"] == 4
+    assert component.requirements["memory_gib"] == 8
+    assert component.requirements["system_disk_gib"] == 100
+    assert component.requirements["operating_system"] == "linux"
+    assert component.field_sources["_architecture_decision"] == "self_hosted"
+    assert "_pending_architecture_decision" not in component.field_sources
+
+
+def test_real_managed_alternative_keeps_customer_architecture_choice() -> None:
+    question = (
+        "AWS 没有与 Doris 完全等价的托管服务。请选择采用 AWS 托管方案，"
+        "还是按原配置在 EC2 上自建 Doris？"
+    )
+    component = ServiceRequirement(
+        service="ec2",
+        calculator_service_name="Amazon EC2（自建 Doris）",
+        quantity=3,
+        requirements={"vcpu": 16, "memory_gib": 128},
+        field_sources={"_pending_architecture_decision": "system_policy"},
+    )
+    intent = ParsedIntent(
+        customer_summary="Doris",
+        services=[component],
+        ambiguities=[question],
+    )
+
+    resolved = QuoteService._resolve_architecture_questions_without_managed_alternative(
+        intent
+    )
+
+    assert resolved == 0
+    assert intent.ambiguities == [question]
+    assert component.field_sources["_pending_architecture_decision"] == "system_policy"
+    assert QuoteService._default_confirmation_options(question, component)
+
+
+def test_unbound_architecture_question_is_kept_instead_of_guessing() -> None:
+    question = "请选择采用 AWS 托管方案，还是在 EC2 上自建 UnknownTool？"
+    intent = ParsedIntent(
+        customer_summary="UnknownTool",
+        services=[ServiceRequirement(service="ec2")],
+        ambiguities=[question],
+    )
+
+    resolved = QuoteService._resolve_architecture_questions_without_managed_alternative(
+        intent
+    )
+
+    assert resolved == 0
+    assert intent.ambiguities == [question]
+
+
 @pytest.mark.asyncio
 async def test_applying_managed_recommendation_updates_component_to_native_service() -> None:
     question = (
@@ -5655,6 +6444,46 @@ async def test_self_hosted_choice_and_machine_configuration_apply_in_one_answer(
 
     component = intent.services[0]
     assert component.quantity == 5
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_model_atomically_replaces_old_shape_with_official_shape() -> None:
+    question = "请选择 AWS 托管方案还是保留原产品自建。"
+    intent = ParsedIntent(
+        customer_summary="Flink",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                calculator_service_name="Amazon EC2（自建 Flink）",
+                quantity=3,
+                requirements={
+                    "vcpu": 24,
+                    "memory_gib": 64,
+                    "_review_confirmation_candidates": [
+                        {
+                            "model": "c6g.8xlarge",
+                            "specifications": {"vCPU": 32, "memoryGiB": 64},
+                        }
+                    ],
+                },
+                field_sources={"_pending_architecture_decision": "system_policy"},
+            )
+        ],
+    )
+    service = QuoteService.__new__(QuoteService)
+
+    await service._apply_confirmation_responses(
+        intent,
+        {question: "self_hosted；选择 c6g.8xlarge；机器数量 3"},
+        response_components={question: 0},
+    )
+
+    component = intent.services[0]
+    assert component.requirements["requested_model"] == "c6g.8xlarge"
+    assert component.requirements["vcpu"] == 32
+    assert component.requirements["memory_gib"] == 64
+    assert component.field_sources["requirements.vcpu"] == "customer_confirmation"
+    assert component.field_sources["requirements.memory_gib"] == "customer_confirmation"
 
 
 @pytest.mark.asyncio

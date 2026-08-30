@@ -18,7 +18,7 @@ from app.integrations.service_templates import DYNAMIC_SEMANTIC_TEMPLATE_FIELDS
 
 PROFILE_TTL_SECONDS = 10 * 24 * 60 * 60
 FAILED_RETRY_SECONDS = 6 * 60 * 60
-PROFILE_SCHEMA_VERSION = 13
+PROFILE_SCHEMA_VERSION = 14
 
 
 def canonical_service_name(value: str) -> str:
@@ -112,6 +112,23 @@ def _dimension_field(dimension: dict[str, Any]) -> tuple[str | None, str | None]
         token in text for token in ("connection", "websocket", "apigatewayminute")
     ):
         return "connection_minutes", "连接时长（分钟）"
+    if "minute" in unit and any(
+        token in text
+        for token in (
+            "process",
+            "processing",
+            "transcod",
+            "encoding",
+            "video",
+            "media",
+            "frame",
+            "resolution",
+        )
+    ):
+        # Keep the customer contract in hours (the form normally used in
+        # sales requirements) and convert to AWS's per-minute unit only at the
+        # verified binding boundary.
+        return "processing_hours", "处理时长（小时）"
     if "query" in unit or "query" in text:
         if any(token in text for token in ("dns", "route 53", "route53")):
             return "dns_queries", "DNS 查询数量"
@@ -148,6 +165,8 @@ def _dimension_field(dimension: dict[str, Any]) -> tuple[str | None, str | None]
     ):
         if "attachment" in text:
             return "attachments_gib", "附件数据量（GiB）"
+        if any(token in text for token in ("upload", "download", "uploaded", "downloaded")):
+            return "data_processed_gib", "处理或传输数据量（GiB）"
         if any(token in text for token in ("transfer", "egress", "data out", "outbound")):
             return "data_transfer_out_gib", "出站流量（GiB）"
         if any(

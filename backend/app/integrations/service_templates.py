@@ -48,7 +48,7 @@ SERVICE_TEMPLATE_FIELDS: dict[str, tuple[str, ...]] = {
         "payment_option", "utilization_percent",
     ),
     "memorydb": (
-        "requested_model", "engine", "memory_gib",
+        "requested_model", "engine", "vcpu", "memory_gib",
         "node_count", "shards", "replicas_per_shard", "snapshot_retention_days",
         "data_transfer_in_gib", "data_transfer_out_gib",
     ),
@@ -73,7 +73,7 @@ SERVICE_TEMPLATE_FIELDS: dict[str, tuple[str, ...]] = {
     "pinpoint": ("outbound_messages",),
     "cloudwatch": (
         "log_ingestion_gib", "log_storage_gib", "custom_metrics", "alarms",
-        "include_logs", "include_metrics",
+        "log_retention_days", "include_logs", "include_metrics",
     ),
     "amp": (
         "active_series", "samples_ingested", "query_samples_processed",
@@ -217,6 +217,11 @@ SERVICE_ALIASES = {
     "wafv2": "waf",
     "awswafv2": "waf",
     "aurora": "rds",
+    # Official product discovery and models use both spellings.  The runtime
+    # contract must not fall back to the generic ``requests`` template merely
+    # because an underscore was inserted into the same AWS product name.
+    "dynamo_db": "dynamodb",
+    "amazon_dynamodb": "dynamodb",
     "cloud_front": "cloudfront",
     "quick_sight": "quicksight",
 }
@@ -287,11 +292,22 @@ SERVICE_SAFE_DEFAULTS: dict[str, dict[str, Any]] = {
 }
 SERVICE_SAFE_DEFAULTS.update(
     {
-    "ec2": {"operating_system": "Linux", "detailed_monitoring": False},
+        "ec2": {
+            "operating_system": "Linux",
+            "detailed_monitoring": False,
+            # A capacity-only disk request is an ordinary EBS volume. Keep
+            # this visible instead of relying on a hidden adapter fallback.
+            "volume_type": "gp3",
+        },
         "elasticache": {"backup_retention_days": 0},
         "msk": {"cluster_type": "provisioned", "storage_type": "ebs"},
+        "opensearch": {"volume_type": "gp3"},
         "apigateway": {"api_type": "http"},
-        "rds": {"performance_insights": False, "enhanced_monitoring": False},
+        "rds": {
+            "storage_type": "gp3",
+            "performance_insights": False,
+            "enhanced_monitoring": False,
+        },
     }
 )
 
@@ -337,7 +353,7 @@ BILLING_DIMENSION_FIELDS = {
     "traces_stored", "monthly_active_users", "machine_to_machine_tokens",
     "provisioned_throughput_units", "crawler_dpu_hours",
     "interactive_session_dpu_hours", "data_catalog_objects", "spice_gib",
-    "task_hours", "instance_hours", "shard_hours", "put_payload_units",
+    "task_hours", "instance_hours", "processing_hours", "shard_hours", "put_payload_units",
     "extended_retention_hours", "deliveries",
 }
 
@@ -364,10 +380,21 @@ def requirement_fields(service: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys((*fields, *COMMON_TEMPLATE_FIELDS)))
 
 
-def safe_requirement_defaults(service: str) -> dict[str, Any]:
+def safe_requirement_defaults(
+    service: str,
+    requirements: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return system-owned defaults that may never override customer input."""
 
-    return dict(SERVICE_SAFE_DEFAULTS.get(normalized_service_key(service), {}))
+    service_key = normalized_service_key(service)
+    defaults = dict(SERVICE_SAFE_DEFAULTS.get(service_key, {}))
+    engine = str((requirements or {}).get("engine") or "").casefold()
+    if service_key == "rds" and engine.startswith("aurora"):
+        # Aurora uses Aurora Standard or Aurora I/O-Optimized shared cluster
+        # storage.  A normal RDS gp3 default is invalid configuration metadata
+        # even though the Aurora price adapter can recover later.
+        defaults.pop("storage_type", None)
+    return defaults
 
 
 def strip_non_pricing_context_fields(

@@ -324,7 +324,10 @@ WAF 明确保护 CloudFront 时 region 写 global；global 是全局范围，不
 客户给出每月邮件封数时写入 outbound_messages；没给用量时只展示官方单位价，不虚构月用量。
 """,
     "cloudwatch": """【Amazon CloudWatch】
-字段：log_ingestion_gib, custom_metrics, include_logs, include_metrics。
+字段：log_ingestion_gib, log_storage_gib, log_retention_days, custom_metrics, alarms,
+include_logs, include_metrics。客户说“每月日志写入500G”写 log_ingestion_gib=500；
+“日志存储1T”写 log_storage_gib=1024；“保留30天”写 log_retention_days=30；
+“100个告警”写 alarms=100。不得把日志写入量、当前存储量和保留天数互相替代。
 “日志和监控”同时写 include_logs=true、include_metrics=true；没给用量时保留服务，
 后端分别展示日志写入和自定义指标的官方单位价，不虚构用量、也不计入月费，请勿提问。
 """,

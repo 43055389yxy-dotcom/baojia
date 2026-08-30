@@ -42,6 +42,87 @@ class RdsPlugin(ServicePlugin):
             versions.append(current)
         return {"engine_version": versions} if versions else {}
 
+    def configuration_candidates(
+        self,
+        requirement: ServiceRequirement,
+        default_region: str,
+    ) -> list[CandidateOption]:
+        """Return the complete orderable regional model catalogue for an engine.
+
+        Normal preview is optimized around the requested shape.  The explicit
+        customer model picker must not inherit that shortlist: it needs every
+        model AWS says is orderable for the selected engine, version and
+        deployment mode.  The final selection is priced again after the user
+        chooses an exact model.
+        """
+
+        region = requirement.region or default_region
+        requested = canonicalize_requirement_fields(requirement.requirements, service="rds")
+        engine = _text(requested.get("engine"))
+        if not engine:
+            return []
+        deployment = _billing_deployment(engine, requested)
+        orderable = self._orderable_classes(
+            region,
+            engine,
+            requested.get("engine_version"),
+            exact_engine_version=(
+                requirement.field_sources.get("requirements.engine_version")
+                == "customer_confirmation"
+            ),
+        )
+        product_filters = {
+            "regionCode": region,
+            "productFamily": "Database Instance",
+            "databaseEngine": _pricing_engine(engine),
+            "deploymentOption": _pricing_deployment(deployment),
+        }
+        if edition := _pricing_edition(engine):
+            product_filters["databaseEdition"] = edition
+        products = self.catalog.products("AmazonRDS", product_filters, max_pages=50)
+        candidates = _rds_candidates(products, engine, deployment, orderable)
+        priced_instance_count = _priced_instance_count(requirement, engine, requested)
+        options: list[CandidateOption] = []
+        for item in candidates:
+            priced_products = [
+                (rate, product)
+                for product in item["products"]
+                if (rate := PricingCatalog.on_demand_rate(product)) is not None
+            ]
+            if not priced_products:
+                continue
+            hourly, product = min(priced_products, key=lambda entry: entry[0])
+            attrs = PricingCatalog.attributes(product)
+            options.append(
+                CandidateOption(
+                    model=item["model"],
+                    family=item["model"].split(".")[0],
+                    specifications={
+                        "vCPU": item["vcpu"],
+                        "memoryGiB": item["memory_gib"],
+                        "engine": engine,
+                        "deployment": deployment,
+                    },
+                    monthly_catalog_cost=(
+                        hourly * requirement.hours_per_month * priced_instance_count
+                    ),
+                    rationale="AWS 当前区域、引擎和部署模式支持的官方 RDS 型号。",
+                    official_product={
+                        "source": "AWS Price List + RDS OrderableDBInstanceOptions",
+                        "sku": product.get("product", {}).get("sku"),
+                        "regionCode": attrs.get("regionCode"),
+                    },
+                )
+            )
+        return sorted(
+            options,
+            key=lambda option: (
+                option.monthly_catalog_cost is None,
+                option.monthly_catalog_cost or 0,
+                option.model,
+            ),
+        )
+
     def preview(self, requirement: ServiceRequirement, default_region: str) -> PreviewSelection:
         region = requirement.region or default_region
         requested = canonicalize_requirement_fields(requirement.requirements, service="rds")
@@ -334,11 +415,17 @@ class RdsPlugin(ServicePlugin):
                 "客户仅指定 SSD、未指定具体 RDS 存储类型；本次按通用型 SSD gp3 报价。"
             )
 
+        read_replica_count = int(requested.get("read_replica_count") or 0)
         architecture = {
             "single_az": "RDS Single-AZ；每个数据库实例按一个计费实例处理",
             "multi_az": "RDS Multi-AZ DB instance；使用 AWS 对应 Multi-AZ 计费维度",
             "multi_az_cluster": "RDS Multi-AZ DB cluster；使用 AWS 对应集群计费维度",
         }[deployment]
+        if deployment == "single_az" and read_replica_count > 0:
+            architecture = (
+                f"RDS 主库 + {read_replica_count} 个只读副本；"
+                "各成员按 Single-AZ 数据库实例与对应存储计费"
+            )
         if _is_aurora_engine(engine):
             customer_deployment = _text(requested.get("deployment"))
             availability = (
@@ -373,6 +460,7 @@ class RdsPlugin(ServicePlugin):
                 "memoryGiB": selected["memory_gib"],
                 "storageType": storage_type_used,
                 "storageGiB": storage_gib,
+                "readReplicaCount": read_replica_count or None,
                 **(
                     {
                         "billingDeploymentOption": attrs.get("deploymentOption"),
@@ -504,7 +592,8 @@ class RdsPlugin(ServicePlugin):
             # A named class must be checked directly. Scanning a truncated broad
             # orderable catalog can falsely report a real customer model missing.
             kwargs["DBInstanceClass"] = requested_model
-        if version := _text(engine_version):
+        version = _text(engine_version)
+        if version:
             # Customers normally provide a major family such as MySQL 8.0 or
             # PostgreSQL 16. The RDS orderable-options API expects a full engine
             # build for EngineVersion, so major-family text must not be sent as-is.
@@ -517,6 +606,33 @@ class RdsPlugin(ServicePlugin):
                 and re.fullmatch(r"\d+(?:\.\d+){2,}(?:[-.][A-Za-z0-9]+)*", version)
             ):
                 kwargs["EngineVersion"] = version
+        # A broad engine-only orderable query can contain many versions of
+        # every class and exceed the read boundary before newer Graviton
+        # families appear. That produced an incomplete, x86-only candidate
+        # set. When no exact class is being checked, constrain the query to the
+        # newest maintained build in the requested major family (or the newest
+        # build overall). Instance prices are version-independent, while the
+        # resulting class list is complete and genuinely orderable.
+        if "EngineVersion" not in kwargs and not requested_model:
+            maintained_versions = self._supported_engine_versions(region, api_engine)
+            selected_version = maintained_versions[0] if maintained_versions else ""
+            if version and maintained_versions:
+                requested_numbers = tuple(int(part) for part in re.findall(r"\d+", version))
+                family_width = 1 if api_engine == "postgres" else 2
+                requested_family = requested_numbers[:family_width]
+                selected_version = next(
+                    (
+                        candidate
+                        for candidate in maintained_versions
+                        if tuple(
+                            int(part) for part in re.findall(r"\d+", candidate)
+                        )[:family_width]
+                        == requested_family
+                    ),
+                    selected_version,
+                )
+            if selected_version:
+                kwargs["EngineVersion"] = selected_version
         try:
             executor = ReadOnlyAwsQueryExecutor(self.clients)
 

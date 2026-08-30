@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from typing import Any
 
 from botocore.config import Config
@@ -14,6 +15,12 @@ from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
 from app.core.data_paths import AWS_DATA_ROOT
+from app.core.diagnostics import (
+    bind_request_id,
+    current_request_id,
+    diagnostic_log,
+    reset_request_id,
+)
 from app.core.errors import QuoteError
 from app.domain.models import (
     ConfigurationFeedbackSubmission,
@@ -67,6 +74,9 @@ from app.services.quote_service import QuoteService
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+diagnostic_log.configure(
+    enabled=settings.app_env.strip().lower() not in {"production", "prod"}
+)
 clients = AwsClients.from_settings(settings)
 regions = RegionResolver(clients)
 catalog = PricingCatalog(clients, regions)
@@ -139,7 +149,43 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT"],
     allow_headers=["Content-Type"],
+    expose_headers=["X-Diagnostic-Request-Id"],
 )
+
+
+@app.middleware("http")
+async def attach_diagnostic_request_id(request: Request, call_next):
+    request_id = request.headers.get("X-Diagnostic-Request-Id") or f"req_{uuid.uuid4().hex}"
+    request.state.diagnostic_request_id = request_id
+    token = bind_request_id(request_id)
+    started_at = time.perf_counter()
+    try:
+        response = await call_next(request)
+        response.headers["X-Diagnostic-Request-Id"] = request_id
+        # Diagnostic maintenance must not create a fresh diagnostic record.
+        # Otherwise "clear logs" immediately leaves behind its own POST entry,
+        # so a refreshed test page can never truthfully start at zero.
+        if request.url.path != "/api/health" and not request.url.path.startswith(
+            "/api/debug/logs"
+        ):
+            diagnostic_log.record(
+                "api_request_completed",
+                level="error" if response.status_code >= 500 else (
+                    "warning" if response.status_code >= 400 else "info"
+                ),
+                message=f"{request.method} {request.url.path} -> {response.status_code}",
+                context={
+                    "method": request.method,
+                    "path": request.url.path,
+                    "query": str(request.url.query),
+                    "status_code": response.status_code,
+                    "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                },
+                request_id=request_id,
+            )
+        return response
+    finally:
+        reset_request_id(token)
 
 
 def _require_aws_request(request: QuoteRequest) -> None:
@@ -204,19 +250,72 @@ async def stop_aws_catalog_maintenance() -> None:
 
 
 @app.exception_handler(QuoteError)
-async def quote_error_handler(_: Request, exc: QuoteError) -> JSONResponse:
-    payload = ErrorResponse(code=exc.code, message=exc.message, details=exc.details)
+async def quote_error_handler(request: Request, exc: QuoteError) -> JSONResponse:
+    request_id = getattr(request.state, "diagnostic_request_id", None) or current_request_id()
+    diagnostic_id = diagnostic_log.record_exception(
+        "quote_api_error",
+        exc,
+        level="warning" if exc.http_status < 500 else "error",
+        context={
+            "method": request.method,
+            "path": request.url.path,
+            "error_code": exc.code,
+            "http_status": exc.http_status,
+            "details": exc.details,
+        },
+        request_id=request_id,
+    )
+    details = dict(exc.details)
+    if diagnostic_id:
+        details.update({"diagnostic_id": diagnostic_id, "request_id": request_id})
+    payload = ErrorResponse(code=exc.code, message=exc.message, details=details)
     return JSONResponse(status_code=exc.http_status, content=payload.model_dump(mode="json"))
 
 
 @app.exception_handler(Exception)
-async def unexpected_error_handler(_: Request, exc: Exception) -> JSONResponse:
+async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResponse:
     logger.exception("Unexpected AWS quote API failure", exc_info=exc)
+    request_id = getattr(request.state, "diagnostic_request_id", None) or current_request_id()
+    diagnostic_id = diagnostic_log.record_exception(
+        "unexpected_quote_api_error",
+        exc,
+        context={"method": request.method, "path": request.url.path},
+        request_id=request_id,
+    )
     payload = ErrorResponse(
         code="internal_error",
         message="AWS 报价程序内部错误；本次未生成猜测价格。",
+        details={
+            "diagnostic_id": diagnostic_id,
+            "request_id": request_id,
+            "error_type": type(exc).__name__,
+        }
+        if diagnostic_id
+        else {},
     )
     return JSONResponse(status_code=500, content=payload.model_dump(mode="json"))
+
+
+@app.get("/api/debug/logs")
+async def get_diagnostic_logs(limit: int = 500, since: str | None = None) -> JSONResponse:
+    if not diagnostic_log.enabled:
+        return JSONResponse(status_code=404, content={"message": "诊断日志仅在测试环境开放"})
+    return JSONResponse(
+        content={
+            "enabled": True,
+            "environment": settings.app_env,
+            "provider": "aws",
+            "entries": diagnostic_log.snapshot(limit=limit, since=since),
+        }
+    )
+
+
+@app.post("/api/debug/logs/clear")
+async def clear_diagnostic_logs() -> Any:
+    if not diagnostic_log.enabled:
+        return JSONResponse(status_code=404, content={"message": "诊断日志仅在测试环境开放"})
+    diagnostic_log.clear()
+    return {"cleared": True}
 
 
 @app.get("/api/health")
@@ -440,7 +539,11 @@ async def submit_confirmation_session(
 ) -> ConfirmationSessionResponse | JSONResponse:
     _require_aws_token(token)
     try:
-        session = confirmation_sessions.submit(token, submission.answers)
+        session = confirmation_sessions.submit(
+            token,
+            submission.answers,
+            processor_architecture=submission.processor_architecture,
+        )
     except ValueError as exc:
         return JSONResponse(status_code=422, content={"message": str(exc)})
     if session is None:
@@ -529,3 +632,15 @@ async def get_quote_job(job_id: str) -> JSONResponse:
     if job is None:
         return JSONResponse(status_code=404, content={"message": "报价任务不存在"})
     return JSONResponse(content=job.public())
+
+
+@app.post("/api/quote-jobs/{job_id}/cancel")
+async def cancel_quote_job(job_id: str) -> dict[str, bool]:
+    if not job_id.startswith("aws-"):
+        raise QuoteError(
+            "provider_boundary_violation",
+            "AWS 报价程序禁止取消 Microsoft Azure 任务。",
+            {"expected_prefix": "aws-"},
+            403,
+        )
+    return {"cancelled": await quote_jobs.cancel(job_id)}

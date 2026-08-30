@@ -3,7 +3,8 @@ import math
 import pytest
 
 from app.core.errors import ManualConfirmationRequired
-from app.domain.models import ServiceRequirement
+from app.domain.fact_ledger import unconsumed_customer_pricing_facts
+from app.domain.models import SelectedResource, ServiceRequirement, UsageLine
 from app.integrations.aws import PricingCatalog
 from app.services.plugins.generic_official import GenericOfficialPlugin
 
@@ -97,6 +98,284 @@ def test_generic_plugin_without_usage_exposes_reference_rate_only() -> None:
     assert selected.reference_rates[0].unit_price == 0.0000002
 
 
+def test_supplement_uses_learned_alias_without_changing_customer_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = GenericOfficialPlugin(None, object())  # type: ignore[arg-type]
+
+    def select(
+        requirement: ServiceRequirement,
+        default_region: str,
+    ) -> SelectedResource:
+        lines = []
+        if "storage_gib" in requirement.requirements:
+            lines.append(
+                UsageLine(
+                    key="storage",
+                    service_code="AmazonLogs",
+                    usage_type="TimedStorage-ByteHrs",
+                    operation="",
+                    amount=float(requirement.requirements["storage_gib"]),
+                    source_fields=["storage_gib"],
+                )
+            )
+        return SelectedResource(
+            service="future_logs",
+            display_name="Future Logs",
+            region=default_region,
+            model="official",
+            architecture="managed",
+            specifications={},
+            official_product={"source": "AWS Price List"},
+            rationale="official",
+            usage_lines=lines,
+        )
+
+    monkeypatch.setattr(plugin, "select", select)
+    requirement = ServiceRequirement(
+        service="future_logs",
+        requirements={"retained_logs_gib": 1024},
+        field_sources={
+            "requirements.retained_logs_gib": "customer_text",
+            "_fact_purpose_alias.retained_logs_gib": "storage_gib",
+        },
+        field_evidence={
+            "requirements.retained_logs_gib": "日志存储1T",
+        },
+    )
+    base = SelectedResource(
+        service="future_logs",
+        display_name="Future Logs",
+        region="ap-southeast-1",
+        model="official",
+        architecture="managed",
+        specifications={},
+        official_product={"source": "AWS Price List"},
+        rationale="official",
+    )
+
+    selected = plugin.supplement_selection(
+        requirement,
+        base,
+        ["requirements.retained_logs_gib"],
+        "ap-southeast-1",
+    )
+
+    assert requirement.requirements == {"retained_logs_gib": 1024}
+    assert selected.usage_lines[0].amount == 1024
+    assert selected.usage_lines[0].source_fields == ["retained_logs_gib"]
+    assert unconsumed_customer_pricing_facts(requirement, selected) == []
+
+
+def test_supplement_resolves_shared_offer_dimension_for_any_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SharedOfferCatalog:
+        @staticmethod
+        def location(region: str) -> str:
+            assert region == "ap-southeast-5"
+            return "Asia Pacific (Malaysia)"
+
+        @staticmethod
+        def products(
+            service_code: str,
+            filters: dict[str, str],
+            *,
+            max_pages: int = 20,
+            refresh: bool = False,
+        ) -> list[dict]:
+            assert service_code == "AWSDataTransfer"
+            assert filters == {
+                "fromLocation": "Asia Pacific (Malaysia)",
+                "toLocation": "External",
+                "transferType": "AWS Outbound",
+            }
+            return [
+                priced_product(
+                    "AWSDataTransfer",
+                    "APS12-DataTransfer-Out-Bytes",
+                    "GB",
+                    0.12,
+                    operation="DataTransfer-Out-Bytes",
+                )
+            ]
+
+    plugin = GenericOfficialPlugin(None, SharedOfferCatalog())  # type: ignore[arg-type]
+    requirement = ServiceRequirement(
+        service="apigateway",
+        region="ap-southeast-5",
+        source_text="API Gateway，每月请求量1亿次，每月公网下行流量2T",
+        requirements={
+            "api_type": "http",
+            "requests": 100_000_000,
+            "data_transfer_out_gib": 2048,
+        },
+        field_sources={
+            "requirements.requests": "customer_text",
+            "requirements.data_transfer_out_gib": "customer_text",
+        },
+        field_evidence={
+            "requirements.requests": "每月请求量1亿次",
+            "requirements.data_transfer_out_gib": "每月公网下行流量2T",
+        },
+    )
+    base = SelectedResource(
+        service="apigateway",
+        display_name="Amazon API Gateway HTTP API",
+        region="ap-southeast-5",
+        model="HTTP API",
+        architecture="每月 1 亿次请求",
+        specifications={"apiType": "HTTP", "requests": 100_000_000},
+        official_product={"source": "AWS Price List"},
+        rationale="official",
+        usage_lines=[
+            UsageLine(
+                key="requests",
+                service_code="AmazonApiGateway",
+                usage_type="APS12-ApiGatewayHttpApi",
+                operation="ApiGatewayHttpApi",
+                amount=100_000_000,
+                source_fields=["requests", "api_type"],
+            )
+        ],
+    )
+    monkeypatch.setattr(plugin, "select", lambda _requirement, _region: base)
+
+    selected = plugin.supplement_selection(
+        requirement,
+        base,
+        ["requirements.data_transfer_out_gib"],
+        "ap-southeast-1",
+    )
+
+    assert [(line.service_code, line.amount) for line in selected.usage_lines] == [
+        ("AmazonApiGateway", 100_000_000),
+        ("AWSDataTransfer", 2048),
+    ]
+    assert selected.usage_lines[1].source_fields == ["data_transfer_out_gib"]
+    assert unconsumed_customer_pricing_facts(requirement, selected) == []
+
+
+def test_shared_offer_dimension_preserves_per_resource_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SharedOfferCatalog:
+        @staticmethod
+        def location(_region: str) -> str:
+            return "Asia Pacific (Singapore)"
+
+        @staticmethod
+        def products(
+            _service_code: str,
+            _filters: dict[str, str],
+            *,
+            max_pages: int = 20,
+            refresh: bool = False,
+        ) -> list[dict]:
+            return [priced_product("AWSDataTransfer", "DataTransfer-Out", "GB", 0.1)]
+
+    plugin = GenericOfficialPlugin(None, SharedOfferCatalog())  # type: ignore[arg-type]
+    requirement = ServiceRequirement(
+        service="future_service",
+        region="ap-southeast-1",
+        quantity=3,
+        requirements={"data_transfer_out_gib": 100},
+        field_sources={
+            "requirements.data_transfer_out_gib": "customer_text",
+        },
+        field_evidence={
+            "requirements.data_transfer_out_gib": "每节点公网出站100G",
+        },
+        field_scopes={"data_transfer_out_gib": "per_resource"},
+    )
+    base = SelectedResource(
+        service="future_service",
+        display_name="Future Service",
+        region="ap-southeast-1",
+        model="official",
+        architecture="managed",
+        specifications={},
+        official_product={"source": "AWS Price List"},
+        rationale="official",
+    )
+    monkeypatch.setattr(plugin, "select", lambda _requirement, _region: base)
+
+    selected = plugin.supplement_selection(
+        requirement,
+        base,
+        ["requirements.data_transfer_out_gib"],
+        "ap-southeast-1",
+    )
+
+    assert selected.usage_lines[0].amount == 300
+    assert unconsumed_customer_pricing_facts(requirement, selected) == []
+
+
+def test_supplement_does_not_alias_over_a_different_customer_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = GenericOfficialPlugin(None, object())  # type: ignore[arg-type]
+
+    def select(
+        requirement: ServiceRequirement,
+        default_region: str,
+    ) -> SelectedResource:
+        return SelectedResource(
+            service="future_logs",
+            display_name="Future Logs",
+            region=default_region,
+            model="official",
+            architecture="managed",
+            specifications={},
+            official_product={"source": "AWS Price List"},
+            rationale="official",
+            usage_lines=[
+                UsageLine(
+                    key="storage",
+                    service_code="AmazonLogs",
+                    usage_type="TimedStorage-ByteHrs",
+                    operation="",
+                    amount=float(requirement.requirements["storage_gib"]),
+                    source_fields=["storage_gib"],
+                )
+            ],
+        )
+
+    monkeypatch.setattr(plugin, "select", select)
+    requirement = ServiceRequirement(
+        service="future_logs",
+        requirements={"retained_logs_gib": 1024, "storage_gib": 2048},
+        field_sources={
+            "requirements.retained_logs_gib": "customer_text",
+            "requirements.storage_gib": "customer_text",
+            "_fact_purpose_alias.retained_logs_gib": "storage_gib",
+        },
+        field_evidence={
+            "requirements.retained_logs_gib": "日志保留1T",
+            "requirements.storage_gib": "归档存储2T",
+        },
+    )
+    base = SelectedResource(
+        service="future_logs",
+        display_name="Future Logs",
+        region="ap-southeast-1",
+        model="official",
+        architecture="managed",
+        specifications={},
+        official_product={"source": "AWS Price List"},
+        rationale="official",
+    )
+
+    selected = plugin.supplement_selection(
+        requirement,
+        base,
+        ["requirements.retained_logs_gib"],
+        "ap-southeast-1",
+    )
+
+    assert selected.usage_lines == []
+
+
 def test_curated_generic_service_uses_official_profile_field_bindings() -> None:
     product = priced_product(
         "AWSCloudMap",
@@ -161,6 +440,82 @@ def test_curated_generic_service_uses_official_profile_field_bindings() -> None:
     assert CloudMapDiscovery.calls == 1
     assert selected.usage_lines[0].amount == 12
     assert selected.reference_rates == []
+
+
+def test_backup_retention_is_consumed_as_configuration_not_second_charge() -> None:
+    product = priced_product(
+        "AWSBackup",
+        "APS2-WarmStorage-ByteHrs",
+        "GB-Mo",
+        0.05,
+        operation="Storage",
+        group="AWS-BackupStorage",
+    )
+
+    class BackupCatalog:
+        @staticmethod
+        def service_codes() -> list[str]:
+            return ["AWSBackup"]
+
+        @staticmethod
+        def products(
+            service_code: str,
+            filters: dict[str, str],
+            *,
+            max_pages: int = 20,
+            refresh: bool = False,
+        ) -> list[dict]:
+            assert service_code == "AWSBackup"
+            return [product]
+
+    class BackupDiscovery:
+        @staticmethod
+        def ensure_profile(**_: object) -> dict[str, object]:
+            return {
+                "status": "verified",
+                "service_code": "AWSBackup",
+                "fields": ["backup_storage_gib"],
+                "field_bindings": [
+                    {
+                        "field": "backup_storage_gib",
+                        "label": "备份存储",
+                        "usage_type": "APS2-WarmStorage-ByteHrs",
+                        "operation": "Storage",
+                        "unit": "GB-Mo",
+                    }
+                ],
+                "dimensions": [],
+            }
+
+    requirement = ServiceRequirement(
+        service="backup",
+        calculator_service_name="AWS Backup",
+        region="ap-southeast-2",
+        requirements={
+            "backup_storage_gib": 5120,
+            "backup_frequency": "daily",
+            "backup_retention_days": 30,
+        },
+        field_sources={
+            "requirements.backup_storage_gib": "customer_text",
+            "requirements.backup_retention_days": "customer_text",
+        },
+        field_evidence={
+            "requirements.backup_storage_gib": "备份数据容量5T",
+            "requirements.backup_retention_days": "保留30天",
+        },
+    )
+    selected = GenericOfficialPlugin(
+        None,  # type: ignore[arg-type]
+        BackupCatalog(),  # type: ignore[arg-type]
+        BackupDiscovery(),  # type: ignore[arg-type]
+    ).select(requirement, "ap-southeast-2")
+
+    assert selected.usage_lines[0].amount == 5120
+    assert selected.usage_lines[0].source_fields == ["backup_storage_gib"]
+    assert "backup_frequency" in selected.applied_requirement_fields
+    assert "backup_retention_days" in selected.applied_requirement_fields
+    assert unconsumed_customer_pricing_facts(requirement, selected) == []
 
 
 def test_profile_customer_amount_replaces_same_dimension_reference_row() -> None:
@@ -427,6 +782,74 @@ def test_timestream_liveanalytics_excludes_influx_and_derives_storage_usage() ->
     assert all("influx" not in item[2][2].casefold() for item in result)
 
 
+def test_timestream_direct_storage_capacity_binds_to_magnetic_gib_months() -> None:
+    product = priced_product(
+        "AmazonTimestream",
+        "USE1-MagneticStore-ByteHrs",
+        "GB-Mo",
+        0.03,
+    )
+    price, unit = PricingCatalog.on_demand_unit_rate(product)
+    _, usage_type, operation = PricingCatalog.billing_identity(product)
+    result = GenericOfficialPlugin._auto_semantic_rates(
+        ServiceRequirement(
+            service="timestream",
+            requirements={
+                "product_variant": "live_analytics",
+                "storage_gib": 2048,
+            },
+        ),
+        [(price, unit, usage_type, operation, product)],
+        profile={
+            "field_bindings": [
+                {
+                    "field": "magnetic_store_gib_months",
+                    "label": "磁性存储",
+                    "usage_type": usage_type,
+                    "operation": operation,
+                    "unit": unit,
+                }
+            ]
+        },
+    )
+
+    assert result[0][1] == 2048
+
+
+def test_profile_processing_hours_are_converted_to_official_minutes() -> None:
+    product = priced_product(
+        "AWSElementalMediaConvert",
+        "IAD-B-AVC-HD-S-30",
+        "minutes",
+        0.012,
+    )
+    price, unit = PricingCatalog.on_demand_unit_rate(product)
+    _, usage_type, operation = PricingCatalog.billing_identity(product)
+    requirement = ServiceRequirement(
+        service="elemental_media_convert",
+        source_text="视频转码，每月处理高清视频5000小时",
+        requirements={"processing_hours": 5000},
+    )
+
+    result = GenericOfficialPlugin._auto_semantic_rates(
+        requirement,
+        [(price, unit, usage_type, operation, product)],
+        profile={
+            "field_bindings": [
+                {
+                    "field": "processing_hours",
+                    "label": "处理时长",
+                    "usage_type": usage_type,
+                    "operation": operation,
+                    "unit": unit,
+                }
+            ]
+        },
+    )
+
+    assert result[0][1] == 5000 * 60
+
+
 def test_dms_shape_constraints_do_not_turn_task_count_into_instance_count() -> None:
     tiny = priced_product(
         "AWSDatabaseMigrationSvc", "APS3-InstanceUsg:dms.t2.micro", "Hrs", 0.02
@@ -457,6 +880,30 @@ def test_dms_shape_constraints_do_not_turn_task_count_into_instance_count() -> N
 
     assert result[0][2][2].endswith("dms.r5.xlarge")
     assert result[0][1] == 730
+
+
+def test_dms_per_instance_storage_uses_replication_instance_count() -> None:
+    storage = priced_product(
+        "AWSDatabaseMigrationSvc",
+        "DMS:GP2-Storage",
+        "GB-Mo",
+        0.115,
+        operation="CreateDMSInstance",
+    )
+    price, unit = PricingCatalog.on_demand_unit_rate(storage)
+    _, usage_type, operation = PricingCatalog.billing_identity(storage)
+    requirement = ServiceRequirement(
+        service="dms",
+        requirements={"replication_instances": 2, "storage_gib": 200},
+        field_scopes={"storage_gib": "per_resource"},
+    )
+
+    result = GenericOfficialPlugin._semantic_rates(
+        requirement,
+        [(price, unit, usage_type, operation, storage)],
+    )
+
+    assert result[0][1] == 400
 
 
 def test_managed_instance_shape_is_enriched_from_official_ec2_specification(
@@ -641,6 +1088,173 @@ def test_fsx_openzfs_prices_storage_throughput_and_backup_not_monitoring() -> No
     assert sum(float(amount) * rate[0] for _, amount, rate in selected) == pytest.approx(
         1604.608
     )
+
+
+def test_fsx_ontap_consumes_storage_deployment_and_throughput_contract() -> None:
+    products = [
+        priced_product(
+            "AmazonFSx",
+            "Storage.SSD.SingleAZ",
+            "GB-Mo",
+            0.10,
+            operation="CreateFileSystem:ONTAP",
+        ),
+        priced_product(
+            "AmazonFSx",
+            "Storage.HDD.MultiAZ",
+            "GB-Mo",
+            0.05,
+            operation="CreateFileSystem:ONTAP",
+        ),
+        priced_product(
+            "AmazonFSx",
+            "Storage.SSD.MultiAZ",
+            "GB-Mo",
+            0.20,
+            operation="CreateFileSystem:ONTAP",
+        ),
+        priced_product(
+            "AmazonFSx",
+            "Throughput.SingleAZ",
+            "MiBps-Mo",
+            0.10,
+            operation="CreateFileSystem:ONTAP",
+        ),
+        priced_product(
+            "AmazonFSx",
+            "Throughput.MultiAZ",
+            "MiBps-Mo",
+            0.30,
+            operation="CreateFileSystem:ONTAP",
+        ),
+    ]
+    for item, (deployment, storage_type) in zip(
+        products,
+        (
+            ("Single-AZ", "SSD"),
+            ("Multi-AZ", "HDD"),
+            ("Multi-AZ", "SSD"),
+            ("Single-AZ", "N/A"),
+            ("Multi-AZ", "N/A"),
+        ),
+        strict=True,
+    ):
+        item["product"]["attributes"].update(
+            {
+                "fileSystemType": "ONTAP",
+                "storageType": storage_type,
+                "deploymentOption": deployment,
+            }
+        )
+
+    rates = []
+    for item in products:
+        price, unit = PricingCatalog.on_demand_unit_rate(item)
+        _, usage_type, operation = PricingCatalog.billing_identity(item)
+        rates.append((price, unit, usage_type, operation, item))
+
+    selected = GenericOfficialPlugin._semantic_rates(
+        ServiceRequirement(
+            service="fsx",
+            requirements={
+                "file_system_type": "ontap",
+                "deployment_type": "multi_az",
+                "storage_type": "ssd",
+                "storage_gib": 8192,
+                "throughput_mbps": 512,
+            },
+        ),
+        rates,
+    )
+
+    assert [amount for _, amount, _ in selected] == [8192, 512]
+    assert [rate[0] for _, _, rate in selected] == [0.20, 0.30]
+
+
+def test_system_chosen_profile_variant_cannot_override_fsx_product_configuration() -> None:
+    wrong_storage = priced_product(
+        "AmazonFSx",
+        "USE1-Storage.MAZ:INT_Monitoring",
+        "GB-Mo",
+        0.0006,
+        operation="CreateFileSystem:OpenZFS",
+    )
+    correct_storage = priced_product(
+        "AmazonFSx",
+        "USE1-Storage.MAZ:SSD",
+        "GB-Mo",
+        0.20,
+        operation="CreateFileSystem:ONTAP",
+    )
+    for product, file_system_type, storage_type in (
+        (wrong_storage, "OpenZFS", "INT"),
+        (correct_storage, "ONTAP", "SSD"),
+    ):
+        product["product"]["attributes"].update(
+            {
+                "fileSystemType": file_system_type,
+                "storageType": storage_type,
+                "deploymentOption": "Multi-AZ",
+            }
+        )
+
+    class Catalog:
+        @staticmethod
+        def service_codes() -> list[str]:
+            return ["AmazonFSx"]
+
+        @staticmethod
+        def products(service_code: str, filters: dict[str, str], *, max_pages: int = 20):
+            return [wrong_storage, correct_storage]
+
+    class Discovery:
+        @staticmethod
+        def ensure_profile(**kwargs: object) -> dict[str, object]:
+            return {
+                "service_code": "AmazonFSx",
+                "field_bindings": [
+                    {
+                        "field": "storage_gib",
+                        "usage_type": "USE1-Storage.MAZ:INT_Monitoring",
+                        "operation": "CreateFileSystem:OpenZFS",
+                        "unit": "GB-Mo",
+                    }
+                ],
+                "dimensions": [
+                    {
+                        "usage_type": "USE1-Storage.MAZ:INT_Monitoring",
+                        "operation": "CreateFileSystem:OpenZFS",
+                        "unit": "GB-Mo",
+                        "price": 0.0006,
+                    }
+                ],
+            }
+
+    requirement = ServiceRequirement(
+        service="fsx",
+        calculator_service_name="Amazon FSx for NetApp ONTAP",
+        region="us-east-1",
+        requirements={
+            "file_system_type": "ontap",
+            "deployment_type": "multi_az",
+            "storage_type": "ssd",
+            "storage_gib": 8192,
+            "_billing_variant_storage_gib": "USE1-Storage.MAZ:INT_Monitoring",
+        },
+        field_sources={
+            "requirements._billing_variant_storage_gib": "system_lowest_compatible"
+        },
+    )
+
+    selected = GenericOfficialPlugin(  # type: ignore[arg-type]
+        None,
+        Catalog(),
+        Discovery(),
+    ).select(requirement, "us-east-1")
+
+    assert [line.usage_type for line in selected.usage_lines] == [
+        "USE1-Storage.MAZ:SSD"
+    ]
 
 
 def test_codedeploy_to_ec2_is_a_valid_zero_cost_official_result() -> None:
@@ -1035,6 +1649,156 @@ def test_lambda_aggregate_invocations_are_not_multiplied_by_function_count() -> 
     assert sum(item[1] * item[2][0] for item in selected if item[1]) == pytest.approx(372.32)
 
 
+def test_lambda_selection_traces_every_derived_input_without_multiplying_functions() -> None:
+    products = [
+        priced_product(
+            "AWSLambda", "APN1-Request", "Request", 0.00000028,
+            group="AWS-Lambda-Requests",
+        ),
+        priced_product(
+            "AWSLambda", "APN1-Lambda-GB-Second", "Lambda-GB-Second", 0.00002292,
+            group="AWS-Lambda-Duration",
+        ),
+    ]
+
+    class LambdaCatalog:
+        @staticmethod
+        def service_codes() -> list[str]:
+            return ["AWSLambda"]
+
+        @staticmethod
+        def products(
+            service_code: str,
+            filters: dict[str, str],
+            *,
+            max_pages: int = 20,
+            refresh: bool = False,
+        ) -> list[dict]:
+            assert service_code == "AWSLambda"
+            return products
+
+    requirement = ServiceRequirement(
+        service="lambda",
+        calculator_service_name="AWS Lambda",
+        region="ap-northeast-1",
+        quantity=10,
+        requirements={
+            "requests": 30_000_000,
+            "memory_mb": 2048,
+            "duration_ms": 1000,
+        },
+        field_sources={
+            "quantity": "customer_text",
+            "requirements.requests": "customer_text",
+            "requirements.memory_mb": "customer_text",
+            "requirements.duration_ms": "customer_text",
+        },
+        field_evidence={
+            "quantity": "10个函数",
+            "requirements.requests": "每月总调用量3000万次",
+            "requirements.memory_mb": "单函数内存2G",
+            "requirements.duration_ms": "平均执行时长1秒",
+        },
+        field_scopes={"requirements.requests": "aggregate"},
+    )
+
+    selected = GenericOfficialPlugin(None, LambdaCatalog()).select(  # type: ignore[arg-type]
+        requirement,
+        "ap-northeast-1",
+    )
+
+    assert [line.amount for line in selected.usage_lines] == [
+        30_000_000,
+        60_000_000,
+    ]
+    assert selected.specifications["function_count"] == 10
+    assert "quantity" in selected.applied_requirement_fields
+    assert {"requests", "memory_mb", "duration_ms"}.issubset(
+        set(selected.usage_lines[1].source_fields)
+    )
+    assert unconsumed_customer_pricing_facts(requirement, selected) == []
+
+
+def test_eks_control_plane_traces_cluster_count_to_cluster_hours() -> None:
+    products = [
+        priced_product(
+            "AmazonEKS",
+            "APN1-AmazonEKS-Hours:perCluster",
+            "Hrs",
+            0.10,
+        )
+    ]
+
+    class EksCatalog:
+        @staticmethod
+        def service_codes() -> list[str]:
+            return ["AmazonEKS"]
+
+        @staticmethod
+        def products(
+            service_code: str,
+            filters: dict[str, str],
+            *,
+            max_pages: int = 20,
+            refresh: bool = False,
+        ) -> list[dict]:
+            assert service_code == "AmazonEKS"
+            return products
+
+    requirement = ServiceRequirement(
+        service="eks",
+        calculator_service_name="Amazon EKS",
+        region="ap-northeast-1",
+        quantity=1,
+        hours_per_month=730,
+        requirements={"cluster_count": 2},
+        field_sources={"requirements.cluster_count": "customer_text"},
+        field_evidence={"requirements.cluster_count": "2套集群"},
+    )
+
+    selected = GenericOfficialPlugin(None, EksCatalog()).select(  # type: ignore[arg-type]
+        requirement,
+        "ap-northeast-1",
+    )
+
+    assert selected.usage_lines[0].amount == 1460
+    assert {"cluster_count", "hours_per_month"}.issubset(
+        set(selected.usage_lines[0].source_fields)
+    )
+    assert unconsumed_customer_pricing_facts(requirement, selected) == []
+
+
+def test_ecs_ec2_control_plane_is_free_and_consumes_cluster_count() -> None:
+    class CatalogMustNotBeCalled:
+        @staticmethod
+        def service_codes() -> list[str]:
+            raise AssertionError("ECS EC2 control plane must not query an instance rate")
+
+        @staticmethod
+        def products(*args, **kwargs):
+            raise AssertionError("ECS EC2 control plane must not query an instance rate")
+
+    requirement = ServiceRequirement(
+        service="ecs",
+        calculator_service_name="Amazon ECS",
+        region="ap-south-1",
+        quantity=1,
+        requirements={"cluster_count": 1, "launch_type": "ec2"},
+        field_sources={"requirements.cluster_count": "customer_text"},
+        field_evidence={"requirements.cluster_count": "1套集群"},
+    )
+
+    selected = GenericOfficialPlugin(  # type: ignore[arg-type]
+        None, CatalogMustNotBeCalled()
+    ).select(requirement, "ap-south-1")
+
+    assert selected.pricing_status == "free"
+    assert selected.model == "ECS 集群控制面（EC2 启动类型）"
+    assert selected.usage_lines == []
+    assert "cluster_count" in selected.applied_requirement_fields
+    assert unconsumed_customer_pricing_facts(requirement, selected) == []
+
+
 def test_kinesis_explicit_shards_are_priced_as_monthly_shard_hours() -> None:
     products = [
         priced_product(
@@ -1186,6 +1950,162 @@ def test_amazon_mq_uses_broker_topology_and_minimum_requested_shape() -> None:
     assert len(selected) == 1
     assert selected[0][1] == 2 * 730
     assert selected[0][2][4]["product"]["attributes"]["instanceType"] == "mq.m5.xlarge"
+
+
+def test_amazon_mq_semantic_rates_declare_every_customer_fact_source() -> None:
+    compute = priced_product(
+        "AmazonMQ",
+        "APS1-RabbitMQ-3-InstanceUsage:mq.m5.xlarge",
+        "Hrs",
+        1.2,
+        operation="CreateBroker:RabbitMQ",
+    )
+    compute["product"]["attributes"].update(
+        {"instanceType": "mq.m5.xlarge", "vcpu": "4", "memory": "16 GiB"}
+    )
+    storage = priced_product(
+        "AmazonMQ",
+        "APS1-RabbitMQ-Storage",
+        "GB-Mo",
+        0.1,
+        operation="CreateBroker:RabbitMQ",
+    )
+
+    class MqCatalog:
+        @staticmethod
+        def service_codes() -> list[str]:
+            return ["AmazonMQ"]
+
+        @staticmethod
+        def products(service_code: str, filters: dict[str, str], *, max_pages: int = 20):
+            assert service_code == "AmazonMQ"
+            return [compute, storage]
+
+    source = "RabbitMQ 消息队列，3个节点，单节点4核16G，磁盘500G"
+    requirement = ServiceRequirement(
+        service="mq",
+        calculator_service_name="Amazon MQ for RabbitMQ",
+        region="ap-northeast-1",
+        quantity=1,
+        hours_per_month=730,
+        requirements={
+            "engine_type": "rabbitmq",
+            "broker_count": 3,
+            "vcpu": 4,
+            "memory_gib": 16,
+            "storage_gib_per_broker": 500,
+        },
+        source_text=source,
+        field_sources={
+            "requirements.broker_count": "customer_text",
+            "requirements.vcpu": "customer_text",
+            "requirements.memory_gib": "customer_text",
+            "requirements.storage_gib_per_broker": "customer_text",
+        },
+        field_evidence={
+            "requirements.broker_count": "3个节点",
+            "requirements.vcpu": "4核16G",
+            "requirements.memory_gib": "4核16G",
+            "requirements.storage_gib_per_broker": "磁盘500G",
+        },
+    )
+
+    selected = GenericOfficialPlugin(None, MqCatalog()).select(  # type: ignore[arg-type]
+        requirement,
+        "ap-northeast-1",
+    )
+
+    assert len(selected.usage_lines) == 2
+    assert unconsumed_customer_pricing_facts(requirement, selected) == []
+
+
+def test_generic_profile_cannot_add_mutually_exclusive_mq_compute_rate() -> None:
+    bundled = priced_product(
+        "AmazonMQ",
+        "APS1-RabbitMQ-3-InstanceUsage:mq.m7g.xlarge",
+        "Hrs",
+        2.05,
+        operation="CreateBroker:RabbitMQ",
+    )
+    single = priced_product(
+        "AmazonMQ",
+        "APS1-RabbitMQ-Single-InstanceUsage:mq.m7g.xlarge",
+        "Hrs",
+        0.68,
+        operation="CreateBroker:RabbitMQ",
+    )
+    storage = priced_product(
+        "AmazonMQ",
+        "APS1-RabbitMQ-Storage",
+        "GB-Mo",
+        0.12,
+        operation="CreateBroker:RabbitMQ",
+    )
+    incompatible_profile_compute = priced_product(
+        "AmazonMQ",
+        "APS1-Multi-AZUsage:mq.m5.2xlarge",
+        "Hrs",
+        0.4,
+        operation="ActiveMQ-CRDR",
+    )
+    for product in (bundled, single):
+        product["product"]["attributes"].update(
+            {"instanceType": "mq.m7g.xlarge", "vcpu": "4", "memory": "16 GiB"}
+        )
+    incompatible_profile_compute["product"]["attributes"].update(
+        {"instanceType": "mq.m5.2xlarge", "vcpu": "8", "memory": "32 GiB"}
+    )
+
+    class MqCatalog:
+        @staticmethod
+        def service_codes() -> list[str]:
+            return ["AmazonMQ"]
+
+        @staticmethod
+        def products(service_code: str, filters: dict[str, str], *, max_pages: int = 20):
+            return [bundled, single, storage, incompatible_profile_compute]
+
+    class Discovery:
+        @staticmethod
+        def ensure_profile(**kwargs: object) -> dict[str, object]:
+            return {
+                "service_code": "AmazonMQ",
+                "field_bindings": [
+                    {
+                        "field": "hours_per_month",
+                        "usage_type": "APS1-Multi-AZUsage:mq.m5.2xlarge",
+                        "operation": "ActiveMQ-CRDR",
+                        "unit": "Hrs",
+                    }
+                ],
+            }
+
+    selected = GenericOfficialPlugin(  # type: ignore[arg-type]
+        None,
+        MqCatalog(),
+        Discovery(),
+    ).select(
+        ServiceRequirement(
+            service="mq",
+            calculator_service_name="Amazon MQ for RabbitMQ",
+            region="ap-northeast-1",
+            quantity=1,
+            hours_per_month=730,
+            requirements={
+                "engine_type": "rabbitmq",
+                "broker_count": 3,
+                "vcpu": 4,
+                "memory_gib": 16,
+                "storage_gib_per_broker": 300,
+            },
+        ),
+        "ap-northeast-1",
+    )
+
+    assert [line.usage_type for line in selected.usage_lines] == [
+        "APS1-RabbitMQ-3-InstanceUsage:mq.m7g.xlarge",
+        "APS1-RabbitMQ-Storage",
+    ]
 
 
 def test_emr_prices_master_and_core_roles_instead_of_one_generic_instance() -> None:
@@ -2599,6 +3519,52 @@ def test_confirmed_neptune_storage_and_backup_are_kept_beside_instance_hours() -
         ("EUC1-InstanceUsage:db.r6g.xl", 2190),
         ("EUC1-StorageUsage", 500),
         ("EUC1-BackupUsage", 100),
+    ]
+
+
+def test_generic_managed_storage_converts_per_node_capacity_to_total_usage() -> None:
+    storage = priced_product(
+        "AmazonNeptune",
+        "EUC1-StorageUsage",
+        "GB-Mo",
+        0.119,
+        operation="CreateDBInstance:0022",
+    )
+
+    price, unit = PricingCatalog.on_demand_unit_rate(storage)
+    _, usage_type, operation = PricingCatalog.billing_identity(storage)
+    profile = {
+        "field_bindings": [
+            {
+                "field": "storage_gib",
+                "label": "存储容量",
+                "usage_type": usage_type,
+                "operation": operation,
+                "unit": unit,
+            }
+        ]
+    }
+    requirement = ServiceRequirement(
+        service="neptune",
+        quantity=1,
+        source_text="3个节点，单节点存储1T",
+        requirements={
+            "instance_count": 3,
+            "storage_gib_per_node": 1024,
+        },
+    )
+
+    selected = GenericOfficialPlugin._auto_semantic_rates(
+        requirement,
+        [(price, unit, usage_type, operation, storage)],
+        profile=profile,
+    )
+
+    assert len(selected) == 1
+    assert selected[0][1] == 3072
+    assert selected[0][2][4]["_astra_source_fields"] == [
+        "instance_count",
+        "storage_gib_per_node",
     ]
 
 

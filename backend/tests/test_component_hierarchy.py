@@ -46,6 +46,32 @@ def test_explicit_ec2_remains_a_top_level_component() -> None:
     assert hierarchy[1].parent_component_id is None
 
 
+def test_legacy_ecs_worker_is_displayed_under_its_cluster() -> None:
+    source = (
+        "Amazon ECS，1套集群，EC2 Worker节点4台，"
+        "单台8核16G，磁盘300G"
+    )
+    services = [
+        ServiceRequirement(
+            service="ecs",
+            calculator_service_name="Amazon ECS",
+            source_text=source,
+        ),
+        ServiceRequirement(
+            service="ec2",
+            calculator_service_name="Amazon EC2 云服务器",
+            source_text=source,
+            quantity=4,
+        ),
+    ]
+
+    hierarchy = component_hierarchy(services)
+
+    assert [item.component_number for item in hierarchy] == ["1", "1.1"]
+    assert hierarchy[1].parent_component_id == "0"
+    assert hierarchy[1].parent_display_name == "Amazon ECS"
+
+
 def test_persisted_lineage_keeps_a_late_child_under_its_parent() -> None:
     services = [
         ServiceRequirement(

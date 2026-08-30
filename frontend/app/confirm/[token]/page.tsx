@@ -52,11 +52,55 @@ function choiceNumber(choice: ConfigurationChoice, keys: string[]): number | nul
   return null;
 }
 
+type ProcessorArchitecture = "arm64" | "x86_64";
+
+function choiceArchitecture(choice: ConfigurationChoice): ProcessorArchitecture | null {
+  const declared = choice.specifications?.processorArchitecture
+    ?? choice.specifications?.processor_architecture;
+  const plural = choice.specifications?.processorArchitectures
+    ?? choice.specifications?.architectures;
+  const declaredValues = [
+    ...(Array.isArray(plural) ? plural : plural === undefined ? [] : [plural]),
+    ...(declared === undefined ? [] : [declared]),
+  ];
+  for (const value of declaredValues) {
+    if (typeof value !== "string") continue;
+    const normalized = value.trim().toLowerCase();
+    if (["arm", "arm64", "aarch64", "graviton"].includes(normalized)) return "arm64";
+    if (["x86", "x86_64", "amd64", "i386"].includes(normalized)) return "x86_64";
+  }
+  const model = (choice.model ?? "").trim().toLowerCase();
+  if (!model.includes(".")) return null;
+  const segments = model.split(".");
+  if (segments.some((segment) => segment === "a1" || segment === "mac2" || segment.startsWith("mac2-"))) return "arm64";
+  if (segments.some((segment) => /\d+g[a-z]*$/.test(segment))) return "arm64";
+  return "x86_64";
+}
+
+function itemHasModelChoices(item: Item): boolean {
+  return [...item.options, ...(item.dependent_options ?? [])].some(
+    (choice) => Boolean(choice.model && choiceArchitecture(choice)),
+  );
+}
+
+function choicesForArchitecture(
+  choices: ConfigurationChoice[],
+  architecture: ProcessorArchitecture,
+): ConfigurationChoice[] {
+  const matching = choices.filter((choice) => choiceArchitecture(choice) === architecture);
+  if (matching.length > 0) return matching;
+  // ARM is the default preference. AWS services that have no ARM model must
+  // keep their official x86-only catalogue available. An explicit x86 choice
+  // never falls back to ARM.
+  return architecture === "arm64" ? choices : [];
+}
+
 function preferredDependentChoice(
   item: Item,
   configuration?: ConfigurationItem,
+  architecture: ProcessorArchitecture = "arm64",
 ): ConfigurationChoice | undefined {
-  const options = item.dependent_options ?? [];
+  const options = choicesForArchitecture(item.dependent_options ?? [], architecture);
   if (options.length === 0 || !configuration) return undefined;
   const requestedModel = typeof configuration.requirements.requested_model === "string"
     ? configuration.requirements.requested_model
@@ -82,19 +126,25 @@ function preferredDependentChoice(
   if (!hasVcpu || !hasMemory) return undefined;
   // Prefill only a real exact match. When AWS has no exact machine, leave the
   // picker open so the customer explicitly chooses one official alternative.
-  return options.find((option) => (
+  const exactOptions = options.filter((option) => (
     choiceNumber(option, ["vCPU", "vcpu", "vcpus"]) === requestedVcpu
     && choiceNumber(option, ["memoryGiB", "memory_gib", "memory"]) === requestedMemory
   ));
+  return exactOptions.sort((left, right) => (
+    (left.monthly_catalog_cost ?? Number.POSITIVE_INFINITY)
+      - (right.monthly_catalog_cost ?? Number.POSITIVE_INFINITY)
+    || (left.model ?? left.label).localeCompare(right.model ?? right.label)
+  ))[0];
 }
 
 function dependentSelectionValue(
   item: Item,
   baseValue: string,
   configuration?: ConfigurationItem,
+  architecture: ProcessorArchitecture = "arm64",
 ): string {
   if (!(item.dependent_on_values ?? []).includes(baseValue)) return baseValue;
-  const choice = preferredDependentChoice(item, configuration);
+  const choice = preferredDependentChoice(item, configuration, architecture);
   if (!choice || !configuration) return baseValue;
   return `${baseValue}；${choice.value}；机器数量 ${Math.max(configuration.quantity, 1)}`;
 }
@@ -210,6 +260,7 @@ function readPendingAddition(token: string): PendingAddition | null {
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "/api/backend";
 const EXPECTED_CLOUD_PROVIDER = "aws" as const;
+const PROCESSOR_ARCHITECTURE_ANSWER_KEY = "__processor_architecture__";
 const DELETE_COMPONENT_MARKER = "__DELETE_COMPONENT__";
 const FIELD_LABELS: Record<string, string> = {
   requested_model: "官方型号",
@@ -806,6 +857,10 @@ function displayServiceName(item: ConfigurationItem): string {
   };
   if (/\baurora\b/i.test(item.display_name)) return item.display_name;
   if (
+    ["elb", "alb", "nlb", "gwlb"].includes(item.service)
+    && /load\s*balancer|负载均衡/i.test(item.display_name)
+  ) return item.display_name;
+  if (
     item.service === "ec2"
     && /(?:自建|用于|工作节点|worker\s*nodes?)/i.test(item.display_name)
   ) return item.display_name;
@@ -887,6 +942,8 @@ function displayPlan(item: ConfigurationItem): string {
   }
   const labels: Record<string, string> = {
     "Application Load Balancer": "应用型负载均衡器",
+    "Network Load Balancer": "网络型负载均衡器",
+    "Gateway Load Balancer": "网关型负载均衡器",
     "CloudFront Pay-as-you-go": "按量付费",
     "S3 Standard": "标准存储",
   };
@@ -944,6 +1001,7 @@ export default function CustomerConfirmationPage() {
   }, []);
   const [session, setSession] = useState<Session | null>(null);
   const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [processorArchitecture, setProcessorArchitecture] = useState<ProcessorArchitecture>("arm64");
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
@@ -1338,6 +1396,10 @@ export default function CustomerConfirmationPage() {
       .then((payload) => {
         setSession(payload);
         setAnswers(payload.answers ?? {});
+        const persistedArchitecture = payload.answers?.[PROCESSOR_ARCHITECTURE_ANSWER_KEY];
+        if (persistedArchitecture === "arm64" || persistedArchitecture === "x86_64") {
+          setProcessorArchitecture(persistedArchitecture);
+        }
         if (
           ["reviewing", "submitted", "processing"].includes(payload.status)
           && payload.confirmation_items.length > 0
@@ -1400,6 +1462,10 @@ export default function CustomerConfirmationPage() {
       fetch(`${API_BASE}/api/confirmation-sessions/${token}`, { cache: "no-store" })
         .then((response) => response.json())
         .then((payload: Session) => {
+          const persistedArchitecture = payload.answers?.[PROCESSOR_ARCHITECTURE_ANSWER_KEY];
+          if (persistedArchitecture === "arm64" || persistedArchitecture === "x86_64") {
+            setProcessorArchitecture(persistedArchitecture);
+          }
           setSession((current) => ({
             ...payload,
             configuration_items: payload.configuration_items?.length
@@ -1540,7 +1606,10 @@ export default function CustomerConfirmationPage() {
       const response = await fetch(`${API_BASE}/api/confirmation-sessions/${token}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ answers }),
+        body: JSON.stringify({
+          answers,
+          processor_architecture: processorArchitecture,
+        }),
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.message ?? "提交失败");
@@ -1777,8 +1846,41 @@ export default function CustomerConfirmationPage() {
 
   function renderConfirmationItems(className = "") {
     if (!session) return null;
+    const hasModelChoices = session.confirmation_items.some(itemHasModelChoices);
+    const changeProcessorArchitecture = (next: ProcessorArchitecture) => {
+      if (next === processorArchitecture) return;
+      setProcessorArchitecture(next);
+      setAnswers((current) => {
+        const revised = { ...current };
+        session.confirmation_items.filter(itemHasModelChoices).forEach((item) => {
+          const answerKey = confirmationAnswerKey(item);
+          const currentAnswer = revised[answerKey] ?? "";
+          const baseValue = currentAnswer.split("；", 1)[0];
+          if ((item.dependent_on_values ?? []).includes(baseValue)) {
+            revised[answerKey] = baseValue;
+          } else if (item.options.some((choice) => Boolean(choice.model))) {
+            delete revised[answerKey];
+          }
+        });
+        return revised;
+      });
+    };
     return (
       <div className={`customer-questions ${className}`.trim()}>
+        {hasModelChoices && <div className="processor-architecture-choice" role="radiogroup" aria-label="选择整份报价的处理器架构">
+          <div>
+            <strong>处理器架构</strong>
+            <span>默认使用价格通常更低的ARM；改选x86后，下面所有组件只显示x86型号。</span>
+          </div>
+          <div>
+            <button type="button" role="radio" aria-checked={processorArchitecture === "arm64"} className={processorArchitecture === "arm64" ? "selected" : ""} onClick={() => changeProcessorArchitecture("arm64")}>
+              ARM（默认）<small>价格通常更低，使用前确认软件兼容</small>
+            </button>
+            <button type="button" role="radio" aria-checked={processorArchitecture === "x86_64"} className={processorArchitecture === "x86_64" ? "selected" : ""} onClick={() => changeProcessorArchitecture("x86_64")}>
+              x86<small>兼容范围更广</small>
+            </button>
+          </div>
+        </div>}
         {session.confirmation_items.map((item, index) => {
           const answerKey = confirmationAnswerKey(item);
           const answer = answers[answerKey] ?? "";
@@ -1788,9 +1890,16 @@ export default function CustomerConfirmationPage() {
             session.configuration_items,
           );
           const baseValue = answer.split("；", 1)[0];
+          const automaticDependentChoice = preferredDependentChoice(
+            item,
+            relatedConfiguration,
+            processorArchitecture,
+          );
           const showDependentConfiguration = (
             item.dependent_on_values ?? []
-          ).includes(baseValue) && (item.dependent_options?.length ?? 0) > 0;
+          ).includes(baseValue)
+            && (item.dependent_options?.length ?? 0) > 0
+            && !automaticDependentChoice;
           return <article key={answerKey}>
             <label><b>{index + 1}</b><span>{item.question}</span></label>
             {context && <div className="customer-question-context">
@@ -1798,25 +1907,42 @@ export default function CustomerConfirmationPage() {
               <span>{context.source}</span>
             </div>}
             {item.options.length > 0 && <ConfigurationOptionPicker
+              key={`${answerKey}-${processorArchitecture}-primary`}
               className="customer-options"
               options={item.options}
               value={answers[answerKey]}
               placeholder={isRegionConfirmation(item) ? "请选择 Azure 部署区域" : "请选择配置选项"}
               catalog={item.selection_mode === "catalog" || item.options.some((option) => Boolean(option.model))}
               requireMachineCount={/自建/.test(item.question) && item.options.some((option) => Boolean(option.model))}
+              architecturePreference={item.options.some((option) => Boolean(option.model))
+                ? processorArchitecture
+                : undefined}
               initialMachineCount={relatedConfiguration?.quantity
                 ?? Number(item.question.match(/当前\s*(\d+)\s*台/)?.[1] ?? 1)}
+              initialVcpu={typeof relatedConfiguration?.requirements.vcpu === "number"
+                ? relatedConfiguration.requirements.vcpu
+                : undefined}
+              initialMemoryGiB={typeof relatedConfiguration?.requirements.memory_gib === "number"
+                ? relatedConfiguration.requirements.memory_gib
+                : undefined}
               onChange={(selected) => setAnswers((current) => ({
                 ...current,
-                [answerKey]: dependentSelectionValue(item, selected, relatedConfiguration),
+                [answerKey]: dependentSelectionValue(
+                  item,
+                  selected,
+                  relatedConfiguration,
+                  processorArchitecture,
+                ),
               }))}
             />}
             {showDependentConfiguration && <ConfigurationOptionPicker
+              key={`${answerKey}-${processorArchitecture}-dependent`}
               className="customer-options dependent-configuration-picker"
               options={item.dependent_options ?? []}
               value={answer.includes("；") ? answer.slice(answer.indexOf("；") + 1) : ""}
               catalog
               requireMachineCount
+              architecturePreference={processorArchitecture}
               initialMachineCount={relatedConfiguration?.quantity ?? 1}
               initialVcpu={typeof relatedConfiguration?.requirements.vcpu === "number"
                 ? relatedConfiguration.requirements.vcpu

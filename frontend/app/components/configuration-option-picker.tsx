@@ -20,6 +20,7 @@ type Props = {
   initialMachineCount?: number;
   initialVcpu?: number;
   initialMemoryGiB?: number;
+  architecturePreference?: "arm64" | "x86_64";
   className?: string;
   placeholder?: string;
 };
@@ -34,8 +35,37 @@ function numericSpecification(option: ConfigurationChoice, keys: string[]): numb
   return null;
 }
 
-function uniqueNumbers(values: Array<number | null>): number[] {
-  return [...new Set(values.filter((value): value is number => value !== null))].sort((left, right) => left - right);
+function optionArchitecture(option: ConfigurationChoice): "arm64" | "x86_64" | null {
+  const declared = option.specifications?.processorArchitecture
+    ?? option.specifications?.processor_architecture;
+  const plural = option.specifications?.processorArchitectures
+    ?? option.specifications?.architectures;
+  const declaredValues = [
+    ...(Array.isArray(plural) ? plural : plural === undefined ? [] : [plural]),
+    ...(declared === undefined ? [] : [declared]),
+  ];
+  for (const value of declaredValues) {
+    if (typeof value !== "string") continue;
+    const normalized = value.trim().toLowerCase();
+    if (["arm", "arm64", "aarch64", "graviton"].includes(normalized)) return "arm64";
+    if (["x86", "x86_64", "amd64", "i386"].includes(normalized)) return "x86_64";
+  }
+  const model = (option.model ?? "").trim().toLowerCase();
+  if (!model.includes(".")) return null;
+  const segments = model.split(".");
+  if (segments.some((segment) => segment === "a1" || segment === "mac2" || segment.startsWith("mac2-"))) return "arm64";
+  if (segments.some((segment) => /\d+g[a-z]*$/.test(segment))) return "arm64";
+  return "x86_64";
+}
+
+function modelConfigurationLabel(option: ConfigurationChoice): string {
+  const vcpu = numericSpecification(option, ["vCPU", "vcpu", "vcpus"]);
+  const memory = numericSpecification(option, ["memoryGiB", "memory_gib", "memory"]);
+  return [
+    option.model ?? option.label,
+    vcpu === null ? null : `${vcpu} vCPU`,
+    memory === null ? null : `${memory} GiB`,
+  ].filter(Boolean).join(" · ");
 }
 
 export function ConfigurationOptionPicker({
@@ -47,28 +77,32 @@ export function ConfigurationOptionPicker({
   initialMachineCount = 1,
   initialVcpu,
   initialMemoryGiB,
+  architecturePreference,
   className = "",
   placeholder,
 }: Props) {
   const selectedValue = (value ?? "").replace(/；机器(?:数量|台数)\s*\d+$/, "");
-  const selectedOption = options.find((option) => option.value === selectedValue);
-  const selectedVcpu = selectedOption
-    ? numericSpecification(selectedOption, ["vCPU", "vcpu", "vcpus"])
-    : null;
-  const selectedMemory = selectedOption
-    ? numericSpecification(selectedOption, ["memoryGiB", "memory_gib", "memory"])
-    : null;
   const selectedMachineCount = Number(
     (value ?? "").match(/；机器(?:数量|台数)\s*(\d+)$/)?.[1],
   );
-  const [vcpu, setVcpu] = useState(
-    selectedVcpu !== null ? String(selectedVcpu) : initialVcpu ? String(initialVcpu) : "",
-  );
-  const [memory, setMemory] = useState(
-    selectedMemory !== null
-      ? String(selectedMemory)
-      : initialMemoryGiB ? String(initialMemoryGiB) : "",
-  );
+  const richOptions = useMemo(() => options.map((option) => ({
+    option,
+    vcpu: numericSpecification(option, ["vCPU", "vcpu", "vcpus"]),
+    memory: numericSpecification(option, ["memoryGiB", "memory_gib", "memory"]),
+    architecture: optionArchitecture(option),
+  })), [options]);
+  const architectureMatches = useMemo(() => (
+    architecturePreference
+      ? richOptions.filter((item) => item.architecture === architecturePreference)
+      : richOptions
+  ), [architecturePreference, richOptions]);
+  // ARM is the cost-oriented default, but a component that AWS exposes only
+  // on x86 must remain selectable. An explicit x86 choice is strict and never
+  // falls back to ARM.
+  const architectureFallback = architecturePreference === "arm64"
+    && architectureMatches.length === 0
+    && richOptions.length > 0;
+  const architectureCatalog = architectureFallback ? richOptions : architectureMatches;
   const [machineCount, setMachineCount] = useState(String(Math.max(
     Number.isFinite(selectedMachineCount) && selectedMachineCount > 0
       ? selectedMachineCount
@@ -82,52 +116,68 @@ export function ConfigurationOptionPicker({
     }
     onChange(requireMachineCount ? `${optionValue}；机器数量 ${Math.max(Number(count) || 1, 1)}` : optionValue);
   };
-  const richOptions = useMemo(() => options.map((option) => ({
-    option,
-    vcpu: numericSpecification(option, ["vCPU", "vcpu", "vcpus"]),
-    memory: numericSpecification(option, ["memoryGiB", "memory_gib", "memory"]),
-  })), [options]);
-  const vcpuValues = useMemo(() => uniqueNumbers(
-    richOptions.map((item) => item.vcpu),
-  ), [richOptions]);
-  const memoryValues = useMemo(() => uniqueNumbers(
-    richOptions
-      .filter((item) => vcpu && item.vcpu === Number(vcpu))
-      .map((item) => item.memory),
-  ), [richOptions, vcpu]);
-  const hasProcessorFilter = vcpuValues.length > 0;
-  const specificationSelectionComplete = !hasProcessorFilter || (
-    Boolean(vcpu) && (memoryValues.length === 0 || Boolean(memory))
-  );
-  const filtered = useMemo(() => {
-    return richOptions.filter((item) => {
-      const vcpuMatches = !vcpu || item.vcpu === Number(vcpu);
-      const memoryMatches = !memory || item.memory === Number(memory);
-      return vcpuMatches && memoryMatches;
-    });
-  }, [memory, richOptions, vcpu]);
-
-  const handleVcpuChange = (nextVcpu: string) => {
-    setVcpu(nextVcpu);
-    setMemory("");
-    onChange("");
-  };
-
-  const handleMemoryChange = (nextMemory: string) => {
-    setMemory(nextMemory);
-    const matching = richOptions.filter((item) => (
-      item.vcpu === Number(vcpu) && item.memory === Number(nextMemory)
+  const visibleOptions = useMemo(() => {
+    const hasRequestedShape = Boolean(initialVcpu && initialMemoryGiB);
+    const distance = (item: (typeof architectureCatalog)[number]) => {
+      if (!hasRequestedShape || item.vcpu === null || item.memory === null) return Number.POSITIVE_INFINITY;
+      return Math.abs(Math.log2(Math.max(item.vcpu, 0.001) / Number(initialVcpu)))
+        + Math.abs(Math.log2(Math.max(item.memory, 0.001) / Number(initialMemoryGiB)));
+    };
+    const ranked = [...architectureCatalog].sort((left, right) => (
+      distance(left) - distance(right)
+      || Number(right.option.specifications?.exactRequestedShape === true)
+        - Number(left.option.specifications?.exactRequestedShape === true)
+      || (left.option.model ?? left.option.label).localeCompare(
+        right.option.model ?? right.option.label,
+      )
     ));
-    const cheapest = [...matching].sort((left, right) => {
-      const leftCost = left.option.monthly_catalog_cost;
-      const rightCost = right.option.monthly_catalog_cost;
-      if (typeof leftCost === "number" && typeof rightCost === "number") return leftCost - rightCost;
-      if (typeof leftCost === "number") return -1;
-      if (typeof rightCost === "number") return 1;
-      return 0;
-    })[0];
-    emitSelection(cheapest?.option.value ?? "");
-  };
+    if (!hasRequestedShape) {
+      return ranked.slice(0, 10).sort((left, right) => (
+        (left.vcpu ?? Number.POSITIVE_INFINITY) - (right.vcpu ?? Number.POSITIVE_INFINITY)
+        || (left.memory ?? Number.POSITIVE_INFINITY) - (right.memory ?? Number.POSITIVE_INFINITY)
+        || (left.option.model ?? left.option.label).localeCompare(
+          right.option.model ?? right.option.label,
+        )
+      ));
+    }
+    // "Lower" means at least one official dimension is below the customer's
+    // request. Everything else is an exact-or-upward option. Keep five from
+    // each side when available, then fill any vacant slots from the nearest
+    // remaining official models so the dropdown never exceeds ten entries.
+    const lowerRanked = ranked.filter((item) => (
+      item.vcpu !== null
+      && item.memory !== null
+      && (item.vcpu < Number(initialVcpu) || item.memory < Number(initialMemoryGiB))
+    ));
+    const upperRanked = ranked.filter((item) => (
+      item.vcpu !== null
+      && item.memory !== null
+      && item.vcpu >= Number(initialVcpu)
+      && item.memory >= Number(initialMemoryGiB)
+    ));
+    const lower = lowerRanked.slice(0, 5);
+    const upper = upperRanked.slice(0, 5);
+    const selectedValues = new Set([...upper, ...lower].map((item) => item.option.value));
+    for (const item of ranked) {
+      if (selectedValues.size >= 10 || selectedValues.has(item.option.value)) continue;
+      selectedValues.add(item.option.value);
+      if (lowerRanked.includes(item)) lower.push(item);
+      else upper.push(item);
+    }
+    const combined = [...upper, ...lower];
+    const selectedOption = architectureCatalog.find((item) => item.option.value === selectedValue);
+    if (selectedOption && !combined.some((item) => item.option.value === selectedValue)) {
+      combined.unshift(selectedOption);
+    }
+    return combined.slice(0, 10).sort((left, right) => (
+      (left.vcpu ?? Number.POSITIVE_INFINITY) - (right.vcpu ?? Number.POSITIVE_INFINITY)
+      || (left.memory ?? Number.POSITIVE_INFINITY) - (right.memory ?? Number.POSITIVE_INFINITY)
+      || (left.option.model ?? left.option.label).localeCompare(
+        right.option.model ?? right.option.label,
+      )
+    ));
+  }, [architectureCatalog, initialMemoryGiB, initialVcpu, selectedValue]);
+  const visibleValues = new Set(visibleOptions.map((item) => item.option.value));
 
   const handleMachineCountChange = (nextCount: string) => {
     const normalized = nextCount.replace(/\D/g, "");
@@ -182,38 +232,20 @@ export function ConfigurationOptionPicker({
           onChange={(event) => handleMachineCountChange(event.target.value)}
         />
       </label>}
-      {hasProcessorFilter && <div className="configuration-picker-filters">
-        <label>
-          <span>处理器</span>
-          <select aria-label="选择处理器" value={vcpu} onChange={(event) => handleVcpuChange(event.target.value)}>
-            <option value="">请选择 vCPU</option>
-              {vcpuValues.map((item) => <option value={item} key={item}>{item} vCPU</option>)}
-          </select>
-        </label>
-        <label>
-          <span>内存</span>
-          <select aria-label="选择内存" value={memory} disabled={!vcpu || memoryValues.length === 0} onChange={(event) => handleMemoryChange(event.target.value)}>
-            <option value="">{!vcpu ? "请先选择处理器" : memoryValues.length === 0 ? "该处理器无需选择内存" : "请选择内存"}</option>
-              {memoryValues.map((item) => <option value={item} key={item}>{item} GiB</option>)}
-          </select>
-        </label>
+      {architectureFallback && <div className="configuration-picker-architecture-note" role="status">
+        该组件当前没有ARM型号，已显示AWS提供的其他官方型号。
       </div>}
-      {hasProcessorFilter && !vcpu ? null : hasProcessorFilter && memoryValues.length > 0 && !memory ? null : filtered.length === 0 ? (
-        <div className="configuration-picker-empty" role="status">当前区域没有同时满足所选处理器和内存的配置，请调整筛选条件。</div>
-      ) : filtered.length === 1 ? (
-        <button type="button" className={`configuration-picker-single ${selectedValue === filtered[0].option.value ? "selected" : ""}`} onClick={() => emitSelection(filtered[0].option.value)}>
-          <small>唯一匹配配置</small><strong>{filtered[0].option.label}</strong>
-        </button>
-      ) : (
-        <label className="configuration-picker-result">
-          {hasProcessorFilter && <span>官方型号</span>}
-          <select className="configuration-picker-select" aria-label="选择可用配置" value={filtered.some(({ option }) => option.value === selectedValue) ? selectedValue : ""} onChange={(event) => emitSelection(event.target.value)}>
-            <option value="">{placeholder ?? `请选择当前区域支持的${hasProcessorFilter ? "型号" : "选项"}`}</option>
-            {filtered.map(({ option }) => <option value={option.value} key={option.value}>{option.label}</option>)}
-          </select>
-        </label>
-      )}
-      {specificationSelectionComplete && <small className="configuration-picker-count">当前可选 {filtered.length} 项，共 {options.length} 项官方配置</small>}
+      {visibleOptions.length === 0 ? (
+        <div className="configuration-picker-empty" role="status">当前地区和处理器架构没有可选的官方型号。</div>
+      ) : <label className="configuration-picker-result">
+        <span>官方型号</span>
+        <select className="configuration-picker-select" aria-label="选择可用型号" value={visibleValues.has(selectedValue) ? selectedValue : ""} onChange={(event) => emitSelection(event.target.value)}>
+          <option value="">{placeholder ?? "请选择型号"}</option>
+          {visibleOptions.map(({ option }) => <option value={option.value} key={option.value}>
+            {modelConfigurationLabel(option)}
+          </option>)}
+        </select>
+      </label>}
     </div>
   );
 }

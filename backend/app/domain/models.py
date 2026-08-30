@@ -66,6 +66,28 @@ class UnmappedPricingFact(BaseModel):
     evidence: str = Field(min_length=1, max_length=300)
 
 
+class CustomerPricingFact(BaseModel):
+    """One immutable customer-owned fact produced by the cleaning boundary.
+
+    The original component text remains available for audit, but pricing,
+    product matching and confirmation consume this table instead of parsing
+    prose again. ``fact_id`` is stable for the same component/path/evidence so
+    every downstream use can be traced without relying on row position.
+    """
+
+    fact_id: str = Field(min_length=12, max_length=80, pattern=r"^fact_[a-f0-9]+$")
+    component_key: str = Field(min_length=8, max_length=80)
+    source_block_key: str | None = Field(default=None, max_length=80)
+    path: str = Field(min_length=1, max_length=160)
+    value: Any
+    unit: str | None = Field(default=None, max_length=40)
+    scope: Literal["component_total", "aggregate", "per_resource", "per_node"] = (
+        "component_total"
+    )
+    evidence: str = Field(min_length=1, max_length=300)
+    source_kind: str = Field(min_length=1, max_length=60)
+
+
 class ServiceRequirement(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -95,6 +117,18 @@ class ServiceRequirement(BaseModel):
     product_identity: str | None = Field(
         default=None, min_length=2, max_length=100, pattern=r"^[a-z0-9_\-]+$"
     )
+    # Semantic identity decided once at the component-cleaning boundary.  It
+    # prevents later stages from re-reading a free-form heading and changing a
+    # plain server role into a named third-party product (or vice versa).
+    workload_identity_kind: Literal[
+        "official_aws_service",
+        "generic_compute",
+        "named_third_party_software",
+        "unresolved",
+    ] | None = None
+    # For named third-party software this is copied verbatim from the isolated
+    # component text.  Generic compute roles deliberately leave it empty.
+    workload_name: str | None = Field(default=None, min_length=1, max_length=120)
     region: str | None = None
     quantity: int = Field(default=1, ge=1, le=10000)
     hours_per_month: float = Field(default=730, gt=0, le=744)
@@ -128,6 +162,11 @@ class ServiceRequirement(BaseModel):
     # values.  This prevents an unknown field from disappearing at a template
     # allow-list boundary.
     unmapped_pricing_facts: list[UnmappedPricingFact] = Field(default_factory=list)
+    # Materialized by the one authorized component-cleaning pass.  Keeping the
+    # facts on the persisted requirement makes the table the actual workflow
+    # contract instead of a view reconstructed from prose at every boundary.
+    customer_pricing_facts: list[CustomerPricingFact] = Field(default_factory=list)
+    fact_ledger_version: int = Field(default=1, ge=1)
 
 
 class ParsedIntent(BaseModel):
@@ -227,6 +266,11 @@ class UsageLine(BaseModel):
     # metadata only and is not submitted to AWS.  It lets the final quote
     # prove that every customer-written pricing fact reached a billing line.
     source_fields: list[str] = Field(default_factory=list)
+    # Stable IDs from the component's materialized customer fact table.  The
+    # adapter declares semantic ``source_fields``; the shared contract binder
+    # resolves those names to immutable facts.  Adapters must never invent
+    # these IDs themselves.
+    source_fact_ids: list[str] = Field(default_factory=list)
 
 
 class ReferenceRate(BaseModel):
@@ -239,6 +283,16 @@ class ReferenceRate(BaseModel):
     service_code: str
     usage_type: str
     operation: str
+
+
+class FactConsumption(BaseModel):
+    """Auditable use of one customer fact by selection or a billing line."""
+
+    fact_id: str = Field(min_length=12, max_length=80, pattern=r"^fact_[a-f0-9]+$")
+    path: str = Field(min_length=1, max_length=160)
+    consumer_type: Literal["selection", "usage_line", "non_billable_context"]
+    consumer_key: str = Field(min_length=1, max_length=120)
+    purpose: str = Field(min_length=1, max_length=240)
 
 
 class SelectedResource(BaseModel):
@@ -272,6 +326,10 @@ class SelectedResource(BaseModel):
     # not directly become a usage amount (for example vCPU and memory used to
     # choose an instance type).
     applied_requirement_fields: list[str] = Field(default_factory=list)
+    # A fact may legitimately influence both model selection and one or more
+    # billing lines.  This list records every use; final audit requires at
+    # least one justified use rather than incorrectly enforcing "exactly once".
+    fact_consumptions: list[FactConsumption] = Field(default_factory=list)
     monthly_commitment_cost: float = Field(default=0, ge=0)
     upfront_commitment_cost: float = Field(default=0, ge=0)
 
@@ -315,6 +373,27 @@ class PreviewSelection(BaseModel):
         "system_configuration",
         "unsupported",
     ] | None = None
+    # The backend owns workflow decisions.  The browser must render this
+    # instruction instead of inferring retry/block/customer behavior from an
+    # error category and accidentally leaving a component in a dead state.
+    next_action: Literal[
+        "none",
+        "retry_component",
+        "request_customer",
+        "internal_block",
+    ] = "none"
+
+    @model_validator(mode="after")
+    def derive_next_action(self) -> PreviewSelection:
+        if self.requires_confirmation or self.status == "customer_issue":
+            self.next_action = "request_customer"
+        elif self.status == "technical_issue" and self.issue_category == "retryable":
+            self.next_action = "retry_component"
+        elif self.status in {"technical_issue", "unsupported"}:
+            self.next_action = "internal_block"
+        else:
+            self.next_action = "none"
+        return self
 
 
 class ConfirmationOption(BaseModel):
@@ -376,6 +455,11 @@ class QuotePreviewResponse(BaseModel):
 
 class ConfirmationSubmission(BaseModel):
     answers: dict[str, str] = Field(min_length=1)
+    # One quote uses one processor-family preference.  This is workflow
+    # metadata rather than a visible question answer, but it must travel with
+    # the confirmation so a refresh or a later pricing pass cannot silently
+    # return to a different architecture.
+    processor_architecture: Literal["arm64", "x86_64"] | None = None
 
     @field_validator("answers")
     @classmethod
@@ -539,6 +623,9 @@ class QuoteResponse(BaseModel):
     # so the customer never mistakes an incomplete subtotal for a full quote.
     is_partial: bool = False
     incomplete_component_ids: list[str] = Field(default_factory=list)
+    # Versioned trust-boundary metadata lets a saved quote prove which fact
+    # schema and service contracts produced it even after code/catalog updates.
+    audit_metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("total_cost")
     @classmethod

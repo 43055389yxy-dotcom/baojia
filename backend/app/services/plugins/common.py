@@ -315,7 +315,28 @@ class S3Plugin(ServicePlugin):
 
 class AlbPlugin(ServicePlugin):
     kind = ServiceKind.ELB
-    display_name = "Application Load Balancer"
+    display_name = "Elastic Load Balancing"
+
+    _TYPE_PROFILES = {
+        "application": (
+            "Application Load Balancer",
+            "ALB",
+            "LoadBalancing:Application",
+            "Application LCU",
+        ),
+        "network": (
+            "Network Load Balancer",
+            "NLB",
+            "LoadBalancing:Network",
+            "Network LCU",
+        ),
+        "gateway": (
+            "Gateway Load Balancer",
+            "GWLB",
+            "LoadBalancing:Gateway",
+            "Gateway LCU",
+        ),
+    }
 
     def preview(self, requirement: ServiceRequirement, default_region: str) -> PreviewSelection:
         preview = super().preview(requirement, default_region)
@@ -327,27 +348,52 @@ class AlbPlugin(ServicePlugin):
 
     def select(self, requirement: ServiceRequirement, default_region: str) -> SelectedResource:
         region = requirement.region or default_region
+        requested = canonicalize_requirement_fields(requirement.requirements, service="elb")
+        requested_type = str(
+            requested.get("load_balancer_type") or "application"
+        ).strip().casefold()
+        aliases = {
+            "alb": "application",
+            "application_load_balancer": "application",
+            "nlb": "network",
+            "network_load_balancer": "network",
+            "gwlb": "gateway",
+            "gateway_load_balancer": "gateway",
+        }
+        load_balancer_type = aliases.get(requested_type, requested_type)
+        if load_balancer_type not in self._TYPE_PROFILES:
+            raise ManualConfirmationRequired(
+                "负载均衡器类型必须是 ALB、NLB 或 GWLB",
+                code="invalid_load_balancer_type",
+                field="load_balancer_type",
+            )
+        display_name, acronym, operation, capacity_label = self._TYPE_PROFILES[
+            load_balancer_type
+        ]
         hourly = _one_product(
             self.catalog,
             "AWSELB",
             {
                 "regionCode": region,
-                "usagetype": self._usage_type(region, "LoadBalancerUsage"),
-                "operation": "LoadBalancing:Application",
+                "usagetype": self._usage_type(
+                    region, operation, "LoadBalancerUsage", acronym
+                ),
+                "operation": operation,
             },
-            f"Application Load Balancer 小时费 ({region})",
+            f"{display_name} 小时费 ({region})",
         )
         lcu = _one_product(
             self.catalog,
             "AWSELB",
             {
                 "regionCode": region,
-                "usagetype": self._usage_type(region, "LCUUsage"),
-                "operation": "LoadBalancing:Application",
+                "usagetype": self._usage_type(
+                    region, operation, "LCUUsage", acronym
+                ),
+                "operation": operation,
             },
-            f"Application Load Balancer LCU ({region})",
+            f"{display_name} 容量单位 ({region})",
         )
-        requested = canonicalize_requirement_fields(requirement.requirements, service="elb")
         processed = required_float(requested, "processed_bytes_gib")
         if processed is None:
             processed = required_float(requested, "data_processed_gib")
@@ -358,15 +404,15 @@ class AlbPlugin(ServicePlugin):
         )
         if processed is None:
             assumption = assumption or (
-                "客户未提供 ALB LCU 业务量；月费仅包含 ALB 实例小时费，"
-                "LCU 仅展示 AWS 官方单位参考价，不计入合计。"
+                f"客户未提供 {acronym} 容量单位业务量；月费仅包含 {acronym} 实例小时费，"
+                "容量单位仅展示 AWS 官方参考价，不计入合计。"
             )
         lines = [
             _line(
                 hourly,
-                key="albh",
+                key=f"{acronym.casefold()}h",
                 amount=requirement.quantity * requirement.hours_per_month,
-                group="alb",
+                group=acronym.casefold(),
                 source_fields=("quantity", "hours_per_month", "load_balancer_type"),
             ),
         ]
@@ -374,37 +420,48 @@ class AlbPlugin(ServicePlugin):
             lines.append(
                 _line(
                     lcu,
-                    key="alblcu",
+                    key=f"{acronym.casefold()}lcu",
                     amount=processed,
-                    group="alb",
+                    group=acronym.casefold(),
                     source_fields=("processed_bytes_gib", "data_processed_gib"),
                 )
             )
         reference_rates = (
-            [_reference(lcu, description="Application LCU 单价")]
+            [_reference(lcu, description=f"{capacity_label} 单价")]
             if processed is None
             else []
         )
         return SelectedResource(
             service=self.kind,
-            display_name=self.display_name,
+            display_name=display_name,
             region=region,
-            model="Application Load Balancer",
-            architecture=f"{requirement.quantity} 个 ALB",
-            specifications={"quantity": requirement.quantity, **({"processedBytesGiB": processed} if processed is not None else {})},
-            official_product={"source": "AWS Price List", "regionCode": region},
-            rationale="ALB 小时费与 Application LCU 使用量分别提交 BCM。",
+            model=display_name,
+            quantity=requirement.quantity,
+            architecture=f"{requirement.quantity} 个 {acronym}",
+            specifications={
+                "quantity": requirement.quantity,
+                "load_balancer_type": load_balancer_type,
+                **({"processedBytesGiB": processed} if processed is not None else {}),
+            },
+            official_product={
+                "source": "AWS Price List",
+                "regionCode": region,
+                "operation": operation,
+            },
+            rationale=f"{acronym} 小时费与 {capacity_label} 使用量分别提交 BCM。",
             substitution_notice=assumption,
             usage_lines=lines,
             reference_rates=reference_rates,
         )
 
-    def _usage_type(self, region: str, suffix: str) -> str:
+    def _usage_type(
+        self, region: str, operation: str, suffix: str, acronym: str
+    ) -> str:
         products = self.catalog.products(
             "AWSELB",
             {
                 "regionCode": region,
-                "operation": "LoadBalancing:Application",
+                "operation": operation,
             },
             max_pages=2,
         )
@@ -418,7 +475,7 @@ class AlbPlugin(ServicePlugin):
         ]
         if len(set(matches)) != 1:
             raise ManualConfirmationRequired(
-                f"AWS 官方目录无法唯一确认 ALB {suffix} 计费项",
+                f"AWS 官方目录无法唯一确认 {acronym} {suffix} 计费项",
                 code="alb_billing_dimension_not_found",
             )
         return matches[0]
