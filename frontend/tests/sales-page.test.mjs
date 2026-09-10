@@ -66,3 +66,15 @@ test("sales portal keeps polling after a transient status failure", async () => 
   assert.match(page, /setPageError\(""\)/);
   assert.doesNotMatch(page, /loadJob\(savedJobId\)\.catch\(\(\) => window\.localStorage\.removeItem/);
 });
+
+test("sales portal uses a structured workspace and grouped result actions", async () => {
+  const page = await readFile(new URL("../app/sales/page.tsx", import.meta.url), "utf8");
+  const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+
+  assert.match(page, /sales-form-grid/);
+  assert.match(page, /sales-result-layout/);
+  assert.match(page, /sales-result-actions/);
+  assert.match(page, /sales-provider-mark/);
+  assert.match(css, /prefers-reduced-motion/);
+  assert.match(css, /sales-result-summary/);
+});

@@ -266,6 +266,101 @@ test('an item containing free and paid tiers requires GPT to bind the paid rate'
   assert.equal(result.status, 'displayed_on_page');
 });
 
+test('a mixed free-tier catalog SKU cannot be disguised as a zero-cost service', async (t) => {
+  const rateCandidates = [
+    {
+      rate_id: 'oci:B93297:free', official_item_id: 'item-1',
+      unit_price: '0', currency: 'USD', is_zero_rate: true,
+    },
+    {
+      rate_id: 'oci:B93297:paid', official_item_id: 'item-1',
+      unit_price: '0.01', currency: 'USD', is_zero_rate: false,
+    },
+  ];
+  const { workflow, directory } = fixture({ provider: 'oci', rateCandidates });
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const batch = await priceBatch(workflow, 'oci');
+  const input = quoteInput(batch.price_batch_id, { provider: 'oci' });
+  input.services[0].price_evidence = [{
+    query_id: 'price-1',
+    official_item_ids: ['item-1'],
+    official_rate_ids: ['oci:B93297:paid'],
+  }];
+  input.fact_ledger.push({
+    fact_id: 'F2',
+    component_key: 'cmp_oci_a1_0002',
+    field: 'quantity',
+    value: 1,
+    unit: 'count',
+    scope: 'total',
+    cleaned_evidence: 'A1 云服务器数量：1。',
+    disposition: 'zero_cost',
+  });
+  input.zero_cost_services = [{
+    component_key: 'cmp_oci_a1_0002',
+    region: 'eu-dublin-1',
+    fact_ids: ['F2'],
+    pricing_basis: 'official_no_additional_charge',
+    official_evidence: {
+      source: 'official_price_catalog',
+      reference: 'Oracle A1 Always Free 零价额度。',
+    },
+    price_evidence: [{
+      query_id: 'price-1',
+      official_item_ids: ['item-1'],
+      official_rate_ids: ['oci:B93297:free'],
+    }],
+    customer_facing: {
+      service_name: 'OCI Compute',
+      model_or_plan: 'VM.Standard.A1.Flex',
+      quantity: '1 台',
+      requirement_summary: 'A1 云服务器 1 台。',
+      configuration_summary: 'A1 云服务器。',
+    },
+  }];
+
+  await assert.rejects(
+    workflow.buildEstimate(input),
+    (error) => error.code === 'official_zero_cost_evidence_invalid'
+      && error.details.violations.includes(
+        'free_allowance_not_zero_cost:cmp_oci_a1_0002:price-1:item-1',
+      ),
+  );
+});
+
+test('free-tier documentation cannot justify a commercial zero-cost line', async (t) => {
+  const { workflow, directory } = fixture({ provider: 'oci' });
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const batch = await priceBatch(workflow, 'oci');
+  const input = quoteInput(batch.price_batch_id, { provider: 'oci' });
+  input.fact_ledger.push({
+    fact_id: 'F2', component_key: 'cmp_free_0002', field: 'quantity', value: 1,
+    unit: 'count', scope: 'total', cleaned_evidence: '云服务器数量：1。',
+    disposition: 'zero_cost',
+  });
+  input.zero_cost_services = [{
+    component_key: 'cmp_free_0002',
+    fact_ids: ['F2'],
+    pricing_basis: 'official_no_additional_charge',
+    official_evidence: {
+      source: 'official_documentation',
+      reference: '该资源使用 Free Tier 免费额度。',
+    },
+    customer_facing: {
+      service_name: '云服务器', requirement_summary: '云服务器 1 台。',
+      configuration_summary: '云服务器 1 台。',
+    },
+  }];
+
+  await assert.rejects(
+    workflow.buildEstimate(input),
+    (error) => error.code === 'official_zero_cost_evidence_invalid'
+      && error.details.violations.includes(
+        'free_allowance_documentation_forbidden:cmp_free_0002',
+      ),
+  );
+});
+
 test('MCP never silently substitutes an item that GPT did not select', async (t) => {
   const { workflow, directory } = fixture({ status: 'ambiguous', itemIds: ['item-1', 'item-2'] });
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));

@@ -82,17 +82,19 @@ const PROVIDER_SCENARIOS: Record<CloudProvider, Array<{ key: ScenarioKey; label:
   ],
 };
 
+const PROVIDER_META: Record<CloudProvider, { label: string; mark: string; detail: string }> = {
+  aws: { label: "AWS", mark: "AWS", detail: "Amazon Web Services" },
+  azure: { label: "微软 Azure", mark: "AZ", detail: "Microsoft Cloud" },
+  oci: { label: "Oracle Cloud", mark: "OCI", detail: "Oracle Infrastructure" },
+  gcp: { label: "Google Cloud", mark: "GCP", detail: "Google Cloud Platform" },
+};
+
 function estimateWindow() {
   return "5～10 分钟";
 }
 
 function providerLabel(provider: CloudProvider | undefined) {
-  return {
-    aws: "AWS",
-    azure: "微软 Azure",
-    oci: "Oracle Cloud",
-    gcp: "Google Cloud",
-  }[provider ?? "aws"];
+  return PROVIDER_META[provider ?? "aws"].label;
 }
 
 function safeSubmissionError(status: number) {
@@ -218,6 +220,20 @@ export default function SalesQuotePage() {
       window.clearInterval(timer);
     };
   }, [trackedJobId, loadJob]);
+
+  useEffect(() => {
+    if (!resultOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") setResultOpen(false);
+    }
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [resultOpen]);
 
   const workflowLabel = useMemo(
     () => `已选 ${selectedScenarios.size} 种报价方案`,
@@ -360,10 +376,16 @@ export default function SalesQuotePage() {
 
   return (
     <main className="sales-portal">
+      <div className="sales-ambient" aria-hidden="true">
+        <i className="sales-ambient-orb sales-ambient-orb-one" />
+        <i className="sales-ambient-orb sales-ambient-orb-two" />
+        <i className="sales-ambient-line sales-ambient-line-one" />
+        <i className="sales-ambient-line sales-ambient-line-two" />
+      </div>
       <header className="sales-portal-header">
         <a href="/sales" className="sales-portal-brand" aria-label="AstraQuote 云成本报价">
-          <span aria-hidden="true">A</span>
-          <div><strong>AstraQuote</strong><small>云成本报价</small></div>
+          <span className="sales-brand-mark" aria-hidden="true"><i>A</i></span>
+          <div><strong>AstraQuote</strong><small>Multi-cloud pricing workspace</small></div>
         </a>
         <div className={`sales-portal-health ${ready ? "ready" : "waiting"}`}>
           <i aria-hidden="true" />
@@ -375,20 +397,23 @@ export default function SalesQuotePage() {
         <section className="sales-quote-workspace">
           <form className="sales-quote-form" onSubmit={submit}>
             <div className="sales-form-heading">
-              <p>MULTI-CLOUD PRICING</p>
-              <h1>新建报价</h1>
+              <div>
+                <p>OFFICIAL CLOUD PRICING</p>
+                <h1>创建云成本报价</h1>
+                <span>选择云厂商并填写客户需求，结果将在当前页面生成。</span>
+              </div>
+              <div className="sales-form-chip"><i aria-hidden="true" /> 官方价格目录</div>
             </div>
 
-            <fieldset className="sales-pricing-mode">
-              <legend>云厂商</legend>
+            <fieldset className="sales-pricing-mode sales-provider-section">
+              <div className="sales-section-heading">
+                <legend>选择云厂商</legend>
+                <span>01 / 03</span>
+              </div>
               <div className="sales-choice-row sales-provider-row">
-                {([
-                  ["aws", "AWS"],
-                  ["azure", "微软 Azure"],
-                  ["oci", "Oracle Cloud"],
-                  ["gcp", "Google Cloud"],
-                ] as const).map(([value, label]) => {
+                {(["aws", "azure", "oci", "gcp"] as const).map((value) => {
                   const catalog = health?.provider_catalogs?.[value];
+                  const provider = PROVIDER_META[value];
                   return (
                     <label className={`${cloudProvider === value ? "selected" : ""} ${catalog?.available === false ? "unavailable" : ""}`} key={value}>
                       <input
@@ -398,8 +423,10 @@ export default function SalesQuotePage() {
                         checked={cloudProvider === value}
                         onChange={() => chooseProvider(value)}
                       />
-                      <span>{label}</span>
-                      {catalog?.available === false && <small>待配置</small>}
+                      <b className="sales-provider-mark" aria-hidden="true">{provider.mark}</b>
+                      <span><strong>{provider.label}</strong><small>{provider.detail}</small></span>
+                      <i className="sales-choice-indicator" aria-hidden="true" />
+                      {catalog?.available === false && <em>待配置</em>}
                     </label>
                   );
                 })}
@@ -412,46 +439,74 @@ export default function SalesQuotePage() {
               </p>
             )}
 
-            <label htmlFor="sales-requirement">需求内容</label>
-            <textarea
-              id="sales-requirement"
-              value={requirement}
-              maxLength={12000}
-              onChange={(event) => setRequirement(event.target.value)}
-              placeholder="区域、服务、数量、规格、存储、流量及购买方式"
-            />
-            <div className="sales-field-foot"><b>{requirement.length.toLocaleString()} / 12,000</b></div>
+            <div className="sales-form-grid">
+              <section className="sales-requirement-panel">
+                <div className="sales-section-heading">
+                  <div><label htmlFor="sales-requirement">填写客户需求</label><p>区域、规格、数量、存储及流量</p></div>
+                  <span>02 / 03</span>
+                </div>
+                <div className="sales-textarea-shell">
+                  <textarea
+                    id="sales-requirement"
+                    value={requirement}
+                    maxLength={12000}
+                    onChange={(event) => setRequirement(event.target.value)}
+                    placeholder="例如：爱尔兰区域，Linux 云服务器 1 台，2 核 4GB，每月运行 730 小时……"
+                  />
+                  <div className="sales-field-foot">
+                    <span>支持自然语言描述</span>
+                    <b>{requirement.length.toLocaleString()} / 12,000</b>
+                  </div>
+                </div>
+              </section>
 
-            <fieldset className="sales-pricing-mode">
-              <legend>报价方案</legend>
-              <div className="sales-choice-row">
-                {PROVIDER_SCENARIOS[cloudProvider].map(({ key, label }) => (
-                  <label className={selectedScenarios.has(key) ? "selected" : ""} key={key}>
-                    <input
-                      type="checkbox"
-                      name="pricing-scenario"
-                      value={key}
-                      checked={selectedScenarios.has(key)}
-                      onChange={() => toggleScenario(key)}
-                    />
-                    <span>{label}</span>
-                  </label>
-                ))}
-              </div>
-            </fieldset>
+              <aside className="sales-options-panel">
+                <div className="sales-section-heading">
+                  <div><strong>设置报价方案</strong><p>采用所选云厂商的计价方式</p></div>
+                  <span>03 / 03</span>
+                </div>
+                <fieldset className="sales-pricing-mode sales-scenario-list">
+                  <legend className="sales-visually-hidden">报价方案</legend>
+                  <div className="sales-choice-row">
+                    {PROVIDER_SCENARIOS[cloudProvider].map(({ key, label }) => (
+                      <label className={selectedScenarios.has(key) ? "selected" : ""} key={key}>
+                        <input
+                          type="checkbox"
+                          name="pricing-scenario"
+                          value={key}
+                          checked={selectedScenarios.has(key)}
+                          onChange={() => toggleScenario(key)}
+                        />
+                        <i aria-hidden="true" />
+                        <span>{label}</span>
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
 
-            <div className="sales-utilization-row">
-              <label htmlFor="sales-utilization">预计使用率</label>
-              <input id="sales-utilization" type="number" min={1} max={100} value={utilization} onChange={(event) => setUtilization(Math.min(100, Math.max(1, Number(event.target.value) || 100)))} />
-              <span>%</span>
-              <small>{workflowLabel}</small>
+                <div className="sales-utilization-row">
+                  <div><label htmlFor="sales-utilization">预计使用率</label><small>{workflowLabel}</small></div>
+                  <div className="sales-utilization-control">
+                    <input id="sales-utilization" type="number" min={1} max={100} value={utilization} onChange={(event) => setUtilization(Math.min(100, Math.max(1, Number(event.target.value) || 100)))} />
+                    <span>%</span>
+                  </div>
+                </div>
+
+                <div className="sales-commercial-note">
+                  <i aria-hidden="true">✓</i>
+                  <span><strong>商业价格口径</strong><small>不抵扣免费额度、试用额度或账户赠送额度</small></span>
+                </div>
+              </aside>
             </div>
 
             {pageError && <p className="sales-form-error" role="alert">{pageError}</p>}
-            <button className="sales-submit" type="submit" disabled={submitting || selectedScenarios.size < 1 || requirement.trim().length < 3 || health?.status === "offline" || selectedCatalogUnavailable}>
-              {submitting ? "正在提交…" : "提交报价"}
-              <span aria-hidden="true">↗</span>
-            </button>
+            <div className="sales-form-submit-row">
+              <span><i aria-hidden="true" /> 数据来自所选云厂商官方价格目录</span>
+              <button className="sales-button sales-button-primary sales-submit" type="submit" disabled={submitting || selectedScenarios.size < 1 || requirement.trim().length < 3 || health?.status === "offline" || selectedCatalogUnavailable}>
+                {submitting ? "正在提交…" : "提交报价"}
+                <i aria-hidden="true">→</i>
+              </button>
+            </div>
           </form>
         </section>
       ) : (
@@ -481,12 +536,20 @@ export default function SalesQuotePage() {
             </div>
           )}
 
+          <div className="sales-job-stages" aria-hidden="true">
+            <span className="complete"><i />需求识别</span>
+            <b />
+            <span className={active ? "current" : "complete"}><i />官方核价</span>
+            <b />
+            <span className={job.status === "completed" ? "complete" : ""}><i />生成结果</span>
+          </div>
+
           <div className="sales-job-actions">
             {active
-              ? <button type="button" className="sales-secondary" onClick={() => void cancelJob()}>撤回报价</button>
+              ? <button type="button" className="sales-button sales-button-ghost" onClick={() => void cancelJob()}>撤回报价</button>
               : job.quick_quote_result
-                ? <><button type="button" className="sales-submit" onClick={() => setResultOpen(true)}>查看报价结果</button><button type="button" className="sales-secondary" onClick={reset}>新建报价</button></>
-                : <button type="button" className="sales-submit" onClick={reset}>新建报价 <span aria-hidden="true">↗</span></button>}
+                ? <><button type="button" className="sales-button sales-button-primary" onClick={() => setResultOpen(true)}>查看报价结果 <i aria-hidden="true">→</i></button><button type="button" className="sales-button sales-button-secondary" onClick={reset}>新建报价</button></>
+                : <button type="button" className="sales-button sales-button-primary" onClick={reset}>新建报价 <i aria-hidden="true">→</i></button>}
           </div>
           {pageError && <p className="sales-form-error" role="alert">{pageError}</p>}
         </section>
@@ -498,38 +561,54 @@ export default function SalesQuotePage() {
         }}>
           <section className="sales-result-dialog" role="dialog" aria-modal="true" aria-labelledby="sales-result-title">
             <header>
-              <div><small>{providerLabel(job.cloud_provider)} · {job.quick_quote_result.region}</small><h2 id="sales-result-title">报价结果</h2></div>
-              <button type="button" aria-label="关闭报价结果" onClick={() => setResultOpen(false)}>×</button>
+              <div className="sales-result-title">
+                <span className="sales-result-status" aria-hidden="true">✓</span>
+                <div><small>{providerLabel(job.cloud_provider)} · {job.quick_quote_result.region}</small><h2 id="sales-result-title">报价已生成</h2><p>官方价格已核对，Excel 文件已就绪</p></div>
+              </div>
+              <button className="sales-result-close" type="button" aria-label="关闭报价结果" onClick={() => setResultOpen(false)}>×</button>
             </header>
-            <div className="sales-result-body">
-              {job.quick_quote_result.components.map((component, index) => (
-                <article key={`${component.service_name}-${index}`}>
-                  <div><b>{index + 1}</b><strong>{component.service_name}</strong><span>{[component.model_or_plan, component.quantity].filter(Boolean).join(" · ")}</span></div>
-                  {component.configuration_summary && <p>{component.configuration_summary}</p>}
-                  <dl>{component.scenario_costs.map((scenario) => (
-                    <div key={scenario.scenario_key}>
-                      <dt>{scenario.label}</dt>
-                      <dd>{money(scenario.monthly_cost, job.quick_quote_result.currency)} / 月{Number(scenario.upfront_cost || 0) > 0 && <small>预付 {money(scenario.upfront_cost, job.quick_quote_result.currency)}</small>}</dd>
+            <div className="sales-result-layout">
+              <div className="sales-result-body">
+                <div className="sales-result-section-label"><span>服务明细</span><b>{job.quick_quote_result.components.length} 项</b></div>
+                {job.quick_quote_result.components.map((component, index) => (
+                  <article key={`${component.service_name}-${index}`} style={{ animationDelay: `${index * 45}ms` }}>
+                    <div className="sales-result-component-head">
+                      <b>{String(index + 1).padStart(2, "0")}</b>
+                      <div><strong>{component.service_name}</strong><span>{[component.model_or_plan, component.quantity].filter(Boolean).join(" · ")}</span></div>
                     </div>
-                  ))}</dl>
-                </article>
-              ))}
-              <section className="sales-result-totals">
-                <h3>报价合计</h3>
-                {job.quick_quote_result.scenarios.map((scenario) => (
-                  <div key={scenario.scenario_key}>
-                    <span>{scenario.label}</span>
-                    <strong>{money(scenario.monthly_total, job.quick_quote_result.currency)} / 月</strong>
-                    {Number(scenario.upfront_total || 0) > 0 && <small>预付总额 {money(scenario.upfront_total, job.quick_quote_result.currency)}</small>}
-                  </div>
+                    {component.configuration_summary && <p>{component.configuration_summary}</p>}
+                    <dl>{component.scenario_costs.map((scenario) => (
+                      <div key={scenario.scenario_key}>
+                        <dt>{scenario.label}</dt>
+                        <dd>{money(scenario.monthly_cost, job.quick_quote_result.currency)}<span>/ 月</span>{Number(scenario.upfront_cost || 0) > 0 && <small>预付 {money(scenario.upfront_cost, job.quick_quote_result.currency)}</small>}</dd>
+                      </div>
+                    ))}</dl>
+                  </article>
                 ))}
-              </section>
+              </div>
+              <aside className="sales-result-summary">
+                <div className="sales-result-summary-heading"><small>QUOTE SUMMARY</small><h3>报价合计</h3></div>
+                <div className="sales-result-totals">
+                  {job.quick_quote_result.scenarios.map((scenario) => (
+                    <div key={scenario.scenario_key}>
+                      <span>{scenario.label}</span>
+                      <strong>{money(scenario.monthly_total, job.quick_quote_result.currency)}</strong>
+                      <small>折合月费</small>
+                      {Number(scenario.upfront_total || 0) > 0 && <em>预付总额 {money(scenario.upfront_total, job.quick_quote_result.currency)}</em>}
+                    </div>
+                  ))}
+                </div>
+                <div className="sales-result-file"><i aria-hidden="true">X</i><span><strong>Excel 报价文件</strong><small>{job.quote_download_filename || "正式报价单.xlsx"}</small></span><b aria-hidden="true">✓</b></div>
+                <p className="sales-result-commercial"><i aria-hidden="true" /> 正常商业价格，不抵扣免费或试用额度</p>
+              </aside>
             </div>
-            <footer>
-              <button type="button" className="sales-secondary" onClick={() => setResultOpen(false)}>关闭</button>
-              <button type="button" className="sales-secondary" onClick={() => void copyDownloadLink()} disabled={!job.quote_download_url}>{copied === "link" ? "链接已复制" : "复制下载链接"}</button>
-              {job.quote_download_url && <a className="sales-secondary sales-download" href={job.quote_download_url} download={job.quote_download_filename || undefined}>下载 Excel</a>}
-              <button type="button" className="sales-submit" onClick={() => void copyQuoteResult()}>{copied === "quote" ? "报价已复制" : "复制报价"}</button>
+            <footer className="sales-result-actions">
+              <span className="sales-result-action-note">报价和文件均可直接发送给客户</span>
+              <div>
+                <button type="button" className="sales-button sales-button-ghost" onClick={() => void copyDownloadLink()} disabled={!job.quote_download_url}><i aria-hidden="true">↗</i>{copied === "link" ? "链接已复制" : "复制下载链接"}</button>
+                {job.quote_download_url && <a className="sales-button sales-button-secondary sales-download" href={job.quote_download_url} download={job.quote_download_filename || undefined}><i aria-hidden="true">↓</i>下载 Excel</a>}
+                <button type="button" className="sales-button sales-button-primary" onClick={() => void copyQuoteResult()}><i aria-hidden="true">□</i>{copied === "quote" ? "报价已复制" : "复制报价"}</button>
+              </div>
             </footer>
           </section>
         </div>

@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.3.0';
+const VERSION = '3.4.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -205,6 +205,9 @@ const zeroCostService = z.object({
   fact_ids: z.array(factId).min(1).max(100),
   pricing_basis: z.literal('official_no_additional_charge'),
   official_evidence: zeroCostEvidence,
+  price_evidence: z.array(officialPriceEvidence).min(1).max(30).optional().describe(
+    '仅当零费用依据来自官方价目目录时填写。必须绑定只含零价、且不存在同 SKU 正常商业费率的官方费率身份。',
+  ),
   customer_facing: customerFacingService,
 }).strict();
 

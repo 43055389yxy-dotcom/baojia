@@ -94,6 +94,8 @@ const SCENARIO_KEYS = Object.freeze([
   'three_year_commitment',
 ]);
 
+const FREE_ALLOWANCE_REFERENCE = /(?:free\s*tier|always\s*free|free\s*trial|trial\s*credit|promotional\s*credit|account\s*credit|免费额度|免费试用|赠送额度|账户(?:信用|赠送)|零价区间)/i;
+
 function relayScenarioKeys(options) {
   if (Array.isArray(options?.pricing_scenarios)) {
     return [...new Set(options.pricing_scenarios)];
@@ -705,6 +707,79 @@ class AstraQuoteV2Workflow {
     }
   }
 
+  validateZeroCostEvidence(input, priceBatch) {
+    const priceResults = new Map(
+      (priceBatch.result.results || []).map((result) => [result.query_id, result]),
+    );
+    const violations = [];
+    for (const component of input.zero_cost_services || []) {
+      const source = component.official_evidence?.source;
+      const reference = String(component.official_evidence?.reference || '');
+      if (FREE_ALLOWANCE_REFERENCE.test(reference)) {
+        violations.push(`free_allowance_documentation_forbidden:${component.component_key}`);
+      }
+      if (source !== 'official_price_catalog') continue;
+
+      const refs = evidenceReferences(component);
+      if (refs.length === 0) {
+        violations.push(`zero_cost_catalog_evidence_missing:${component.component_key}`);
+        continue;
+      }
+      for (const ref of refs) {
+        const result = priceResults.get(ref.query_id);
+        if (!result) {
+          violations.push(`unknown_zero_cost_price_query:${component.component_key}:${ref.query_id}`);
+          continue;
+        }
+        if (result.provider !== input.cloud_provider) {
+          violations.push(`zero_cost_price_provider_mismatch:${component.component_key}:${ref.query_id}`);
+        }
+        const availableItems = new Set(result.official_item_ids || []);
+        const selectedItems = ref.official_item_ids || [];
+        const rateCandidates = Array.isArray(result.official_rate_candidates)
+          ? result.official_rate_candidates
+          : [];
+        const availableRates = new Map(rateCandidates.map((rate) => [rate.rate_id, rate]));
+        const selectedRates = ref.official_rate_ids || [];
+        if (selectedItems.length === 0 || selectedRates.length === 0) {
+          violations.push(`zero_cost_rate_selection_required:${component.component_key}:${ref.query_id}`);
+        }
+        for (const itemId of selectedItems) {
+          if (!availableItems.has(itemId)) {
+            violations.push(`unknown_zero_cost_item:${component.component_key}:${ref.query_id}:${itemId}`);
+            continue;
+          }
+          const itemRates = rateCandidates.filter((rate) => rate.official_item_id === itemId);
+          if (itemRates.some((rate) => Number(rate.unit_price) > 0)) {
+            violations.push(`free_allowance_not_zero_cost:${component.component_key}:${ref.query_id}:${itemId}`);
+          }
+          if (!itemRates.some((rate) => rate.is_zero_rate === true || Number(rate.unit_price) === 0)) {
+            violations.push(`official_zero_rate_missing:${component.component_key}:${ref.query_id}:${itemId}`);
+          }
+        }
+        for (const rateId of selectedRates) {
+          const rate = availableRates.get(rateId);
+          if (!rate) {
+            violations.push(`unknown_zero_cost_rate:${component.component_key}:${ref.query_id}:${rateId}`);
+            continue;
+          }
+          if (!selectedItems.includes(rate.official_item_id)) {
+            violations.push(`zero_cost_rate_item_mismatch:${component.component_key}:${ref.query_id}:${rateId}`);
+          }
+          if (rate.is_zero_rate !== true && Number(rate.unit_price) !== 0) {
+            violations.push(`positive_rate_in_zero_cost_service:${component.component_key}:${ref.query_id}:${rateId}`);
+          }
+        }
+      }
+    }
+    if (violations.length > 0) {
+      const error = new Error('Official zero-cost evidence is invalid for a commercial quote.');
+      error.code = 'official_zero_cost_evidence_invalid';
+      error.details = { violations };
+      throw error;
+    }
+  }
+
   async deliverRecord(record) {
     let deliveryResult;
     if (typeof this.deliverer.createArtifact === 'function'
@@ -785,6 +860,7 @@ class AstraQuoteV2Workflow {
     );
     validateCustomerDocumentMetadata(normalizedInput);
     this.validatePriceEvidence(normalizedInput, priceBatch);
+    this.validateZeroCostEvidence(normalizedInput, priceBatch);
     const compiled = prepareOfficialApiSubmission(normalizedInput);
     const quoteId = `aqv2_${randomUUID()}`;
     const record = {
