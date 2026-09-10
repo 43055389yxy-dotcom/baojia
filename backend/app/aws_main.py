@@ -54,7 +54,7 @@ quote_artifacts = QuoteArtifactStore()
 
 app = FastAPI(
     title="AstraQuote 多云报价 API",
-    version="3.0.0",
+    version="3.2.0",
     description="提供官方云价目读取与销售报价任务入口。",
 )
 app.add_middleware(
@@ -194,7 +194,7 @@ async def mcp_v2_health(request: Request) -> dict[str, Any]:
     _require_mcp_internal_token(request)
     return {
         "status": "ready",
-        "workflow_version": "3.0.0",
+        "workflow_version": "3.2.0",
         "internal_ai_enabled": False,
         "role": "official cloud catalog client",
         "price_sources": [
@@ -203,6 +203,7 @@ async def mcp_v2_health(request: Request) -> dict[str, Any]:
             "Oracle Cloud Price List API",
             "Google Cloud Billing Catalog API",
         ],
+        "provider_catalogs": mcp_v2_pricing.catalog_availability(),
     }
 
 
@@ -254,7 +255,7 @@ class GptRelayQuoteRequest(BaseModel):
     )
 
     @model_validator(mode="after")
-    def validate_provider_scenarios(self) -> "GptRelayQuoteRequest":
+    def validate_provider_scenarios(self) -> GptRelayQuoteRequest:
         scenarios = list(dict.fromkeys(self.pricing_scenarios))
         if len(scenarios) != len(self.pricing_scenarios):
             raise ValueError("pricing_scenarios must be unique")
@@ -307,7 +308,10 @@ async def cancel_gpt_relay_job(job_id: str) -> dict[str, Any] | JSONResponse:
 
 @app.get("/api/quote-relay/health")
 async def gpt_relay_health() -> dict[str, Any]:
-    return gpt_quote_relay.health()
+    return {
+        **gpt_quote_relay.health(),
+        "provider_catalogs": mcp_v2_pricing.catalog_availability(),
+    }
 
 
 @app.get("/api/quote-artifacts/{token}", response_model=None)

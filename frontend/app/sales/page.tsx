@@ -48,6 +48,10 @@ type RelayJob = {
 type RelayHealth = {
   status: "ready" | "offline";
   message?: string;
+  provider_catalogs?: Partial<Record<CloudProvider, {
+    available: boolean;
+    message?: string;
+  }>>;
 };
 
 const statusCopy: Record<RelayJob["status"], { title: string; detail?: string }> = {
@@ -78,16 +82,24 @@ const PROVIDER_SCENARIOS: Record<CloudProvider, Array<{ key: ScenarioKey; label:
   ],
 };
 
-function approximateProgress(job: RelayJob) {
-  if (job.status === "completed") return 100;
-  if (["failed", "cancelled"].includes(job.status)) return 0;
-  const createdAt = job.created_at ? new Date(job.created_at).valueOf() : Date.now();
-  const elapsedSeconds = Math.max(0, (Date.now() - createdAt) / 1000);
-  return Math.min(92, Math.round(14 + (elapsedSeconds / (10 * 60)) * 78));
-}
-
 function estimateWindow() {
   return "5～10 分钟";
+}
+
+function providerLabel(provider: CloudProvider | undefined) {
+  return {
+    aws: "AWS",
+    azure: "微软 Azure",
+    oci: "Oracle Cloud",
+    gcp: "Google Cloud",
+  }[provider ?? "aws"];
+}
+
+function safeSubmissionError(status: number) {
+  if (status === 422) return "报价选项与所选云厂商不一致，请检查后重新提交。";
+  if (status === 429) return "当前提交较多，请稍候再试。";
+  if (status >= 500) return "报价服务暂时不可用，请稍后重试。";
+  return "报价提交失败，请检查填写内容后重试。";
 }
 
 function money(value: string | undefined, currency = "USD") {
@@ -101,7 +113,7 @@ function money(value: string | undefined, currency = "USD") {
 function quoteCopyText(job: RelayJob) {
   const result = job.quick_quote_result;
   if (!result) return "";
-  const lines = [`提交码：${job.submission_code}`, `区域：${result.region}`, ""];
+  const lines = [`云厂商：${providerLabel(job.cloud_provider)}`, `区域：${result.region}`, ""];
   result.components.forEach((component, index) => {
     const identity = [component.service_name, component.model_or_plan, component.quantity]
       .filter(Boolean).join(" · ");
@@ -145,8 +157,6 @@ export default function SalesQuotePage() {
   const [trackedJobId, setTrackedJobId] = useState("");
   const [resultOpen, setResultOpen] = useState(false);
   const [copied, setCopied] = useState<"" | "quote" | "link">("");
-  const [, refreshProgress] = useState(0);
-
   const active = Boolean(job && ["queued", "processing", "needs_login"].includes(job.status));
 
   const loadJob = useCallback(async (jobId: string) => {
@@ -209,12 +219,6 @@ export default function SalesQuotePage() {
     };
   }, [trackedJobId, loadJob]);
 
-  useEffect(() => {
-    if (!active) return;
-    const timer = window.setInterval(() => refreshProgress((value) => value + 1), 15000);
-    return () => window.clearInterval(timer);
-  }, [active]);
-
   const workflowLabel = useMemo(
     () => `已选 ${selectedScenarios.size} 种报价方案`,
     [selectedScenarios],
@@ -232,6 +236,7 @@ export default function SalesQuotePage() {
   function chooseProvider(provider: CloudProvider) {
     setCloudProvider(provider);
     setSelectedScenarios(new Set(PROVIDER_SCENARIOS[provider].map((scenario) => scenario.key)));
+    setPageError("");
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -277,15 +282,24 @@ export default function SalesQuotePage() {
         }
       }
       if (!response) throw new Error("network_error");
-      const payload = await response.json() as RelayJob;
-      if (!response.ok || !payload.job_id) throw new Error("报价提交失败，请稍后重试。");
+      let payload: RelayJob | null = null;
+      try {
+        payload = await response.json() as RelayJob;
+      } catch {
+        throw new Error(safeSubmissionError(response.status));
+      }
+      if (!response.ok || !payload?.job_id) throw new Error(safeSubmissionError(response.status));
       window.sessionStorage.setItem(ACTIVE_JOB_KEY, payload.job_id);
       window.sessionStorage.removeItem(PENDING_SUBMISSION_KEY);
       setTrackedJobId(payload.job_id);
       setJob(payload);
       setRequirement("");
-    } catch {
-      setPageError("报价提交失败，请稍后重试。");
+    } catch (error) {
+      setPageError(
+        error instanceof Error && error.message !== "network_error"
+          ? error.message
+          : "网络连接不稳定，请检查网络后重新提交。",
+      );
     } finally {
       setSubmitting(false);
     }
@@ -341,7 +355,8 @@ export default function SalesQuotePage() {
   }
 
   const ready = health?.status === "ready";
-  const progress = job ? approximateProgress(job) : 0;
+  const selectedCatalog = health?.provider_catalogs?.[cloudProvider];
+  const selectedCatalogUnavailable = selectedCatalog?.available === false;
 
   return (
     <main className="sales-portal">
@@ -372,20 +387,30 @@ export default function SalesQuotePage() {
                   ["azure", "微软 Azure"],
                   ["oci", "Oracle Cloud"],
                   ["gcp", "Google Cloud"],
-                ] as const).map(([value, label]) => (
-                  <label className={cloudProvider === value ? "selected" : ""} key={value}>
-                    <input
-                      type="radio"
-                      name="cloud-provider"
-                      value={value}
-                      checked={cloudProvider === value}
-                      onChange={() => chooseProvider(value)}
-                    />
-                    <span>{label}</span>
-                  </label>
-                ))}
+                ] as const).map(([value, label]) => {
+                  const catalog = health?.provider_catalogs?.[value];
+                  return (
+                    <label className={`${cloudProvider === value ? "selected" : ""} ${catalog?.available === false ? "unavailable" : ""}`} key={value}>
+                      <input
+                        type="radio"
+                        name="cloud-provider"
+                        value={value}
+                        checked={cloudProvider === value}
+                        onChange={() => chooseProvider(value)}
+                      />
+                      <span>{label}</span>
+                      {catalog?.available === false && <small>待配置</small>}
+                    </label>
+                  );
+                })}
               </div>
             </fieldset>
+
+            {selectedCatalogUnavailable && (
+              <p className="sales-catalog-note" role="status">
+                {selectedCatalog?.message ?? "所选云厂商的官方价格接口待配置。"}
+              </p>
+            )}
 
             <label htmlFor="sales-requirement">需求内容</label>
             <textarea
@@ -423,7 +448,7 @@ export default function SalesQuotePage() {
             </div>
 
             {pageError && <p className="sales-form-error" role="alert">{pageError}</p>}
-            <button className="sales-submit" type="submit" disabled={submitting || selectedScenarios.size < 1 || requirement.trim().length < 3 || health?.status === "offline"}>
+            <button className="sales-submit" type="submit" disabled={submitting || selectedScenarios.size < 1 || requirement.trim().length < 3 || health?.status === "offline" || selectedCatalogUnavailable}>
               {submitting ? "正在提交…" : "提交报价"}
               <span aria-hidden="true">↗</span>
             </button>
@@ -431,12 +456,17 @@ export default function SalesQuotePage() {
         </section>
       ) : (
         <section className={`sales-job-card status-${job.status}`} aria-live="polite">
-          <div className="sales-job-status-icon" aria-hidden="true">
-            {job.status === "completed" ? "✓" : job.status === "failed" ? "!" : job.status === "cancelled" ? "×" : <i />}
+          <div className="sales-job-visual" aria-hidden="true">
+            <span className="sales-job-orbit sales-job-orbit-one" />
+            <span className="sales-job-orbit sales-job-orbit-two" />
+            <span className="sales-job-node sales-job-node-one" />
+            <span className="sales-job-node sales-job-node-two" />
+            <div className="sales-job-status-icon">
+              {job.status === "completed" ? "✓" : job.status === "failed" ? "!" : job.status === "cancelled" ? "×" : <i />}
+            </div>
           </div>
           <div className="sales-job-copy">
-            <p>提交码</p>
-            <strong className="sales-submission-code">{job.submission_code}</strong>
+            <p>LIVE QUOTE WORKFLOW · {providerLabel(job.cloud_provider)}</p>
             <h1>{statusCopy[job.status].title}</h1>
             <span>{job.status === "completed" && job.quick_quote_result
               ? "报价结果和 Excel 已生成，可查看、复制或下载。"
@@ -444,10 +474,10 @@ export default function SalesQuotePage() {
           </div>
 
           {active && (
-            <div className="sales-job-progress" aria-label={`处理进度约 ${progress}%`}>
-              <div><span>处理中</span><b>{progress}%</b></div>
-              <i><span style={{ width: `${progress}%` }} /></i>
-              <small>预计 {estimateWindow()}</small>
+            <div className="sales-job-progress" aria-label="报价引擎处理中">
+              <div><span>报价引擎处理中</span><b><i /> 正在运行</b></div>
+              <i><span /></i>
+              <small>正在读取官网价格并生成报价，预计 {estimateWindow()}</small>
             </div>
           )}
 
@@ -468,7 +498,7 @@ export default function SalesQuotePage() {
         }}>
           <section className="sales-result-dialog" role="dialog" aria-modal="true" aria-labelledby="sales-result-title">
             <header>
-              <div><small>提交码 {job.submission_code}</small><h2 id="sales-result-title">报价结果</h2></div>
+              <div><small>{providerLabel(job.cloud_provider)} · {job.quick_quote_result.region}</small><h2 id="sales-result-title">报价结果</h2></div>
               <button type="button" aria-label="关闭报价结果" onClick={() => setResultOpen(false)}>×</button>
             </header>
             <div className="sales-result-body">

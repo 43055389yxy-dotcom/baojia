@@ -7,17 +7,6 @@ type RouteContext = { params: Promise<{ path: string[] }> };
 async function forward(request: NextRequest, context: RouteContext) {
   const { path } = await context.params;
   const joinedPath = path.join("/");
-  const isAzurePath = joinedPath.startsWith("api/azure/")
-    || joinedPath === "api/azure-product-registry"
-    || joinedPath.includes("/azure_")
-    || joinedPath.includes("/azure-")
-    || request.nextUrl.searchParams.get("provider") === "azure";
-  if (isAzurePath) {
-    return Response.json(
-      { code: "provider_boundary_violation", message: "AWS 报价系统禁止访问 Azure 数据。" },
-      { status: 403 },
-    );
-  }
   const target = new URL(BACKEND_URL);
   const backendPrefix = target.pathname.replace(/\/+$/, "");
   target.pathname = `${backendPrefix}/${joinedPath}`.replace(/\/{2,}/g, "/");
@@ -33,15 +22,6 @@ async function forward(request: NextRequest, context: RouteContext) {
     const body = request.method === "GET" || request.method === "HEAD"
       ? undefined
       : await request.arrayBuffer();
-    if (body && request.headers.get("content-type")?.includes("application/json")) {
-      const payload = JSON.parse(new TextDecoder().decode(body)) as { cloud_provider?: string };
-      if (payload.cloud_provider && payload.cloud_provider !== "aws") {
-        return Response.json(
-          { code: "provider_boundary_violation", message: "AWS 报价系统只接受 AWS 报价任务。" },
-          { status: 403 },
-        );
-      }
-    }
     const response = await fetch(target, {
       method: request.method,
       headers,

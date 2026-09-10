@@ -52,6 +52,12 @@ ASTRAQUOTE_PUBLIC_BASE_URL=https://baojia.tontiancloud.com
 
 Jenkins 使用 [`deploy/jenkins-shell.sh`](./jenkins-shell.sh) 构建并启动容器。上线前至少运行：
 
+该脚本还会把同一版本的 `backend`、`tools`、`policies` 同步到宿主机
+`/home/ec2-user/astraquote/source`，然后重启 `astraquote-gpt-relay.service`。
+因此 Jenkins 运行用户必须能免密使用 `sudo` 执行 `rsync/install/systemctl`，并能
+以 `ec2-user` 运行桌面中继的 Python 编译检查；否则部署会明确失败，不能留下
+新旧版本并存。
+
 ```bash
 cd deploy/astraquote-mcp && npm test
 cd frontend && npm test && npm run build

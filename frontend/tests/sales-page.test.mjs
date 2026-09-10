@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-test("sales portal returns a server-issued submission code and recovers active jobs", async () => {
+test("sales portal keeps its internal job identity private and recovers active jobs", async () => {
   const page = await readFile(new URL("../app/sales/page.tsx", import.meta.url), "utf8");
 
   assert.doesNotMatch(page, /销售姓名|salesName|sales_name/);
-  assert.match(page, /提交码/);
+  assert.doesNotMatch(page, /提交码/);
   assert.match(page, /submission_code/);
   assert.match(page, /提交报价/);
   assert.match(page, /\/api\/quote-relay\/jobs/);
@@ -31,9 +31,19 @@ test("sales portal returns a server-issued submission code and recovers active j
   assert.match(page, /1 年承诺使用/);
   assert.match(page, /OCI 公开按量价/);
   assert.match(page, /type="radio"/);
+  assert.match(page, /provider_catalogs/);
+  assert.match(page, /价格接口待配置/);
   assert.doesNotMatch(page, /get_prices|build_estimate|Fact Ledger/);
   assert.doesNotMatch(page, /chat_url|管理员查看对话/);
   assert.doesNotMatch(page, /\/api\/gpt-relay/);
+});
+
+test("sales portal uses provider-native purchase labels instead of one AWS-only model", async () => {
+  const page = await readFile(new URL("../app/sales/page.tsx", import.meta.url), "utf8");
+
+  assert.match(page, /azure:\s*\[[\s\S]*即用即付[\s\S]*1 年预留[\s\S]*3 年预留[\s\S]*\]/);
+  assert.match(page, /oci:\s*\[\{[^\n]*OCI 公开按量价/);
+  assert.match(page, /gcp:\s*\[[\s\S]*1 年承诺使用[\s\S]*3 年承诺使用[\s\S]*\]/);
 });
 
 test("sales portal exposes only formal progress copy and no internal implementation", async () => {

@@ -329,6 +329,9 @@ def test_per_quote_prompt_carries_the_current_nearest_lower_policy() -> None:
     assert "build_estimate" not in prompt
     assert "ASTRAQUOTE_STATUS" not in prompt
     assert "禁止为了满足目标而向上选择" in prompt
+    assert "完全匹配" in prompt
+    assert "总报价最低" in prompt
+    assert "由 GPT" in prompt
 
 
 def test_default_comparison_prompt_lists_all_three_selected_scenarios() -> None:
@@ -352,6 +355,36 @@ def test_default_comparison_prompt_lists_all_three_selected_scenarios() -> None:
     assert "3 年预留" in prompt
     assert "云厂商：微软 Azure（销售已选定，不得改换）" in prompt
     assert "生成 Excel，并在销售报价页提供报价与下载链接；不发送企业微信群" in prompt
+
+
+@pytest.mark.parametrize(
+    ("provider", "scenarios", "expected", "forbidden"),
+    [
+        ("aws", ["on_demand"], "按需付费", "即用即付"),
+        ("azure", ["on_demand", "one_year_commitment"], "1 年预留", "预留实例全预付"),
+        ("oci", ["on_demand"], "OCI 公开按量价", "承诺使用"),
+        ("gcp", ["on_demand", "three_year_commitment"], "3 年承诺使用", "预留实例"),
+    ],
+)
+def test_quote_prompt_keeps_each_provider_purchase_vocabulary(
+    provider: str,
+    scenarios: list[str],
+    expected: str,
+    forbidden: str,
+) -> None:
+    prompt = build_quote_prompt(
+        "2 核 4 GiB，一台。",
+        {
+            "pricing_scenarios": scenarios,
+            "utilization_percent": 100,
+            "cloud_provider": provider,
+        },
+        relay_job_id="gpt-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        submission_code="4",
+    )
+
+    assert expected in prompt
+    assert forbidden not in prompt
 
 
 def test_every_quote_prompt_requires_excel_and_sales_page_delivery_only() -> None:

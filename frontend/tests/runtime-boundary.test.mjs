@@ -27,3 +27,15 @@ test("backend proxy preserves an optional public base path", async () => {
   assert.match(route, /`\$\{backendPrefix\}\/\$\{joinedPath\}`/);
   assert.doesNotMatch(route, /new URL\(`\/\$\{joinedPath\}`, BACKEND_URL\)/);
 });
+
+test("the shared sales proxy forwards every selected cloud provider", async () => {
+  const route = await readFile(
+    new URL("../app/api/backend/[...path]/route.ts", import.meta.url),
+    "utf8",
+  );
+
+  assert.doesNotMatch(route, /payload\.cloud_provider\s*!==\s*["']aws["']/);
+  assert.doesNotMatch(route, /AWS 报价系统只接受 AWS 报价任务/);
+  assert.doesNotMatch(route, /AWS 报价系统禁止访问 Azure 数据/);
+  assert.match(route, /await fetch\(target/);
+});

@@ -152,3 +152,77 @@ def test_azure_next_page_url_is_restricted_to_official_host() -> None:
             query_id="bad-page",
             next_page_url="https://example.com/steal",
         )
+
+
+def test_gcp_response_filters_narrow_paginated_official_results_without_mcp_selection() -> None:
+    http = _HttpRecorder(
+        [
+            {
+                "services": [
+                    {"serviceId": "first", "displayName": "Unrelated Service"},
+                    {"serviceId": "compute", "displayName": "Compute Engine"},
+                ],
+                "nextPageToken": "page-2",
+            },
+            {
+                "services": [
+                    {"serviceId": "other", "displayName": "Another Service"},
+                ]
+            },
+        ]
+    )
+    service = OfficialPricingService(
+        _UnusedAwsExecutor(), http_get=http, gcp_api_key="not-a-real-secret"
+    )
+
+    result = service.get_prices(
+        GetPricesRequest(
+            queries=[
+                GcpPriceQuery(
+                    query_id="gcp-compute-service",
+                    operation="list_services",
+                    response_filters={"displayName": "Compute Engine"},
+                    max_pages=4,
+                )
+            ]
+        )
+    )["results"][0]
+
+    assert result["status"] == "exact"
+    assert result["official_item_ids"] == ["compute"]
+    assert result["services"] == [
+        {"serviceId": "compute", "displayName": "Compute Engine"}
+    ]
+    assert len(http.calls) == 2
+    assert http.calls[1][1]["pageToken"] == "page-2"
+
+
+def test_oci_response_filters_are_caller_supplied_and_return_only_exact_matches() -> None:
+    http = _HttpRecorder(
+        [
+            {
+                "items": [
+                    {"partNumber": "B1", "displayName": "Virtual Machine Standard"},
+                    {"partNumber": "B2", "displayName": "Object Storage"},
+                ]
+            }
+        ]
+    )
+    service = OfficialPricingService(_UnusedAwsExecutor(), http_get=http)
+
+    result = service.get_prices(
+        GetPricesRequest(
+            queries=[
+                OciPriceQuery(
+                    query_id="oci-object-storage",
+                    response_filters={"displayName": "Object Storage"},
+                )
+            ]
+        )
+    )["results"][0]
+
+    assert result["status"] == "exact"
+    assert result["official_item_ids"] == ["B2"]
+    assert result["items"] == [
+        {"partNumber": "B2", "displayName": "Object Storage"}
+    ]

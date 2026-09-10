@@ -85,6 +85,12 @@ class OciPriceQuery(StrictModel):
     query_id: str = Field(min_length=1, max_length=100)
     part_number: str | None = Field(default=None, min_length=1, max_length=120)
     currency_code: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
+    response_filters: dict[str, str] = Field(default_factory=dict, max_length=12)
+
+    @model_validator(mode="after")
+    def validate_response_filters(self) -> OciPriceQuery:
+        _validate_objective_response_filters(self.response_filters)
+        return self
 
 
 class GcpPriceQuery(StrictModel):
@@ -100,6 +106,8 @@ class GcpPriceQuery(StrictModel):
     page_size: int = Field(default=5000, ge=1, le=5000)
     page_token: str | None = Field(default=None, max_length=4000)
     currency_code: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
+    response_filters: dict[str, str] = Field(default_factory=dict, max_length=12)
+    max_pages: int = Field(default=8, ge=1, le=20)
 
     @model_validator(mode="after")
     def validate_operation(self) -> GcpPriceQuery:
@@ -107,6 +115,7 @@ class GcpPriceQuery(StrictModel):
             raise ValueError("list_skus requires service_id")
         if self.operation == "list_services" and self.service_id:
             raise ValueError("list_services does not accept service_id")
+        _validate_objective_response_filters(self.response_filters)
         return self
 
 
@@ -152,7 +161,26 @@ class OfficialPricingService:
     ) -> None:
         self._executor = executor
         self._http_get = http_get
-        self._gcp_api_key = gcp_api_key or os.getenv("GCP_BILLING_API_KEY", "")
+        self._gcp_api_key = (
+            os.getenv("GCP_BILLING_API_KEY", "")
+            if gcp_api_key is None
+            else gcp_api_key
+        )
+
+    def catalog_availability(self) -> dict[str, dict[str, Any]]:
+        return {
+            "aws": {"available": True},
+            "azure": {"available": True},
+            "oci": {"available": True},
+            "gcp": {
+                "available": bool(self._gcp_api_key),
+                "message": (
+                    "Google Cloud 官方价格接口可用"
+                    if self._gcp_api_key
+                    else "Google Cloud 官方价格接口待配置 API Key"
+                ),
+            },
+        }
 
     def describe_service(self, request: DescribeServiceRequest) -> dict[str, Any]:
         payload = self._executor.execute(
@@ -349,7 +377,8 @@ class OfficialPricingService:
         if query.part_number:
             params["partNumber"] = query.part_number
         payload = self._official_json(self.OCI_URL, params=params)
-        items = payload.get("items") if isinstance(payload.get("items"), list) else []
+        raw_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+        items = _filter_official_candidates(raw_items, query.response_filters)
         item_ids = [
             str(item.get("partNumber"))
             for item in items
@@ -359,6 +388,7 @@ class OfficialPricingService:
             "status": _identity_status(len(item_ids)),
             "official_item_ids": item_ids,
             "items": items,
+            "response_filters": query.response_filters,
             "currency": query.currency_code,
             "source": "Oracle Cloud Price List API",
         }
@@ -375,16 +405,31 @@ class OfficialPricingService:
         else:
             url = f"{self.GCP_BASE_URL}/services/{quote(query.service_id or '', safe='')}/skus"
             response_key = "skus"
-        params: dict[str, Any] = {
-            "key": self._gcp_api_key,
-            "pageSize": query.page_size,
-        }
-        if query.operation == "list_skus":
-            params["currencyCode"] = query.currency_code
-        if query.page_token:
-            params["pageToken"] = query.page_token
-        payload = self._official_json(url, params=params)
-        items = payload.get(response_key) if isinstance(payload.get(response_key), list) else []
+        items: list[Any] = []
+        page_token = query.page_token
+        pages_scanned = 0
+        scanned_item_count = 0
+        while True:
+            params: dict[str, Any] = {
+                "key": self._gcp_api_key,
+                "pageSize": query.page_size,
+            }
+            if query.operation == "list_skus":
+                params["currencyCode"] = query.currency_code
+            if page_token:
+                params["pageToken"] = page_token
+            payload = self._official_json(url, params=params)
+            page_items = (
+                payload.get(response_key)
+                if isinstance(payload.get(response_key), list)
+                else []
+            )
+            scanned_item_count += len(page_items)
+            items.extend(_filter_official_candidates(page_items, query.response_filters))
+            pages_scanned += 1
+            page_token = str(payload.get("nextPageToken") or "") or None
+            if not page_token or not query.response_filters or pages_scanned >= query.max_pages:
+                break
         item_ids = [
             str(item.get("skuId") or item.get("serviceId") or item.get("name"))
             for item in items
@@ -396,7 +441,10 @@ class OfficialPricingService:
             "operation": query.operation,
             "official_item_ids": item_ids,
             response_key: items,
-            "next_page_token": payload.get("nextPageToken"),
+            "next_page_token": page_token,
+            "response_filters": query.response_filters,
+            "pages_scanned": pages_scanned,
+            "scanned_item_count": scanned_item_count,
             "currency": query.currency_code,
             "source": "Google Cloud Billing Catalog API",
         }
@@ -428,6 +476,48 @@ def _identity_status(count: int) -> str:
     if count == 1:
         return "exact"
     return "ambiguous"
+
+
+def _validate_objective_response_filters(filters: dict[str, str]) -> None:
+    for field, value in filters.items():
+        parts = field.split(".")
+        if (
+            not parts
+            or any(
+                not part or len(part) > 120 or not part.replace("_", "").isalnum()
+                for part in parts
+            )
+            or len(field) > 360
+        ):
+            raise ValueError("response_filters keys must be dotted official JSON field paths")
+        if not isinstance(value, str) or not value.strip() or len(value) > 500:
+            raise ValueError("response_filters values must be non-empty strings")
+
+
+def _candidate_field(candidate: dict[str, Any], field: str) -> Any:
+    current: Any = candidate
+    for part in field.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _filter_official_candidates(
+    candidates: list[Any],
+    filters: dict[str, str],
+) -> list[Any]:
+    if not filters:
+        return list(candidates)
+    return [
+        candidate
+        for candidate in candidates
+        if isinstance(candidate, dict)
+        and all(
+            str(_candidate_field(candidate, field)) == expected
+            for field, expected in filters.items()
+        )
+    ]
 
 
 def _flatten_scalar_fields(value: Any, *, prefix: str = "") -> dict[str, set[str]]:
@@ -498,6 +588,9 @@ def _require_refinement_for_large_result(
     filters = getattr(query, "filters", None)
     if isinstance(filters, dict):
         excluded.update(str(key) for key in filters)
+    response_filters = getattr(query, "response_filters", None)
+    if isinstance(response_filters, dict):
+        excluded.update(str(key) for key in response_filters)
     compact = {
         key: value
         for key, value in result.items()

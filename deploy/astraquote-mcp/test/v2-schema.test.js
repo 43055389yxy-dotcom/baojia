@@ -67,12 +67,16 @@ test('get_prices accepts four provider-specific raw query shapes', async (t) => 
           filter: "serviceName eq 'Virtual Machines'", currency_code: 'USD',
         },
         { provider: 'oci', query_id: 'oci-1', part_number: 'B93113', currency_code: 'USD' },
-        { provider: 'gcp', query_id: 'gcp-1', operation: 'list_services' },
+        {
+          provider: 'gcp', query_id: 'gcp-1', operation: 'list_services',
+          response_filters: { displayName: 'Compute Engine' }, max_pages: 4,
+        },
       ],
     },
   });
   assert.equal(result.isError, undefined);
   assert.equal(result.structuredContent.input.queries.length, 4);
+  assert.equal(result.structuredContent.input.queries[3].response_filters.displayName, 'Compute Engine');
 });
 
 test('build_estimate carries provider, official item evidence and no calculator fields', async (t) => {

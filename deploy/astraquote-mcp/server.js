@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.1.0';
+const VERSION = '3.2.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -70,6 +70,10 @@ const ociPriceQuery = z.object({
   query_id: z.string().min(1).max(100),
   part_number: z.string().min(1).max(120).optional(),
   currency_code: z.string().regex(/^[A-Z]{3}$/).default('USD'),
+  response_filters: z.record(z.string().min(1).max(500)).refine(
+    (value) => Object.keys(value).length <= 12,
+    'At most 12 caller-supplied exact response filters are allowed.',
+  ).default({}).describe('Exact dotted official JSON field matches supplied by GPT. The MCP does not choose values.'),
 }).strict();
 
 const gcpPriceQuery = z.object({
@@ -80,6 +84,13 @@ const gcpPriceQuery = z.object({
   page_size: z.number().int().min(1).max(5000).default(5000),
   page_token: z.string().max(4000).optional(),
   currency_code: z.string().regex(/^[A-Z]{3}$/).default('USD'),
+  response_filters: z.record(z.string().min(1).max(500)).refine(
+    (value) => Object.keys(value).length <= 12,
+    'At most 12 caller-supplied exact response filters are allowed.',
+  ).default({}).describe('Exact dotted official JSON field matches supplied by GPT. The MCP does not choose values.'),
+  max_pages: z.number().int().min(1).max(20).default(8).describe(
+    'Maximum official pages to scan when response_filters are supplied.',
+  ),
 }).strict();
 
 const priceQuery = z.discriminatedUnion('provider', [
