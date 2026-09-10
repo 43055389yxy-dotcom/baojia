@@ -25,7 +25,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     BACKEND_API_URL=http://127.0.0.1:8000
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl gzip tini \
+    && apt-get install -y --no-install-recommends ca-certificates curl gzip tini util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node

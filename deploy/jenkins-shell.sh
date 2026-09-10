@@ -33,46 +33,6 @@ stage_host_browser_relay() {
       '
 }
 
-stop_host_browser_relay() {
-  echo "Stopping the exact desktop relay worker; systemd will restart it"
-  docker run --rm --pid=host \
-    -e RELAY_WORKER_COMMAND="$RELAY_WORKER_COMMAND" \
-    --entrypoint /bin/sh \
-    astraquote:production -ceu '
-      found=0
-      stopped_pids=""
-      for cmdline in /proc/[0-9]*/cmdline; do
-        test -r "$cmdline" || continue
-        command=$(tr "\000" " " < "$cmdline")
-        case "$command" in
-          "$RELAY_WORKER_COMMAND "*)
-            pid=${cmdline#/proc/}
-            pid=${pid%/cmdline}
-            kill -TERM "$pid"
-            found=1
-            stopped_pids="$stopped_pids $pid"
-            ;;
-        esac
-      done
-      if test "$found" -ne 1; then
-        echo "AstraQuote desktop relay worker was not running on the Docker host" >&2
-        exit 1
-      fi
-      for attempt in 1 2 3 4 5 6; do
-        still_running=0
-        for pid in $stopped_pids; do
-          if kill -0 "$pid" 2>/dev/null; then
-            still_running=1
-          fi
-        done
-        test "$still_running" -eq 1 || exit 0
-        sleep 5
-      done
-      echo "AstraQuote desktop relay worker did not stop cleanly" >&2
-      exit 1
-    '
-}
-
 activate_host_browser_relay() {
   echo "Activating the staged desktop relay source"
   docker run --rm \
@@ -100,8 +60,24 @@ activate_host_browser_relay() {
     '
 }
 
+restart_host_browser_relay() {
+  echo "Restarting the desktop relay through the Docker host systemd"
+  docker run --rm --privileged --pid=host \
+    --entrypoint /usr/bin/nsenter \
+    astraquote:production \
+    --target 1 \
+    --mount \
+    --uts \
+    --ipc \
+    --net \
+    --pid \
+    --root=/proc/1/root \
+    --wd=/ \
+    /usr/bin/systemctl restart astraquote-gpt-relay.service
+}
+
 wait_for_host_browser_relay() {
-  echo "Waiting for systemd to restart the desktop relay worker"
+  echo "Waiting for the restarted desktop relay worker to remain stable"
   docker run --rm --pid=host \
     -e RELAY_WORKER_COMMAND="$RELAY_WORKER_COMMAND" \
     --entrypoint /bin/sh \
@@ -138,8 +114,8 @@ wait_for_host_browser_relay() {
 
 update_host_browser_relay() {
   stage_host_browser_relay
-  stop_host_browser_relay
   activate_host_browser_relay
+  restart_host_browser_relay
   wait_for_host_browser_relay
 }
 

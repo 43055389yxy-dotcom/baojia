@@ -12,7 +12,8 @@ def test_jenkins_deploy_updates_and_restarts_the_host_browser_relay() -> None:
     assert '-v "$RELAY_HOST_ROOT:/host/astraquote"' in script
     assert "--pid=host" in script
     assert '"$RELAY_WORKER_COMMAND "*' in script
-    assert "systemd will restart it" in script
+    assert "--entrypoint /usr/bin/nsenter" in script
+    assert "/usr/bin/systemctl restart astraquote-gpt-relay.service" in script
     assert "rsync" not in script
     assert "sudo" not in script
 
@@ -25,3 +26,11 @@ def test_jenkins_health_checks_explain_the_failure_stage() -> None:
     assert "AstraQuote container endpoints did not become ready" in script
     assert "Staging the desktop relay source" in script
     assert "Activating the staged desktop relay source" in script
+    assert "Restarting the desktop relay through the Docker host systemd" in script
+
+
+def test_runtime_image_contains_the_host_namespace_helper() -> None:
+    root = Path(__file__).resolve().parents[2]
+    dockerfile = (root / "deploy/Dockerfile").read_text(encoding="utf-8")
+
+    assert "util-linux" in dockerfile

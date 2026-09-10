@@ -53,10 +53,11 @@ ASTRAQUOTE_PUBLIC_BASE_URL=https://baojia.tontiancloud.com
 Jenkins 使用 [`deploy/jenkins-shell.sh`](./jenkins-shell.sh) 构建并启动容器。上线前至少运行：
 
 该脚本还会把同一版本的 `backend`、`tools`、`policies` 同步到 Docker 宿主机
-`/home/ec2-user/astraquote/source`，然后精确停止桌面报价 worker，由已安装的
-`astraquote-gpt-relay.service` 自动重启。Jenkins 本身运行在容器中，所以这里
-通过它已有的 Docker socket 完成宿主机文件同步和进程重启，不要求 Jenkins
-容器安装 `rsync`、`sudo` 或 `systemctl`。Docker 宿主机必须已经安装并启用该
+`/home/ec2-user/astraquote/source`，然后通过临时的 Docker 宿主机命名空间调用
+已安装的 `astraquote-gpt-relay.service` 完成明确重启。Jenkins 本身运行在容器
+中，所以这里通过它已有的 Docker socket 完成宿主机文件同步和进程重启，不要求
+Jenkins 容器安装 `rsync`、`sudo` 或 `systemctl`。临时容器只执行固定的
+`systemctl restart astraquote-gpt-relay.service`，Docker 宿主机必须已经安装该
 systemd 服务。
 
 ```bash
