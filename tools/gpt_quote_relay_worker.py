@@ -2,8 +2,8 @@
 """Drive the server's logged-in browser for isolated sales quote jobs.
 
 One visible Firefox process owns the administrator session. Each active quote
-uses its own tab and conversation; the configured work-tab count is capped at
-four so one profile never creates competing browser processes.
+uses its own tab and conversation. Every queued quote receives an independent
+work tab; there is no application-level concurrency cap.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from typing import Any, Callable
 from app.services.gpt_browser_navigation import (
     active_quote_poll_order,
     bounded_continuation_attempts,
-    bounded_parallel_tabs,
     canonical_url_path,
     is_new_project_chat,
     is_persistent_permission_action,
@@ -60,7 +59,6 @@ STATE_PATH = Path(
 )
 POLL_SECONDS = float(os.environ.get("ASTRAQUOTE_GPT_RELAY_POLL_SECONDS", "4"))
 QUOTE_TIMEOUT_SECONDS = int(os.environ.get("ASTRAQUOTE_GPT_QUOTE_TIMEOUT", "1800"))
-MAX_CONCURRENCY = bounded_parallel_tabs(os.environ.get("ASTRAQUOTE_GPT_RELAY_MAX_TABS"))
 MAX_CONTINUATION_ATTEMPTS = bounded_continuation_attempts(
     os.environ.get("ASTRAQUOTE_GPT_MAX_CONTINUATIONS")
 )
@@ -882,7 +880,7 @@ def main() -> int:
                 browser.start()
                 for record in store.claim_submitted_for_monitoring(
                     WORKER_ID,
-                    limit=MAX_CONCURRENCY,
+                    limit=None,
                     lease_minutes=35,
                 ):
                     active = browser.resume_quote(
@@ -904,7 +902,7 @@ def main() -> int:
                     else "等待销售报价任务"
                 ) if logged_in else "等待管理员登录 ChatGPT",
             )
-            while logged_in and len(active_quotes) < MAX_CONCURRENCY:
+            while logged_in:
                 record = store.claim_next(WORKER_ID, lease_minutes=35)
                 if record is None:
                     break

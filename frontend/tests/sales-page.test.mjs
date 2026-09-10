@@ -44,6 +44,8 @@ test("sales portal uses provider-native purchase labels instead of one AWS-only 
   assert.match(page, /azure:\s*\[[\s\S]*即用即付[\s\S]*1 年预留[\s\S]*3 年预留[\s\S]*\]/);
   assert.match(page, /oci:\s*\[\{[^\n]*OCI 公开按量价/);
   assert.match(page, /gcp:\s*\[[\s\S]*1 年承诺使用[\s\S]*3 年承诺使用[\s\S]*\]/);
+  assert.match(page, /new Set<ScenarioKey>\(\["on_demand"\]\)/);
+  assert.match(page, /setSelectedScenarios\(new Set<ScenarioKey>\(\["on_demand"\]\)\)/);
 });
 
 test("sales portal exposes only formal progress copy and no internal implementation", async () => {
@@ -73,8 +75,25 @@ test("sales portal uses a structured workspace and grouped result actions", asyn
 
   assert.match(page, /sales-form-grid/);
   assert.match(page, /sales-result-layout/);
+  assert.match(page, /<table className="sales-result-table">/);
+  assert.match(page, /sales-result-config/);
+  assert.doesNotMatch(page, /<dl>/);
   assert.match(page, /sales-result-actions/);
   assert.match(page, /sales-provider-mark/);
   assert.match(css, /prefers-reduced-motion/);
   assert.match(css, /sales-result-summary/);
+  assert.match(css, /\.sales-result-table\s*\{/);
+  assert.match(css, /grid-template-columns:\s*repeat\(auto-fit, minmax\(150px, 1fr\)\)/);
+});
+
+test("sales portal uses a pale-blue glass theme and distinguishes queued work", async () => {
+  const page = await readFile(new URL("../app/sales/page.tsx", import.meta.url), "utf8");
+  const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+
+  assert.match(page, /queued:\s*\{ title: "报价正在排队"/);
+  assert.match(page, /job\.status === "queued" \? "等待启动"/);
+  assert.match(css, /color-scheme:\s*light/);
+  assert.match(css, /--page:\s*#eef8ff/);
+  assert.match(css, /backdrop-filter:\s*blur\(28px\) saturate\(145%\)/);
+  assert.match(css, /\.sales-result-backdrop[^{]*\{[^}]*rgba\(213, 235, 251, \.72\)/s);
 });

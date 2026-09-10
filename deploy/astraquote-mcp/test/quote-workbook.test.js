@@ -173,6 +173,18 @@ test('removes internal cost-selection wording but preserves useful configuration
     simplifyCustomerText('完全匹配 8C32G，并按官方候选价格选择较低档。'),
     /最低|较低档|最便宜|候选价格/,
   );
+  assert.equal(
+    simplifyCustomerText('P10 LRS 128 GiB ×4；未查到 1 年预留价格，因此 1 年方案继续按即用即付。'),
+    'P10 LRS 128 GiB ×4。',
+  );
+  assert.equal(
+    simplifyCustomerText('Premium 2 MU，730 小时/月；官方价目未返回单独消息请求费用，因此不再重复加价。'),
+    'Premium 2 MU，730 小时/月。',
+  );
+  assert.equal(
+    simplifyCustomerText('未指定 Functions 计划，按官方允许的低成本 Consumption 方案。'),
+    '未指定 Functions 计划，采用 Consumption 方案。',
+  );
 });
 
 test('removes an internal downsize rule without deleting customer-visible specifications', () => {

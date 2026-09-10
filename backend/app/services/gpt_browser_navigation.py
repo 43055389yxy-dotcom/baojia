@@ -11,16 +11,6 @@ _PROJECT_ID_PATTERN = re.compile(
 )
 
 
-def bounded_parallel_tabs(value: str | None) -> int:
-    """Keep one browser profile within the supported one-to-four work tabs."""
-
-    try:
-        requested = int(value or "4")
-    except (TypeError, ValueError):
-        requested = 4
-    return min(4, max(1, requested))
-
-
 def bounded_continuation_attempts(value: str | None) -> int:
     """Keep automatic continuation finite without making large quotes too brittle."""
 
@@ -45,7 +35,16 @@ def is_transient_browser_poll_exception(exc: BaseException) -> bool:
     though the conversation and browser tab are still healthy.
     """
 
-    return type(exc).__name__ == "StaleElementReferenceException"
+    error_name = type(exc).__name__
+    if error_name in {
+        "StaleElementReferenceException",
+        "ReadTimeoutError",
+        "NewConnectionError",
+        "ProtocolError",
+    }:
+        return True
+    message = str(exc).casefold()
+    return "httpconnectionpool" in message and "read timed out" in message
 
 
 def canonical_url_path(url: str) -> str:

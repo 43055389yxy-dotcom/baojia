@@ -10,6 +10,7 @@ const {
   QuoteDeliveryService,
   buildPageResult,
   defaultDeliveryGuard,
+  shortQuoteFilename,
   writeRelayCompletionReceipt,
 } = require('../lib/quote-delivery');
 
@@ -23,6 +24,17 @@ test('sales-page result removes internal cheapest-candidate wording', () => {
   assert.equal(
     result.components[0].configuration_summary,
     'Premium P3，26 GiB，3 个物理节点。',
+  );
+});
+
+test('uses a short provider-specific Excel filename', () => {
+  assert.equal(
+    shortQuoteFilename({
+      cloud_provider: 'azure',
+      quote_id: 'aqv2_42fac36a-cf5b-43bd-b30b-503deed0b14a',
+      quote_name: '一份非常非常长且不应进入文件名的客户正式云服务报价',
+    }),
+    'Azure报价-eed0b14a.xlsx',
   );
 });
 
@@ -75,6 +87,8 @@ test('uploads the Excel file privately and returns one stable sales-page downloa
   assert.equal(commands[0].input.ServerSideEncryption, 'AES256');
   assert.match(commands[0].input.Key, /\.xlsx$/);
   assert.equal(commands[0].input.ContentType, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  assert.equal(result.spreadsheet_filename, 'AWS报价-eeeeeeee.xlsx');
+  assert.doesNotMatch(result.spreadsheet_filename, /东京 AWS 报价|aqv2_/);
   const manifests = fs.readdirSync(artifactDirectory);
   assert.equal(manifests.length, 2);
   const tokenManifestName = manifests.find((name) => name.startsWith('aqdl_'));

@@ -163,7 +163,7 @@ const customerFacingService = z.object({
   quantity: z.string().min(1).max(80).optional().describe('客户可读的资源数量。'),
   requirement_summary: z.string().min(1).max(800).describe('客户可直接阅读的中文需求摘要。'),
   configuration_summary: z.string().min(1).max(1000).describe(
-    '客户可直接阅读的中文最终配置摘要。保留型号、规格、数量、拓扑、高可用和计费口径；禁止出现最低价、最便宜、月费最低、较低档、候选筛选过程或不超配规则等内部选型措辞。',
+    '客户可直接阅读的精简最终配置。只写型号、规格、数量、拓扑、高可用、运行时长和必要计费口径；禁止写 API 查询过程、候选比较、价格高低、未查到某价格后的回退过程、不超配规则或其他内部操作说明。',
   ),
   reference_unit_price: z.string().min(1).max(120).optional().describe(
     '仅填写用于核对的官方单位价格。它不能代替 scenario_costs 中按客户全部数量计算的方案折合月费。',

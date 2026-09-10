@@ -483,7 +483,7 @@ class GptQuoteRelayStore:
         self,
         worker_id: str,
         *,
-        limit: int,
+        limit: int | None,
         lease_minutes: int = 30,
     ) -> list[dict[str, Any]]:
         """Reattach submitted conversations after the browser worker restarts.
@@ -492,7 +492,7 @@ class GptQuoteRelayStore:
         the saved conversation URL instead of being submitted a second time.
         """
 
-        if limit < 1:
+        if limit is not None and limit < 1:
             return []
         claimed: list[dict[str, Any]] = []
         with self._lock():
@@ -509,7 +509,9 @@ class GptQuoteRelayStore:
                 ):
                     candidates.append((str(record.get("created_at") or ""), path, record))
             now = datetime.now(UTC)
-            for _, path, record in sorted(candidates, key=lambda item: item[0])[:limit]:
+            ordered = sorted(candidates, key=lambda item: item[0])
+            selected = ordered if limit is None else ordered[:limit]
+            for _, path, record in selected:
                 record.update(
                     {
                         "worker_id": worker_id,

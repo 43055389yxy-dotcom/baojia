@@ -73,8 +73,10 @@ function simplifyCustomerText(value) {
       .replace(/按不超配规则(?:选择|选)?(?:最临近的?)?(?:小一档|较低档)\s*/g, '')
       .replace(/^.*?按官方较低价格选择\s*/g, '')
       .replace(/最低成本/g, '')
+      .replace(/低成本/g, '')
       .replace(/官方最低价/g, '官方价格')
       .replace(/最低价(?:格)?/g, '')
+      .replace(/按官方允许的\s*/g, '采用 ')
       .replace(/[，,]\s*(?:并|且)?(?:价格|月费|费用|成本)(?:最低|较低)[^，,]*$/g, '')
       .replace(/\s{2,}/g, ' ')
       .replace(/[，,\s]+$/g, '')
@@ -84,6 +86,19 @@ function simplifyCustomerText(value) {
       && /(?:月费|价格|费用|成本)/.test(clause)
       && /(?:最低|较低|最便宜)/.test(clause)
     ))
+    .filter((clause) => !(
+      /(?:本次查到|官方候选|候选型号|候选筛选|筛选过程|内部选型|比价)/.test(clause)
+      && /(?:价格|月费|费用|成本|总价|更低|最低)/.test(clause)
+    ))
+    .filter((clause) => !(
+      /(?:未查到|未返回|没有对应|无对应)/.test(clause)
+      && /(?:价格|费用|费率|预留|承诺)/.test(clause)
+    ))
+    .filter((clause) => !(
+      /(?:继续|回退|沿用)/.test(clause)
+      && /(?:按需|即用即付|按量|预留|承诺)/.test(clause)
+    ))
+    .filter((clause) => !/(?:不再|无需|没有|未)(?:重复)?加价/.test(clause))
     .filter(Boolean);
   const result = clauses.join('；');
   if (!result) return '';

@@ -38,6 +38,19 @@ function safeSubmissionCode(value) {
   return /^[1-9]$/.test(normalized) ? normalized : '';
 }
 
+function shortQuoteFilename(record) {
+  const provider = {
+    aws: 'AWS',
+    azure: 'Azure',
+    oci: 'OCI',
+    gcp: 'GCP',
+  }[record.cloud_provider] || 'Cloud';
+  const suffix = String(record.quote_id || '')
+    .replace(/[^a-z0-9]/gi, '')
+    .slice(-8) || crypto.randomBytes(4).toString('hex');
+  return `${provider}报价-${suffix}.xlsx`;
+}
+
 const PROVIDER_SCENARIO_LABELS = Object.freeze({
   aws: {
     on_demand: '按需付费',
@@ -326,7 +339,7 @@ class QuoteDeliveryService {
     const date = new Date(record.verification.verified_at || Date.now());
     const year = String(date.getUTCFullYear());
     const month = String(date.getUTCMonth() + 1).padStart(2, '0');
-    const filename = `${safeName(record.quote_name)}-${record.quote_id}.xlsx`;
+    const filename = shortQuoteFilename(record);
     const key = `${this.prefix}/${year}/${month}/${record.quote_id}/${filename}`;
     await this.assertDeliveryAllowed(record);
     try {
@@ -397,6 +410,7 @@ module.exports = {
   defaultDeliveryGuard,
   safeName,
   safeSubmissionCode,
+  shortQuoteFilename,
   readExistingArtifact,
   writeArtifactManifest,
   writeRelayCompletionReceipt,

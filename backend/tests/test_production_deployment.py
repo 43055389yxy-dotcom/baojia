@@ -26,7 +26,13 @@ def test_jenkins_health_checks_explain_the_failure_stage() -> None:
     assert "AstraQuote container endpoints did not become ready" in script
     assert "Staging the desktop relay source" in script
     assert "Activating the staged desktop relay source" in script
+    assert "Installing the versioned desktop relay systemd unit" in script
     assert "Restarting the desktop relay through the Docker host systemd" in script
+
+    unit = (root / "deploy/desktop/astraquote-gpt-relay.service").read_text(
+        encoding="utf-8"
+    )
+    assert "ASTRAQUOTE_GPT_RELAY_MAX_TABS" not in unit
 
 
 def test_runtime_image_contains_the_host_namespace_helper() -> None:

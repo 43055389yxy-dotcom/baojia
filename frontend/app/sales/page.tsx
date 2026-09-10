@@ -55,9 +55,9 @@ type RelayHealth = {
 };
 
 const statusCopy: Record<RelayJob["status"], { title: string; detail?: string }> = {
-  queued: { title: "报价申请已提交" },
+  queued: { title: "报价正在排队", detail: "正在为本次报价创建独立工作标签。" },
   processing: { title: "报价申请已提交" },
-  needs_login: { title: "报价申请已提交" },
+  needs_login: { title: "报价等待登录", detail: "报价服务正在等待管理员恢复登录。" },
   completed: { title: "报价已完成", detail: "报价结果和 Excel 已生成。" },
   failed: { title: "报价未完成", detail: "请联系管理员处理。" },
   cancelled: { title: "报价已撤回", detail: "本次报价已停止处理。" },
@@ -148,7 +148,7 @@ async function submissionFingerprint(value: unknown) {
 export default function SalesQuotePage() {
   const [requirement, setRequirement] = useState("");
   const [selectedScenarios, setSelectedScenarios] = useState(
-    () => new Set<ScenarioKey>(PROVIDER_SCENARIOS.aws.map((scenario) => scenario.key)),
+    () => new Set<ScenarioKey>(["on_demand"]),
   );
   const [utilization, setUtilization] = useState(100);
   const [cloudProvider, setCloudProvider] = useState<CloudProvider>("aws");
@@ -251,7 +251,7 @@ export default function SalesQuotePage() {
 
   function chooseProvider(provider: CloudProvider) {
     setCloudProvider(provider);
-    setSelectedScenarios(new Set(PROVIDER_SCENARIOS[provider].map((scenario) => scenario.key)));
+    setSelectedScenarios(new Set<ScenarioKey>(["on_demand"]));
     setPageError("");
   }
 
@@ -530,9 +530,9 @@ export default function SalesQuotePage() {
 
           {active && (
             <div className="sales-job-progress" aria-label="报价引擎处理中">
-              <div><span>报价引擎处理中</span><b><i /> 正在运行</b></div>
+              <div><span>{job.status === "queued" ? "等待启动" : "报价引擎处理中"}</span><b><i /> {job.status === "queued" ? "排队中" : "正在运行"}</b></div>
               <i><span /></i>
-              <small>正在读取官网价格并生成报价，预计 {estimateWindow()}</small>
+              <small>{job.status === "queued" ? "正在创建独立报价标签，即将开始处理" : `正在读取官网价格并生成报价，预计 ${estimateWindow()}`}</small>
             </div>
           )}
 
@@ -568,25 +568,7 @@ export default function SalesQuotePage() {
               <button className="sales-result-close" type="button" aria-label="关闭报价结果" onClick={() => setResultOpen(false)}>×</button>
             </header>
             <div className="sales-result-layout">
-              <div className="sales-result-body">
-                <div className="sales-result-section-label"><span>服务明细</span><b>{job.quick_quote_result.components.length} 项</b></div>
-                {job.quick_quote_result.components.map((component, index) => (
-                  <article key={`${component.service_name}-${index}`} style={{ animationDelay: `${index * 45}ms` }}>
-                    <div className="sales-result-component-head">
-                      <b>{String(index + 1).padStart(2, "0")}</b>
-                      <div><strong>{component.service_name}</strong><span>{[component.model_or_plan, component.quantity].filter(Boolean).join(" · ")}</span></div>
-                    </div>
-                    {component.configuration_summary && <p>{component.configuration_summary}</p>}
-                    <dl>{component.scenario_costs.map((scenario) => (
-                      <div key={scenario.scenario_key}>
-                        <dt>{scenario.label}</dt>
-                        <dd>{money(scenario.monthly_cost, job.quick_quote_result.currency)}<span>/ 月</span>{Number(scenario.upfront_cost || 0) > 0 && <small>预付 {money(scenario.upfront_cost, job.quick_quote_result.currency)}</small>}</dd>
-                      </div>
-                    ))}</dl>
-                  </article>
-                ))}
-              </div>
-              <aside className="sales-result-summary">
+              <section className="sales-result-summary">
                 <div className="sales-result-summary-heading"><small>QUOTE SUMMARY</small><h3>报价合计</h3></div>
                 <div className="sales-result-totals">
                   {job.quick_quote_result.scenarios.map((scenario) => (
@@ -600,7 +582,50 @@ export default function SalesQuotePage() {
                 </div>
                 <div className="sales-result-file"><i aria-hidden="true">X</i><span><strong>Excel 报价文件</strong><small>{job.quote_download_filename || "正式报价单.xlsx"}</small></span><b aria-hidden="true">✓</b></div>
                 <p className="sales-result-commercial"><i aria-hidden="true" /> 正常商业价格，不抵扣免费或试用额度</p>
-              </aside>
+              </section>
+              <div className="sales-result-body">
+                <div className="sales-result-section-label"><span>服务明细</span><b>{job.quick_quote_result.components.length} 项</b></div>
+                <div className="sales-result-table-wrap">
+                  <table className="sales-result-table">
+                    <thead>
+                      <tr>
+                        <th>服务</th>
+                        <th>型号 / 数量</th>
+                        <th>配置</th>
+                        {job.quick_quote_result.scenarios.map((scenario) => (
+                          <th key={scenario.scenario_key}>{scenario.label}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {job.quick_quote_result.components.map((component, index) => (
+                        <tr key={`${component.service_name}-${index}`} style={{ animationDelay: `${index * 35}ms` }}>
+                          <td>
+                            <span className="sales-result-row-index">{String(index + 1).padStart(2, "0")}</span>
+                            <strong>{component.service_name}</strong>
+                          </td>
+                          <td><strong>{component.model_or_plan || "—"}</strong><small>{component.quantity || "—"}</small></td>
+                          <td>
+                            {component.configuration_summary
+                              ? <details className="sales-result-config"><summary>{component.configuration_summary}</summary><p>{component.configuration_summary}</p></details>
+                              : <span className="sales-result-empty">—</span>}
+                          </td>
+                          {job.quick_quote_result.scenarios.map((scenario) => {
+                            const cost = component.scenario_costs.find((item) => item.scenario_key === scenario.scenario_key);
+                            return (
+                              <td className="sales-result-price" key={scenario.scenario_key}>
+                                {cost
+                                  ? <><strong>{money(cost.monthly_cost, job.quick_quote_result!.currency)}</strong><small>折合月费</small>{Number(cost.upfront_cost || 0) > 0 && <em>预付 {money(cost.upfront_cost, job.quick_quote_result!.currency)}</em>}</>
+                                  : <span className="sales-result-empty">—</span>}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
             </div>
             <footer className="sales-result-actions">
               <span className="sales-result-action-note">报价和文件均可直接发送给客户</span>

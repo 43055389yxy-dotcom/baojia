@@ -9,7 +9,6 @@ import pytest
 from app.services.gpt_browser_navigation import (
     active_quote_poll_order,
     bounded_continuation_attempts,
-    bounded_parallel_tabs,
     canonical_url_path,
     is_new_project_chat,
     is_persistent_permission_action,
@@ -512,12 +511,13 @@ def test_project_navigation_requires_a_fresh_chat_in_the_same_project() -> None:
     assert canonical_url_path(old_chat_url) == "/g/g-p-abc123/c/old-chat"
 
 
-def test_parallel_browser_work_is_capped_at_four_tabs() -> None:
-    assert bounded_parallel_tabs(None) == 4
-    assert bounded_parallel_tabs("2") == 2
-    assert bounded_parallel_tabs("0") == 1
-    assert bounded_parallel_tabs("99") == 4
-    assert bounded_parallel_tabs("invalid") == 4
+def test_browser_worker_has_no_fixed_parallel_tab_cap() -> None:
+    worker = (
+        Path(__file__).resolve().parents[2] / "tools/gpt_quote_relay_worker.py"
+    ).read_text(encoding="utf-8")
+
+    assert "MAX_CONCURRENCY" not in worker
+    assert "while logged_in:" in worker
 
 
 def test_automatic_continuation_attempts_are_bounded_and_config_safe() -> None:
@@ -544,9 +544,13 @@ def test_every_active_quote_tab_is_visited_in_each_polling_round() -> None:
 
 def test_stale_dom_reference_is_retryable_without_failing_the_quote() -> None:
     stale_error = type("StaleElementReferenceException", (Exception,), {})()
+    transport_timeout = type("ReadTimeoutError", (Exception,), {})(
+        "HTTPConnectionPool(host='localhost', port=46059): Read timed out."
+    )
     permanent_error = RuntimeError("the quote tab was closed")
 
     assert is_transient_browser_poll_exception(stale_error)
+    assert is_transient_browser_poll_exception(transport_timeout)
     assert not is_transient_browser_poll_exception(permanent_error)
 
 
@@ -573,3 +577,26 @@ def test_submitted_processing_job_can_be_reattached_after_worker_restart(
     assert resumed[0]["status"] == "processing"
     assert resumed[0]["customer_request"] == ""
     assert resumed[0]["worker_id"] == "worker-new"
+
+
+def test_all_submitted_jobs_are_reattached_when_parallel_work_is_unlimited(
+    tmp_path: Path,
+) -> None:
+    store = GptQuoteRelayStore(tmp_path)
+    jobs = [store.create(f"报价需求 {index}", {}) for index in range(6)]
+    for job in jobs:
+        claimed = store.claim_next("worker-old")
+        assert claimed is not None
+        store.update(
+            job["job_id"],
+            {"chat_url": f"https://chatgpt.com/g/g-p-abc123/c/quote-{job['job_id']}"},
+        )
+        store.purge_source(job["job_id"])
+
+    resumed = store.claim_submitted_for_monitoring(
+        "worker-new",
+        limit=None,
+        lease_minutes=35,
+    )
+
+    assert [record["job_id"] for record in resumed] == [job["job_id"] for job in jobs]

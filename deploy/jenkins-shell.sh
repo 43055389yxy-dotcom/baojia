@@ -16,7 +16,7 @@ stage_host_browser_relay() {
     --exclude='backend/artifacts' \
     --exclude='**/__pycache__' \
     --exclude='**/*.pyc' \
-    -cf - backend tools policies \
+    -cf - backend tools policies deploy/desktop/astraquote-gpt-relay.service \
     | docker run --rm -i \
       -e RELAY_STAGE_NAME="$RELAY_STAGE_NAME" \
       -v "$RELAY_HOST_ROOT:/host/astraquote" \
@@ -29,6 +29,7 @@ stage_host_browser_relay() {
         test -f "$stage/tools/gpt_quote_relay_worker.py"
         test -f "$stage/backend/app/services/gpt_quote_prompt.py"
         test -f "$stage/policies/sales-selection-policy.json"
+        test -f "$stage/deploy/desktop/astraquote-gpt-relay.service"
         chown -R 1000:1000 "$stage"
       '
 }
@@ -55,8 +56,33 @@ activate_host_browser_relay() {
         mv "$stage/$name" "$target/$name"
         rm -rf "$previous"
       done
+      mv "$stage/deploy/desktop/astraquote-gpt-relay.service" \
+        /host/astraquote/astraquote-gpt-relay.service.next
+      rmdir "$stage/deploy/desktop" "$stage/deploy"
       rmdir "$stage"
-      chown -R 1000:1000 "$target/backend" "$target/tools" "$target/policies"
+      chown -R 1000:1000 "$target/backend" "$target/tools" "$target/policies" \
+        /host/astraquote/astraquote-gpt-relay.service.next
+    '
+}
+
+install_host_browser_relay_service() {
+  echo "Installing the versioned desktop relay systemd unit"
+  docker run --rm --privileged --pid=host \
+    --entrypoint /usr/bin/nsenter \
+    astraquote:production \
+    --target 1 \
+    --mount \
+    --uts \
+    --ipc \
+    --net \
+    --pid \
+    --root=/proc/1/root \
+    --wd=/ \
+    /bin/sh -ceu '
+      install -m 0644 \
+        /home/ec2-user/astraquote/astraquote-gpt-relay.service.next \
+        /etc/systemd/system/astraquote-gpt-relay.service
+      systemctl daemon-reload
     '
 }
 
@@ -115,6 +141,7 @@ wait_for_host_browser_relay() {
 update_host_browser_relay() {
   stage_host_browser_relay
   activate_host_browser_relay
+  install_host_browser_relay_service
   restart_host_browser_relay
   wait_for_host_browser_relay
 }
