@@ -9,6 +9,7 @@ const {
   componentDetails,
   friendlyRegion,
   materialAdjustment,
+  simplifyCustomerText,
 } = require('../lib/quote-workbook');
 
 function verifiedRecord() {
@@ -118,8 +119,8 @@ test('renders every selected pricing scenario as a separate component column', a
 
   const { sheet } = await readWorkbook(record);
   assert.equal(sheet.getCell('G1').value, '按需月费');
-  assert.equal(sheet.getCell('H1').value, '1 年预留实例全预付月费');
-  assert.equal(sheet.getCell('I1').value, '3 年预留实例全预付月费');
+  assert.equal(sheet.getCell('H1').value, '1 年预留折合月费');
+  assert.equal(sheet.getCell('I1').value, '3 年预留折合月费');
   assert.equal(sheet.getCell('G2').value, 245.67);
   assert.equal(sheet.getCell('H2').value, 183.92);
   assert.equal(sheet.getCell('I2').value, 117.58);
@@ -151,4 +152,65 @@ test('unchanged or incomplete adjustments are not shown to customers', () => {
   assert.equal(materialAdjustment({ customer_requirement: '2 核 4G', quoted_configuration: '2 核 4G' }), '');
   assert.equal(materialAdjustment({ customer_requirement: '', quoted_configuration: '4 核 8G' }), '');
   assert.equal(friendlyRegion('ap-northeast-1'), '东京');
+});
+
+test('removes internal cost-selection wording but preserves useful configuration facts', () => {
+  assert.equal(
+    simplifyCustomerText(
+      '选择 Standard_B8as_v2，8 vCPU / 32 GiB，6 台，730 小时/月；在已核对的精确 8C32G Linux 候选中月费最低。',
+    ),
+    '选择 Standard_B8as_v2，8 vCPU / 32 GiB，6 台，730 小时/月。',
+  );
+  assert.equal(
+    simplifyCustomerText('P10 LRS 128 GiB，共 6 块；未指定冗余方式，采用最低成本 LRS。'),
+    'P10 LRS 128 GiB，共 6 块；未指定冗余方式，采用 LRS。',
+  );
+  assert.equal(
+    simplifyCustomerText('Premium P3，26 GiB 级别，按 3 个物理节点计；主节点+2 个副本，支持自动故障切换。'),
+    'Premium P3，26 GiB 级别，按 3 个物理节点计；主节点+2 个副本，支持自动故障切换。',
+  );
+  assert.doesNotMatch(
+    simplifyCustomerText('完全匹配 8C32G，并按官方候选价格选择较低档。'),
+    /最低|较低档|最便宜|候选价格/,
+  );
+});
+
+test('removes an internal downsize rule without deleting customer-visible specifications', () => {
+  const text = simplifyCustomerText(
+    '官方完全匹配的 8C32GiB Redis 节点，按不超配规则选择最临近的小一档 cache.m6g.2xlarge。',
+  );
+
+  assert.match(text, /8C32GiB Redis/);
+  assert.match(text, /cache\.m6g\.2xlarge/);
+  assert.doesNotMatch(text, /不超配|小一档/);
+});
+
+test('removes a cheapest-candidate suffix without deleting its configuration', () => {
+  const text = simplifyCustomerText(
+    'Standard_B8as_v2，8 vCPU / 32 GiB，6 台，在已核对候选中月费最低。',
+  );
+
+  assert.match(text, /Standard_B8as_v2/);
+  assert.match(text, /8 vCPU \/ 32 GiB/);
+  assert.doesNotMatch(text, /候选|月费最低/);
+});
+
+test('uses the full requested quantity in each GPT-supplied amortized scenario amount', () => {
+  const record = verifiedRecord();
+  record.pricing_scenarios = [
+    { scenario_key: 'on_demand', monthly_total: '742.92', upfront_total: '0' },
+    { scenario_key: 'one_year_commitment', monthly_total: '436.75', upfront_total: '5241.00' },
+  ];
+  record.resource_ir[0].customer_facing.quantity = '3 台';
+  record.resource_ir[0].customer_facing.reference_unit_price = '按需 $0.3392/台小时；1 年全预付 $1,747/台';
+  record.resource_ir[0].scenario_costs = [
+    { scenario_key: 'on_demand', monthly_cost: '742.92', upfront_cost: '0' },
+    { scenario_key: 'one_year_commitment', monthly_cost: '436.75', upfront_cost: '5241.00' },
+  ];
+
+  const rows = componentDetails(record);
+  assert.equal(rows[0][4], '3 台');
+  assert.equal(rows[0][6], 742.92);
+  assert.equal(rows[0][7], 436.75);
+  assert.equal(rows[0][8], '按需 $0.3392/台小时；1 年全预付 $1,747/台');
 });

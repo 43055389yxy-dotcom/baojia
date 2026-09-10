@@ -92,6 +92,63 @@ def test_azure_and_oci_are_raw_official_catalog_queries() -> None:
     assert http.calls[1][1] == {"partNumber": "B107951", "currencyCode": "USD"}
 
 
+def test_oci_catalog_exposes_each_tier_as_a_stable_rate_candidate() -> None:
+    http = _HttpRecorder(
+        [
+            {
+                "items": [
+                    {
+                        "partNumber": "B93297",
+                        "displayName": "Compute - Standard - A1 - OCPU",
+                        "metricName": "OCPU Per Hour",
+                        "currencyCodeLocalizations": [
+                            {
+                                "currencyCode": "USD",
+                                "prices": [
+                                    {
+                                        "model": "PAY_AS_YOU_GO",
+                                        "value": 0,
+                                        "rangeMin": 0,
+                                        "rangeMax": 3000,
+                                    },
+                                    {
+                                        "model": "PAY_AS_YOU_GO",
+                                        "value": 0.01,
+                                        "rangeMin": 3000,
+                                        "rangeMax": 999999999999999,
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        ]
+    )
+    service = OfficialPricingService(_UnusedAwsExecutor(), http_get=http)
+
+    result = service.get_prices(
+        GetPricesRequest(
+            queries=[
+                OciPriceQuery(
+                    query_id="oci-a1-ocpu",
+                    part_number="B93297",
+                    currency_code="USD",
+                )
+            ]
+        )
+    )["results"][0]
+
+    rates = result["official_rate_candidates"]
+    assert len(rates) == 2
+    assert len({rate["rate_id"] for rate in rates}) == 2
+    assert {rate["official_item_id"] for rate in rates} == {"B93297"}
+    assert [rate["unit_price"] for rate in rates] == ["0", "0.01"]
+    assert [rate["is_zero_rate"] for rate in rates] == [True, False]
+    assert rates[1]["tier_start"] == "3000"
+    assert rates[1]["unit"] == "OCPU Per Hour"
+
+
 def test_gcp_catalog_requires_key_and_returns_raw_skus() -> None:
     without_key = OfficialPricingService(_UnusedAwsExecutor(), http_get=_HttpRecorder([]))
     missing_key_result = without_key.get_prices(

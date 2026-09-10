@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.2.0';
+const VERSION = '3.3.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -129,21 +129,32 @@ const scenarioKey = z.enum([
 const officialPriceEvidence = z.object({
   query_id: z.string().min(1).max(100),
   official_item_ids: z.array(z.string().min(1).max(500)).min(1).max(100),
+  official_rate_ids: z.array(z.string().min(1).max(800)).min(1).max(100).optional().describe(
+    'GPT 选中的具体官方费率身份。当同一 SKU 同时含免费额度和正常商业费率时必须填写，并且只能选择正常商业费率。',
+  ),
 }).strict();
 
 const componentScenarioCost = z.object({
   scenario_key: scenarioKey,
   pricing_basis: z.enum(['on_demand', 'reserved', 'provider_commitment', 'on_demand_fallback']),
-  monthly_cost: z.string().regex(/^\d+(?:\.\d{1,10})?$/),
-  upfront_cost: z.string().regex(/^\d+(?:\.\d{1,10})?$/).default('0'),
+  monthly_cost: z.string().regex(/^\d+(?:\.\d{1,10})?$/).describe(
+    '该组件按客户要求的全部数量计算后的折合月费，不是单台价格。全预付方案须把整批预付额除以合同月数，并加上该方案未覆盖的持续月费。',
+  ),
+  upfront_cost: z.string().regex(/^\d+(?:\.\d{1,10})?$/).default('0').describe(
+    '该组件按客户要求的全部数量计算的一次性预付总额；没有预付款时填 0。',
+  ),
   price_query_ids: z.array(z.string().min(1).max(100)).min(1).max(30).optional(),
   price_evidence: z.array(officialPriceEvidence).min(1).max(30).optional(),
 }).strict();
 
 const quoteScenarioTotal = z.object({
   scenario_key: scenarioKey,
-  monthly_total: z.string().regex(/^\d+(?:\.\d{1,10})?$/),
-  upfront_total: z.string().regex(/^\d+(?:\.\d{1,10})?$/).default('0'),
+  monthly_total: z.string().regex(/^\d+(?:\.\d{1,10})?$/).describe(
+    '整张报价在该方案下的折合月费，必须等于所有组件整批折合月费之和。',
+  ),
+  upfront_total: z.string().regex(/^\d+(?:\.\d{1,10})?$/).default('0').describe(
+    '整张报价在该方案下的一次性预付总额，必须等于所有组件预付总额之和。',
+  ),
 }).strict();
 
 const customerFacingService = z.object({
@@ -151,8 +162,12 @@ const customerFacingService = z.object({
   model_or_plan: z.string().min(1).max(160).optional().describe('客户可读的实例型号或计费方案。'),
   quantity: z.string().min(1).max(80).optional().describe('客户可读的资源数量。'),
   requirement_summary: z.string().min(1).max(800).describe('客户可直接阅读的中文需求摘要。'),
-  configuration_summary: z.string().min(1).max(1000).describe('客户可直接阅读的中文最终配置摘要。'),
-  reference_unit_price: z.string().min(1).max(120).optional().describe('有清晰单价时填写客户可读参考单价。'),
+  configuration_summary: z.string().min(1).max(1000).describe(
+    '客户可直接阅读的中文最终配置摘要。保留型号、规格、数量、拓扑、高可用和计费口径；禁止出现最低价、最便宜、月费最低、较低档、候选筛选过程或不超配规则等内部选型措辞。',
+  ),
+  reference_unit_price: z.string().min(1).max(120).optional().describe(
+    '仅填写用于核对的官方单位价格。它不能代替 scenario_costs 中按客户全部数量计算的方案折合月费。',
+  ),
 }).strict();
 
 const pricedService = z.object({
@@ -162,7 +177,7 @@ const pricedService = z.object({
   group: z.string().min(1).max(160).optional(),
   price_query_ids: z.array(z.string().min(1).max(100)).min(1).max(30).optional(),
   price_evidence: z.array(officialPriceEvidence).min(1).max(30).optional().describe(
-    'GPT 从官方原始结果中选中的查询与 SKU/价格项身份。',
+    'GPT 从官方原始结果中选中的查询、SKU/价格项及具体费率身份。正式商业报价不得选择 Free Tier、Always Free、免费试用或账户赠送额度。',
   ),
   fact_ids: z.array(factId).min(1).max(100).describe(
     '该组件在 ResourceIR、BillingUsageIR 和 PriceIR 中消费的客户事实 ID。',

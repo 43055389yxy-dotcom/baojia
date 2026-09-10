@@ -8,9 +8,23 @@ const path = require('node:path');
 
 const {
   QuoteDeliveryService,
+  buildPageResult,
   defaultDeliveryGuard,
   writeRelayCompletionReceipt,
 } = require('../lib/quote-delivery');
+
+test('sales-page result removes internal cheapest-candidate wording', () => {
+  const pageRecord = record();
+  pageRecord.resource_ir[0].customer_facing.configuration_summary =
+    'Premium P3，26 GiB，3 个物理节点；在候选型号中月费最低。';
+
+  const result = buildPageResult(pageRecord);
+
+  assert.equal(
+    result.components[0].configuration_summary,
+    'Premium P3，26 GiB，3 个物理节点。',
+  );
+});
 
 function record() {
   return {

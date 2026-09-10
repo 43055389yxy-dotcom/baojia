@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, Literal
 from urllib.parse import quote, urlparse
 
@@ -264,11 +265,17 @@ class OfficialPricingService:
         else:
             result = self._get_gcp_catalog(query)
         identified = {"query_id": query.query_id, "provider": query.provider, **result}
-        return _require_refinement_for_large_result(
+        narrowed = _require_refinement_for_large_result(
             query,
             identified,
             maximum=self.MAX_RETURNED_CANDIDATES,
         )
+        if narrowed.get("status") != "needs_refinement":
+            narrowed["official_rate_candidates"] = _official_rate_candidates(
+                query.provider,
+                narrowed,
+            )
+        return narrowed
 
     def _price_list_products(self, request: ProductSearchRequest) -> list[dict[str, Any]]:
         filters = [
@@ -594,7 +601,14 @@ def _require_refinement_for_large_result(
     compact = {
         key: value
         for key, value in result.items()
-        if key not in {"products", "items", "services", "skus", "official_item_ids"}
+        if key not in {
+            "products",
+            "items",
+            "services",
+            "skus",
+            "official_item_ids",
+            "official_rate_candidates",
+        }
     }
     compact.update(
         {
@@ -637,6 +651,187 @@ def _azure_item_id(item: dict[str, Any]) -> str:
         json.dumps(identity, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
     ).hexdigest()[:20]
     return f"azure:{item.get('meterId') or 'item'}:{digest}"
+
+
+def _price_text(value: Any) -> str | None:
+    try:
+        decimal = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not decimal.is_finite():
+        return None
+    return format(decimal, "f")
+
+
+def _rate_candidate(
+    provider: str,
+    official_item_id: str,
+    *,
+    unit_price: Any,
+    currency: str,
+    unit: Any = None,
+    pricing_model: Any = None,
+    description: Any = None,
+    tier_start: Any = None,
+    tier_end: Any = None,
+    source_identity: Any = None,
+) -> dict[str, Any] | None:
+    price = _price_text(unit_price)
+    if price is None:
+        return None
+    identity = {
+        "provider": provider,
+        "official_item_id": official_item_id,
+        "currency": str(currency),
+        "unit_price": price,
+        "unit": None if unit is None else str(unit),
+        "pricing_model": None if pricing_model is None else str(pricing_model),
+        "tier_start": None if tier_start is None else str(tier_start),
+        "tier_end": None if tier_end is None else str(tier_end),
+        "source_identity": source_identity,
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    ).hexdigest()[:24]
+    return {
+        "rate_id": f"{provider}:{official_item_id}:{digest}",
+        "official_item_id": official_item_id,
+        "unit_price": price,
+        "currency": str(currency),
+        "unit": None if unit is None else str(unit),
+        "pricing_model": None if pricing_model is None else str(pricing_model),
+        "description": None if description is None else str(description),
+        "tier_start": None if tier_start is None else str(tier_start),
+        "tier_end": None if tier_end is None else str(tier_end),
+        "is_zero_rate": Decimal(price) == 0,
+    }
+
+
+def _official_rate_candidates(provider: str, result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten official price dimensions without selecting or calculating them."""
+    candidates: list[dict[str, Any]] = []
+    if provider == "aws":
+        for product in result.get("products") or []:
+            if not isinstance(product, dict) or not product.get("sku"):
+                continue
+            item_id = str(product["sku"])
+            for dimension in product.get("price_dimensions") or []:
+                if not isinstance(dimension, dict):
+                    continue
+                prices = dimension.get("price_per_unit") or {}
+                if not isinstance(prices, dict):
+                    continue
+                for currency, value in prices.items():
+                    candidate = _rate_candidate(
+                        provider,
+                        item_id,
+                        unit_price=value,
+                        currency=str(currency),
+                        unit=dimension.get("unit"),
+                        description=dimension.get("description"),
+                        tier_start=dimension.get("begin_range"),
+                        tier_end=dimension.get("end_range"),
+                        source_identity=(
+                            dimension.get("rate_code") or dimension.get("dimension_code")
+                        ),
+                    )
+                    if candidate:
+                        candidates.append(candidate)
+    elif provider == "azure":
+        for item in result.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            item_id = _azure_item_id(item)
+            candidate = _rate_candidate(
+                provider,
+                item_id,
+                unit_price=item.get("retailPrice", item.get("unitPrice")),
+                currency=str(item.get("currencyCode") or result.get("currency") or "USD"),
+                unit=item.get("unitOfMeasure"),
+                pricing_model=item.get("type"),
+                description=item.get("meterName") or item.get("productName"),
+                tier_start=item.get("tierMinimumUnits"),
+                source_identity=item_id,
+            )
+            if candidate:
+                candidates.append(candidate)
+    elif provider == "oci":
+        for item in result.get("items") or []:
+            if not isinstance(item, dict) or not item.get("partNumber"):
+                continue
+            item_id = str(item["partNumber"])
+            localizations = item.get("currencyCodeLocalizations")
+            if not isinstance(localizations, list):
+                localizations = [{
+                    "currencyCode": result.get("currency") or "USD",
+                    "prices": item.get("prices") or [],
+                }]
+            for localization in localizations:
+                if not isinstance(localization, dict):
+                    continue
+                currency = str(localization.get("currencyCode") or result.get("currency") or "USD")
+                for index, price in enumerate(localization.get("prices") or []):
+                    if not isinstance(price, dict):
+                        continue
+                    candidate = _rate_candidate(
+                        provider,
+                        item_id,
+                        unit_price=price.get("value"),
+                        currency=currency,
+                        unit=item.get("metricName"),
+                        pricing_model=price.get("model"),
+                        description=item.get("displayName"),
+                        tier_start=price.get("rangeMin"),
+                        tier_end=price.get("rangeMax"),
+                        source_identity={"index": index, "price": price},
+                    )
+                    if candidate:
+                        candidates.append(candidate)
+    elif provider == "gcp":
+        for sku in result.get("skus") or []:
+            if not isinstance(sku, dict):
+                continue
+            item_id = str(sku.get("skuId") or sku.get("name") or "")
+            if not item_id:
+                continue
+            for info_index, pricing_info in enumerate(sku.get("pricingInfo") or []):
+                if not isinstance(pricing_info, dict):
+                    continue
+                expression = pricing_info.get("pricingExpression") or {}
+                if not isinstance(expression, dict):
+                    continue
+                for tier_index, tier in enumerate(expression.get("tieredRates") or []):
+                    if not isinstance(tier, dict):
+                        continue
+                    unit_price = tier.get("unitPrice") or {}
+                    if not isinstance(unit_price, dict):
+                        continue
+                    try:
+                        units = Decimal(str(unit_price.get("units") or "0"))
+                        nanos = Decimal(str(unit_price.get("nanos") or "0"))
+                        value = units + (nanos / Decimal("1000000000"))
+                    except (InvalidOperation, TypeError, ValueError):
+                        continue
+                    candidate = _rate_candidate(
+                        provider,
+                        item_id,
+                        unit_price=value,
+                        currency=str(
+                            unit_price.get("currencyCode")
+                            or result.get("currency")
+                            or "USD"
+                        ),
+                        unit=expression.get("usageUnit"),
+                        description=(
+                            sku.get("description")
+                            or (sku.get("category") or {}).get("resourceFamily")
+                        ),
+                        tier_start=tier.get("startUsageAmount"),
+                        source_identity={"pricing_info": info_index, "tier": tier_index},
+                    )
+                    if candidate:
+                        candidates.append(candidate)
+    return candidates
 
 
 def _product_identity(payload: dict[str, Any]) -> dict[str, Any]:

@@ -9,7 +9,7 @@ const {
   S3Client,
 } = require('@aws-sdk/client-s3');
 
-const { buildQuoteWorkbook } = require('./quote-workbook');
+const { buildQuoteWorkbook, simplifyCustomerText } = require('./quote-workbook');
 
 const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 
@@ -70,13 +70,13 @@ function buildPageResult(record) {
     ...(record.zero_cost_ir || []),
   ].map((component) => ({
     service_name: String(
-      component.customer_facing?.service_name
+      simplifyCustomerText(component.customer_facing?.service_name)
       || component.component_key,
     ).slice(0, 120),
-    model_or_plan: String(component.customer_facing?.model_or_plan || '').slice(0, 160),
-    quantity: String(component.customer_facing?.quantity || '').slice(0, 80),
+    model_or_plan: simplifyCustomerText(component.customer_facing?.model_or_plan).slice(0, 160),
+    quantity: simplifyCustomerText(component.customer_facing?.quantity).slice(0, 80),
     configuration_summary: String(
-      component.customer_facing?.configuration_summary || '',
+      simplifyCustomerText(component.customer_facing?.configuration_summary),
     ).slice(0, 1200),
     scenario_costs: (
       component.pricing_basis === 'official_no_additional_charge'

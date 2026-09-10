@@ -611,12 +611,46 @@ class AstraQuoteV2Workflow {
         }
         const available = new Set(result.official_item_ids || []);
         const selected = ref.official_item_ids || [];
+        const rateCandidates = Array.isArray(result.official_rate_candidates)
+          ? result.official_rate_candidates
+          : [];
+        const availableRates = new Map(
+          rateCandidates.map((rate) => [rate.rate_id, rate]),
+        );
+        const selectedRates = ref.official_rate_ids || [];
         if (result.status === 'ambiguous' && selected.length === 0) {
           violations.push(`official_item_selection_required:${component.component_key}:${ref.query_id}`);
         }
         for (const itemId of selected) {
           if (!available.has(itemId)) {
             violations.push(`unknown_official_item:${component.component_key}:${ref.query_id}:${itemId}`);
+          }
+        }
+        for (const rateId of selectedRates) {
+          const rate = availableRates.get(rateId);
+          if (!rate) {
+            violations.push(`unknown_official_rate:${component.component_key}:${ref.query_id}:${rateId}`);
+            continue;
+          }
+          if (!selected.includes(rate.official_item_id)) {
+            violations.push(`official_rate_item_mismatch:${component.component_key}:${ref.query_id}:${rateId}`);
+          }
+          if (rate.is_zero_rate === true || Number(rate.unit_price) === 0) {
+            violations.push(`free_or_zero_rate_forbidden:${component.component_key}:${ref.query_id}:${rateId}`);
+          }
+        }
+        for (const itemId of selected) {
+          const itemRates = rateCandidates.filter((rate) => rate.official_item_id === itemId);
+          if (!itemRates.some((rate) => rate.is_zero_rate === true || Number(rate.unit_price) === 0)) {
+            continue;
+          }
+          const selectedItemRates = selectedRates
+            .map((rateId) => availableRates.get(rateId))
+            .filter((rate) => rate?.official_item_id === itemId);
+          if (!selectedItemRates.some(
+            (rate) => rate.is_zero_rate !== true && Number(rate.unit_price) > 0,
+          )) {
+            violations.push(`paid_rate_selection_required:${component.component_key}:${ref.query_id}:${itemId}`);
           }
         }
       }

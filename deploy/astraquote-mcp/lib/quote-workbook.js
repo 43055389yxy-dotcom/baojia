@@ -28,8 +28,8 @@ const TEXT = 'FF24313A';
 const PROVIDER_SCENARIO_LABELS = Object.freeze({
   aws: {
     on_demand: '按需月费',
-    one_year_commitment: '1 年预留实例全预付月费',
-    three_year_commitment: '3 年预留实例全预付月费',
+    one_year_commitment: '1 年预留折合月费',
+    three_year_commitment: '3 年预留折合月费',
   },
   azure: {
     on_demand: '即用即付月费',
@@ -39,8 +39,8 @@ const PROVIDER_SCENARIO_LABELS = Object.freeze({
   oci: { on_demand: 'OCI 公开按量月费' },
   gcp: {
     on_demand: '按需月费',
-    one_year_commitment: '1 年承诺使用月费',
-    three_year_commitment: '3 年承诺使用月费',
+    one_year_commitment: '1 年承诺使用折合月费',
+    three_year_commitment: '3 年承诺使用折合月费',
   },
 });
 
@@ -56,10 +56,38 @@ function friendlyRegion(value) {
 }
 
 function simplifyCustomerText(value) {
-  return String(value ?? '')
+  const normalized = String(value ?? '')
     .replace(/最低合法值/g, '最低可用值')
     .replace(/\s{2,}/g, ' ')
     .trim();
+  if (!normalized) return '';
+
+  const endedWithFullStop = /[。；;]$/.test(normalized);
+  const clauses = normalized
+    .split(/[；;。]+/)
+    .map((rawClause) => rawClause.trim())
+    .filter(Boolean)
+    .map((rawClause) => rawClause
+      .replace(/[，,]?\s*(?:在|从)[^，,]*候选[^；;。]*?(?:月费|价格|费用|成本)(?:最低|较低|最便宜)[^；;。]*$/g, '')
+      .replace(/[，,]\s*(?:并|且)?按官方候选价格选择(?:较低档|最低价[^，,]*)/g, '')
+      .replace(/按不超配规则(?:选择|选)?(?:最临近的?)?(?:小一档|较低档)\s*/g, '')
+      .replace(/^.*?按官方较低价格选择\s*/g, '')
+      .replace(/最低成本/g, '')
+      .replace(/官方最低价/g, '官方价格')
+      .replace(/最低价(?:格)?/g, '')
+      .replace(/[，,]\s*(?:并|且)?(?:价格|月费|费用|成本)(?:最低|较低)[^，,]*$/g, '')
+      .replace(/\s{2,}/g, ' ')
+      .replace(/[，,\s]+$/g, '')
+      .trim())
+    .filter((clause) => !(
+      /(?:候选|筛选|比价|选型)/.test(clause)
+      && /(?:月费|价格|费用|成本)/.test(clause)
+      && /(?:最低|较低|最便宜)/.test(clause)
+    ))
+    .filter(Boolean);
+  const result = clauses.join('；');
+  if (!result) return '';
+  return endedWithFullStop ? `${result}。` : result;
 }
 
 function compactPart(value) {

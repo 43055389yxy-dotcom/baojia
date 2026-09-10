@@ -9,7 +9,9 @@ const path = require('node:path');
 const { AstraQuoteV2Workflow } = require('../lib/v2-workflow');
 const { V2QuoteStore } = require('../lib/v2-quote-store');
 
-function fixture({ status = 'exact', provider = 'azure', itemIds = ['item-1'] } = {}) {
+function fixture({
+  status = 'exact', provider = 'azure', itemIds = ['item-1'], rateCandidates = [],
+} = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-api-workflow-'));
   const delivered = [];
   const displayed = [];
@@ -22,6 +24,7 @@ function fixture({ status = 'exact', provider = 'azure', itemIds = ['item-1'] } 
         provider,
         status,
         official_item_ids: itemIds,
+        official_rate_candidates: rateCandidates,
         items: itemIds.map((id) => ({ id })),
       }],
     }),
@@ -198,6 +201,71 @@ test('GPT may select one official identity from an ambiguous result', async (t) 
   assert.equal(delivered.length, 0);
 });
 
+test('a priced service cannot use a free allowance tier from an official catalog item', async (t) => {
+  const rateCandidates = [
+    {
+      rate_id: 'oci:B93297:free', official_item_id: 'item-1',
+      unit_price: '0', currency: 'USD', is_zero_rate: true,
+    },
+    {
+      rate_id: 'oci:B93297:paid', official_item_id: 'item-1',
+      unit_price: '0.01', currency: 'USD', is_zero_rate: false,
+    },
+  ];
+  const { workflow, directory } = fixture({ provider: 'oci', rateCandidates });
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const batch = await priceBatch(workflow, 'oci');
+
+  await assert.rejects(
+    workflow.buildEstimate(quoteInput(batch.price_batch_id, {
+      provider: 'oci', monthly: '0',
+      evidence: [{
+        query_id: 'price-1',
+        official_item_ids: ['item-1'],
+        official_rate_ids: ['oci:B93297:free'],
+      }],
+    })),
+    (error) => error.code === 'official_price_evidence_invalid'
+      && error.details.violations.includes(
+        'free_or_zero_rate_forbidden:cmp_compute_0001:price-1:oci:B93297:free',
+      ),
+  );
+});
+
+test('an item containing free and paid tiers requires GPT to bind the paid rate', async (t) => {
+  const rateCandidates = [
+    {
+      rate_id: 'oci:B93297:free', official_item_id: 'item-1',
+      unit_price: '0', currency: 'USD', is_zero_rate: true,
+    },
+    {
+      rate_id: 'oci:B93297:paid', official_item_id: 'item-1',
+      unit_price: '0.01', currency: 'USD', is_zero_rate: false,
+    },
+  ];
+  const { workflow, directory } = fixture({ provider: 'oci', rateCandidates });
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const batch = await priceBatch(workflow, 'oci');
+
+  await assert.rejects(
+    workflow.buildEstimate(quoteInput(batch.price_batch_id, { provider: 'oci' })),
+    (error) => error.code === 'official_price_evidence_invalid'
+      && error.details.violations.includes(
+        'paid_rate_selection_required:cmp_compute_0001:price-1:item-1',
+      ),
+  );
+
+  const result = await workflow.buildEstimate(quoteInput(batch.price_batch_id, {
+    provider: 'oci', monthly: '18.98',
+    evidence: [{
+      query_id: 'price-1',
+      official_item_ids: ['item-1'],
+      official_rate_ids: ['oci:B93297:paid'],
+    }],
+  }));
+  assert.equal(result.status, 'displayed_on_page');
+});
+
 test('MCP never silently substitutes an item that GPT did not select', async (t) => {
   const { workflow, directory } = fixture({ status: 'ambiguous', itemIds: ['item-1', 'item-2'] });
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -263,6 +331,37 @@ test('OCI public catalog cannot be presented as a one-year public commitment pri
     workflow.buildEstimate(input),
     (error) => error.code === 'provider_pricing_scenario_invalid'
       && error.details.violations.some((item) => item.includes('scenario_not_available_for_provider')),
+  );
+});
+
+test('a component without a commitment discount keeps its on-demand monthly cost', async (t) => {
+  const { workflow, directory } = fixture();
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const batch = await priceBatch(workflow);
+  const input = quoteInput(batch.price_batch_id, { monthly: '230.40' });
+  input.pricing_scenarios = [
+    { scenario_key: 'on_demand', monthly_total: '230.40', upfront_total: '0' },
+    { scenario_key: 'one_year_commitment', monthly_total: '0', upfront_total: '0' },
+  ];
+  input.services[0].scenario_costs = [
+    {
+      scenario_key: 'on_demand', pricing_basis: 'on_demand',
+      monthly_cost: '230.40', upfront_cost: '0',
+      price_evidence: [{ query_id: 'price-1', official_item_ids: ['item-1'] }],
+    },
+    {
+      scenario_key: 'one_year_commitment', pricing_basis: 'on_demand_fallback',
+      monthly_cost: '0', upfront_cost: '0',
+      price_evidence: [{ query_id: 'price-1', official_item_ids: ['item-1'] }],
+    },
+  ];
+
+  await assert.rejects(
+    workflow.buildEstimate(input),
+    (error) => error.code === 'official_price_evidence_invalid'
+      && error.details.violations.includes(
+        'scenario_fallback_cost_changed:cmp_compute_0001:one_year_commitment',
+      ),
   );
 });
 
