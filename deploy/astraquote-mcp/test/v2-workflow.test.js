@@ -42,6 +42,7 @@ function fixture({ status = 'exact', provider = 'azure', itemIds = ['item-1'] } 
     directory,
     delivered,
     displayed,
+    backend,
     workflow: new AstraQuoteV2Workflow({
       backend,
       store: new V2QuoteStore({ directory }),
@@ -114,6 +115,45 @@ test('get_prices stores raw official evidence without choosing or calculating', 
   assert.equal(result.monthly_total, undefined);
 });
 
+test('resuming a price batch queries only unfinished ids and reuses successful results', async (t) => {
+  const { workflow, directory, backend } = fixture({ status: 'needs_refinement', itemIds: [] });
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const query = { provider: 'azure', query_id: 'price-1', filter: 'caller supplied query' };
+  let calls = 1;
+  const first = await workflow.getPrices({ queries: [query] });
+  assert.equal(first.status, 'needs_refinement');
+
+  backend.getPrices = async (input) => {
+    calls += 1;
+    return {
+      status: 'completed',
+      result_count: 1,
+      results: [{
+        query_id: input.queries[0].query_id,
+        provider: 'azure',
+        status: 'exact',
+        official_item_ids: ['item-1'],
+        items: [{ id: 'item-1' }],
+      }],
+    };
+  };
+  const resumed = await workflow.getPrices({
+    price_batch_id: first.price_batch_id,
+    queries: [query],
+  });
+  assert.equal(resumed.price_batch_id, first.price_batch_id);
+  assert.deepEqual(resumed.queried_query_ids, ['price-1']);
+  assert.equal(resumed.results[0].status, 'exact');
+
+  const replayed = await workflow.getPrices({
+    price_batch_id: first.price_batch_id,
+    queries: [query],
+  });
+  assert.equal(calls, 2);
+  assert.deepEqual(replayed.reused_query_ids, ['price-1']);
+  assert.deepEqual(replayed.queried_query_ids, []);
+});
+
 test('build validates selected official evidence then delivers', async (t) => {
   const { workflow, directory, delivered } = fixture();
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -121,11 +161,8 @@ test('build validates selected official evidence then delivers', async (t) => {
 
   const result = await workflow.buildEstimate(quoteInput(batch.price_batch_id));
 
-  assert.equal(result.status, 'delivered');
-  assert.equal(delivered.length, 1);
-  assert.equal(delivered[0].cloud_provider, 'azure');
-  assert.equal(delivered[0].verification.status, 'official_price_verified');
-  assert.deepEqual(delivered[0].resource_ir[0].price_evidence[0].official_item_ids, ['item-1']);
+  assert.equal(result.status, 'displayed_on_page');
+  assert.equal(delivered.length, 0);
 });
 
 test('an ambiguous official query requires GPT to identify the chosen item', async (t) => {
@@ -155,8 +192,8 @@ test('GPT may select one official identity from an ambiguous result', async (t) 
     evidence: [{ query_id: 'price-1', official_item_ids: ['item-2'] }],
   }));
 
-  assert.equal(result.status, 'delivered');
-  assert.equal(delivered.length, 1);
+  assert.equal(result.status, 'displayed_on_page');
+  assert.equal(delivered.length, 0);
 });
 
 test('MCP never silently substitutes an item that GPT did not select', async (t) => {
@@ -185,6 +222,48 @@ test('official evidence cannot cross cloud providers', async (t) => {
   );
 });
 
+test('provider pricing semantics cannot reuse AWS reserved rules for Azure', async (t) => {
+  const { workflow, directory } = fixture();
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const batch = await priceBatch(workflow);
+  const input = quoteInput(batch.price_batch_id);
+  input.pricing_scenarios = [{
+    scenario_key: 'one_year_commitment', monthly_total: '12.34', upfront_total: '148.08',
+  }];
+  input.services[0].scenario_costs = [{
+    scenario_key: 'one_year_commitment', pricing_basis: 'reserved',
+    monthly_cost: '12.34', upfront_cost: '148.08',
+    price_evidence: [{ query_id: 'price-1', official_item_ids: ['item-1'] }],
+  }];
+
+  await assert.rejects(
+    workflow.buildEstimate(input),
+    (error) => error.code === 'provider_pricing_scenario_invalid'
+      && error.details.violations.some((item) => item.includes('provider_commitment_basis_invalid')),
+  );
+});
+
+test('OCI public catalog cannot be presented as a one-year public commitment price', async (t) => {
+  const { workflow, directory } = fixture({ provider: 'oci' });
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const batch = await priceBatch(workflow, 'oci');
+  const input = quoteInput(batch.price_batch_id, { provider: 'oci' });
+  input.pricing_scenarios = [{
+    scenario_key: 'one_year_commitment', monthly_total: '12.34', upfront_total: '0',
+  }];
+  input.services[0].scenario_costs = [{
+    scenario_key: 'one_year_commitment', pricing_basis: 'provider_commitment',
+    monthly_cost: '12.34', upfront_cost: '0',
+    price_evidence: [{ query_id: 'price-1', official_item_ids: ['item-1'] }],
+  }];
+
+  await assert.rejects(
+    workflow.buildEstimate(input),
+    (error) => error.code === 'provider_pricing_scenario_invalid'
+      && error.details.violations.some((item) => item.includes('scenario_not_available_for_provider')),
+  );
+});
+
 test('GPT component totals are checked but never redistributed by the MCP', async (t) => {
   const { workflow, directory } = fixture();
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -199,7 +278,7 @@ test('GPT component totals are checked but never redistributed by the MCP', asyn
   assert.equal(input.services[0].expected_monthly_cost, '19.00');
 });
 
-test('page result mode skips document and webhook delivery', async (t) => {
+test('every quote uses the sales-page delivery path', async (t) => {
   const { workflow, directory, delivered, displayed } = fixture();
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const batch = await priceBatch(workflow);
@@ -223,4 +302,62 @@ test('a structured zero-cost fact cannot be smuggled into a priced component', a
     (error) => error.code === 'official_api_fact_mapping_invalid'
       && error.details.violations.some((item) => item.includes('zero_cost_fact_in_priced_service')),
   );
+});
+
+test('completed relay jobs replay before the processing guard and expose stage-level resume', async (t) => {
+  const { workflow, directory, displayed } = fixture();
+  const relayDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-relay-resume-'));
+  const jobsDirectory = path.join(relayDirectory, 'jobs');
+  fs.mkdirSync(jobsDirectory);
+  const relayJobId = `gpt-${'a'.repeat(32)}`;
+  const relayPath = path.join(jobsDirectory, `${relayJobId}.json`);
+  const relay = {
+    job_id: relayJobId,
+    submission_code: '6',
+    status: 'processing',
+    quote_options: {
+      cloud_provider: 'azure',
+      pricing_scenarios: ['on_demand'],
+    },
+  };
+  fs.writeFileSync(relayPath, JSON.stringify(relay));
+  const previous = process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+  process.env.ASTRAQUOTE_GPT_RELAY_DIR = relayDirectory;
+  t.after(() => {
+    if (previous === undefined) delete process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+    else process.env.ASTRAQUOTE_GPT_RELAY_DIR = previous;
+    fs.rmSync(directory, { recursive: true, force: true });
+    fs.rmSync(relayDirectory, { recursive: true, force: true });
+  });
+
+  const batch = await workflow.getPrices({
+    relay_job_id: relayJobId,
+    submission_code: '6',
+    queries: [{ provider: 'azure', query_id: 'price-1', filter: 'caller supplied query' }],
+  });
+  assert.equal(workflow.getQuoteJobStatus({
+    relay_job_id: relayJobId, submission_code: '6',
+  }).stage, 'pricing_completed');
+
+  const input = quoteInput(batch.price_batch_id);
+  input.relay_job_id = relayJobId;
+  input.pricing_scenarios = [{
+    scenario_key: 'on_demand', monthly_total: '12.34', upfront_total: '0',
+  }];
+  input.services[0].scenario_costs = [{
+    scenario_key: 'on_demand', pricing_basis: 'on_demand',
+    monthly_cost: '12.34', upfront_cost: '0',
+    price_evidence: [{ query_id: 'price-1', official_item_ids: ['item-1'] }],
+  }];
+  const first = await workflow.buildEstimate(input);
+  assert.equal(first.status, 'displayed_on_page');
+  relay.status = 'completed';
+  fs.writeFileSync(relayPath, JSON.stringify(relay));
+
+  const replay = await workflow.buildEstimate({ ...input, idempotency_key: 'new-key-after-timeout' });
+  assert.equal(replay.idempotent_replay, true);
+  assert.equal(displayed.length, 1);
+  const resumed = workflow.resumeQuoteJob({ relay_job_id: relayJobId, submission_code: '6' });
+  assert.equal(resumed.stage, 'delivery_completed');
+  assert.match(resumed.next_action, /do not query, generate or deliver again/);
 });

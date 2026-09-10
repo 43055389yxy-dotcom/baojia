@@ -11,6 +11,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import secrets
 import tempfile
 import uuid
@@ -34,6 +35,8 @@ PUBLIC_FIELDS = {
     "cloud_provider",
     "display_result_on_page",
     "quick_quote_result",
+    "quote_download_url",
+    "quote_download_filename",
 }
 
 
@@ -66,11 +69,14 @@ class GptQuoteRelayStore:
             )
         self.jobs_directory = self.directory / "jobs"
         self.completions_directory = self.directory / "completions"
+        self.requests_directory = self.directory / "requests"
         self.jobs_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.completions_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.requests_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._set_owner(self.directory)
         self._set_owner(self.jobs_directory)
         self._set_owner(self.completions_directory)
+        self._set_owner(self.requests_directory)
         self.lock_path = self.directory / ".queue.lock"
         self.heartbeat_path = self.directory / "worker-heartbeat.json"
 
@@ -102,6 +108,15 @@ class GptQuoteRelayStore:
     def _completion_path(self, job_id: str) -> Path:
         self._path(job_id)
         return self.completions_directory / f"{job_id}.json"
+
+    def _request_path(self, client_request_id: str) -> Path:
+        try:
+            normalized = str(uuid.UUID(client_request_id))
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise GptRelayError(
+                "无效的客户端提交编号。", code="gpt_relay_client_request_id_invalid"
+            ) from exc
+        return self.requests_directory / f"{normalized}.json"
 
     def _write_atomic(self, path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -141,6 +156,16 @@ class GptQuoteRelayStore:
         job_id = f"gpt-{uuid.uuid4().hex}"
         now = utc_now()
         with self._lock():
+            client_request_id = str(options.get("client_request_id") or uuid.uuid4())
+            request_path = self._request_path(client_request_id)
+            if request_path.exists():
+                try:
+                    request_index = self._read(request_path)
+                    existing_path = self._path(str(request_index.get("job_id") or ""))
+                    if existing_path.exists():
+                        return self.public(self._read(existing_path))
+                except (OSError, ValueError, TypeError, GptRelayError):
+                    pass
             active_codes: set[str] = set()
             for path in self.jobs_directory.glob("gpt-*.json"):
                 try:
@@ -158,9 +183,7 @@ class GptQuoteRelayStore:
                 "job_id": job_id,
                 "submission_code": submission_code,
                 "cloud_provider": str(options.get("cloud_provider") or "aws"),
-                "display_result_on_page": bool(
-                    options.get("display_result_on_page", False)
-                ),
+                "display_result_on_page": True,
                 "status": "queued",
                 "created_at": now,
                 "updated_at": now,
@@ -174,6 +197,10 @@ class GptQuoteRelayStore:
                 "error": None,
             }
             self._write_atomic(self._path(job_id), record)
+            self._write_atomic(
+                request_path,
+                {"client_request_id": client_request_id, "job_id": job_id, "created_at": now},
+            )
         return self.public(record)
 
     def get(self, job_id: str) -> dict[str, Any]:
@@ -191,10 +218,9 @@ class GptQuoteRelayStore:
     def reconcile_delivery_receipt(self, job_id: str) -> dict[str, Any]:
         """Prefer a verified MCP delivery receipt over brittle chat prose.
 
-        The receipt is written only after the private workbook upload and
-        enterprise WebHook both succeed. It is bound to the relay job id and
-        submission code, and it can repair an earlier false browser failure.
-        Cancellation always wins.
+        The receipt is written only after the private workbook and stable sales
+        page link exist. It is bound to the relay job id and submission code,
+        and it repairs an earlier false browser failure. Cancellation wins.
         """
 
         with self._lock():
@@ -204,9 +230,10 @@ class GptQuoteRelayStore:
             record = self._read(job_path)
             if record.get("status") == "cancelled":
                 return record
-            if record.get("status") == "completed" and (
-                not record.get("display_result_on_page")
-                or record.get("quick_quote_result")
+            if (
+                record.get("status") == "completed"
+                and record.get("quick_quote_result")
+                and record.get("quote_download_url")
             ):
                 return record
             receipt_path = self._completion_path(job_id)
@@ -227,21 +254,19 @@ class GptQuoteRelayStore:
             ):
                 return record
             page_result = self._page_result_public(receipt.get("page_result"))
-            if receipt.get("status") == "page_result_ready":
-                if not record.get("display_result_on_page") or page_result is None:
-                    return record
-            else:
-                page_result = None
+            download_url = self._download_url_public(receipt.get("spreadsheet_url"))
+            if page_result is None or download_url is None:
+                return record
             record.update(
                 {
                     "status": "completed",
                     "result_status": receipt["status"],
-                    "result_summary": (
-                        "报价结果已生成。"
-                        if page_result
-                        else "报价结果已发送至企业微信群。"
-                    ),
+                    "result_summary": "报价结果和 Excel 已生成。",
                     "quick_quote_result": page_result,
+                    "quote_download_url": download_url,
+                    "quote_download_filename": str(
+                        receipt.get("spreadsheet_filename") or "报价单.xlsx"
+                    )[:220],
                     "error": None,
                     "lease_expires_at": None,
                     "updated_at": utc_now(),
@@ -249,9 +274,7 @@ class GptQuoteRelayStore:
                         *(record.get("events") or []),
                         self._event(
                             "completed",
-                            "报价结果已生成"
-                            if page_result
-                            else "报价文档已完成交付",
+                            "报价结果和 Excel 已生成",
                         ),
                     ][-100:],
                 }
@@ -274,6 +297,8 @@ class GptQuoteRelayStore:
             return None
         allowed_scenarios = {
             "on_demand",
+            "one_year_commitment",
+            "three_year_commitment",
             "one_year_all_upfront",
             "three_year_all_upfront",
         }
@@ -346,6 +371,23 @@ class GptQuoteRelayStore:
             "components": public_components,
             "scenarios": public_scenarios,
         }
+
+    @staticmethod
+    def _download_url_public(value: Any) -> str | None:
+        from urllib.parse import urlsplit
+
+        text = str(value or "").strip()
+        try:
+            parsed = urlsplit(text)
+        except ValueError:
+            return None
+        if parsed.scheme != "https" or not parsed.netloc or parsed.query or parsed.fragment:
+            return None
+        if not re.fullmatch(
+            r"/api/backend/api/quote-artifacts/aqdl_[a-f0-9]{48}", parsed.path
+        ):
+            return None
+        return text
 
     def update(
         self,

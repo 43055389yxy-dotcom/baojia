@@ -11,6 +11,8 @@ function fakeWorkflow() {
     describeService: async (input) => ({ status: 'ok', input }),
     getAttributeValues: async (input) => ({ status: 'ok', input }),
     getPrices: async (input) => ({ status: 'completed', input }),
+    getQuoteJobStatus: async (input) => ({ status: 'created', input }),
+    resumeQuoteJob: async (input) => ({ status: 'created', input }),
     buildEstimate: async (input) => ({ status: 'delivered', input }),
   };
 }
@@ -36,6 +38,8 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
     'describe_service',
     'get_attribute_values',
     'get_prices',
+    'get_quote_job_status',
+    'resume_quote_job',
     'build_estimate',
   ]);
   assert.match(INSTRUCTIONS, /GPT.*理解.*选择.*计算/s);

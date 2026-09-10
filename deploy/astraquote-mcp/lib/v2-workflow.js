@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const { isDeepStrictEqual } = require('node:util');
 
 const { V2QuoteStore } = require('./v2-quote-store');
 const { QuoteDeliveryService } = require('./quote-delivery');
@@ -89,37 +90,57 @@ function normalizeComponentCosts(input) {
 
 const SCENARIO_KEYS = Object.freeze([
   'on_demand',
-  'one_year_all_upfront',
-  'three_year_all_upfront',
+  'one_year_commitment',
+  'three_year_commitment',
 ]);
 
 function relayScenarioKeys(options) {
+  if (Array.isArray(options?.pricing_scenarios)) {
+    return [...new Set(options.pricing_scenarios)];
+  }
+  // Read-only compatibility boundary for jobs submitted before schema v3.1.
   const keys = [];
   if (options?.include_on_demand_scenario !== false) keys.push('on_demand');
   if (options?.pricing_mode === 'reserved' && options?.payment_option === 'all_upfront') {
     for (const years of options.reserved_term_years || []) {
-      if (Number(years) === 1) keys.push('one_year_all_upfront');
-      if (Number(years) === 3) keys.push('three_year_all_upfront');
+      if (Number(years) === 1) keys.push('one_year_commitment');
+      if (Number(years) === 3) keys.push('three_year_commitment');
     }
   }
   return [...new Set(keys)];
 }
 
-function bindRelayJobContext(input) {
-  const relayJobId = String(input.relay_job_id || '');
-  if (!relayJobId) return input;
+function readRelayJob(relayJobId) {
   const relayDirectory = path.resolve(process.env.ASTRAQUOTE_GPT_RELAY_DIR || '/data/gpt-relay');
   const jobPath = path.join(relayDirectory, 'jobs', `${relayJobId}.json`);
-  let job;
   try {
-    job = JSON.parse(fs.readFileSync(jobPath, 'utf8'));
+    const job = JSON.parse(fs.readFileSync(jobPath, 'utf8'));
+    if (job.job_id !== relayJobId) throw new Error('relay identity mismatch');
+    return job;
   } catch {
     const error = new Error('The sales quote task could not be verified.');
     error.code = 'relay_job_context_missing';
     error.details = { relay_job_id: relayJobId };
     throw error;
   }
-  if (job.job_id !== relayJobId || job.status !== 'processing') {
+}
+
+function assertRelayIdentity({ relay_job_id: relayJobId, submission_code: submissionCode }) {
+  const job = readRelayJob(String(relayJobId || ''));
+  if (String(job.submission_code || '') !== String(submissionCode || '')) {
+    const error = new Error('The sales quote submission code does not match.');
+    error.code = 'relay_submission_code_invalid';
+    error.details = { relay_job_id: relayJobId };
+    throw error;
+  }
+  return job;
+}
+
+function bindRelayJobContext(input) {
+  const relayJobId = String(input.relay_job_id || '');
+  if (!relayJobId) return input;
+  const job = readRelayJob(relayJobId);
+  if (job.status !== 'processing') {
     const error = new Error('The sales quote task is no longer active.');
     error.code = 'relay_job_not_processing';
     error.details = { relay_job_id: relayJobId, status: job.status || null };
@@ -143,20 +164,6 @@ function bindRelayJobContext(input) {
     error.details = { relay_job_id: relayJobId, expected, received };
     throw error;
   }
-  const expectedPageResult = job.quote_options?.display_result_on_page === true;
-  const receivedPageResult = input.display_result_on_page === undefined
-    ? expectedPageResult
-    : input.display_result_on_page === true;
-  if (receivedPageResult !== expectedPageResult) {
-    const error = new Error('The page result option does not match the sales submission.');
-    error.code = 'relay_page_result_option_mismatch';
-    error.details = {
-      relay_job_id: relayJobId,
-      expected: expectedPageResult,
-      received: receivedPageResult,
-    };
-    throw error;
-  }
   const expectedProvider = String(job.quote_options?.cloud_provider || 'aws');
   if (input.cloud_provider !== expectedProvider) {
     const error = new Error('The cloud provider does not match the sales submission.');
@@ -171,7 +178,7 @@ function bindRelayJobContext(input) {
   return {
     ...input,
     submission_code: submissionCode,
-    display_result_on_page: receivedPageResult,
+    display_result_on_page: true,
   };
 }
 
@@ -262,6 +269,43 @@ function normalizeScenarioCosts(input) {
     const error = new Error('Pricing scenario costs do not reconcile.');
     error.code = 'pricing_scenario_cost_mismatch';
     error.details = { violations };
+    throw error;
+  }
+  return input;
+}
+
+function validateProviderScenarioSemantics(input) {
+  const allowedQuoteScenarios = input.cloud_provider === 'oci'
+    ? new Set(['on_demand'])
+    : new Set(SCENARIO_KEYS);
+  const commitmentBasis = {
+    aws: 'reserved',
+    azure: 'provider_commitment',
+    gcp: 'provider_commitment',
+  }[input.cloud_provider];
+  const violations = [];
+  for (const scenario of input.pricing_scenarios || []) {
+    if (!allowedQuoteScenarios.has(scenario.scenario_key)) {
+      violations.push(`scenario_not_available_for_provider:${scenario.scenario_key}`);
+    }
+  }
+  for (const service of input.services || []) {
+    for (const scenario of service.scenario_costs || []) {
+      if (scenario.scenario_key === 'on_demand' && scenario.pricing_basis !== 'on_demand') {
+        violations.push(`on_demand_basis_invalid:${service.component_key}`);
+      }
+      if (scenario.scenario_key !== 'on_demand'
+        && ![commitmentBasis, 'on_demand_fallback'].includes(scenario.pricing_basis)) {
+        violations.push(
+          `provider_commitment_basis_invalid:${service.component_key}:${scenario.scenario_key}`,
+        );
+      }
+    }
+  }
+  if (violations.length > 0) {
+    const error = new Error('Pricing scenarios do not match the selected cloud provider.');
+    error.code = 'provider_pricing_scenario_invalid';
+    error.details = { cloud_provider: input.cloud_provider, violations };
     throw error;
   }
   return input;
@@ -417,21 +461,126 @@ class AstraQuoteV2Workflow {
     return this.backend.getAttributeValues(input);
   }
 
-  getPrices(input) {
-    return this.backend.getPrices(input).then((result) => {
-      const priceBatchId = `aqpb_${randomUUID()}`;
-      this.store.putPriceBatch({
-        schema_version: 'astraquote-v3-price-batch/1',
-        price_batch_id: priceBatchId,
-        created_at: new Date().toISOString(),
-        request: input,
-        result,
-      });
-      return {
-        ...result,
-        price_batch_id: priceBatchId,
-      };
+  async getPrices(input) {
+    const relayJobId = input.relay_job_id || null;
+    if (relayJobId) assertRelayIdentity(input);
+    const queryIds = input.queries.map((query) => query.query_id);
+    if (new Set(queryIds).size !== queryIds.length) {
+      const error = new Error('Every official price query must have a unique query_id.');
+      error.code = 'duplicate_price_query_id';
+      throw error;
+    }
+    const existing = input.price_batch_id
+      ? this.store.getPriceBatch(input.price_batch_id)
+      : null;
+    if (existing && (existing.relay_job_id || null) !== relayJobId) {
+      const error = new Error('The saved price batch belongs to a different sales quote task.');
+      error.code = 'price_batch_relay_context_mismatch';
+      throw error;
+    }
+
+    const existingResults = new Map(
+      (existing?.result?.results || []).map((item) => [item.query_id, item]),
+    );
+    const existingQueries = new Map(
+      (existing?.request?.queries || []).map((item) => [item.query_id, item]),
+    );
+    const pendingQueries = [];
+    for (const query of input.queries) {
+      const priorResult = existingResults.get(query.query_id);
+      if (priorResult && ['exact', 'ambiguous'].includes(priorResult.status)) {
+        if (!isDeepStrictEqual(existingQueries.get(query.query_id), query)) {
+          const error = new Error('A completed query_id cannot be reused for different filters.');
+          error.code = 'price_query_identity_conflict';
+          error.details = { query_id: query.query_id };
+          throw error;
+        }
+        continue;
+      }
+      pendingQueries.push(query);
+    }
+
+    const result = pendingQueries.length > 0
+      ? await this.backend.getPrices({ queries: pendingQueries })
+      : { status: 'completed', result_count: 0, results: [] };
+    const priceBatchId = existing?.price_batch_id || `aqpb_${randomUUID()}`;
+    const mergedResults = new Map(existingResults);
+    for (const item of result.results || []) mergedResults.set(item.query_id, item);
+    const mergedQueries = new Map(existingQueries);
+    for (const query of input.queries) mergedQueries.set(query.query_id, query);
+    const incompleteQueryIds = [...mergedQueries.keys()].filter((queryId) => {
+      const item = mergedResults.get(queryId);
+      return !item || !['exact', 'ambiguous'].includes(item.status);
     });
+    const completed = incompleteQueryIds.length === 0;
+    const mergedResult = {
+      status: completed ? 'completed' : 'needs_refinement',
+      result_count: mergedResults.size,
+      results: [...mergedResults.values()],
+    };
+    this.store.putPriceBatch({
+      schema_version: 'astraquote-v3-price-batch/1',
+      price_batch_id: priceBatchId,
+      created_at: existing?.created_at || new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      relay_job_id: relayJobId,
+      request: { queries: [...mergedQueries.values()] },
+      result: mergedResult,
+    });
+    if (relayJobId) {
+      this.store.putCheckpoint(relayJobId, {
+        stage: completed ? 'pricing_completed' : 'pricing_partial',
+        price_batch_id: priceBatchId,
+        incomplete_query_ids: incompleteQueryIds,
+      });
+    }
+    return {
+      ...mergedResult,
+      price_batch_id: priceBatchId,
+      resumed_batch: Boolean(existing),
+      reused_query_ids: input.queries
+        .filter((query) => !pendingQueries.includes(query))
+        .map((query) => query.query_id),
+      queried_query_ids: pendingQueries.map((query) => query.query_id),
+    };
+  }
+
+  getQuoteJobStatus(input) {
+    const job = assertRelayIdentity(input);
+    const checkpoint = this.store.getCheckpoint(input.relay_job_id);
+    if (!checkpoint) {
+      return {
+        relay_job_id: input.relay_job_id,
+        relay_status: job.status,
+        stage: 'created',
+        next_action: 'Continue official price queries with get_prices.',
+      };
+    }
+    return {
+      relay_job_id: input.relay_job_id,
+      relay_status: job.status,
+      stage: checkpoint.stage,
+      price_batch_id: checkpoint.price_batch_id || null,
+      incomplete_query_ids: checkpoint.incomplete_query_ids || [],
+      quote_id: checkpoint.quote_id || null,
+      failed_stage: checkpoint.failed_stage || null,
+      error: checkpoint.stage === 'failed' ? checkpoint.error : undefined,
+      result: checkpoint.stage === 'delivery_completed' ? checkpoint.result : undefined,
+    };
+  }
+
+  resumeQuoteJob(input) {
+    const status = this.getQuoteJobStatus(input);
+    const nextActions = {
+      created: 'Continue official price queries with get_prices.',
+      pricing_partial: 'Query only incomplete_query_ids; keep the saved price batch.',
+      pricing_completed: 'Reuse price_batch_id and continue with build_estimate.',
+      estimate_validated: 'Resume artifact generation and sales-page delivery only.',
+      artifacts_generated: 'Reuse the existing Excel artifact and finish the completion receipt.',
+      delivery_completed: 'Return result exactly as saved; do not query, generate or deliver again.',
+      failed: 'Inspect the saved failure and retry only its missing stage.',
+    };
+    return { ...status, resumed_from: status.stage, next_action: nextActions[status.stage] };
   }
 
   validatePriceEvidence(input, priceBatch) {
@@ -473,6 +622,15 @@ class AstraQuoteV2Workflow {
         const results = evidenceReferences(scenario)
           .map((ref) => priceResults.get(ref.query_id))
           .filter(Boolean);
+        if (scenario.pricing_basis === 'on_demand_fallback') {
+          const onDemandCost = (component.scenario_costs || []).find(
+            (cost) => cost.scenario_key === 'on_demand',
+          );
+          if (onDemandCost
+            && roundedCents(onDemandCost.monthly_cost) !== roundedCents(scenario.monthly_cost)) {
+            violations.push(`scenario_fallback_cost_changed:${component.component_key}:${scenario.scenario_key}`);
+          }
+        }
         if (input.cloud_provider !== 'aws') continue;
         const expectedBasis = scenario.pricing_basis === 'on_demand_fallback'
           ? 'on_demand'
@@ -490,8 +648,8 @@ class AstraQuoteV2Workflow {
           violations.push(`scenario_committed_evidence_missing:${component.component_key}:${scenario.scenario_key}`);
         }
         const expectedTermYears = {
-          one_year_all_upfront: 1,
-          three_year_all_upfront: 3,
+          one_year_commitment: 1,
+          three_year_commitment: 3,
         }[scenario.scenario_key];
         if (scenario.pricing_basis === 'reserved'
           && !results.some((result) => (
@@ -500,15 +658,6 @@ class AstraQuoteV2Workflow {
             && result.payment_option === 'all_upfront'
           ))) {
           violations.push(`scenario_commitment_terms_mismatch:${component.component_key}:${scenario.scenario_key}`);
-        }
-        if (scenario.pricing_basis === 'on_demand_fallback') {
-          const onDemandCost = (component.scenario_costs || []).find(
-            (cost) => cost.scenario_key === 'on_demand',
-          );
-          if (onDemandCost
-            && roundedCents(onDemandCost.monthly_cost) !== roundedCents(scenario.monthly_cost)) {
-            violations.push(`scenario_fallback_cost_changed:${component.component_key}:${scenario.scenario_key}`);
-          }
         }
       }
     }
@@ -521,10 +670,27 @@ class AstraQuoteV2Workflow {
   }
 
   async deliverRecord(record) {
-    const pageOnly = record.display_result_on_page === true;
-    const deliveryResult = pageOnly
-      ? await this.deliverer.deliverPageResult(record)
-      : await this.deliverer.deliver(record);
+    let deliveryResult;
+    if (typeof this.deliverer.createArtifact === 'function'
+      && typeof this.deliverer.completeSalesPageDelivery === 'function') {
+      const artifact = await this.deliverer.createArtifact(record);
+      if (record.relay_job_id) {
+        this.store.putCheckpoint(record.relay_job_id, {
+          stage: 'artifacts_generated',
+          quote_id: record.quote_id,
+          price_batch_id: record.price_batch_id,
+          spreadsheet_url: artifact.spreadsheet_url,
+          spreadsheet_filename: artifact.spreadsheet_filename,
+        });
+      }
+      deliveryResult = await this.deliverer.completeSalesPageDelivery(
+        record,
+        artifact,
+        'displayed_on_page',
+      );
+    } else {
+      deliveryResult = await this.deliverer.deliverPageResult(record);
+    }
     this.store.update(record.quote_id, {
       delivery: {
         status: 'delivered',
@@ -532,21 +698,29 @@ class AstraQuoteV2Workflow {
         result: deliveryResult,
       },
     });
+    if (record.relay_job_id) {
+      this.store.putCheckpoint(record.relay_job_id, {
+        stage: 'delivery_completed',
+        quote_id: record.quote_id,
+        price_batch_id: record.price_batch_id,
+        result: deliveryResult,
+      });
+    }
     return {
       ...deliveryResult,
-      status: pageOnly ? 'displayed_on_page' : 'delivered',
+      status: 'displayed_on_page',
       quote_id: record.quote_id,
-      next_step: pageOnly
-        ? 'The structured quote is ready on the sales page.'
-        : 'The Excel quote has been delivered to the configured WebHook.',
+      next_step: 'The structured quote and Excel download link are ready on the sales page.',
     };
   }
 
   async buildEstimate(input) {
-    const relayBoundInput = bindRelayJobContext(input);
-    const replay = this.store.findByIdempotencyKey(relayBoundInput.idempotency_key);
+    const replay = (
+      (input.relay_job_id && this.store.findByRelayJobId(input.relay_job_id))
+      || this.store.findByIdempotencyKey(input.idempotency_key)
+    );
     if (replay) {
-      if ((relayBoundInput.relay_job_id || null) !== (replay.relay_job_id || null)) {
+      if ((input.relay_job_id || null) !== (replay.relay_job_id || null)) {
         const error = new Error('The idempotency key belongs to a different sales quote task.');
         error.code = 'relay_idempotency_context_mismatch';
         throw error;
@@ -557,12 +731,22 @@ class AstraQuoteV2Workflow {
       return { ...(await this.deliverRecord(replay)), idempotent_replay: true };
     }
 
+    const relayBoundInput = bindRelayJobContext(input);
+
     uniqueComponentKeys([
       ...(relayBoundInput.services || []),
       ...(relayBoundInput.zero_cost_services || []),
     ]);
     const priceBatch = this.store.getPriceBatch(relayBoundInput.price_batch_id);
-    const normalizedInput = normalizeScenarioCosts(normalizeComponentCosts(relayBoundInput));
+    if (priceBatch.relay_job_id
+      && priceBatch.relay_job_id !== (relayBoundInput.relay_job_id || null)) {
+      const error = new Error('The saved price batch belongs to a different sales quote task.');
+      error.code = 'price_batch_relay_context_mismatch';
+      throw error;
+    }
+    const normalizedInput = validateProviderScenarioSemantics(
+      normalizeScenarioCosts(normalizeComponentCosts(relayBoundInput)),
+    );
     validateCustomerDocumentMetadata(normalizedInput);
     this.validatePriceEvidence(normalizedInput, priceBatch);
     const compiled = prepareOfficialApiSubmission(normalizedInput);
@@ -575,10 +759,11 @@ class AstraQuoteV2Workflow {
       quote_name: normalizedInput.quote_name,
       submission_code: normalizedInput.submission_code || null,
       relay_job_id: normalizedInput.relay_job_id || null,
+      price_batch_id: normalizedInput.price_batch_id,
       default_region: normalizedInput.default_region,
       cloud_provider: normalizedInput.cloud_provider,
       currency: normalizedInput.currency,
-      display_result_on_page: normalizedInput.display_result_on_page === true,
+      display_result_on_page: true,
       fact_ledger: normalizedInput.fact_ledger,
       fact_coverage: compiled.fact_coverage,
       transformation_trace: compiled.transformation_trace,
@@ -615,6 +800,19 @@ class AstraQuoteV2Workflow {
           },
         },
       });
+      if (record.relay_job_id) {
+        const checkpoint = this.store.getCheckpoint(record.relay_job_id);
+        this.store.putCheckpoint(record.relay_job_id, {
+          stage: 'failed',
+          failed_stage: checkpoint?.stage || 'estimate_validated',
+          quote_id: record.quote_id,
+          price_batch_id: record.price_batch_id,
+          error: {
+            code: deliveryError?.code || 'quote_delivery_failed',
+            message: deliveryError?.message || 'Quote delivery failed.',
+          },
+        });
+      }
       throw deliveryError;
     }
   }
@@ -628,4 +826,5 @@ module.exports = {
   officialCosts,
   prepareOfficialApiSubmission,
   validateCustomerDocumentMetadata,
+  validateProviderScenarioSemantics,
 };

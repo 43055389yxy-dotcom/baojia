@@ -41,6 +41,9 @@ class ProductSearchRequest(DescribeServiceRequest):
 class AwsPriceQuery(ProductSearchRequest):
     provider: Literal["aws"] = "aws"
     query_id: str = Field(min_length=1, max_length=100)
+    # At least eleven rows are needed to distinguish a complete ten-row
+    # result from a larger result that must be refined by GPT.
+    max_results: int = Field(default=100, ge=11, le=1000)
     pricing_model: Literal["on_demand", "reserved"] = "on_demand"
     term_years: Literal[1, 3] | None = None
     payment_option: Literal["no_upfront", "partial_upfront", "all_upfront"] | None = None
@@ -138,6 +141,7 @@ class OfficialPricingService:
     AZURE_URL = "https://prices.azure.com/api/retail/prices"
     OCI_URL = "https://apexapps.oracle.com/pls/apex/cetools/api/v1/products/"
     GCP_BASE_URL = "https://cloudbilling.googleapis.com/v1"
+    MAX_RETURNED_CANDIDATES = 10
 
     def __init__(
         self,
@@ -231,7 +235,12 @@ class OfficialPricingService:
             result = self._get_oci_prices(query)
         else:
             result = self._get_gcp_catalog(query)
-        return {"query_id": query.query_id, "provider": query.provider, **result}
+        identified = {"query_id": query.query_id, "provider": query.provider, **result}
+        return _require_refinement_for_large_result(
+            query,
+            identified,
+            maximum=self.MAX_RETURNED_CANDIDATES,
+        )
 
     def _price_list_products(self, request: ProductSearchRequest) -> list[dict[str, Any]]:
         filters = [
@@ -419,6 +428,96 @@ def _identity_status(count: int) -> str:
     if count == 1:
         return "exact"
     return "ambiguous"
+
+
+def _flatten_scalar_fields(value: Any, *, prefix: str = "") -> dict[str, set[str]]:
+    fields: dict[str, set[str]] = {}
+    if isinstance(value, dict):
+        for key, child in value.items():
+            name = f"{prefix}.{key}" if prefix else str(key)
+            child_fields = _flatten_scalar_fields(child, prefix=name)
+            for field, values in child_fields.items():
+                fields.setdefault(field, set()).update(values)
+    elif isinstance(value, (str, int, float, bool)):
+        text = str(value).strip()
+        if text and len(text) <= 160:
+            fields[prefix] = {text}
+    return fields
+
+
+def _objective_refinement_fields(
+    candidates: list[dict[str, Any]],
+    *,
+    excluded: set[str],
+) -> list[dict[str, Any]]:
+    collected: dict[str, set[str]] = {}
+    for candidate in candidates:
+        for field, values in _flatten_scalar_fields(candidate).items():
+            short_field = field.removeprefix("attributes.")
+            if field in excluded or short_field in excluded:
+                continue
+            collected.setdefault(field, set()).update(values)
+    ranked = sorted(
+        (
+            (field, sorted(values))
+            for field, values in collected.items()
+            if values
+        ),
+        key=lambda item: (len(item[1]), item[0]),
+    )
+    return [
+        {
+            "field": field,
+            "candidate_values": values[:10],
+            "value_count": len(values),
+        }
+        for field, values in ranked[:12]
+    ]
+
+
+def _require_refinement_for_large_result(
+    query: PriceQueryInput,
+    result: dict[str, Any],
+    *,
+    maximum: int,
+) -> dict[str, Any]:
+    candidate_key = next(
+        (
+            key
+            for key in ("products", "items", "services", "skus")
+            if isinstance(result.get(key), list)
+        ),
+        None,
+    )
+    candidates = list(result.get(candidate_key) or []) if candidate_key else []
+    more_available = bool(result.get("next_page_url") or result.get("next_page_token"))
+    if len(candidates) <= maximum and not more_available:
+        return result
+
+    excluded = set()
+    filters = getattr(query, "filters", None)
+    if isinstance(filters, dict):
+        excluded.update(str(key) for key in filters)
+    compact = {
+        key: value
+        for key, value in result.items()
+        if key not in {"products", "items", "services", "skus", "official_item_ids"}
+    }
+    compact.update(
+        {
+            "status": "needs_refinement",
+            "matched_count": len(candidates),
+            "matched_count_is_lower_bound": more_available,
+            "more_results_available": more_available,
+            "query": query.model_dump(exclude_none=True),
+            "refinement_fields": _objective_refinement_fields(
+                [item for item in candidates if isinstance(item, dict)],
+                excluded=excluded,
+            ),
+            "official_item_ids": [],
+        }
+    )
+    return compact
 
 
 def _azure_item_id(item: dict[str, Any]) -> str:

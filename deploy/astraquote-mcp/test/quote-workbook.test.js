@@ -107,19 +107,19 @@ test('renders every selected pricing scenario as a separate component column', a
   const record = verifiedRecord();
   record.pricing_scenarios = [
     { scenario_key: 'on_demand', monthly_total: '245.67', upfront_total: '0' },
-    { scenario_key: 'one_year_all_upfront', monthly_total: '183.92', upfront_total: '2207.04' },
-    { scenario_key: 'three_year_all_upfront', monthly_total: '117.58', upfront_total: '4232.88' },
+    { scenario_key: 'one_year_commitment', monthly_total: '183.92', upfront_total: '2207.04' },
+    { scenario_key: 'three_year_commitment', monthly_total: '117.58', upfront_total: '4232.88' },
   ];
   record.resource_ir[0].scenario_costs = [
     { scenario_key: 'on_demand', monthly_cost: '245.67', upfront_cost: '0' },
-    { scenario_key: 'one_year_all_upfront', monthly_cost: '183.92', upfront_cost: '2207.04' },
-    { scenario_key: 'three_year_all_upfront', monthly_cost: '117.58', upfront_cost: '4232.88' },
+    { scenario_key: 'one_year_commitment', monthly_cost: '183.92', upfront_cost: '2207.04' },
+    { scenario_key: 'three_year_commitment', monthly_cost: '117.58', upfront_cost: '4232.88' },
   ];
 
   const { sheet } = await readWorkbook(record);
   assert.equal(sheet.getCell('G1').value, '按需月费');
-  assert.equal(sheet.getCell('H1').value, '1 年全预付月费');
-  assert.equal(sheet.getCell('I1').value, '3 年全预付月费');
+  assert.equal(sheet.getCell('H1').value, '1 年预留实例全预付月费');
+  assert.equal(sheet.getCell('I1').value, '3 年预留实例全预付月费');
   assert.equal(sheet.getCell('G2').value, 245.67);
   assert.equal(sheet.getCell('H2').value, 183.92);
   assert.equal(sheet.getCell('I2').value, 117.58);

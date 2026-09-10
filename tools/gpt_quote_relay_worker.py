@@ -3,7 +3,7 @@
 
 One visible Firefox process owns the administrator session. Each active quote
 uses its own tab and conversation; the configured work-tab count is capped at
-three so one profile never creates competing browser processes.
+four so one profile never creates competing browser processes.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.services.gpt_browser_navigation import (
     active_quote_poll_order,
@@ -565,7 +565,11 @@ class ChatGptBrowser:
             self._switch_to_launcher()
             raise
 
-    def poll_quote(self, quote: ActiveQuote) -> str | None:
+    def poll_quote(
+        self,
+        quote: ActiveQuote,
+        completion_check: Callable[[], bool] | None = None,
+    ) -> str | None:
         driver = self._driver()
         self._switch_to_quote(quote)
         if canonical_url_path(driver.current_url) != canonical_url_path(quote.chat_url):
@@ -582,7 +586,9 @@ class ChatGptBrowser:
             if quote.retry_visible_since is None:
                 quote.retry_visible_since = now
             if not quote.retry_clicked and now - quote.retry_visible_since >= 60:
-                retry.click()
+                if completion_check is not None and completion_check():
+                    return None
+                self._click(retry, driver)
                 quote.retry_clicked = True
                 quote.retry_visible_since = now
             return None
@@ -748,7 +754,9 @@ def complete_job(store: GptQuoteRelayStore, job_id: str, response: str) -> None:
     if current.get("status") in {"cancelled", "completed"}:
         return
     status, summary = parse_final_response(response)
-    if status in {"delivered", "delivered_without_calculator_link"}:
+    # `displayed_on_page` is the current delivery contract. `delivered` is
+    # accepted only for conversations started before the contract changed.
+    if status in {"displayed_on_page", "delivered"}:
         store.update_if_not_cancelled(
             job_id,
             {
@@ -861,7 +869,13 @@ def main() -> int:
                         active_quotes.pop(job_id, None)
                     continue
                 try:
-                    response = browser.poll_quote(active)
+                    response = browser.poll_quote(
+                        active,
+                        completion_check=lambda job_id=job_id: (
+                            store.reconcile_delivery_receipt(job_id).get("status")
+                            == "completed"
+                        ),
+                    )
                     if response is None:
                         continue
                     complete_job(store, job_id, response)

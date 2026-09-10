@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.0.0';
+const VERSION = '3.1.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -47,7 +47,9 @@ const awsPriceQuery = z.object({
   service_code: serviceCode,
   region: region.default('global'),
   filters: z.record(z.string()).default({}),
-  max_results: z.number().int().min(1).max(1000).default(100),
+  max_results: z.number().int().min(11).max(1000).default(100).describe(
+    'Fetch cap. Minimum 11 lets the MCP prove whether a result set exceeds the 10-item return boundary.',
+  ),
   pricing_model: z.enum(['on_demand', 'reserved']).default('on_demand'),
   term_years: z.union([z.literal(1), z.literal(3)]).optional(),
   payment_option: z.enum(['no_upfront', 'partial_upfront', 'all_upfront']).optional(),
@@ -89,6 +91,11 @@ const priceQuery = z.discriminatedUnion('provider', [
 
 const getPricesInput = z.object({
   queries: z.array(priceQuery).min(1).max(50),
+  relay_job_id: z.string().regex(/^gpt-[a-f0-9]{32}$/).optional(),
+  submission_code: z.string().regex(/^[1-9]$/).optional(),
+  price_batch_id: z.string().regex(/^aqpb_[a-f0-9-]{36}$/).optional().describe(
+    'Saved batch to extend during resume. Existing successful query_ids are reused.',
+  ),
 }).strict();
 
 const fact = z.object({
@@ -104,8 +111,8 @@ const fact = z.object({
 
 const scenarioKey = z.enum([
   'on_demand',
-  'one_year_all_upfront',
-  'three_year_all_upfront',
+  'one_year_commitment',
+  'three_year_commitment',
 ]);
 
 const officialPriceEvidence = z.object({
@@ -150,7 +157,7 @@ const pricedService = z.object({
     '该组件在 ResourceIR、BillingUsageIR 和 PriceIR 中消费的客户事实 ID。',
   ),
   monthly_cost: z.string().regex(/^\d+(?:\.\d{1,10})?$/).optional().describe(
-    'GPT 根据本批 exact AWS 官方价格计算的组件月费（USD）。',
+    'GPT 根据本批官方价格计算的组件月费。',
   ),
   expected_monthly_cost: z.string().regex(/^\d+(?:\.\d{1,10})?$/).optional().describe(
     '旧会话兼容字段；新调用请使用 monthly_cost。',
@@ -191,7 +198,7 @@ const buildEstimateInput = z.object({
   currency: z.string().regex(/^[A-Z]{3}$/).default('USD'),
   price_batch_id: z.string().regex(/^aqpb_[a-f0-9-]{36}$/),
   display_result_on_page: z.boolean().optional().describe(
-    '是否仅把结构化报价结果返回销售页面；开启时不生成 Excel、不发送 WebHook。',
+    '兼容字段；当前所有报价均生成 Excel 并返回销售页面，不发送 WebHook。',
   ),
   expected_monthly_total: z.string().regex(/^\d+(?:\.\d{1,10})?$/),
   pricing_scenarios: z.array(quoteScenarioTotal).min(1).max(3).optional().describe(
@@ -205,6 +212,11 @@ const buildEstimateInput = z.object({
   assumptions: z.array(z.string().min(1).max(500).describe('客户可直接阅读的中文报价假设。')).max(100).default([]),
   adjustments: z.array(quoteAdjustment).max(200).default([]),
   idempotency_key: z.string().min(12).max(160),
+}).strict();
+
+const quoteJobInput = z.object({
+  relay_job_id: z.string().regex(/^gpt-[a-f0-9]{32}$/),
+  submission_code: z.string().regex(/^[1-9]$/),
 }).strict();
 
 function ok(payload) {
@@ -291,9 +303,23 @@ function buildServer(workflow) {
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, guarded((args) => workflow.getPrices(args)));
 
+  server.registerTool('get_quote_job_status', {
+    title: 'Read a resumable quote job checkpoint',
+    description: 'Returns only persisted stage, price batch and delivery state. It never reruns a completed step.',
+    inputSchema: quoteJobInput,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, guarded((args) => workflow.getQuoteJobStatus(args)));
+
+  server.registerTool('resume_quote_job', {
+    title: 'Resume a quote job from its saved stage',
+    description: 'Returns the next missing action and saved identifiers. It does not restart price queries, files or delivery.',
+    inputSchema: quoteJobInput,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, guarded((args) => workflow.resumeQuoteJob(args)));
+
   server.registerTool('build_estimate', {
     title: 'Validate and deliver an official API quote',
-    description: 'Checks selected official catalog evidence, fact coverage and GPT-calculated totals, then returns a page result or delivers the Excel quote to the configured WebHook.',
+    description: 'Checks selected official catalog evidence, fact coverage and GPT-calculated totals, then creates one Excel link and returns it with the quote to the sales page.',
     inputSchema: buildEstimateInput,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, guarded((args) => workflow.buildEstimate(normalizeBuildEstimateInput(args))));

@@ -18,7 +18,7 @@ from urllib.parse import quote
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.core.config import get_settings
 from app.core.diagnostics import (
@@ -245,14 +245,23 @@ async def mcp_v2_get_prices(
 class GptRelayQuoteRequest(BaseModel):
     customer_request: str = Field(min_length=3, max_length=12000)
     cloud_provider: Literal["aws", "azure", "oci", "gcp"] = "aws"
-    pricing_mode: Literal["on_demand", "reserved"] = "on_demand"
-    reserved_term_years: list[Literal[1, 3]] = Field(default_factory=list, max_length=2)
-    payment_option: Literal[
-        "not_applicable", "no_upfront", "partial_upfront", "all_upfront"
-    ] = "not_applicable"
-    include_on_demand_scenario: bool = True
+    pricing_scenarios: list[
+        Literal["on_demand", "one_year_commitment", "three_year_commitment"]
+    ] = Field(default_factory=lambda: ["on_demand"], min_length=1, max_length=3)
     utilization_percent: int = Field(default=100, ge=1, le=100)
-    display_result_on_page: bool = False
+    client_request_id: str = Field(
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    )
+
+    @model_validator(mode="after")
+    def validate_provider_scenarios(self) -> "GptRelayQuoteRequest":
+        scenarios = list(dict.fromkeys(self.pricing_scenarios))
+        if len(scenarios) != len(self.pricing_scenarios):
+            raise ValueError("pricing_scenarios must be unique")
+        if self.cloud_provider == "oci" and scenarios != ["on_demand"]:
+            raise ValueError("OCI public catalog currently supports on_demand only")
+        self.pricing_scenarios = scenarios
+        return self
 
 
 def _gpt_relay_error_response(exc: GptRelayError) -> JSONResponse:
@@ -269,13 +278,11 @@ async def create_gpt_relay_job(request: GptRelayQuoteRequest) -> dict[str, Any] 
         return gpt_quote_relay.create(
             request.customer_request,
             {
-                "pricing_mode": request.pricing_mode,
                 "cloud_provider": request.cloud_provider,
-                "reserved_term_years": list(dict.fromkeys(request.reserved_term_years)),
-                "payment_option": request.payment_option,
-                "include_on_demand_scenario": request.include_on_demand_scenario,
+                "pricing_scenarios": request.pricing_scenarios,
                 "utilization_percent": request.utilization_percent,
-                "display_result_on_page": request.display_result_on_page,
+                "display_result_on_page": True,
+                "client_request_id": request.client_request_id,
             },
         )
     except GptRelayError as exc:

@@ -14,6 +14,8 @@ test('public MCP is an official four-cloud catalog API-only workflow', async (t)
     describeService: async (input) => ({ status: 'ok', input }),
     getAttributeValues: async (input) => ({ status: 'ok', input }),
     getPrices: async (input) => ({ status: 'ok', input }),
+    getQuoteJobStatus: async (input) => ({ status: 'created', input }),
+    resumeQuoteJob: async (input) => ({ status: 'created', input }),
     buildEstimate: async (input) => ({ status: 'delivered', input }),
   };
   const server = buildServer(workflow);
@@ -29,7 +31,7 @@ test('public MCP is an official four-cloud catalog API-only workflow', async (t)
   const listed = await client.listTools();
   assert.deepEqual(
     listed.tools.map((tool) => tool.name),
-    ['describe_service', 'get_attribute_values', 'get_prices', 'build_estimate'],
+    ['describe_service', 'get_attribute_values', 'get_prices', 'get_quote_job_status', 'resume_quote_job', 'build_estimate'],
   );
   assert.doesNotMatch(INSTRUCTIONS, /Calculator|官方报价链接|模板指纹|模板搜索/i);
   assert.match(INSTRUCTIONS, /AWS Price List API/);

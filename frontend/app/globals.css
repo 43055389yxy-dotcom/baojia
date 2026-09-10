@@ -388,8 +388,9 @@ button, input, textarea { font: inherit; }
 .sales-result-totals span { color: #5f829e; font-size: 12px; }
 .sales-result-totals strong { color: #187dbd; font-size: 14px; }
 .sales-result-totals small { grid-column: 2; color: #6e90aa; font-size: 10px; text-align: right; }
-.sales-result-dialog > footer { border-top: 1px solid rgba(102, 161, 209, .2); }
+.sales-result-dialog > footer { flex-wrap: wrap; border-top: 1px solid rgba(102, 161, 209, .2); }
 .sales-result-dialog > footer button { width: auto; min-width: 130px; margin: 0; padding: 0 22px; }
+.sales-result-dialog > footer .sales-download { display: inline-flex; min-width: 130px; align-items: center; justify-content: center; text-decoration: none; }
 
 @keyframes sales-spinner { to { transform: rotate(360deg); } }
 @keyframes sales-status-pulse { 50% { opacity: .58; transform: scale(.88); } }

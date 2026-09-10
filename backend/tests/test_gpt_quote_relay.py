@@ -37,6 +37,22 @@ def test_relay_queues_and_hides_raw_customer_text(tmp_path: Path) -> None:
     assert "sales_name" not in internal
 
 
+def test_repeated_client_request_id_returns_the_original_job(tmp_path: Path) -> None:
+    store = GptQuoteRelayStore(tmp_path)
+    client_request_id = "123e4567-e89b-42d3-a456-426614174000"
+    first = store.create(
+        "东京 EC2 两台，按需。",
+        {"client_request_id": client_request_id, "cloud_provider": "aws"},
+    )
+    second = store.create(
+        "这一段不会覆盖第一次提交。",
+        {"client_request_id": client_request_id, "cloud_provider": "azure"},
+    )
+
+    assert second["job_id"] == first["job_id"]
+    assert store.get(first["job_id"])["customer_request"] == "东京 EC2 两台，按需。"
+
+
 def test_worker_claims_one_job_and_purges_source_after_submission(tmp_path: Path) -> None:
     store = GptQuoteRelayStore(tmp_path)
     first = store.create("东京 EC2 两台，按需。", {})
@@ -88,7 +104,24 @@ def test_delivery_receipt_corrects_a_false_failed_browser_result(tmp_path: Path)
                 "quote_id": "aqv2_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
                 "status": "delivered",
                 "delivered_at": "2026-09-09T17:44:15.870Z",
-                "webhook_event_id": "aqevt_receipt",
+                "spreadsheet_url": "https://baojia.tontiancloud.com/api/backend/api/quote-artifacts/aqdl_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "spreadsheet_filename": "quote.xlsx",
+                "page_result": {
+                    "schema_version": "astraquote-page-result/1",
+                    "currency": "USD",
+                    "region": "ap-northeast-1",
+                    "components": [{
+                        "service_name": "Amazon EC2",
+                        "scenario_costs": [{
+                            "scenario_key": "on_demand", "label": "按需付费",
+                            "monthly_cost": "100", "upfront_cost": "0",
+                        }],
+                    }],
+                    "scenarios": [{
+                        "scenario_key": "on_demand", "label": "按需付费",
+                        "monthly_total": "100", "upfront_total": "0",
+                    }],
+                },
             }
         ),
         encoding="utf-8",
@@ -100,6 +133,7 @@ def test_delivery_receipt_corrects_a_false_failed_browser_result(tmp_path: Path)
     internal = store.get(public["job_id"])
     assert internal["result_status"] == "delivered"
     assert internal["error"] is None
+    assert reconciled["quote_download_url"].endswith("a" * 48)
 
 
 def test_page_result_receipt_completes_job_and_exposes_only_display_data(
@@ -122,6 +156,8 @@ def test_page_result_receipt_completes_job_and_exposes_only_display_data(
                 "quote_id": "aqv2_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
                 "status": "page_result_ready",
                 "delivered_at": "2026-09-09T17:44:15.870Z",
+                "spreadsheet_url": "https://baojia.tontiancloud.com/api/backend/api/quote-artifacts/aqdl_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "spreadsheet_filename": "quote.xlsx",
                 "page_result": {
                     "schema_version": "astraquote-page-result/1",
                     "currency": "USD",
@@ -161,6 +197,7 @@ def test_page_result_receipt_completes_job_and_exposes_only_display_data(
     assert result["status"] == "completed"
     assert result["display_result_on_page"] is True
     assert result["quick_quote_result"]["components"][0]["service_name"] == "Amazon EC2"
+    assert result["quote_download_url"].endswith("b" * 48)
     assert "customer_request" not in result
 
 
@@ -292,10 +329,11 @@ def test_default_comparison_prompt_lists_all_three_selected_scenarios() -> None:
     prompt = build_quote_prompt(
         "东京 EC2 两台，Linux。",
         {
-            "pricing_mode": "reserved",
-            "reserved_term_years": [1, 3],
-            "payment_option": "all_upfront",
-            "include_on_demand_scenario": True,
+            "pricing_scenarios": [
+                "on_demand",
+                "one_year_commitment",
+                "three_year_commitment",
+            ],
             "utilization_percent": 100,
             "cloud_provider": "azure",
         },
@@ -303,15 +341,14 @@ def test_default_comparison_prompt_lists_all_three_selected_scenarios() -> None:
         submission_code="3",
     )
 
-    assert "按需付费" in prompt
-    assert "1 年全预付" in prompt
-    assert "3 年全预付" in prompt
+    assert "即用即付" in prompt
+    assert "1 年预留" in prompt
+    assert "3 年预留" in prompt
     assert "云厂商：微软 Azure（销售已选定，不得改换）" in prompt
-    assert "结果交付方式：生成 Excel 并发送企业微信群" in prompt
-    assert "同时提供按需方案作比较" not in prompt
+    assert "生成 Excel，并在销售报价页提供报价与下载链接；不发送企业微信群" in prompt
 
 
-def test_page_result_prompt_forbids_document_and_group_delivery() -> None:
+def test_every_quote_prompt_requires_excel_and_sales_page_delivery_only() -> None:
     prompt = build_quote_prompt(
         "东京 EC2 一台。",
         {
@@ -326,17 +363,26 @@ def test_page_result_prompt_forbids_document_and_group_delivery() -> None:
     )
 
     assert "官方报价链接" not in prompt
-    assert "报价页直接展示；不生成文档；不发送企业微信群" in prompt
+    assert "生成 Excel，并在销售报价页提供报价与下载链接；不发送企业微信群" in prompt
 
 
 def test_completion_markers_are_still_parsed_outside_the_browser_driver() -> None:
     status, summary = parse_final_response(
-        "报价已交付。\nASTRAQUOTE_STATUS: delivered\n"
-        "ASTRAQUOTE_SUMMARY: 月费 12.34 USD，Excel 已发送，官方链接已生成。"
+        "报价已交付。\nASTRAQUOTE_STATUS: displayed_on_page\n"
+        "ASTRAQUOTE_SUMMARY: 月费 12.34 USD，Excel 和下载链接已在报价页生成。"
     )
 
-    assert status == "delivered"
-    assert summary == "月费 12.34 USD，Excel 已发送，官方链接已生成。"
+    assert status == "displayed_on_page"
+    assert summary == "月费 12.34 USD，Excel 和下载链接已在报价页生成。"
+
+
+def test_browser_worker_accepts_the_current_page_delivery_marker() -> None:
+    worker = (
+        Path(__file__).resolve().parents[2] / "tools/gpt_quote_relay_worker.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'status in {"displayed_on_page", "delivered"}' in worker
+    assert "delivered_without_calculator_link" not in worker
 
 
 def test_permission_detection_accepts_any_explicit_tool_card() -> None:
@@ -381,12 +427,12 @@ def test_project_navigation_requires_a_fresh_chat_in_the_same_project() -> None:
     assert canonical_url_path(old_chat_url) == "/g/g-p-abc123/c/old-chat"
 
 
-def test_parallel_browser_work_is_capped_at_three_tabs() -> None:
-    assert bounded_parallel_tabs(None) == 3
+def test_parallel_browser_work_is_capped_at_four_tabs() -> None:
+    assert bounded_parallel_tabs(None) == 4
     assert bounded_parallel_tabs("2") == 2
     assert bounded_parallel_tabs("0") == 1
-    assert bounded_parallel_tabs("99") == 3
-    assert bounded_parallel_tabs("invalid") == 3
+    assert bounded_parallel_tabs("99") == 4
+    assert bounded_parallel_tabs("invalid") == 4
 
 
 def test_every_active_quote_tab_is_visited_in_each_polling_round() -> None:
@@ -426,7 +472,7 @@ def test_submitted_processing_job_can_be_reattached_after_worker_restart(
 
     resumed = store.claim_submitted_for_monitoring(
         "worker-new",
-        limit=3,
+        limit=4,
         lease_minutes=35,
     )
 

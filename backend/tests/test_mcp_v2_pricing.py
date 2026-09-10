@@ -213,6 +213,32 @@ def test_get_prices_marks_multiple_official_products_ambiguous_without_guessing(
     assert "selected_product" not in item
 
 
+def test_get_prices_requires_refinement_instead_of_returning_a_large_sku_set() -> None:
+    products = [_price_product(f"SKU{index}", {}) for index in range(11)]
+    service = OfficialPricingService(FakeExecutor([{"PriceList": products}]))
+
+    result = service.get_prices(
+        GetPricesRequest(
+            queries=[
+                PriceQuery(
+                    query_id="too-broad",
+                    service_code="AWSLambda",
+                    region="ap-southeast-1",
+                    filters={},
+                )
+            ]
+        )
+    )
+
+    item = result["results"][0]
+    assert item["status"] == "needs_refinement"
+    assert item["matched_count"] == 11
+    assert item["query"]["service_code"] == "AWSLambda"
+    assert item["official_item_ids"] == []
+    assert "products" not in item
+    assert item["refinement_fields"]
+
+
 def test_reserved_prices_use_price_list_terms_instead_of_account_offering_apis() -> None:
     executor = FakeExecutor([{"PriceList": [_reserved_price_product("SKU-RI")]}])
     service = OfficialPricingService(executor)

@@ -14,7 +14,7 @@ Environment=XAUTHORITY=/home/ec2-user/.Xauthority
 Environment=PYTHONPATH=/home/ec2-user/astraquote/source/backend
 Environment=ASTRAQUOTE_GPT_RELAY_DIR=/home/ec2-user/astraquote/data/gpt-relay
 Environment=ASTRAQUOTE_GPT_RELAY_STATE=/home/ec2-user/astraquote/data/gpt-relay/browser-state.json
-Environment=ASTRAQUOTE_GPT_RELAY_MAX_TABS=3
+Environment=ASTRAQUOTE_GPT_RELAY_MAX_TABS=4
 Environment=ASTRAQUOTE_FIREFOX_PROFILE=/home/ec2-user/.mozilla/firefox/z97ytnft.default-default
 Environment=ASTRAQUOTE_CHATGPT_PROJECT=baojia
 Environment=ASTRAQUOTE_CHATGPT_URL=https://chatgpt.com/projects

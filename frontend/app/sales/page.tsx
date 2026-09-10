@@ -4,12 +4,13 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "/api/backend";
 const ACTIVE_JOB_KEY = "astraquote.sales.active-job.v1";
+const PENDING_SUBMISSION_KEY = "astraquote.sales.pending-submission.v1";
 
-type ScenarioKey = "on_demand" | "reserved_1yr_all_upfront" | "reserved_3yr_all_upfront";
+type ScenarioKey = "on_demand" | "one_year_commitment" | "three_year_commitment";
 type CloudProvider = "aws" | "azure" | "oci" | "gcp";
 
 type PageScenarioCost = {
-  scenario_key: "on_demand" | "one_year_all_upfront" | "three_year_all_upfront";
+  scenario_key: ScenarioKey;
   label: string;
   monthly_cost?: string;
   upfront_cost?: string;
@@ -40,6 +41,8 @@ type RelayJob = {
   cloud_provider?: CloudProvider;
   display_result_on_page?: boolean;
   quick_quote_result?: QuickQuoteResult | null;
+  quote_download_url?: string | null;
+  quote_download_filename?: string | null;
 };
 
 type RelayHealth = {
@@ -51,9 +54,28 @@ const statusCopy: Record<RelayJob["status"], { title: string; detail?: string }>
   queued: { title: "报价申请已提交" },
   processing: { title: "报价申请已提交" },
   needs_login: { title: "报价申请已提交" },
-  completed: { title: "报价已完成", detail: "报价结果已发送至企业微信群。" },
+  completed: { title: "报价已完成", detail: "报价结果和 Excel 已生成。" },
   failed: { title: "报价未完成", detail: "请联系管理员处理。" },
-  cancelled: { title: "报价已撤回", detail: "本次报价不会发送至企业微信群。" },
+  cancelled: { title: "报价已撤回", detail: "本次报价已停止处理。" },
+};
+
+const PROVIDER_SCENARIOS: Record<CloudProvider, Array<{ key: ScenarioKey; label: string }>> = {
+  aws: [
+    { key: "on_demand", label: "按需付费" },
+    { key: "one_year_commitment", label: "1 年预留实例全预付" },
+    { key: "three_year_commitment", label: "3 年预留实例全预付" },
+  ],
+  azure: [
+    { key: "on_demand", label: "即用即付" },
+    { key: "one_year_commitment", label: "1 年预留" },
+    { key: "three_year_commitment", label: "3 年预留" },
+  ],
+  oci: [{ key: "on_demand", label: "OCI 公开按量价" }],
+  gcp: [
+    { key: "on_demand", label: "按需付费" },
+    { key: "one_year_commitment", label: "1 年承诺使用" },
+    { key: "three_year_commitment", label: "3 年承诺使用" },
+  ],
 };
 
 function approximateProgress(job: RelayJob) {
@@ -64,7 +86,7 @@ function approximateProgress(job: RelayJob) {
   return Math.min(92, Math.round(14 + (elapsedSeconds / (10 * 60)) * 78));
 }
 
-function estimateWindow(_job: RelayJob) {
+function estimateWindow() {
   return "5～10 分钟";
 }
 
@@ -103,21 +125,26 @@ function quoteCopyText(job: RelayJob) {
   return lines.join("\n").trim();
 }
 
+async function submissionFingerprint(value: unknown) {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 export default function SalesQuotePage() {
   const [requirement, setRequirement] = useState("");
   const [selectedScenarios, setSelectedScenarios] = useState(
-    () => new Set<ScenarioKey>(["on_demand", "reserved_1yr_all_upfront", "reserved_3yr_all_upfront"]),
+    () => new Set<ScenarioKey>(PROVIDER_SCENARIOS.aws.map((scenario) => scenario.key)),
   );
   const [utilization, setUtilization] = useState(100);
   const [cloudProvider, setCloudProvider] = useState<CloudProvider>("aws");
-  const [displayResultOnPage, setDisplayResultOnPage] = useState(false);
   const [health, setHealth] = useState<RelayHealth | null>(null);
   const [job, setJob] = useState<RelayJob | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [pageError, setPageError] = useState("");
   const [trackedJobId, setTrackedJobId] = useState("");
   const [resultOpen, setResultOpen] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState<"" | "quote" | "link">("");
   const [, refreshProgress] = useState(0);
 
   const active = Boolean(job && ["queued", "processing", "needs_login"].includes(job.status));
@@ -132,7 +159,7 @@ export default function SalesQuotePage() {
     if (payload.status === "completed" && payload.quick_quote_result) setResultOpen(true);
     setPageError("");
     if (["completed", "failed", "cancelled"].includes(payload.status)) {
-      window.localStorage.removeItem(ACTIVE_JOB_KEY);
+      window.sessionStorage.removeItem(ACTIVE_JOB_KEY);
       setTrackedJobId("");
     }
     return payload;
@@ -158,7 +185,7 @@ export default function SalesQuotePage() {
   }, []);
 
   useEffect(() => {
-    const savedJobId = window.localStorage.getItem(ACTIVE_JOB_KEY);
+    const savedJobId = window.sessionStorage.getItem(ACTIVE_JOB_KEY);
     if (!savedJobId) return;
     const timer = window.setTimeout(() => setTrackedJobId(savedJobId), 0);
     return () => window.clearTimeout(timer);
@@ -202,33 +229,58 @@ export default function SalesQuotePage() {
     });
   }
 
+  function chooseProvider(provider: CloudProvider) {
+    setCloudProvider(provider);
+    setSelectedScenarios(new Set(PROVIDER_SCENARIOS[provider].map((scenario) => scenario.key)));
+  }
+
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (submitting || active || selectedScenarios.size < 1 || requirement.trim().length < 3) return;
     setSubmitting(true);
     setPageError("");
     try {
-      const reservedTerms = ([1, 3] as const).filter((year) => (
-        selectedScenarios.has(year === 1 ? "reserved_1yr_all_upfront" : "reserved_3yr_all_upfront")
-      ));
-      const includesCommitment = reservedTerms.length > 0;
-      const response = await fetch(`${API_BASE}/api/quote-relay/jobs`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          customer_request: requirement.trim(),
-          cloud_provider: cloudProvider,
-          pricing_mode: includesCommitment ? "reserved" : "on_demand",
-          reserved_term_years: reservedTerms,
-          payment_option: includesCommitment ? "all_upfront" : "not_applicable",
-          include_on_demand_scenario: selectedScenarios.has("on_demand"),
-          utilization_percent: utilization,
-          display_result_on_page: displayResultOnPage,
-        }),
-      });
+      const requestDetails = {
+        customer_request: requirement.trim(),
+        cloud_provider: cloudProvider,
+        pricing_scenarios: PROVIDER_SCENARIOS[cloudProvider]
+          .map((scenario) => scenario.key)
+          .filter((scenario) => selectedScenarios.has(scenario)),
+        utilization_percent: utilization,
+      };
+      const fingerprint = await submissionFingerprint(requestDetails);
+      let pending: { fingerprint?: string; client_request_id?: string } = {};
+      try {
+        pending = JSON.parse(window.sessionStorage.getItem(PENDING_SUBMISSION_KEY) || "{}");
+      } catch {
+        pending = {};
+      }
+      const clientRequestId = pending.fingerprint === fingerprint && pending.client_request_id
+        ? pending.client_request_id
+        : crypto.randomUUID();
+      window.sessionStorage.setItem(PENDING_SUBMISSION_KEY, JSON.stringify({
+        fingerprint,
+        client_request_id: clientRequestId,
+      }));
+      const body = JSON.stringify({ ...requestDetails, client_request_id: clientRequestId });
+      let response: Response | null = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          response = await fetch(`${API_BASE}/api/quote-relay/jobs`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body,
+          });
+          if (response.ok || response.status < 500) break;
+        } catch {
+          if (attempt === 1) throw new Error("network_error");
+        }
+      }
+      if (!response) throw new Error("network_error");
       const payload = await response.json() as RelayJob;
       if (!response.ok || !payload.job_id) throw new Error("报价提交失败，请稍后重试。");
-      window.localStorage.setItem(ACTIVE_JOB_KEY, payload.job_id);
+      window.sessionStorage.setItem(ACTIVE_JOB_KEY, payload.job_id);
+      window.sessionStorage.removeItem(PENDING_SUBMISSION_KEY);
       setTrackedJobId(payload.job_id);
       setJob(payload);
       setRequirement("");
@@ -248,7 +300,7 @@ export default function SalesQuotePage() {
       });
       if (!response.ok) throw new Error();
       const payload = await response.json() as RelayJob;
-      window.localStorage.removeItem(ACTIVE_JOB_KEY);
+      window.sessionStorage.removeItem(ACTIVE_JOB_KEY);
       setTrackedJobId("");
       setJob(payload);
     } catch {
@@ -257,22 +309,34 @@ export default function SalesQuotePage() {
   }
 
   function reset() {
-    window.localStorage.removeItem(ACTIVE_JOB_KEY);
+    window.sessionStorage.removeItem(ACTIVE_JOB_KEY);
+    window.sessionStorage.removeItem(PENDING_SUBMISSION_KEY);
     setTrackedJobId("");
     setJob(null);
     setPageError("");
     setResultOpen(false);
-    setCopied(false);
+    setCopied("");
   }
 
   async function copyQuoteResult() {
     if (!job?.quick_quote_result) return;
     try {
       await navigator.clipboard.writeText(quoteCopyText(job));
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1800);
+      setCopied("quote");
+      window.setTimeout(() => setCopied(""), 1800);
     } catch {
       setPageError("复制失败，请选中报价内容后复制。");
+    }
+  }
+
+  async function copyDownloadLink() {
+    if (!job?.quote_download_url) return;
+    try {
+      await navigator.clipboard.writeText(job.quote_download_url);
+      setCopied("link");
+      window.setTimeout(() => setCopied(""), 1800);
+    } catch {
+      setPageError("下载链接复制失败，请直接点击下载。");
     }
   }
 
@@ -315,7 +379,7 @@ export default function SalesQuotePage() {
                       name="cloud-provider"
                       value={value}
                       checked={cloudProvider === value}
-                      onChange={() => setCloudProvider(value)}
+                      onChange={() => chooseProvider(value)}
                     />
                     <span>{label}</span>
                   </label>
@@ -336,18 +400,14 @@ export default function SalesQuotePage() {
             <fieldset className="sales-pricing-mode">
               <legend>报价方案</legend>
               <div className="sales-choice-row">
-                {([
-                  ["on_demand", "按需付费"],
-                  ["reserved_1yr_all_upfront", "1 年全预付"],
-                  ["reserved_3yr_all_upfront", "3 年全预付"],
-                ] as const).map(([value, label]) => (
-                  <label className={selectedScenarios.has(value) ? "selected" : ""} key={value}>
+                {PROVIDER_SCENARIOS[cloudProvider].map(({ key, label }) => (
+                  <label className={selectedScenarios.has(key) ? "selected" : ""} key={key}>
                     <input
                       type="checkbox"
                       name="pricing-scenario"
-                      value={value}
-                      checked={selectedScenarios.has(value)}
-                      onChange={() => toggleScenario(value)}
+                      value={key}
+                      checked={selectedScenarios.has(key)}
+                      onChange={() => toggleScenario(key)}
                     />
                     <span>{label}</span>
                   </label>
@@ -360,22 +420,6 @@ export default function SalesQuotePage() {
               <input id="sales-utilization" type="number" min={1} max={100} value={utilization} onChange={(event) => setUtilization(Math.min(100, Math.max(1, Number(event.target.value) || 100)))} />
               <span>%</span>
               <small>{workflowLabel}</small>
-            </div>
-
-            <div className="sales-delivery-option">
-              <div>
-                <strong>在页面显示报价结果</strong>
-                <small>适合少量组件；完成后可直接复制，不生成文件，也不发送到企业微信群。</small>
-              </div>
-              <label className="sales-switch">
-                <input
-                  type="checkbox"
-                  checked={displayResultOnPage}
-                  onChange={(event) => setDisplayResultOnPage(event.target.checked)}
-                />
-                <span aria-hidden="true" />
-                <b>{displayResultOnPage ? "开启" : "关闭"}</b>
-              </label>
             </div>
 
             {pageError && <p className="sales-form-error" role="alert">{pageError}</p>}
@@ -395,15 +439,15 @@ export default function SalesQuotePage() {
             <strong className="sales-submission-code">{job.submission_code}</strong>
             <h1>{statusCopy[job.status].title}</h1>
             <span>{job.status === "completed" && job.quick_quote_result
-              ? "报价结果已生成，可直接查看并复制。"
-              : statusCopy[job.status].detail ?? `预计 ${estimateWindow(job)}完成，${job.display_result_on_page ? "完成后将在当前页面显示。" : "结果将自动发送至企业微信群。"}`}</span>
+              ? "报价结果和 Excel 已生成，可查看、复制或下载。"
+              : statusCopy[job.status].detail ?? `预计 ${estimateWindow()}完成，结果将在当前页面显示。`}</span>
           </div>
 
           {active && (
             <div className="sales-job-progress" aria-label={`处理进度约 ${progress}%`}>
               <div><span>处理中</span><b>{progress}%</b></div>
               <i><span style={{ width: `${progress}%` }} /></i>
-              <small>预计 {estimateWindow(job)}</small>
+              <small>预计 {estimateWindow()}</small>
             </div>
           )}
 
@@ -453,7 +497,9 @@ export default function SalesQuotePage() {
             </div>
             <footer>
               <button type="button" className="sales-secondary" onClick={() => setResultOpen(false)}>关闭</button>
-              <button type="button" className="sales-submit" onClick={() => void copyQuoteResult()}>{copied ? "已复制" : "复制报价"}</button>
+              <button type="button" className="sales-secondary" onClick={() => void copyDownloadLink()} disabled={!job.quote_download_url}>{copied === "link" ? "链接已复制" : "复制下载链接"}</button>
+              {job.quote_download_url && <a className="sales-secondary sales-download" href={job.quote_download_url} download={job.quote_download_filename || undefined}>下载 Excel</a>}
+              <button type="button" className="sales-submit" onClick={() => void copyQuoteResult()}>{copied === "quote" ? "报价已复制" : "复制报价"}</button>
             </footer>
           </section>
         </div>

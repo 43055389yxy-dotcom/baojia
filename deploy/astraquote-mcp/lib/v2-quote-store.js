@@ -24,6 +24,13 @@ class V2QuoteStore {
     return path.join(this.directory, `idempotency-${digest}.json`);
   }
 
+  relayPath(relayJobId) {
+    if (!/^gpt-[a-f0-9]{32}$/.test(relayJobId)) {
+      throw new QuoteStoreError('Invalid relay job ID.', { code: 'relay_job_id_invalid' });
+    }
+    return path.join(this.directory, `relay-${relayJobId}.json`);
+  }
+
   quotePath(quoteId) {
     if (!/^aqv2_[a-f0-9-]{36}$/.test(quoteId)) {
       throw new QuoteStoreError('Invalid quote ID.', { code: 'quote_id_invalid' });
@@ -59,6 +66,29 @@ class V2QuoteStore {
     return this.get(index.quote_id);
   }
 
+  findByRelayJobId(relayJobId) {
+    const target = this.relayPath(relayJobId);
+    if (!fs.existsSync(target)) return null;
+    const index = JSON.parse(fs.readFileSync(target, 'utf8'));
+    return index.quote_id ? this.get(index.quote_id) : null;
+  }
+
+  getCheckpoint(relayJobId) {
+    const target = this.relayPath(relayJobId);
+    if (!fs.existsSync(target)) return null;
+    return JSON.parse(fs.readFileSync(target, 'utf8'));
+  }
+
+  putCheckpoint(relayJobId, changes) {
+    const target = this.relayPath(relayJobId);
+    const current = fs.existsSync(target)
+      ? JSON.parse(fs.readFileSync(target, 'utf8'))
+      : { relay_job_id: relayJobId, stage: 'created', created_at: new Date().toISOString() };
+    const updated = { ...current, ...changes, relay_job_id: relayJobId, updated_at: new Date().toISOString() };
+    this.writeAtomic(target, updated);
+    return updated;
+  }
+
   put(record) {
     const target = this.quotePath(record.quote_id);
     this.writeAtomic(target, record);
@@ -66,6 +96,14 @@ class V2QuoteStore {
       quote_id: record.quote_id,
       created_at: record.created_at,
     });
+    if (record.relay_job_id) {
+      this.putCheckpoint(record.relay_job_id, {
+        quote_id: record.quote_id,
+        idempotency_key: record.idempotency_key,
+        price_batch_id: record.price_batch_id,
+        stage: 'estimate_validated',
+      });
+    }
   }
 
   get(quoteId) {

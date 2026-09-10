@@ -29,23 +29,24 @@ GCP_BILLING_API_KEY=...
 
 API Key 只用于访问官方目录，MCP 不接收也不向 GPT 返回密钥。
 
-Excel 交付仍需要配置私有 S3、稳定下载入口和企业微信 WebHook：
+Excel 交付需要配置私有 S3 和稳定下载入口；结果只回到销售页面，不发送企业微信：
 
 ```text
 ASTRAQUOTE_XLSX_BUCKET=...
 ASTRAQUOTE_XLSX_REGION=...
 ASTRAQUOTE_PUBLIC_BASE_URL=https://baojia.tontiancloud.com
-ASTRAQUOTE_WEBHOOK_URL=...
 ```
 
 ## MCP 工具
 
-生产 MCP 只公开四个工具：
+生产 MCP 只公开六个工具：
 
 1. `describe_service`：查询 AWS Price List 服务元数据。
 2. `get_attribute_values`：查询 AWS 官方属性值。
 3. `get_prices`：按 GPT 提供的参数查询 AWS、Azure、OCI 或 GCP 官方价目。
-4. `build_estimate`：验证 GPT 选中的官方证据与计算结果，然后交付。
+4. `get_quote_job_status`：读取已保存的报价阶段和批次。
+5. `resume_quote_job`：只返回下一缺失步骤，不重跑已成功动作。
+6. `build_estimate`：验证 GPT 选中的官方证据与计算结果，然后生成 Excel 并返回销售页面。
 
 ## 部署与检查
 

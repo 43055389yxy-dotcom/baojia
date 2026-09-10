@@ -25,11 +25,30 @@ const LABEL_FILL = 'FFEAF2F5';
 const ALT_FILL = 'FFF5F9FA';
 const BORDER = 'FFD4DDE1';
 const TEXT = 'FF24313A';
-const SCENARIO_LABELS = Object.freeze({
-  on_demand: '按需月费',
-  one_year_all_upfront: '1 年全预付月费',
-  three_year_all_upfront: '3 年全预付月费',
+const PROVIDER_SCENARIO_LABELS = Object.freeze({
+  aws: {
+    on_demand: '按需月费',
+    one_year_commitment: '1 年预留实例全预付月费',
+    three_year_commitment: '3 年预留实例全预付月费',
+  },
+  azure: {
+    on_demand: '即用即付月费',
+    one_year_commitment: '1 年预留折合月费',
+    three_year_commitment: '3 年预留折合月费',
+  },
+  oci: { on_demand: 'OCI 公开按量月费' },
+  gcp: {
+    on_demand: '按需月费',
+    one_year_commitment: '1 年承诺使用月费',
+    three_year_commitment: '3 年承诺使用月费',
+  },
 });
+
+function scenarioLabel(record, scenario) {
+  return PROVIDER_SCENARIO_LABELS[record.cloud_provider || 'aws']?.[scenario.scenario_key]
+    || scenario.label
+    || null;
+}
 
 function friendlyRegion(value) {
   const code = String(value || '').trim();
@@ -90,7 +109,7 @@ function componentDetails(record) {
     adjustmentsByComponent.set(item.component_key, existing);
   }
   const scenarios = Array.isArray(record.pricing_scenarios)
-    ? record.pricing_scenarios.filter((scenario) => SCENARIO_LABELS[scenario.scenario_key])
+    ? record.pricing_scenarios.filter((scenario) => scenarioLabel(record, scenario))
     : [];
   return components.map((component, index) => {
     const display = component.customer_facing || {};
@@ -144,7 +163,7 @@ async function buildQuoteWorkbook(record) {
 
   const costs = record.verification.costs || {};
   const scenarios = Array.isArray(record.pricing_scenarios)
-    ? record.pricing_scenarios.filter((scenario) => SCENARIO_LABELS[scenario.scenario_key])
+    ? record.pricing_scenarios.filter((scenario) => scenarioLabel(record, scenario))
     : [];
   const rows = componentDetails(record);
   const priceColumnCount = scenarios.length || 1;
@@ -184,7 +203,7 @@ async function buildQuoteWorkbook(record) {
   ];
 
   const priceHeaders = scenarios.length > 0
-    ? scenarios.map((scenario) => SCENARIO_LABELS[scenario.scenario_key])
+    ? scenarios.map((scenario) => scenarioLabel(record, scenario))
     : ['月费'];
   const headers = ['序号', '云服务', '区域', '型号 / 方案', '数量', '配置', ...priceHeaders, '参考单价', '备注'];
   const headerRow = sheet.getRow(1);

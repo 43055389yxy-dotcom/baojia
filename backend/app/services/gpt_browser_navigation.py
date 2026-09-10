@@ -12,13 +12,13 @@ _PROJECT_ID_PATTERN = re.compile(
 
 
 def bounded_parallel_tabs(value: str | None) -> int:
-    """Keep one browser profile within the supported one-to-three work tabs."""
+    """Keep one browser profile within the supported one-to-four work tabs."""
 
     try:
-        requested = int(value or "3")
+        requested = int(value or "4")
     except (TypeError, ValueError):
-        requested = 3
-    return min(3, max(1, requested))
+        requested = 4
+    return min(4, max(1, requested))
 
 
 def active_quote_poll_order(active_quotes: Mapping[str, Any]) -> tuple[str, ...]:

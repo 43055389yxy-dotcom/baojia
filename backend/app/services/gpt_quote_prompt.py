@@ -29,36 +29,40 @@ def _selection_policy_prompt() -> str:
 
 
 def _pricing_summary(options: dict[str, Any]) -> str:
-    pricing_mode = str(options.get("pricing_mode") or "on_demand")
-    terms = options.get("reserved_term_years") or []
-    payment = str(options.get("payment_option") or "not_applicable")
+    provider = str(options.get("cloud_provider") or "aws")
     utilization = int(options.get("utilization_percent") or 100)
-    include_on_demand = bool(options.get("include_on_demand_scenario", True))
-
-    if pricing_mode == "reserved" and payment == "all_upfront":
-        parts = ["按需付费"] if include_on_demand else []
-        parts.extend(f"{int(term)} 年全预付" for term in terms)
-        parts.append(f"使用率 {utilization}%")
-        return "；".join(parts)
-
-    mode_labels = {
-        "on_demand": "按需付费",
-        "reserved": "预留实例",
-    }
-    payment_labels = {
-        "not_applicable": "不适用预付选项",
-        "no_upfront": "无预付",
-        "partial_upfront": "部分预付",
-        "all_upfront": "全预付",
-    }
-    parts = [mode_labels.get(pricing_mode, pricing_mode)]
-    if terms:
-        parts.append("期限 " + "、".join(f"{int(term)} 年" for term in terms))
-    if payment != "not_applicable":
-        parts.append(payment_labels.get(payment, payment))
+    scenarios = options.get("pricing_scenarios")
+    if not scenarios:
+        # Read-only boundary for tasks queued before the provider-native schema.
+        scenarios = []
+        if options.get("include_on_demand_scenario", True):
+            scenarios.append("on_demand")
+        if options.get("pricing_mode") == "reserved" and options.get("payment_option") == "all_upfront":
+            for years in options.get("reserved_term_years") or []:
+                if int(years) == 1:
+                    scenarios.append("one_year_commitment")
+                if int(years) == 3:
+                    scenarios.append("three_year_commitment")
+    labels = {
+        "aws": {
+            "on_demand": "按需付费",
+            "one_year_commitment": "1 年预留实例全预付",
+            "three_year_commitment": "3 年预留实例全预付",
+        },
+        "azure": {
+            "on_demand": "即用即付",
+            "one_year_commitment": "1 年预留",
+            "three_year_commitment": "3 年预留",
+        },
+        "oci": {"on_demand": "OCI 公开按量价"},
+        "gcp": {
+            "on_demand": "按需付费",
+            "one_year_commitment": "1 年承诺使用",
+            "three_year_commitment": "3 年承诺使用",
+        },
+    }.get(provider, {})
+    parts = [labels.get(str(scenario), str(scenario)) for scenario in scenarios]
     parts.append(f"使用率 {utilization}%")
-    if include_on_demand and pricing_mode != "on_demand":
-        parts.append("同时提供按需方案作比较")
     return "；".join(parts)
 
 
@@ -77,11 +81,7 @@ def build_quote_prompt(
         "oci": "Oracle Cloud",
         "gcp": "Google Cloud",
     }.get(provider, provider)
-    delivery_method = (
-        "报价页直接展示；不生成文档；不发送企业微信群"
-        if options.get("display_result_on_page")
-        else "生成 Excel 并发送企业微信群"
-    )
+    delivery_method = "生成 Excel，并在销售报价页提供报价与下载链接；不发送企业微信群"
     return (
         f"请使用 AstraQuote 完成正式 {provider_label} 报价并交付。\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n\n"
