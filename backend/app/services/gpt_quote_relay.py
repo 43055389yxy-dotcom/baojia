@@ -17,9 +17,11 @@ import tempfile
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+UTC = timezone.utc
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 DELIVERY_RECEIPT_STATUSES = {

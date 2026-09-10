@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 
@@ -24,6 +25,25 @@ from app.services.gpt_quote_prompt import (
     parse_final_response,
 )
 from app.services.gpt_quote_relay import GptQuoteRelayStore, GptRelayError
+
+
+def test_host_relay_uses_python39_compatible_datetime_api() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "services"
+        / "gpt_quote_relay.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+
+    datetime_imports = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "datetime"
+        for alias in node.names
+    }
+
+    assert "UTC" not in datetime_imports
 
 
 def test_relay_queues_and_hides_raw_customer_text(tmp_path: Path) -> None:
