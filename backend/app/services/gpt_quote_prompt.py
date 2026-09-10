@@ -94,11 +94,29 @@ def build_quote_prompt(
     )
 
 
+def build_quote_continuation_prompt(
+    *,
+    relay_job_id: str,
+    submission_code: str,
+) -> str:
+    """Continue one submitted quote without restoring or repeating customer text."""
+
+    return (
+        "这不是新报价，当前 AstraQuote 报价尚未产生最终结果。"
+        "请在本对话中从已保存阶段继续完成，不要只汇报剩余待办，"
+        "也不要重复已经成功的查价、文件或交付步骤。\n\n"
+        f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n\n"
+        "只有报价与 Excel 下载链接已经在销售页面就绪，或者存在确实无法继续处理的"
+        "单一阻塞原因时，才结束本次回复。"
+    )
+
+
 def parse_final_response(text: str) -> tuple[str, str]:
     status_match = FINAL_STATUS_PATTERN.search(text)
     summary_match = FINAL_SUMMARY_PATTERN.search(text)
     if not status_match:
-        return "blocked", "ChatGPT 未返回可验证的 AstraQuote 完成状态。"
+        summary = text.strip()[-800:] or "ChatGPT 尚未返回 AstraQuote 最终状态。"
+        return "incomplete", summary
     status = status_match.group(1).lower()
     summary = summary_match.group(1).strip() if summary_match else text.strip()[-800:]
     return status, summary[:1600]

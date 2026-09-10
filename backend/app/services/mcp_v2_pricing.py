@@ -506,6 +506,8 @@ def _require_refinement_for_large_result(
     compact.update(
         {
             "status": "needs_refinement",
+            "terminal": False,
+            "next_action": "refine_query",
             "matched_count": len(candidates),
             "matched_count_is_lower_bound": more_available,
             "more_results_available": more_available,

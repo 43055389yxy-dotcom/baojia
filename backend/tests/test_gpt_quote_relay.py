@@ -7,6 +7,7 @@ import pytest
 
 from app.services.gpt_browser_navigation import (
     active_quote_poll_order,
+    bounded_continuation_attempts,
     bounded_parallel_tabs,
     canonical_url_path,
     is_new_project_chat,
@@ -17,7 +18,11 @@ from app.services.gpt_browser_navigation import (
     is_tool_permission_prompt,
     is_transient_browser_poll_exception,
 )
-from app.services.gpt_quote_prompt import build_quote_prompt, parse_final_response
+from app.services.gpt_quote_prompt import (
+    build_quote_continuation_prompt,
+    build_quote_prompt,
+    parse_final_response,
+)
 from app.services.gpt_quote_relay import GptQuoteRelayStore, GptRelayError
 
 
@@ -34,6 +39,7 @@ def test_relay_queues_and_hides_raw_customer_text(tmp_path: Path) -> None:
     assert public["cloud_provider"] == "aws"
     internal = store.get(public["job_id"])
     assert internal["customer_request"] == "东京 EC2 两台，按需。"
+    assert internal["continuation_attempts"] == 0
     assert "sales_name" not in internal
 
 
@@ -376,12 +382,38 @@ def test_completion_markers_are_still_parsed_outside_the_browser_driver() -> Non
     assert summary == "月费 12.34 USD，Excel 和下载链接已在报价页生成。"
 
 
+def test_stage_summary_without_final_marker_requires_continuation() -> None:
+    status, summary = parse_final_response(
+        "当前已确认 EC2 和 RDS 官方价格。Redis 与 S3 仍需继续收窄，"
+        "下一步完成剩余查询后再生成 Excel。"
+    )
+
+    assert status == "incomplete"
+    assert "Redis 与 S3" in summary
+
+
+def test_continuation_prompt_reuses_identity_without_restoring_customer_text() -> None:
+    prompt = build_quote_continuation_prompt(
+        relay_job_id="gpt-dddddddddddddddddddddddddddddddd",
+        submission_code="6",
+    )
+
+    assert "gpt-dddddddddddddddddddddddddddddddd" in prompt
+    assert "提交码 6" in prompt
+    assert "从已保存阶段继续" in prompt
+    assert "客户需求" not in prompt
+    assert "get_prices" not in prompt
+    assert "build_estimate" not in prompt
+
+
 def test_browser_worker_accepts_the_current_page_delivery_marker() -> None:
     worker = (
         Path(__file__).resolve().parents[2] / "tools/gpt_quote_relay_worker.py"
     ).read_text(encoding="utf-8")
 
     assert 'status in {"displayed_on_page", "delivered"}' in worker
+    assert 'if outcome == "continue":' in worker
+    assert "browser.continue_quote(active, continuation_prompt)" in worker
     assert "delivered_without_calculator_link" not in worker
 
 
@@ -433,6 +465,14 @@ def test_parallel_browser_work_is_capped_at_four_tabs() -> None:
     assert bounded_parallel_tabs("0") == 1
     assert bounded_parallel_tabs("99") == 4
     assert bounded_parallel_tabs("invalid") == 4
+
+
+def test_automatic_continuation_attempts_are_bounded_and_config_safe() -> None:
+    assert bounded_continuation_attempts(None) == 20
+    assert bounded_continuation_attempts("8") == 8
+    assert bounded_continuation_attempts("0") == 1
+    assert bounded_continuation_attempts("99") == 20
+    assert bounded_continuation_attempts("invalid") == 20
 
 
 def test_every_active_quote_tab_is_visited_in_each_polling_round() -> None:

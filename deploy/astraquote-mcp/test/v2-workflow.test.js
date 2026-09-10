@@ -122,6 +122,8 @@ test('resuming a price batch queries only unfinished ids and reuses successful r
   let calls = 1;
   const first = await workflow.getPrices({ queries: [query] });
   assert.equal(first.status, 'needs_refinement');
+  assert.equal(first.terminal, false);
+  assert.equal(first.next_action, 'refine_incomplete_queries');
 
   backend.getPrices = async (input) => {
     calls += 1;

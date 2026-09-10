@@ -195,6 +195,7 @@ class GptQuoteRelayStore:
                 "project_name": None,
                 "result_summary": None,
                 "error": None,
+                "continuation_attempts": 0,
             }
             self._write_atomic(self._path(job_id), record)
             self._write_atomic(

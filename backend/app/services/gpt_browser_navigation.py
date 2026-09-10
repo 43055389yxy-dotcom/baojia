@@ -21,6 +21,16 @@ def bounded_parallel_tabs(value: str | None) -> int:
     return min(4, max(1, requested))
 
 
+def bounded_continuation_attempts(value: str | None) -> int:
+    """Keep automatic continuation finite without making large quotes too brittle."""
+
+    try:
+        requested = int(value or "20")
+    except (TypeError, ValueError):
+        requested = 20
+    return min(20, max(1, requested))
+
+
 def active_quote_poll_order(active_quotes: Mapping[str, Any]) -> tuple[str, ...]:
     """Snapshot every active tab so one polling round cannot omit background work."""
 

@@ -232,6 +232,8 @@ def test_get_prices_requires_refinement_instead_of_returning_a_large_sku_set() -
 
     item = result["results"][0]
     assert item["status"] == "needs_refinement"
+    assert item["terminal"] is False
+    assert item["next_action"] == "refine_query"
     assert item["matched_count"] == 11
     assert item["query"]["service_code"] == "AWSLambda"
     assert item["official_item_ids"] == []

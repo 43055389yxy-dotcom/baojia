@@ -515,6 +515,8 @@ class AstraQuoteV2Workflow {
     const completed = incompleteQueryIds.length === 0;
     const mergedResult = {
       status: completed ? 'completed' : 'needs_refinement',
+      terminal: completed,
+      next_action: completed ? 'build_estimate' : 'refine_incomplete_queries',
       result_count: mergedResults.size,
       results: [...mergedResults.values()],
     };

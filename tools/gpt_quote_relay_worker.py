@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 from app.services.gpt_browser_navigation import (
     active_quote_poll_order,
+    bounded_continuation_attempts,
     bounded_parallel_tabs,
     canonical_url_path,
     is_new_project_chat,
@@ -29,7 +30,11 @@ from app.services.gpt_browser_navigation import (
     is_tool_permission_prompt,
     is_transient_browser_poll_exception,
 )
-from app.services.gpt_quote_prompt import build_quote_prompt, parse_final_response
+from app.services.gpt_quote_prompt import (
+    build_quote_continuation_prompt,
+    build_quote_prompt,
+    parse_final_response,
+)
 from app.services.gpt_quote_relay import GptQuoteRelayStore, utc_now
 from selenium import webdriver
 from selenium.common.exceptions import WebDriverException
@@ -56,6 +61,9 @@ STATE_PATH = Path(
 POLL_SECONDS = float(os.environ.get("ASTRAQUOTE_GPT_RELAY_POLL_SECONDS", "4"))
 QUOTE_TIMEOUT_SECONDS = int(os.environ.get("ASTRAQUOTE_GPT_QUOTE_TIMEOUT", "1800"))
 MAX_CONCURRENCY = bounded_parallel_tabs(os.environ.get("ASTRAQUOTE_GPT_RELAY_MAX_TABS"))
+MAX_CONTINUATION_ATTEMPTS = bounded_continuation_attempts(
+    os.environ.get("ASTRAQUOTE_GPT_MAX_CONTINUATIONS")
+)
 WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
 
 def atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -107,6 +115,7 @@ class ActiveQuote:
     saw_assistant: bool = False
     retry_visible_since: float | None = None
     retry_clicked: bool = False
+    minimum_assistant_messages: int = 0
 
 
 class ChatGptBrowser:
@@ -596,6 +605,12 @@ class ChatGptBrowser:
         messages = self._visible(
             driver.find_elements(By.CSS_SELECTOR, "[data-message-author-role='assistant']")
         )
+        if len(messages) < quote.minimum_assistant_messages:
+            if time.monotonic() >= quote.deadline:
+                raise TimeoutError(
+                    f"ChatGPT quote did not finish in {QUOTE_TIMEOUT_SECONDS} seconds"
+                )
+            return None
         current = messages[-1].text.strip() if messages else ""
         now = time.monotonic()
         if current:
@@ -658,6 +673,15 @@ class ChatGptBrowser:
 
     def submit(self, prompt: str) -> str:
         driver = self._driver()
+        self._send_prompt(prompt)
+        WebDriverWait(driver, 30).until(lambda _: "/c/" in driver.current_url)
+        return driver.current_url
+
+    def _send_prompt(self, prompt: str) -> None:
+        driver = self._driver()
+        user_message_count = len(
+            driver.find_elements(By.CSS_SELECTOR, "[data-message-author-role='user']")
+        )
         composer = self._composer(45)
         composer.click()
         lines = prompt.splitlines()
@@ -668,10 +692,34 @@ class ChatGptBrowser:
                 composer.send_keys(Keys.SHIFT, Keys.ENTER)
         composer.send_keys(Keys.ENTER)
         WebDriverWait(driver, 30).until(
-            lambda _: bool(driver.find_elements(By.CSS_SELECTOR, "[data-message-author-role='user']"))
+            lambda _: len(
+                driver.find_elements(By.CSS_SELECTOR, "[data-message-author-role='user']")
+            )
+            > user_message_count
         )
-        WebDriverWait(driver, 30).until(lambda _: "/c/" in driver.current_url)
-        return driver.current_url
+
+    def continue_quote(self, quote: ActiveQuote, prompt: str) -> None:
+        """Continue an unfinished response in its original isolated quote tab."""
+
+        driver = self._driver()
+        self._switch_to_quote(quote)
+        if canonical_url_path(driver.current_url) != canonical_url_path(quote.chat_url):
+            raise RuntimeError("报价工作页已离开对应会话。")
+        assistant_count = len(
+            self._visible(
+                driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "[data-message-author-role='assistant']",
+                )
+            )
+        )
+        self._send_prompt(prompt)
+        quote.minimum_assistant_messages = assistant_count + 1
+        quote.last_text = ""
+        quote.stable_since = time.monotonic()
+        quote.saw_assistant = False
+        quote.retry_visible_since = None
+        quote.retry_clicked = False
 
     def wait_for_final_response(self, timeout_seconds: int) -> str:
         driver = self._driver()
@@ -749,11 +797,13 @@ def submit_job(
     return active
 
 
-def complete_job(store: GptQuoteRelayStore, job_id: str, response: str) -> None:
+def complete_job(store: GptQuoteRelayStore, job_id: str, response: str) -> str:
     current = store.reconcile_delivery_receipt(job_id)
     if current.get("status") in {"cancelled", "completed"}:
-        return
+        return str(current["status"])
     status, summary = parse_final_response(response)
+    if status == "incomplete":
+        return "continue"
     # `displayed_on_page` is the current delivery contract. `delivered` is
     # accepted only for conversations started before the contract changed.
     if status in {"displayed_on_page", "delivered"}:
@@ -769,7 +819,7 @@ def complete_job(store: GptQuoteRelayStore, job_id: str, response: str) -> None:
             stage="completed",
             message="报价文档和可用链接已完成交付",
         )
-        return
+        return "completed"
     store.update_if_not_cancelled(
         job_id,
         {
@@ -780,6 +830,24 @@ def complete_job(store: GptQuoteRelayStore, job_id: str, response: str) -> None:
         },
         stage="failed",
         message="ChatGPT 未通过最终报价核对，任务已安全停止",
+    )
+    return "failed"
+
+
+def fail_continuation_limit(store: GptQuoteRelayStore, job_id: str) -> None:
+    store.update_if_not_cancelled(
+        job_id,
+        {
+            "status": "failed",
+            "result_summary": "ChatGPT 多次只返回阶段进度，未给出最终完成或明确阻塞状态。",
+            "error": {
+                "code": "gpt_quote_continuation_limit",
+                "message": "报价在限定续跑次数内仍未产生最终状态。",
+            },
+            "lease_expires_at": None,
+        },
+        stage="failed",
+        message="报价多次续跑后仍未产生最终状态",
     )
 
 
@@ -878,7 +946,27 @@ def main() -> int:
                     )
                     if response is None:
                         continue
-                    complete_job(store, job_id, response)
+                    outcome = complete_job(store, job_id, response)
+                    if outcome == "continue":
+                        latest = store.get(job_id)
+                        attempts = int(latest.get("continuation_attempts") or 0)
+                        if attempts >= MAX_CONTINUATION_ATTEMPTS:
+                            fail_continuation_limit(store, job_id)
+                            browser.close_quote(active)
+                            active_quotes.pop(job_id, None)
+                            continue
+                        continuation_prompt = build_quote_continuation_prompt(
+                            relay_job_id=job_id,
+                            submission_code=str(latest.get("submission_code") or ""),
+                        )
+                        browser.continue_quote(active, continuation_prompt)
+                        store.update_if_not_cancelled(
+                            job_id,
+                            {"continuation_attempts": attempts + 1},
+                            stage="continuing",
+                            message="报价尚未完成，已在原对话从保存阶段自动继续",
+                        )
+                        continue
                     browser.close_quote(active)
                     active_quotes.pop(job_id, None)
                 except Exception as exc:

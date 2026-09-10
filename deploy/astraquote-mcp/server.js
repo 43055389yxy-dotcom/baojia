@@ -298,7 +298,7 @@ function buildServer(workflow) {
 
   server.registerTool('get_prices', {
     title: 'Batch query official cloud prices',
-    description: 'Dispatches caller-supplied parameters to AWS, Azure, OCI or GCP official price catalogs and returns raw candidates. GPT chooses and calculates.',
+    description: 'Dispatches caller-supplied parameters to AWS, Azure, OCI or GCP official price catalogs and returns raw candidates. needs_refinement is non-terminal: GPT must refine the unfinished queries and continue. GPT chooses and calculates.',
     inputSchema: getPricesInput,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, guarded((args) => workflow.getPrices(args)));
