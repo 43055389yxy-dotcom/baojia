@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from app.domain.customer_facts import CUSTOMER_FACT_SOURCES
 from app.domain.models import ServiceRequirement
 
-PRICING_CONTRACT_VERSION = "2026-08-30.3"
+PRICING_CONTRACT_VERSION = "2026-09-01.2"
 
 _EBS_STORAGE_TYPES = {"gp2", "gp3", "io1", "io2", "st1", "sc1", "standard"}
 _DISK_FIELDS = {
@@ -24,6 +24,91 @@ class PricingContractIssue:
     field: str
     message: str
     evidence: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ScaledTotalContract:
+    """Declarative arithmetic relation between one unit and its total."""
+
+    per_resource_field: str
+    total_field: str
+    topology_fields: tuple[str, ...] = ()
+    include_deployment_quantity: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class SharedOfferUsageContract:
+    """Declarative cross-offer usage derived from formal requirement fields."""
+
+    amount_field: str
+    service_code: str
+    billing_kind: str
+    topology_fields: tuple[str, ...] = ()
+    include_deployment_quantity: bool = True
+    default_variant: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class DeclaredSharedOfferUsage:
+    amount_field: str
+    service_code: str
+    billing_kind: str
+    amount: float
+    source_fields: tuple[str, ...]
+    variant: str = ""
+
+
+_SCALED_TOTAL_CONTRACTS: dict[str, tuple[ScaledTotalContract, ...]] = {
+    "ec2": (
+        ScaledTotalContract("system_disk_gib", "total_system_disk_gib"),
+        ScaledTotalContract(
+            "data_transfer_out_gib_per_instance",
+            "data_transfer_out_gib",
+        ),
+    ),
+    "ebs": (ScaledTotalContract("storage_gib", "total_storage_gib"),),
+    "msk": (
+        ScaledTotalContract(
+            "storage_gib_per_broker",
+            "total_storage_gib",
+            topology_fields=("broker_count",),
+        ),
+    ),
+    "mq": (
+        ScaledTotalContract(
+            "storage_gib_per_broker",
+            "total_storage_gib",
+            topology_fields=("broker_count",),
+        ),
+    ),
+    "opensearch": (
+        ScaledTotalContract(
+            "storage_gib_per_node",
+            "total_storage_gib",
+            topology_fields=("data_nodes", "nodes"),
+            include_deployment_quantity=False,
+        ),
+    ),
+}
+
+
+# Role-scoped capacity belongs to the workload component while AWS may publish
+# its price in another offer.  Keep topology arithmetic here so adapters never
+# invent their own ``capacity × nodes × deployments`` interpretation.
+_SHARED_OFFER_USAGE_CONTRACTS: dict[
+    str, tuple[SharedOfferUsageContract, ...]
+] = {
+    "emr": tuple(
+        SharedOfferUsageContract(
+            amount_field=f"{role}_storage_gib_per_node",
+            service_code="AmazonEC2",
+            billing_kind="ebs_volume_storage",
+            topology_fields=(f"{role}_nodes",),
+            default_variant="gp3",
+        )
+        for role in ("master", "core", "task")
+    ),
+}
 
 
 def _service_key(requirement: ServiceRequirement) -> str:
@@ -145,6 +230,271 @@ def _remove_duplicate_alias(
         _remove_field(requirement, alias_field)
 
 
+def _normalize_evidence(value: str) -> str:
+    return "".join(character.casefold() for character in value if character.isalnum())
+
+
+def _collapse_duplicate_ec2_disk_fact(requirement: ServiceRequirement) -> None:
+    """Ensure one customer storage statement owns one EC2 disk field.
+
+    The cleaning model may interpret an unqualified phrase such as
+    ``每节点存储2T`` as an additional EBS volume while the deterministic
+    literal overlay interprets the same phrase as the instance system disk.
+    Those are two representations of one fact, not two disks.  Explicitly
+    separate system/data disk statements remain independent even when their
+    capacities happen to match.
+    """
+
+    system_size = requirement.requirements.get("system_disk_gib")
+    volumes = requirement.requirements.get("additional_ebs_volumes")
+    if (
+        not isinstance(system_size, (int, float))
+        or isinstance(system_size, bool)
+        or not isinstance(volumes, list)
+        or len(volumes) != 1
+        or not isinstance(volumes[0], dict)
+    ):
+        return
+
+    volume = volumes[0]
+    data_size = volume.get("size_gib")
+    count = volume.get("count_per_instance", 1)
+    if (
+        not isinstance(data_size, (int, float))
+        or isinstance(data_size, bool)
+        or not isinstance(count, (int, float))
+        or isinstance(count, bool)
+        or abs(float(count) - 1.0) > 1e-9
+        or abs(float(system_size) - float(data_size)) > 1e-9
+    ):
+        return
+
+    system_evidence = requirement.field_evidence.get(
+        _path("system_disk_gib"), ""
+    )
+    data_evidence = requirement.field_evidence.get(
+        _path("additional_ebs_volumes"), ""
+    )
+    normalized_system = _normalize_evidence(system_evidence)
+    normalized_data = _normalize_evidence(data_evidence)
+    same_statement = bool(
+        normalized_system
+        and normalized_data
+        and (
+            normalized_system == normalized_data
+            or normalized_system in normalized_data
+            or normalized_data in normalized_system
+        )
+    )
+    if not same_statement:
+        return
+
+    combined_evidence = f"{system_evidence}；{data_evidence}".casefold()
+    has_explicit_system_role = bool(
+        re.search(
+            r"系统盘|启动盘|根卷|root\s*(?:disk|volume)|boot\s*(?:disk|volume)",
+            combined_evidence,
+            flags=re.IGNORECASE,
+        )
+    )
+    has_explicit_data_role = bool(
+        re.search(
+            r"数据盘|附加盘|数据卷|附加卷|data\s*(?:disk|volume)",
+            combined_evidence,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    if has_explicit_system_role and has_explicit_data_role:
+        return
+    if has_explicit_data_role:
+        _remove_field(requirement, "system_disk_gib")
+        return
+
+    # A sole explicit system role, or an unqualified storage phrase, uses the
+    # established EC2 canonical owner.  The important invariant is that the
+    # one customer fact is consumed exactly once.
+    _remove_field(requirement, "additional_ebs_volumes")
+
+
+def _reconcile_per_resource_total(
+    requirement: ServiceRequirement,
+    *,
+    per_resource_field: str,
+    total_field: str,
+    issues: list[PricingContractIssue],
+    multiplier: float | None = None,
+) -> None:
+    """Reconcile a per-resource value with its arithmetic total.
+
+    An arithmetic total generated by the system is never a second customer
+    fact.  Two explicit customer values may coexist as a useful cross-check,
+    but a contradiction must stop the quote instead of allowing an adapter to
+    pick whichever field it happens to read first.
+    """
+
+    per_resource = requirement.requirements.get(per_resource_field)
+    total = requirement.requirements.get(total_field)
+    if (
+        not isinstance(per_resource, (int, float))
+        or isinstance(per_resource, bool)
+        or not isinstance(total, (int, float))
+        or isinstance(total, bool)
+    ):
+        return
+
+    per_path = _path(per_resource_field)
+    total_path = _path(total_field)
+    per_source = requirement.field_sources.get(per_path, "")
+    total_source = requirement.field_sources.get(total_path, "")
+
+    # A generated total is never an additional customer fact and must not
+    # survive into usage provenance. The canonical per-resource value remains
+    # the owner when the customer supplied the per-resource value.
+    if total_source == "system_derived":
+        _remove_field(requirement, total_field)
+        return
+
+    scale = float(requirement.quantity) if multiplier is None else float(multiplier)
+    if scale <= 0:
+        return
+
+    per_is_customer = _customer_owned(requirement, per_resource_field)
+    total_is_customer = _customer_owned(requirement, total_field)
+    if total_is_customer and not per_is_customer:
+        # Some parsers receive only an explicit total. Keep that customer fact
+        # and materialize the per-unit helper required by pricing adapters.
+        # Recalculate stale defaults/derived values rather than making the
+        # customer repair arithmetic the system can prove itself.
+        requirement.requirements[per_resource_field] = float(total) / scale
+        requirement.field_sources[per_path] = "system_derived"
+        requirement.field_evidence[per_path] = "system_derived"
+        requirement.locked_fields = [
+            item for item in requirement.locked_fields if item != per_path
+        ]
+        return
+    if per_is_customer and not total_is_customer:
+        _remove_field(requirement, total_field)
+        return
+
+    expected_total = float(per_resource) * scale
+    same_total = abs(expected_total - float(total)) <= max(
+        1e-9, abs(expected_total) * 1e-9
+    )
+    if same_total:
+        # Both values were explicitly supplied. Keep them as independent
+        # validation facts; downstream usage declares both as its provenance.
+        return
+    if per_is_customer and total_is_customer:
+        issues.append(
+            PricingContractIssue(
+                field=total_field,
+                message=(
+                    f"{per_resource_field} × 数量 与 {total_field} 的总量不一致；"
+                    "必须先确认口径，不能选择其中一个继续报价"
+                ),
+                evidence="；".join(
+                    evidence
+                    for evidence in (
+                        requirement.field_evidence.get(
+                            _path(per_resource_field), ""
+                        ),
+                        requirement.field_evidence.get(_path(total_field), ""),
+                    )
+                    if evidence
+                ),
+            )
+        )
+    else:
+        # Neither side is a customer fact. Keep the canonical per-unit helper
+        # used by adapters and discard a redundant or stale total.
+        _remove_field(requirement, total_field)
+
+
+def _scaled_total_multiplier(
+    requirement: ServiceRequirement,
+    contract: ScaledTotalContract,
+) -> float:
+    topology_count: float | None = None
+    for field in contract.topology_fields:
+        value = requirement.requirements.get(field)
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value > 0
+        ):
+            topology_count = float(value)
+            break
+
+    if contract.include_deployment_quantity:
+        return float(requirement.quantity) * (topology_count or 1.0)
+    # OpenSearch and similar schemas use the node count itself as the billed
+    # topology. When it is absent the adapter falls back to shared quantity.
+    return topology_count or float(requirement.quantity)
+
+
+def declared_shared_offer_usages(
+    requirement: ServiceRequirement,
+    target_fields: set[str],
+) -> tuple[DeclaredSharedOfferUsage, ...]:
+    """Resolve registered cross-offer arithmetic without reading customer text.
+
+    A role-scoped per-node value requires an explicit topology field.  Missing
+    topology deliberately yields no usage so the compiler keeps the customer
+    fact unconsumed and blocks publication instead of silently assuming one.
+    """
+
+    usages: list[DeclaredSharedOfferUsage] = []
+    for contract in _SHARED_OFFER_USAGE_CONTRACTS.get(_service_key(requirement), ()):
+        if contract.amount_field not in target_fields:
+            continue
+        raw_amount = requirement.requirements.get(contract.amount_field)
+        if (
+            not isinstance(raw_amount, (int, float))
+            or isinstance(raw_amount, bool)
+            or raw_amount <= 0
+        ):
+            continue
+
+        topology_field = ""
+        topology_count = 1.0
+        if contract.topology_fields:
+            for candidate in contract.topology_fields:
+                raw_count = requirement.requirements.get(candidate)
+                if (
+                    isinstance(raw_count, (int, float))
+                    and not isinstance(raw_count, bool)
+                    and raw_count > 0
+                ):
+                    topology_field = candidate
+                    topology_count = float(raw_count)
+                    break
+            if not topology_field:
+                continue
+
+        deployment_count = (
+            float(requirement.quantity or 1)
+            if contract.include_deployment_quantity
+            else 1.0
+        )
+        source_fields = [contract.amount_field]
+        if topology_field:
+            source_fields.append(topology_field)
+        if contract.include_deployment_quantity:
+            source_fields.append("quantity")
+        usages.append(
+            DeclaredSharedOfferUsage(
+                amount_field=contract.amount_field,
+                service_code=contract.service_code,
+                billing_kind=contract.billing_kind,
+                amount=float(raw_amount) * topology_count * deployment_count,
+                source_fields=tuple(sorted(set(source_fields))),
+                variant=contract.default_variant,
+            )
+        )
+    return tuple(usages)
+
+
 def _normalize_deployment_count_alias(
     requirement: ServiceRequirement,
     count_field: str,
@@ -204,6 +554,50 @@ def _normalize_deployment_count_alias(
     )
     if same_value and same_evidence:
         _remove_field(requirement, count_field)
+
+
+def _prefer_product_role_count_owner(
+    requirement: ServiceRequirement,
+    count_field: str,
+) -> None:
+    """Collapse a generic quantity duplicated by a product-role count.
+
+    Products such as WAF and Route 53 price a named resource count directly.
+    When cleaning assigns the same customer phrase to both that field and the
+    compatibility ``quantity`` scalar, the product field is the sole formal
+    owner.  The scalar value remains available for display but is explicitly
+    marked derived so it cannot become a second customer pricing fact.
+    """
+
+    count = requirement.requirements.get(count_field)
+    if (
+        not isinstance(count, (int, float))
+        or isinstance(count, bool)
+        or requirement.field_sources.get("quantity") not in CUSTOMER_FACT_SOURCES
+        or abs(float(requirement.quantity) - float(count)) > 1e-9
+    ):
+        return
+    quantity_evidence = _normalize_evidence(
+        requirement.field_evidence.get("quantity", "")
+    )
+    count_evidence = _normalize_evidence(
+        requirement.field_evidence.get(_path(count_field), "")
+    )
+    if not (
+        quantity_evidence
+        and count_evidence
+        and (
+            quantity_evidence == count_evidence
+            or quantity_evidence in count_evidence
+            or count_evidence in quantity_evidence
+        )
+    ):
+        return
+    requirement.field_sources["quantity"] = "system_derived"
+    requirement.field_evidence["quantity"] = "system_derived"
+    requirement.locked_fields = [
+        item for item in requirement.locked_fields if item != "quantity"
+    ]
 
 
 def apply_pricing_contract(
@@ -277,6 +671,13 @@ def apply_pricing_contract(
     if count_alias := deployment_count_aliases.get(service):
         _normalize_deployment_count_alias(requirement, count_alias)
 
+    product_role_count_owners = {
+        "waf": "web_acls",
+        "route53": "hosted_zones",
+    }
+    if product_count_field := product_role_count_owners.get(service):
+        _prefer_product_role_count_owner(requirement, product_count_field)
+
     # Product-specific fields are authoritative over generic AI aliases when
     # both point to the same customer evidence. Collapse these before sealing
     # the fact ledger so dedicated and generic adapters cannot charge the same
@@ -289,6 +690,15 @@ def apply_pricing_contract(
         },
         "cloudfront": {
             "requests": "https_requests",
+        },
+        "msk": {
+            "storage_gib": "storage_gib_per_broker",
+        },
+        "mq": {
+            "storage_gib": "storage_gib_per_broker",
+        },
+        "opensearch": {
+            "storage_gib": "storage_gib_per_node",
         },
     }
     for alias_field, canonical_field in semantic_aliases.get(service, {}).items():
@@ -305,10 +715,27 @@ def apply_pricing_contract(
                 _remove_field(requirement, "requests")
                 break
 
+    # Per-unit values and totals are reconciled by a declarative formula table,
+    # not by adapter read order. New services register their topology fields
+    # here and automatically inherit duplicate/contradiction protection.
+    for scaled_contract in _SCALED_TOTAL_CONTRACTS.get(service, ()):
+        _reconcile_per_resource_total(
+            requirement,
+            per_resource_field=scaled_contract.per_resource_field,
+            total_field=scaled_contract.total_field,
+            issues=issues,
+            multiplier=_scaled_total_multiplier(requirement, scaled_contract),
+        )
+
     if service == "ec2":
+        _collapse_duplicate_ec2_disk_fact(requirement)
         has_disk = any(
             fields.get(field) not in (None, "", [], {})
-            for field in ("system_disk_gib", "additional_ebs_volumes")
+            for field in (
+                "system_disk_gib",
+                "total_system_disk_gib",
+                "additional_ebs_volumes",
+            )
         )
         if has_disk and not fields.get("volume_type"):
             fields["volume_type"] = "gp3"

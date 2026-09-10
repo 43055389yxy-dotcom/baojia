@@ -125,12 +125,15 @@ def test_reviewed_no_additional_charge_components_never_query_catalog(
         ServiceRequirement(
             service="code_deploy",
             source_text="CodeDeploy每月更新80台本地服务器",
-            requirements={"deployment_updates": 80},
+            requirements={
+                "deployment_updates": 80,
+                "deployment_target": "on_premises",
+            },
         ),
         ServiceRequirement(
             service="cloud_formation",
             source_text="CloudFormation自定义Hook每月5000次操作",
-            requirements={"requests": 5000},
+            requirements={"hook_invocations": 5000},
         ),
         ServiceRequirement(
             service="ecr",
@@ -157,7 +160,7 @@ def test_paid_variants_are_not_suppressed_by_free_base_policy(
 
 
 def test_every_fixed_template_has_a_deterministic_billing_policy_outcome() -> None:
-    # The 52 hand-maintained semantic templates and all dynamic products use
+    # The hand-maintained semantic templates and all dynamic products use
     # the same two-way gate: an explicitly reviewed zero-service-fee decision,
     # or the normal metered/conditional path. No third implicit fallback exists.
     outcomes = {
@@ -165,7 +168,7 @@ def test_every_fixed_template_has_a_deterministic_billing_policy_outcome() -> No
         for service in SERVICE_TEMPLATE_FIELDS
     }
 
-    assert len(outcomes) == 52
+    assert len(outcomes) == 88
     assert set(outcomes.values()) <= {
         "no_additional_charge",
         "metered_or_conditional",

@@ -15,7 +15,12 @@ logger = logging.getLogger(__name__)
 
 # Explicitly read-only. Adding a service never grants its write APIs automatically.
 READ_ONLY_OPERATIONS: dict[str, frozenset[str]] = {
-    "ec2": frozenset({"describe_instance_type_offerings", "describe_instance_types"}),
+    "ec2": frozenset(
+        {
+            "describe_instance_type_offerings",
+            "describe_instance_types",
+        }
+    ),
     "rds": frozenset(
         {
             "describe_db_engine_versions",
@@ -92,7 +97,9 @@ class ReadOnlyAwsQueryExecutor:
             region,
         )
         payload: dict[str, Any] | None = None
-        last_error: ClientError | BotoCoreError | ParamValidationError | AttributeError | None = None
+        last_error: (
+            ClientError | BotoCoreError | ParamValidationError | AttributeError | None
+        ) = None
         # Botocore already retries many transport failures.  Keep this small
         # application-level retry as a second safety net because catalog reads
         # also fail occasionally after a connection-pool or endpoint reset.
@@ -116,20 +123,6 @@ class ReadOnlyAwsQueryExecutor:
                     break
 
         if payload is None:
-            # If AWS is temporarily unavailable after the normal TTL, an exact
-            # response previously returned by the official API is safer than
-            # failing an already-reviewed quote.  This cache never contains a
-            # guessed product and remains bound to the full request key.
-            stale = self._cache.get(cache_key, allow_stale=True)
-            if isinstance(stale, dict):
-                logger.warning(
-                    "Using stale official AWS read cache after query failure "
-                    "service=%s operation=%s region=%s",
-                    normalized_service,
-                    normalized_operation,
-                    region,
-                )
-                return stale
             assert last_error is not None
             exc = last_error
             aws_error_code = ""
@@ -143,7 +136,8 @@ class ReadOnlyAwsQueryExecutor:
             # the always-enabled us-east-1 control plane first.
             if aws_error_code == "AuthFailure" and self._region_not_enabled(region):
                 raise ManualConfirmationRequired(
-                    f"AWS 账号尚未启用区域 {region}，无法查询或生成该区域报价；请先在 AWS 控制台启用该区域，或改选已启用区域",
+                    f"AWS 账号尚未启用区域 {region}，无法查询或生成该区域报价；"
+                    "请先在 AWS 控制台启用该区域，或改选已启用区域",
                     code="aws_region_not_enabled",
                     service=normalized_service,
                     operation=normalized_operation,
@@ -166,6 +160,34 @@ class ReadOnlyAwsQueryExecutor:
                     region=region,
                     aws_error_code=aws_error_code,
                 ) from exc
+            if aws_error_code in {
+                "AccessDenied",
+                "AccessDeniedException",
+                "UnauthorizedOperation",
+            }:
+                raise ManualConfirmationRequired(
+                    "AWS 当前凭证或组织 SCP 禁止该只读定价查询；"
+                    "请授权后重试，系统不会用猜测价格代替",
+                    code="aws_pricing_permission_denied",
+                    service=normalized_service,
+                    operation=normalized_operation,
+                    region=region,
+                    aws_error_code=aws_error_code,
+                ) from exc
+            # Only retryable transport/service failures may use an exact stale
+            # response. Authentication, authorization and invalid-request
+            # failures must never be hidden by cached data.
+            if _is_retryable_read_error(exc):
+                stale = self._cache.get(cache_key, allow_stale=True)
+                if isinstance(stale, dict):
+                    logger.warning(
+                        "Using stale official AWS read cache after transient query failure "
+                        "service=%s operation=%s region=%s",
+                        normalized_service,
+                        normalized_operation,
+                        region,
+                    )
+                    return stale
             raise ManualConfirmationRequired(
                 "AWS 无法执行系统生成的只读查询计划",
                 code="aws_query_execution_failed",

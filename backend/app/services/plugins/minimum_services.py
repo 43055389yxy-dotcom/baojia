@@ -152,6 +152,115 @@ class Route53Plugin(_MinimumAssumptionPlugin):
     display_name = "Amazon Route 53"
 
     def select(self, requirement: ServiceRequirement, default_region: str) -> SelectedResource:
+        route53_type = str(
+            requirement.requirements.get("route53_type") or "hosted_zone"
+        ).strip().casefold()
+        if route53_type == "resolver":
+            region = requirement.region or default_region
+
+            def usage_ends_with(suffix: str):
+                return lambda attrs: str(
+                    attrs.get("usagetype") or ""
+                ).casefold().endswith(suffix.casefold())
+
+            interface_product = _one_matching(
+                self.catalog,
+                "AmazonRoute53",
+                {"regionCode": region, "group": "DNS Query"},
+                usage_ends_with("-ResolverNetworkInterface"),
+                f"Route 53 Resolver Network Interface ({region})",
+                fallback_filters={"regionCode": region},
+            )
+            query_product = _one_matching(
+                self.catalog,
+                "AmazonRoute53",
+                {"regionCode": region, "group": "DNS Query"},
+                usage_ends_with("-DNS-Queries"),
+                f"Route 53 Resolver DNS Queries ({region})",
+                fallback_filters={"regionCode": region},
+            )
+            endpoints = (
+                required_float(requirement.requirements, "resolver_endpoints")
+                or float(requirement.quantity)
+            )
+            interfaces_per_endpoint = (
+                required_float(
+                    requirement.requirements,
+                    "resolver_ip_addresses_per_endpoint",
+                )
+                or 2.0
+            )
+            queries = required_float(requirement.requirements, "dns_queries")
+            lines = [
+                _usage(
+                    interface_product,
+                    key="r53rni",
+                    amount=(
+                        endpoints
+                        * interfaces_per_endpoint
+                        * requirement.hours_per_month
+                    ),
+                    group="route53_resolver",
+                    source_fields=(
+                        "route53_type",
+                        "resolver_endpoints",
+                        "resolver_ip_addresses_per_endpoint",
+                        "hours_per_month",
+                    ),
+                )
+            ]
+            references: list[ReferenceRate] = []
+            if queries is None:
+                references.append(
+                    _reference(
+                        query_product,
+                        description="Route 53 Resolver DNS 查询单价",
+                    )
+                )
+            else:
+                lines.append(
+                    _usage(
+                        query_product,
+                        key="r53dns",
+                        amount=queries,
+                        group="route53_resolver",
+                        source_fields=("route53_type", "dns_queries"),
+                    )
+                )
+            return SelectedResource(
+                service=self.kind,
+                display_name=self.display_name,
+                region=region,
+                model="Route 53 Resolver Endpoint",
+                quantity=requirement.quantity,
+                architecture=(
+                    f"{endpoints:g} 个 Resolver Endpoint × "
+                    f"{interfaces_per_endpoint:g} 个网络接口"
+                ),
+                specifications={
+                    "route53Type": "resolver",
+                    "resolverEndpoints": endpoints,
+                    "ipAddressesPerEndpoint": interfaces_per_endpoint,
+                    **({"dnsQueries": queries} if queries is not None else {}),
+                },
+                official_product={
+                    "source": "AWS Price List",
+                    "regionCode": region,
+                    "usageTypes": [line.usage_type for line in lines],
+                },
+                rationale=(
+                    "按 Route 53 Resolver 网络接口小时和 DNS 查询量核算；"
+                    "未明确每个 Endpoint 的 IP 地址数时采用 AWS 的最低 2 个。"
+                ),
+                substitution_notice=(
+                    "客户未提供 DNS 查询量；仅展示查询官方单位价，不计入月费合计。"
+                    if queries is None
+                    else None
+                ),
+                usage_lines=lines,
+                reference_rates=references,
+            )
+
         hosted_zones = required_float(requirement.requirements, "hosted_zones") or 1.0
         product = PricingCatalog.require_unique(
             self.catalog.products("AmazonRoute53", {"usagetype": "HostedZone"}, max_pages=1),
@@ -425,7 +534,12 @@ class CloudWatchPlugin(_MinimumAssumptionPlugin):
         requested = requirement.requirements
         has_log_usage = any(
             requested.get(field) not in (None, "")
-            for field in ("log_ingestion_gib", "log_storage_gib", "log_retention_days")
+            for field in (
+                "log_ingestion_gib",
+                "log_delivery_to_s3_gib",
+                "log_storage_gib",
+                "log_retention_days",
+            )
         )
         has_metric_usage = any(
             requested.get(field) not in (None, "")
@@ -447,27 +561,89 @@ class CloudWatchPlugin(_MinimumAssumptionPlugin):
             applied_fields.append("log_retention_days")
         if include_logs:
             logs = required_float(requested, "log_ingestion_gib")
-            product = _one_matching(
-                self.catalog,
-                "AmazonCloudWatch",
-                {"regionCode": region, "group": "Ingested Logs"},
-                lambda attrs: attrs.get("usagetype", "").endswith("-DataProcessing-Bytes")
-                and attrs.get("operation") == "PutLogEvents",
-                f"CloudWatch Logs 写入 ({region})",
-            )
-            if logs is None:
-                reference_rates.append(_reference(product, description="CloudWatch Logs 写入单价"))
-            else:
+            delivered_to_s3 = required_float(requested, "log_delivery_to_s3_gib")
+            if logs is not None or delivered_to_s3 is None:
+                product = _one_matching(
+                    self.catalog,
+                    "AmazonCloudWatch",
+                    {"regionCode": region, "group": "Ingested Logs"},
+                    lambda attrs: attrs.get("usagetype", "").endswith("-DataProcessing-Bytes")
+                    and attrs.get("operation") == "PutLogEvents",
+                    f"CloudWatch Logs 写入 ({region})",
+                )
+                if logs is None:
+                    reference_rates.append(
+                        _reference(product, description="CloudWatch Logs 写入单价")
+                    )
+                else:
+                    lines.append(
+                        _usage(
+                            product,
+                            key="cwlog",
+                            amount=logs,
+                            group="cloudwatch",
+                            source_fields=("log_ingestion_gib", "include_logs"),
+                        )
+                    )
+                    specs["logIngestionGiB"] = logs
+            if delivered_to_s3 is not None:
+                delivery_product = _one_matching(
+                    self.catalog,
+                    "AmazonCloudWatch",
+                    {"regionCode": region, "group": "Delivered Logs"},
+                    lambda attrs: attrs.get("usagetype", "").endswith(
+                        "-S3-Egress-Bytes"
+                    )
+                    and attrs.get("operation", "") == "",
+                    f"CloudWatch Logs 投递到 S3 ({region})",
+                    fallback_filters={"regionCode": region},
+                    fallback_predicate=lambda attrs: attrs.get(
+                        "usagetype", ""
+                    ).endswith("-S3-Egress-Bytes")
+                    and attrs.get("operation", "") == "",
+                )
                 lines.append(
                     _usage(
-                        product,
-                        key="cwlog",
-                        amount=logs,
+                        delivery_product,
+                        key="cwlogs3del",
+                        amount=delivered_to_s3,
                         group="cloudwatch",
-                        source_fields=("log_ingestion_gib", "include_logs"),
+                        source_fields=("log_delivery_to_s3_gib", "log_destination"),
                     )
                 )
-                specs["logIngestionGiB"] = logs
+                specs["logsDeliveredToS3GiB"] = delivered_to_s3
+                retention_days = required_float(requested, "log_retention_days")
+                if retention_days is not None and retention_days > 0:
+                    s3_storage_product = _one_matching(
+                        self.catalog,
+                        "AmazonS3",
+                        {
+                            "regionCode": region,
+                            "storageClass": "General Purpose",
+                            "volumeType": "Standard",
+                        },
+                        lambda attrs: attrs.get("usagetype", "").endswith(
+                            "-TimedStorage-ByteHrs"
+                        )
+                        and attrs.get("storageClass") == "General Purpose"
+                        and attrs.get("volumeType") == "Standard",
+                        f"VPC Flow Logs 的 S3 Standard 存储 ({region})",
+                    )
+                    retained_storage_gib = delivered_to_s3 * retention_days / 30
+                    lines.append(
+                        _usage(
+                            s3_storage_product,
+                            key="cwlogs3sto",
+                            amount=retained_storage_gib,
+                            group="s3",
+                            source_fields=(
+                                "log_delivery_to_s3_gib",
+                                "log_retention_days",
+                                "log_destination",
+                            ),
+                        )
+                    )
+                    specs["s3RetainedLogStorageGiB"] = retained_storage_gib
             log_storage = required_float(requested, "log_storage_gib")
             if log_storage is not None:
                 storage_product = _one_matching(
@@ -562,7 +738,10 @@ class CloudWatchPlugin(_MinimumAssumptionPlugin):
             architecture=("按客户提供的日志与指标用量计费" if lines else "未提供用量，仅展示官方单位参考价"),
             specifications=specs,
             official_product={"source": "AWS Price List", "regionCode": region},
-            rationale="按 CloudWatch Logs 写入、标准存储、自定义指标和标准告警官方计费维度提交 BCM。",
+            rationale=(
+                "按 CloudWatch Logs 写入、投递到 S3、日志存储、"
+                "自定义指标和标准告警的官方计费维度提交 BCM。"
+            ),
             substitution_notice=(
                 "客户未提供 CloudWatch 用量；仅展示 AWS 官方单位价，不计入月费合计。"
                 if reference_rates

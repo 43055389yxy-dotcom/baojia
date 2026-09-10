@@ -1,0 +1,488 @@
+[
+  {
+    "id": 1,
+    "name": "伦敦SaaS门户",
+    "expected_region": "eu-west-2",
+    "lines": [
+      "## 生成回归01｜伦敦SaaS门户",
+      "1、Nginx Web网关（Amazon EC2自建）：英国伦敦 eu-west-2，4台，m6i.2xlarge，Linux，单台8核32GiB，系统盘100GiB，另挂500GiB gp3数据盘，按需运行。",
+      "2、PostgreSQL数据库（Amazon RDS）：1套Multi-AZ，db.m6i.xlarge，单实例4 vCPU、16GiB内存，gp3存储800GiB。",
+      "3、Redis缓存（Amazon ElastiCache）：2个节点，1主1从，cache.r7g.large，每节点约13GiB内存。",
+      "4、S3对象存储：Standard容量12TiB，每月PUT类请求600万次、GET类请求9000万次。",
+      "5、应用型负载均衡 ALB：2个，每月处理4TiB流量。",
+      "6、CDN（Amazon CloudFront）：访客主要在欧洲，每月公网下行6TiB，HTTPS请求8000万次。",
+      "7、NAT网关：2个，每月处理3TiB数据。",
+      "8、CloudWatch Logs：每月写入750GiB，日志存储1.5TiB，保留45天。",
+      "9、AWS WAF：1个Web ACL，15条规则，每月检查1亿次请求。",
+      "10、Route 53：3个Hosted Zone，每月DNS查询5000万次。"
+    ]
+  },
+  {
+    "id": 2,
+    "name": "圣保罗零售容器平台",
+    "expected_region": "sa-east-1",
+    "lines": [
+      "## 2026-Q3｜圣保罗零售容器平台",
+      "1、Kubernetes集群（Amazon EKS）：巴西圣保罗 sa-east-1，1套；Worker节点6台，单台m6i.2xlarge、8核32G，系统盘100G，每台数据盘800G。",
+      "2、Amazon Aurora MySQL：1个集群，1个Writer加2个Reader，db.r6g.2xlarge，单节点8核64G，数据库存储2TB。",
+      "3、Redis Cluster（ElastiCache）：共6节点，2个分片，每分片1主2从，cache.r7g.xlarge，单节点约26GiB。",
+      "4、Amazon MSK Provisioned：6个Broker，m7g.xlarge，单Broker 4核16G、1TB存储。",
+      "5、Amazon OpenSearch Service：6个数据节点，r6g.xlarge.search，单节点4核32G、1TB存储；另有3个专用主节点。",
+      "6、Amazon S3：Standard存储40TB，每月上传类请求2000万次、下载类请求3亿次。",
+      "7、Application Load Balancer：3个，每月合计处理12TB流量。",
+      "8、CloudFront：南美访客为主，每月下行15TB，HTTPS请求1.6亿次。",
+      "9、AWS NAT Gateway：3个，每月合计处理8TB数据。",
+      "10、AWS Backup：受保护数据40TB，每日备份，保留35天。"
+    ]
+  },
+  {
+    "id": 3,
+    "name": "加拿大无服务器会员系统",
+    "expected_region": "ca-central-1",
+    "lines": [
+      "## 场景03｜加拿大无服务器会员系统",
+      "1、Amazon API Gateway HTTP API：加拿大 ca-central-1，每月1.2亿次API调用，平均请求大小64KB。",
+      "2、AWS Lambda：每月2亿次调用，单次平均执行300毫秒，配置512MB内存，ARM64架构。",
+      "3、Amazon DynamoDB（On-Demand）：数据量2TB，每月读取请求5亿次、写入请求1.2亿次。",
+      "4、SQS标准队列：每月3.5亿次请求，平均消息大小64KB。",
+      "5、AWS Step Functions Standard：每月5000万次状态转换。",
+      "6、Amazon S3 Standard：存储25TB，每月PUT 1200万次、GET 2.5亿次。",
+      "7、Amazon CloudFront：北美流量，每月下行12TB，HTTPS请求2亿次。",
+      "8、Amazon Cognito：每月活跃用户120万，使用用户池登录。",
+      "9、Amazon CloudWatch Logs：每月日志写入1.2TB，存储3TB，保留90天。",
+      "10、AWS Key Management Service（KMS）：20个客户托管密钥，每月API请求8000万次。"
+    ]
+  },
+  {
+    "id": 4,
+    "name": "巴黎物联网采集平台",
+    "expected_region": "eu-west-3",
+    "lines": [
+      "## IoT生产架构第4版｜巴黎",
+      "1、AWS IoT Core：法国巴黎 eu-west-3，接入5万台设备，每月发送8亿条消息，平均每条5KB。",
+      "2、Kinesis Data Streams（Provisioned）：20个Shard，每月写入15TB、读取30TB。",
+      "3、Amazon Timestream：每月写入10TB时序数据，磁性存储保留30TB。",
+      "4、Lambda数据处理函数：每月5亿次调用，单次400ms，内存1024MB。",
+      "5、RabbitMQ（Amazon MQ）：1套三节点集群，mq.m5.large，单Broker磁盘200GB。",
+      "6、PostgreSQL（RDS）：1套主备，db.r6g.xlarge，4核32G，存储1.5TB。",
+      "7、ElastiCache for Redis：3个节点，1主2从，单节点4核、约26GiB内存。",
+      "8、S3数据湖：Standard存储60TB，每月GET请求1亿次。",
+      "9、API Gateway WebSocket API：每月6亿条消息、9000万连接分钟。",
+      "10、CloudWatch Logs：每月写入2TB，保存60天。"
+    ]
+  },
+  {
+    "id": 5,
+    "name": "爱尔兰数据分析平台",
+    "expected_region": "eu-west-1",
+    "lines": [
+      "## 数据平台-05｜爱尔兰",
+      "1、Amazon EMR：爱尔兰 eu-west-1，1个长期集群；1台m6i.xlarge主节点，8台r6i.2xlarge核心节点，每台挂1TB EBS。",
+      "2、AWS Glue ETL：每天运行4小时，平均使用20个DPU，每月运行30天。",
+      "3、Amazon Athena：每月扫描120TB数据。",
+      "4、Amazon Redshift RA3：4个ra3.4xlarge计算节点，托管存储20TB。",
+      "5、Amazon S3数据湖：Standard 200TB，每月PUT 3000万次、GET 4亿次。",
+      "6、Kinesis Data Firehose：每月摄取30TB数据并写入S3。",
+      "7、AWS Step Functions：Standard工作流每月3000万次状态转换。",
+      "8、AWS Lambda：每月8000万次调用，平均执行2秒，内存2GB。",
+      "9、NAT Gateway：2个，每月处理6TB数据。",
+      "10、CloudWatch：每月日志写入3TB，自定义指标5000个，保留30天。"
+    ]
+  },
+  {
+    "id": 6,
+    "name": "斯德哥尔摩视频平台",
+    "expected_region": "eu-north-1",
+    "lines": [
+      "## Media-2026-06｜斯德哥尔摩",
+      "1、Amazon ECS on Fargate：瑞典斯德哥尔摩 eu-north-1，1套服务，常驻24个Task，每Task 2 vCPU、4GB内存，每月运行730小时。",
+      "2、Amazon ECR：镜像存储2TB，每月向同区域任务传输20TB。",
+      "3、AWS Elemental MediaConvert：每月转码10万分钟，主要为1080p基础层输出。",
+      "4、Amazon S3 Intelligent-Tiering：视频文件120TB，每月PUT 500万次、GET 1亿次。",
+      "5、CloudFront CDN：欧洲用户为主，每月下行80TB，HTTPS请求10亿次。",
+      "6、ALB应用负载均衡：2个，每月处理10TB流量。",
+      "7、Aurora PostgreSQL：1主1只读，db.r6g.xlarge，单节点4核32G，存储2TB。",
+      "8、Redis（ElastiCache）：3节点，1主2从，cache.r7g.large。",
+      "9、Route53：2个托管区域，每月DNS查询1亿次。",
+      "10、Web应用防火墙 AWS WAF：1个Web ACL，25条规则，每月检查8亿次请求。"
+    ]
+  },
+  {
+    "id": 7,
+    "name": "巴林Windows迁移项目",
+    "expected_region": "me-south-1",
+    "lines": [
+      "## Migration Wave 7｜巴林",
+      "1、IIS应用服务器（EC2）：巴林 me-south-1，6台m6i.2xlarge，Windows Server 2022，单台系统盘150GiB、数据盘2TiB gp3。",
+      "2、Amazon RDS for SQL Server：1套Multi-AZ，db.r6i.2xlarge，License Included，存储3TiB。",
+      "3、Amazon FSx for Windows File Server：Multi-AZ，SSD容量12TiB，吞吐能力512MB/s。",
+      "4、AWS Database Migration Service：2个dms.r6i.large复制实例，4个迁移任务，每月运行730小时。",
+      "5、AWS Transfer Family（SFTP）：2个服务器端点，每月上传和下载合计8TB。",
+      "6、S3 Glacier Flexible Retrieval：归档100TB，每月取回4TB。",
+      "7、AWS Backup：备份容量25TB，每日备份，保留90天。",
+      "8、AWS KMS：50个客户托管密钥，每月1000万次加解密请求。",
+      "9、Amazon CloudWatch Logs：每月写入600GB，保留180天。",
+      "10、AWS Site-to-Site VPN：2条连接，全天运行，每月传输5TB。"
+    ]
+  },
+  {
+    "id": 8,
+    "name": "开普敦实时分析平台",
+    "expected_region": "af-south-1",
+    "lines": [
+      "## 8号容量清单｜开普敦实时分析",
+      "1、ClickHouse分析节点（Amazon EC2自建）：南非开普敦 af-south-1，3台r6i.4xlarge，Linux，单台16核128G；系统盘100GiB，数据盘4TiB/台。",
+      "2、Apache Flink计算节点（EC2自建）：4台c6i.4xlarge，单台16核32G，系统盘100G，临时数据盘500G。",
+      "3、Kafka（Amazon MSK）：5个Broker，m7g.2xlarge，每Broker存储2TiB。",
+      "4、Amazon OpenSearch Service：5个数据节点，r6g.2xlarge.search，单节点存储2TB。",
+      "5、Amazon Aurora MySQL：1个Writer、2个Reader，db.r6g.2xlarge，存储3TB。",
+      "6、Amazon MemoryDB for Redis：3个分片，每分片1主1副本，单节点约26GiB。",
+      "7、Amazon EFS：Regional文件系统8TiB，Provisioned Throughput 200MiB/s。",
+      "8、Amazon S3：Standard容量80TB，每月GET 2亿次、PUT 2000万次。",
+      "9、Network Load Balancer（NLB）：2个，每月处理10TB流量。",
+      "10、CloudWatch Logs：每月写入3TB，日志存储6TB，保留60天。"
+    ]
+  },
+  {
+    "id": 9,
+    "name": "大阪灾备与API平台",
+    "expected_region": "ap-northeast-3",
+    "lines": [
+      "## DR/API场景09｜大阪",
+      "1、Java API节点（Amazon EC2）：日本大阪 ap-northeast-3，5台m7g.xlarge，单台4核16GiB，系统盘80GiB、数据盘300GiB。",
+      "2、RDS PostgreSQL数据库：1套Multi-AZ，db.m6g.xlarge，4核16G，gp3存储1TB。",
+      "3、Amazon DynamoDB Provisioned：存储5TB，读取容量50000 RCU，写入容量20000 WCU。",
+      "4、Amazon API Gateway REST API：每月9000万次调用，平均请求128KB。",
+      "5、Lambda：ARM64，内存1GB，每月1.5亿次调用，平均执行250ms。",
+      "6、S3 Standard-IA：存储30TB，每月取回6TB，并跨区域复制新增2TB数据。",
+      "7、Amazon CloudFront：日本访客，每月下行10TB，HTTPS请求1.5亿次。",
+      "8、AWS WAF：1个Web ACL，20条规则，每月检查1.5亿次请求。",
+      "9、AWS Backup：受保护数据35TB，每日备份保留180天，每月备份保留1年。",
+      "10、Amazon Route 53：5个Hosted Zone，每月权威DNS查询1亿次。"
+    ]
+  },
+  {
+    "id": 10,
+    "name": "苏黎世大型交易平台",
+    "expected_region": "eu-central-2",
+    "lines": [
+      "## Enterprise Scale 10｜苏黎世交易平台",
+      "1、Amazon EKS生产集群：瑞士苏黎世 eu-central-2，共2套集群；每套10台Worker，单Worker m7g.2xlarge、8核32G、系统盘100G、数据盘1TB。",
+      "2、Amazon Aurora MySQL：1套集群，1主3只读，db.r7g.4xlarge，单节点16核128G，存储6TB。",
+      "3、ElastiCache Redis Cluster：12节点、4分片，每分片1主2从，cache.r7g.2xlarge，单节点约53GiB。",
+      "4、Amazon MSK Provisioned：9个Broker，m7g.2xlarge，单Broker 8核32G、4TB磁盘。",
+      "5、OpenSearch：9个r7g.2xlarge.search数据节点，单节点8核64G、4TB存储；3个专用主节点。",
+      "6、S3 Standard：容量500TB，每月PUT请求1亿次、GET请求20亿次。",
+      "7、Network Load Balancer：4个，每月处理50TB数据。",
+      "8、CloudFront：欧洲流量，每月公网下行100TB，HTTPS请求20亿次。",
+      "9、AWS NAT Gateway：6个，每月处理40TB数据。",
+      "10、AWS WAF：2个Web ACL，每个30条规则，每月合计检查30亿次请求。"
+    ]
+  },
+  {
+    "id": 11,
+    "name": "首尔多架构可观测交易系统",
+    "expected_region": "ap-northeast-2",
+    "lines": [
+      "## Seoul-MixedArch-11｜首尔多架构交易系统",
+      "1、撮合计算机（EC2）：韩国首尔 ap-northeast-2，4部c7g.2xlarge，Amazon Linux，ARM64，单机8核16GiB，根卷80GiB gp3。",
+      "2、报表Windows节点（Amazon EC2）：3台m7i.2xlarge，x86_64，Windows Server 2022，每台系统盘120GiB和一块1TiB gp3数据盘。",
+      "3、RDS MariaDB主备库：Multi-AZ一套，db.m7g.xlarge，4 vCPU、16GiB，gp3容量800GiB。",
+      "4、Amazon EventBridge Scheduler：每月触发5000万次计划任务。",
+      "5、SNS标准主题：每月发布1亿条通知。",
+      "6、SQS FIFO队列：每月处理2亿次请求，消息平均32KB。",
+      "7、AWS X-Ray：每月接收8000万条Trace，其中存储2000万条。",
+      "8、密钥管理 KMS：40把客户托管Key，每月3000万次API请求。",
+      "9、CloudWatch Logs与指标：每月摄入1TiB日志，保存2TiB，自定义指标12000个。",
+      "10、Amazon SES：每月向外发送1000万封邮件。"
+    ]
+  },
+  {
+    "id": 12,
+    "name": "孟买移动端无服务器平台",
+    "expected_region": "ap-south-1",
+    "lines": [
+      "## Mobile Backend 十二号｜Mumbai",
+      "1、AWS AppSync GraphQL API：印度孟买 ap-south-1，每月执行1.8亿次查询和变更，请求平均24KB。",
+      "2、Amazon Cognito用户池：月活跃用户250万。",
+      "3、Lambda业务函数：x86架构，内存1536MB，月调用3亿回，平均耗时180毫秒。",
+      "4、DynamoDB按请求付费表：数据3TiB，每月读请求9亿、写请求2.5亿。",
+      "5、Step Functions Express Workflows：每月执行4000万次，平均持续2秒、使用128MB内存。",
+      "6、API网关 REST API：月请求2亿次，平均报文96KB。",
+      "7、对象桶 S3 Standard：容量45TiB，每月PUT 1800万次、GET 4亿次。",
+      "8、CloudFront CDN：亚洲访客，每月下行25TiB，HTTPS请求4亿次。",
+      "9、Web应用防火墙：1个ACL、18条Rule，每月合计检查4亿次。",
+      "10、Route53 DNS：4个Hosted Zones，每月查询1.2亿次。"
+    ]
+  },
+  {
+    "id": 13,
+    "name": "雅加达安全与数据治理平台",
+    "expected_region": "ap-southeast-3",
+    "lines": [
+      "## Security/Data Governance #13｜Jakarta",
+      "1、Amazon S3数据归档：印度尼西亚雅加达 ap-southeast-3，Standard存储150TB，每月PUT 1000万次、GET 5000万次。",
+      "2、AWS Glue数据目录与ETL：200万个Catalog对象；ETL每天使用30 DPU运行6小时。",
+      "3、Amazon Athena：每月扫描250TB。",
+      "4、AWS Secrets Manager：保存5000个Secret，每月调用1000万次API。",
+      "5、Amazon GuardDuty：每月分析20TB VPC Flow Logs和10亿条CloudTrail事件。",
+      "6、AWS Security Hub：每月执行5000万次安全检查。",
+      "7、AWS CloudTrail：每月记录12亿条管理与数据事件。",
+      "8、AWS Config：每月记录3000万个配置项。",
+      "9、Amazon EventBridge：每月接收4亿个自定义事件。",
+      "10、AWS KMS：100个客户管理密钥，每月5000万次请求。"
+    ]
+  },
+  {
+    "id": 14,
+    "name": "香港图数据库与时序平台",
+    "expected_region": "ap-east-1",
+    "lines": [
+      "## HK Graph+TimeSeries 14",
+      "1、Amazon DocumentDB：香港 ap-east-1，3个db.r6g.2xlarge实例，单节点8核64G，集群存储4TB。",
+      "2、Amazon Neptune图数据库：1写2读共3个db.r6g.xlarge，单节点4核32G，存储2TB。",
+      "3、Amazon Timestream：每月写入18TB，磁性存储维持60TB。",
+      "4、Amazon OpenSearch Service：6个r7g.xlarge.search数据节点，每节点1.5TB存储。",
+      "5、MemoryDB for Redis：2个Shard，每分片1主2副本，节点内存约26GiB。",
+      "6、EFS共享盘：Regional Standard容量12TiB，Elastic Throughput。",
+      "7、S3 Standard：对象容量100TiB，每月GET 3亿、PUT 2500万。",
+      "8、Lambda聚合任务：ARM64，2GB内存，每月调用1亿次，平均600ms。",
+      "9、API Gateway WebSocket：每月传递3亿条消息，连接时长6000万分钟。",
+      "10、CloudWatch Logs：每月写入2.5TiB，存放5TiB，保留90日。"
+    ]
+  },
+  {
+    "id": 15,
+    "name": "法兰克福异步消息中台",
+    "expected_region": "eu-central-1",
+    "lines": [
+      "## Messaging Fabric XV｜Frankfurt",
+      "1、Amazon MQ for ActiveMQ：德国法兰克福 eu-central-1，2套双实例Active/Standby代理，mq.m5.xlarge，每个Broker存储500GiB。",
+      "2、Amazon MSK Serverless：每月写入20TiB、读取40TiB。",
+      "3、Kinesis Data Streams On-Demand：每月写15TB、读30TB。",
+      "4、Kinesis Data Firehose：每月摄取并投递25TB到S3。",
+      "5、Amazon EventBridge事件总线：每月4.5亿个自定义事件。",
+      "6、Amazon SNS：每月发布2亿条标准消息。",
+      "7、Amazon SQS Standard：每月请求7亿次，平均消息48KB。",
+      "8、AWS Lambda消费者：arm64，1024MB，每月执行2.2亿次，平均250ms。",
+      "9、AWS Step Functions Standard：每月6500万次状态转换。",
+      "10、CloudWatch Logs：每月接收1.8TB日志，留存30天。"
+    ]
+  },
+  {
+    "id": 16,
+    "name": "俄勒冈智能内容流水线",
+    "expected_region": "us-west-2",
+    "lines": [
+      "## AI Content Pipeline 16｜Oregon",
+      "1、Amazon SageMaker实时推理Endpoint：美国俄勒冈 us-west-2，4个ml.g5.2xlarge实例，每月运行730小时。",
+      "2、Amazon Bedrock：每月处理2亿输入Token和5000万输出Token，使用Claude类文本模型。",
+      "3、Amazon Textract：每月分析500万页文档。",
+      "4、Amazon Comprehend：每月处理2亿字符文本。",
+      "5、Amazon Rekognition：每月分析3000万张图片。",
+      "6、Amazon Transcribe：每月转写120万分钟音频。",
+      "7、Amazon Translate：每月翻译5亿字符。",
+      "8、Amazon Polly：每月合成3亿字符。",
+      "9、S3智能分层存储：容量300TB，每月PUT 5000万、GET 8亿。",
+      "10、Lambda编排器：x86_64，内存2048MB，每月5000万次，平均1.2秒。"
+    ]
+  },
+  {
+    "id": 17,
+    "name": "弗吉尼亚全球网络枢纽",
+    "expected_region": "us-east-1",
+    "lines": [
+      "## Global Network Hub 17｜N. Virginia",
+      "1、AWS Transit Gateway：美东弗吉尼亚 us-east-1，20个VPC Attachment，每月处理100TB。",
+      "2、AWS Direct Connect：2条10Gbps专线，每月传出80TB。",
+      "3、AWS Global Accelerator：2个加速器，每月处理60TB公网流量。",
+      "4、NAT网关：8个，每月处理50TB。",
+      "5、AWS Network Firewall：4个防火墙端点，每月检查120TB。",
+      "6、Site to Site VPN：4条连接，整月在线，每月传送12TB。",
+      "7、Route 53 Resolver：6个入站/出站Endpoint，每月DNS查询8亿次。",
+      "8、Interface VPC Endpoint：30个端点，每月处理25TB数据。",
+      "9、Gateway Load Balancer：4个，每月处理90TB。",
+      "10、CloudWatch网络日志：每月摄入4TB，保存8TB。"
+    ]
+  },
+  {
+    "id": 18,
+    "name": "东京分层存储与传输平台",
+    "expected_region": "ap-northeast-1",
+    "lines": [
+      "## Storage Hierarchy 18｜Tokyo",
+      "1、Amazon FSx for Lustre：日本东京 ap-northeast-1，Persistent SSD容量48TiB，吞吐200MB/s/TiB。",
+      "2、EFS One Zone-IA：容量20TiB，每月读取5TiB。",
+      "3、S3 Glacier Deep Archive：归档500TiB，每月恢复2TiB。",
+      "4、Amazon S3 Express One Zone：存储30TiB，每月PUT 8000万、GET 10亿。",
+      "5、AWS Backup：备份存储120TiB，每日执行并保留365天。",
+      "6、AWS Storage Gateway File Gateway：缓存容量10TiB，每月写入40TiB。",
+      "7、AWS DataSync：每月向AWS传输80TiB数据。",
+      "8、AWS Transfer Family SFTP：3个端点，每月传输30TiB。",
+      "9、归档索引节点（EC2）：2台c7g.xlarge，ARM，Linux，单机4核8GiB、系统盘100GiB。",
+      "10、CloudWatch Logs：月写入800GiB，保存1.6TiB。"
+    ]
+  },
+  {
+    "id": 19,
+    "name": "悉尼企业办公与联络中心",
+    "expected_region": "ap-southeast-2",
+    "lines": [
+      "## EUC & Contact Center 19｜Sydney",
+      "1、Amazon WorkSpaces：澳大利亚悉尼 ap-southeast-2，500个Standard Bundle桌面，按月计费。",
+      "2、Amazon AppStream 2.0：200名并发用户，stream.standard.large实例，每月每人使用120小时。",
+      "3、Amazon Connect：300名坐席，每月通话180万分钟。",
+      "4、Amazon QuickSight Enterprise：80名Author、1200名Reader，每月20万次Reader Session，SPICE容量2TB。",
+      "5、Amazon WorkMail：1000个邮箱账户。",
+      "6、AWS Directory Service for Microsoft AD：2套Standard Edition目录，整月运行。",
+      "7、FSx for Windows File Server：Multi-AZ SSD 20TiB，吞吐1024MB/s。",
+      "8、Amazon SES：每月外发1500万封邮件。",
+      "9、Route 53：8个Public Hosted Zone，每月查询2亿次。",
+      "10、AWS Backup：保护40TB办公数据，每日备份，保留180天。"
+    ]
+  },
+  {
+    "id": 20,
+    "name": "俄亥俄双架构容器平台",
+    "expected_region": "us-east-2",
+    "lines": [
+      "## Containers Mixed ISA 20｜Ohio",
+      "1、Amazon ECS Fargate ARM服务：美国俄亥俄 us-east-2，常驻40个Task，每个2 vCPU、4GB内存，ARM64，月运行730小时。",
+      "2、ECS on Fargate x86服务：常驻25项任务，每Task 4核8GB，x86_64，每月730小时。",
+      "3、Amazon ECR：容器镜像存储5TiB，同区域每月拉取40TiB。",
+      "4、AWS Cloud Map：200个服务实例，每月执行2亿次服务发现查询。",
+      "5、Application Load Balancer：4个，每月处理30TiB。",
+      "6、RDS PostgreSQL：Multi-AZ 2套，db.m7i.2xlarge，8核32G，每套gp3存储2TiB。",
+      "7、ElastiCache for Redis：6节点、2分片、每分片1主2从，cache.r7g.xlarge。",
+      "8、S3 Standard：容量120TiB，每月PUT 4000万、GET 6亿。",
+      "9、CloudWatch Container Insights和Logs：每月摄入3TiB日志，5000个自定义指标。",
+      "10、AWS WAF：2个Web ACL，每个22条规则，每月总计检查12亿次。"
+    ]
+  },
+  {
+    "id": 21,
+    "name": "法兰克福迁移与私网安全",
+    "expected_region": "eu-central-1",
+    "lines": [
+      "## Migration & Private Network 21｜Frankfurt",
+      "1、AWS Database Migration Service (DMS)：德国法兰克福 eu-central-1，2台dms.r6i.xlarge复制实例，同时执行12项迁移任务。",
+      "2、AWS DataSync：Enhanced模式，每月搬运60TiB数据到AWS。",
+      "3、AWS Transfer Family / SFTP：部署5个Endpoint，月度传输18TiB。",
+      "4、Interface VPC Endpoint (PrivateLink)：共24个私网端点，每月Data Processed 32TiB。",
+      "5、AWS Site-to-Site VPN：6条隧道连接，全天在线，月传输9TiB。",
+      "6、Direct Connect：三条10 Gbps dedicated connection，每月出站45TiB。",
+      "7、AWS Network Firewall：6个防火墙Endpoint，每月inspection traffic 75TiB。",
+      "8、Route 53 Resolver：4个Inbound/Outbound端点，月查询量3.5亿。",
+      "9、Secrets Manager：保存3000个Secret，每月调用API 1亿次。",
+      "10、AWS KMS：100把客户托管密钥，每月请求1.5亿次。"
+    ]
+  },
+  {
+    "id": 22,
+    "name": "北加州事件驱动发布平台",
+    "expected_region": "us-west-1",
+    "lines": [
+      "## Async Delivery & Workflow 22｜N. California",
+      "1、Amazon SNS FIFO：美国北加州 us-west-1，每月Publish 250,000,000次，并向订阅端投递4亿次。",
+      "2、SQS FIFO queue：月处理600,000,000 requests，平均payload 256KB。",
+      "3、Amazon EventBridge：每月3亿个custom events、1.2亿次Pipes请求，并做1000万次schema discovery。",
+      "4、EventBridge Scheduler：维护250个schedule，每月触发50,000,000次。",
+      "5、AWS AppConfig：月配置请求2000万次，配置retrieval 500万次，接收目标8000个。",
+      "6、AWS X-Ray：每月record 9亿条trace、retrieve 1.5亿条、stored traces 3亿条。",
+      "7、Step Functions Express workflow：80,000,000 executions，合计150,000,000 GB-seconds。",
+      "8、API Gateway WebSocket API：每月传递2亿条message，连接90,000,000分钟。",
+      "9、Amazon Cognito User Pools：2,000,000 MAU，另有500,000,000个machine-to-machine token。",
+      "10、Amazon SES：每月外发5000万封、接收1500万封邮件，附件流量2TiB。"
+    ]
+  },
+  {
+    "id": 23,
+    "name": "弗吉尼亚多架构DevSecOps工厂",
+    "expected_region": "us-east-1",
+    "lines": [
+      "## DevSecOps Build Farm XXIII｜Virginia",
+      "1、构建机（AWS CodeBuild）：美国弗吉尼亚 us-east-1，Linux x86_64 / amd64，general1.medium，每月跑900,000 build minutes。",
+      "2、CodeBuild Graviton runner：ARM64架构，arm1.medium，月度构建时长600,000分钟。",
+      "3、AWS CodePipeline流水线：V2类型，每月累计1,200,000个action execution minutes。",
+      "4、CodeArtifact制品仓：包存储10TiB，每月2亿次request，并向互联网下载15TiB。",
+      "5、CodeDeploy发布：面向EC2实例，每月更新80,000台次。",
+      "6、CloudFormation IaC：每月调用5,000,000次第三方资源handler operation。",
+      "7、Inspector v2漏洞检查：覆盖2000台EC2、5000份ECR image以及300个Lambda函数。",
+      "8、Macie敏感数据发现：盘点400个S3 bucket，每月分类扫描60TiB。",
+      "9、Security Hub CSPM：纳管4000个资源，每月完成30,000,000次security check。",
+      "10、AWS Audit Manager：每月评估15,000个资源并收集8,000,000条证据。"
+    ]
+  },
+  {
+    "id": 24,
+    "name": "东京物联网与实时媒体平台",
+    "expected_region": "ap-northeast-1",
+    "lines": [
+      "## IoT + Live Media 24｜Tokyo",
+      "1、AWS IoT Core MQTT：日本东京 ap-northeast-1，50万台设备，每月累计360,000,000连接分钟并交换20亿条5KB消息。",
+      "2、IoT Device Management：登记500,000个Thing，每月下发10,000,000次remote action。",
+      "3、AWS IoT Device Defender：保护500,000台设备，每月分析1,500,000,000个metric datapoint。",
+      "4、Kinesis Video Streams：月度ingest 100TiB、consumer读取300TiB，并保持50TiB视频存储。",
+      "5、Amazon IVS Low-Latency Streaming：每月输入20,000 channel-hours，观众输出4,000,000 viewer-hours。",
+      "6、AWS Elemental MediaConvert：每月转码8,000,000分钟HD视频。",
+      "7、MediaLive标准频道：30个Standard channel，全天运行730小时。",
+      "8、AWS Elemental MediaPackage：每月摄取100TiB，并从origin向外传送300TiB。",
+      "9、AWS Elemental MediaConnect：20个output整月运行，每月传送80TiB。",
+      "10、CloudFront CDN：亚洲流量，每月下行500TiB，HTTPS请求量50亿次。"
+    ]
+  },
+  {
+    "id": 25,
+    "name": "法兰克福别名与双架构混合平台",
+    "expected_region": "eu-central-1",
+    "lines": [
+      "## Alias + Mixed ISA 25｜Frankfurt",
+      "1、Graviton EC2 nodes：德国法兰克福 eu-central-1，3台 m7g.xlarge，Linux / ARM64，系统盘80GiB gp3。",
+      "2、AMD64 Elastic Compute Cloud VM：2台 m7i.xlarge，Ubuntu x86_64，boot volume 100GiB gp3。",
+      "3、AWS函数 Lambda：Graviton arm64，monthly 600,000,000 invokes，1024MB内存，平均180ms。",
+      "4、Serverless Lambda / amd64：月调用400,000,000次，2048MB内存，平均350ms，x86-64。",
+      "5、Fargate容器任务：Linux ARM64，持续运行60个task，每个2 vCPU、4GiB内存，每月730小时。",
+      "6、Elastic Kubernetes Service (EKS)：1套控制面，3台x86 Worker，每台4 vCPU、16GiB内存，系统盘120GiB。",
+      "7、DocDB兼容Mongo：3个节点，每节点4核16GiB，数据库存储2TiB、月IO请求量8亿次。",
+      "8、MemoryDB for Redis：6个node，每节点8 vCPU、32GiB内存，快照保留7天。",
+      "9、Managed Streaming for Kafka (MSK)：6个broker，m7g.large，单broker 1TiB存储，整月运行。",
+      "10、CDN / CloudFront：欧洲访客，每月出网100TiB，HTTPS calls 1,500,000,000。"
+    ]
+  },
+  {
+    "id": 26,
+    "name": "新加坡智能内容与联络分析平台",
+    "expected_region": "ap-southeast-1",
+    "lines": [
+      "## Intelligent Content 26｜Singapore",
+      "1、AWS基础模型平台 Bedrock：新加坡 ap-southeast-1，每月输入token 120亿、输出token 30亿，使用Claude 3.5 Sonnet。",
+      "2、SageMaker endpoint：4个ml.g5.2xlarge实时推理端点，每个整月运行，模型数据盘500GiB。",
+      "3、Textract OCR：每月处理800万页文档，需要表格和表单分析。",
+      "4、Comprehend NLP：每月分析60亿个字符，做实体识别和情感分析。",
+      "5、Rekognition图像审核：每月检查2亿张图片。",
+      "6、Transcribe语音转文字：每月转录900万分钟普通话通话录音。",
+      "7、Translate机器翻译：每月翻译100亿个字符。",
+      "8、Polly语音合成：Neural voice，每月合成20亿个字符。",
+      "9、Pinpoint营销触达：每月发送3000万条推送和500万条短信。",
+      "10、QuickSight BI：Enterprise版，120名Author、3000名Reader，每月80万次Reader Session，SPICE 5TiB。"
+    ]
+  },
+  {
+    "id": 27,
+    "name": "弗吉尼亚英文计量与双架构平台",
+    "expected_region": "us-east-1",
+    "lines": [
+      "## English Units + Mixed ISA 27｜N. Virginia",
+      "1、EC2 Graviton fleet：us-east-1，3 x c7g.large instances，Amazon Linux ARM64，80 GiB gp3 boot disk each。",
+      "2、Elastic Compute Cloud amd64 pool：2 pcs m7i.large，Linux x86-64，100 GiB gp3 root volume per VM。",
+      "3、Lambda arm serverless：ARM64，1.2 billion requests per month，1 GiB memory，average duration 250 ms。",
+      "4、Lambda x86 functions：x86_64，850 million invocations monthly，512 MiB memory，average duration 400 ms。",
+      "5、AWS Fargate ARM workloads：48 tasks，1 vCPU and 2 GiB per task，730 task-hours monthly，Linux ARM。",
+      "6、ECS on Fargate amd64：32 tasks，2 vCPU / 8 GiB each，730 hours per month，Linux x86_64。",
+      "7、Elastic Block Store / EBS：gp3 capacity 12.5 TiB，provisioned 40,000 IOPS and 1,500 MiB/s throughput。",
+      "8、Simple Storage Service S3：Standard tier 1.2 PiB，50 million PUTs and 2 billion GETs monthly。",
+      "9、Simple Queue Service SQS：2.4 billion requests per month，average payload 64 KiB。",
+      "10、CDN CloudFront：North America viewers，256 TiB monthly egress，3.2 billion HTTPS requests。"
+    ]
+  }
+]

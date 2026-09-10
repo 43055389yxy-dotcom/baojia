@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.core.errors import ManualConfirmationRequired
@@ -496,31 +497,55 @@ class NatGatewayPlugin(_NoConfirmationPlugin):
 
     def select(self, requirement: ServiceRequirement, default_region: str) -> SelectedResource:
         region = requirement.region or default_region
-        products = self.catalog.products(
-            "AmazonEC2",
-            {"regionCode": region, "productFamily": "NAT Gateway"},
-            max_pages=3,
-        )
-        hourly = next(
-            (
-                product
-                for product in products
-                if str(PricingCatalog.attributes(product).get("usagetype") or "").endswith(
-                    "-NatGateway-Hours"
+        narrow_filters = {"regionCode": region, "productFamily": "NAT Gateway"}
+
+        def query(filters: dict[str, str], *, refresh: bool = False) -> list[dict[str, Any]]:
+            try:
+                return self.catalog.products(
+                    "AmazonEC2", filters, max_pages=4, refresh=refresh
                 )
-            ),
-            None,
-        )
-        processed = next(
-            (
-                product
-                for product in products
-                if str(PricingCatalog.attributes(product).get("usagetype") or "").endswith(
-                    "-NatGateway-Bytes"
+            except TypeError as exc:
+                if "refresh" not in str(exc):
+                    raise
+                return self.catalog.products("AmazonEC2", filters, max_pages=4)
+
+        products = query(narrow_filters)
+
+        def standard_meter(product: dict[str, Any], suffix: str) -> bool:
+            attrs = PricingCatalog.attributes(product)
+            usage_type = str(attrs.get("usagetype") or "")
+            operation = str(attrs.get("operation") or "")
+            # Region prefixes are optional in AWS's catalog. Regional NAT
+            # Gateway and provisioned-bandwidth rows are separate products and
+            # deliberately do not satisfy this exact standard-meter pattern.
+            return bool(
+                re.fullmatch(
+                    rf"(?:[A-Z0-9]+-)?NatGateway-{suffix}",
+                    usage_type,
+                    re.I,
                 )
-            ),
-            None,
-        )
+                and operation.casefold() == "natgateway"
+            )
+
+        def resolve(suffix: str) -> dict[str, Any] | None:
+            candidates = [
+                product for product in products if standard_meter(product, suffix)
+            ]
+            if not candidates:
+                candidates = [
+                    product
+                    for product in query({"regionCode": region}, refresh=True)
+                    if standard_meter(product, suffix)
+                ]
+            if not candidates:
+                return None
+            return PricingCatalog.require_unique(
+                candidates,
+                context=f"NAT Gateway {suffix} ({region})",
+            )
+
+        hourly = resolve("Hours")
+        processed = resolve("Bytes")
         if hourly is None or processed is None:
             raise ManualConfirmationRequired(
                 "AWS 官方目录没有返回 NAT Gateway 标准计费项",

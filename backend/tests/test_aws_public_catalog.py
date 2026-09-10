@@ -1,3 +1,5 @@
+import json
+import sqlite3
 from pathlib import Path
 
 from botocore.exceptions import ClientError
@@ -407,6 +409,89 @@ def test_product_registry_retrieves_renamed_official_candidate_without_auto_sele
         "AmazonKinesisFirehose"
     )
     assert learned_after_sync["identity_match_source"] == "learned_alias"
+
+
+def test_product_registry_repairs_marketing_alias_owned_by_wrong_official_offer(
+    tmp_path: Path,
+) -> None:
+    def fetch(url: str) -> dict:
+        if url.endswith("/offers/v1.0/aws/index.json"):
+            return {
+                "publicationDate": "2026-08-31T00:00:00Z",
+                "offers": {
+                    "AmazonGlacier": {
+                        "offerCode": "AmazonGlacier",
+                        "currentVersionUrl": "/glacier/current/index.json",
+                    },
+                    "AmazonS3GlacierDeepArchive": {
+                        "offerCode": "AmazonS3GlacierDeepArchive",
+                        "currentVersionUrl": "/deep-archive/current/index.json",
+                    },
+                },
+            }
+        if url.endswith(("/glacier/current/index.json", "/deep-archive/current/index.json")):
+            return {"products": {}, "terms": {}}
+        raise AssertionError(f"unexpected fixture URL: {url}")
+
+    database = tmp_path / "glacier-products.sqlite3"
+    catalog = PublicAwsPriceCatalog(fetch)
+    registry = AwsProductRegistry(catalog, database)
+    registry.sync()
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT aliases_json FROM aws_product_registry WHERE service_code = ?",
+            ("AmazonS3GlacierDeepArchive",),
+        ).fetchone()
+        aliases = json.loads(row[0])
+        aliases.append("S3 Glacier Flexible Retrieval")
+        connection.execute(
+            "UPDATE aws_product_registry SET aliases_json = ? WHERE service_code = ?",
+            (json.dumps(aliases), "AmazonS3GlacierDeepArchive"),
+        )
+
+    repaired = AwsProductRegistry(catalog, database)
+    resolved = repaired.resolve_product("S3 Glacier Flexible Retrieval")
+
+    assert resolved is not None
+    assert resolved["service_code"] == "AmazonGlacier"
+    assert resolved["identity_match_source"] == "provider"
+    deep_archive = next(
+        item
+        for item in repaired.list_products()
+        if item["service_code"] == "AmazonS3GlacierDeepArchive"
+    )
+    assert "S3 Glacier Flexible Retrieval" not in deep_archive["aliases"]
+
+
+def test_product_registry_maps_transit_gateway_to_its_official_vpc_offer(
+    tmp_path: Path,
+) -> None:
+    def fetch(url: str) -> dict:
+        if url.endswith("/offers/v1.0/aws/index.json"):
+            return {
+                "publicationDate": "2026-08-31T00:00:00Z",
+                "offers": {
+                    "AmazonVPC": {
+                        "offerCode": "AmazonVPC",
+                        "currentVersionUrl": "/vpc/current/index.json",
+                    }
+                },
+            }
+        if url.endswith("/vpc/current/index.json"):
+            return {"products": {}, "terms": {}}
+        raise AssertionError(f"unexpected fixture URL: {url}")
+
+    registry = AwsProductRegistry(
+        PublicAwsPriceCatalog(fetch),
+        tmp_path / "vpc-products.sqlite3",
+    )
+    registry.sync()
+
+    resolved = registry.resolve_product("AWS Transit Gateway")
+
+    assert resolved is not None
+    assert resolved["service_code"] == "AmazonVPC"
+    assert resolved["identity_match_source"] == "provider"
 
 
 def test_product_registry_can_reuse_learned_non_ascii_customer_wording(

@@ -18,7 +18,9 @@ async function forward(request: NextRequest, context: RouteContext) {
       { status: 403 },
     );
   }
-  const target = new URL(`/${joinedPath}`, BACKEND_URL);
+  const target = new URL(BACKEND_URL);
+  const backendPrefix = target.pathname.replace(/\/+$/, "");
+  target.pathname = `${backendPrefix}/${joinedPath}`.replace(/\/{2,}/g, "/");
   target.search = request.nextUrl.search;
 
   const headers = new Headers(request.headers);

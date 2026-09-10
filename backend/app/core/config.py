@@ -23,6 +23,10 @@ class Settings(BaseSettings):
 
     app_env: str = "development"
     app_cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+    # Shared only by the private AstraQuote MCP aggregator and this backend.
+    # It is independent from OAuth/browser credentials and must never be
+    # exposed to ChatGPT or persisted in quote data.
+    astraquote_mcp_internal_token: str = ""
 
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
@@ -41,12 +45,21 @@ class Settings(BaseSettings):
     # can be tuned independently.
     component_revision_model: str = "deepseek.v3.2"
     component_revision_timeout_seconds: float = 30.0
+    # A confirmation recheck is bounded so a dead AI/catalog call cannot keep
+    # the customer page spinning forever. Progress heartbeats and worker leases
+    # handle normal multi-component runs and application restarts separately.
+    confirmation_reprocessing_timeout_seconds: float = 300.0
     # The first inventory pass is latency-sensitive. Keep the preferred model,
     # but hedge to a distinct configured route instead of waiting for one
     # endpoint to exhaust two long serial timeouts.
     intake_ai_hedge_delay_seconds: float = 4.0
     intake_ai_primary_timeout_seconds: float = 16.0
     intake_ai_recovery_timeout_seconds: float = 14.0
+    # If every independent route fails with a transient network/429/5xx
+    # condition, retry them once in parallel. This keeps the first-pass
+    # cleaner reliable without falling back to local keyword parsing.
+    intake_ai_retry_timeout_seconds: float = 35.0
+    intake_ai_retry_delay_seconds: float = 1.0
     # Compatibility override for local tests and deployments that previously
     # supplied a single AI_API_KEY instead of a provider-specific key.
     ai_api_key_override: str = Field(
@@ -117,24 +130,9 @@ class Settings(BaseSettings):
     bcm_poll_interval_seconds: float = 1.0
     bcm_poll_timeout_seconds: float = 30.0
 
-    calculator_browser_channel: str = "chrome"
-    calculator_enabled: bool = True
-    # Public estimate links are intentionally disabled. The UI exports the
-    # current result to Excel and the application does not retain quote links.
-    calculator_generate_share_link: bool = False
-    calculator_headless: bool = True
-    calculator_timeout_seconds: float = 90.0
-    # Keep a modest, irregular pace.  Long fixed pauses make a multi-service
-    # estimate unnecessarily slow, while zero-delay bursts are fragile.
-    calculator_action_delay_min_seconds: float = 0.35
-    calculator_action_delay_max_seconds: float = 0.85
-    calculator_navigation_delay_min_seconds: float = 1.1
-    calculator_navigation_delay_max_seconds: float = 2.1
-    calculator_ai_agent_enabled: bool = True
-    calculator_ai_max_steps: int = 48
-    calculator_ai_snapshot_chars: int = 5000
-    calculator_ai_repeated_action_limit: int = 2
-    calculator_ai_repeated_state_limit: int = 4
+    # Validate the compiler output against Calculator's live field schema as a
+    # second, non-pricing path. This never replaces BCM amounts or publishes a
+    # Calculator estimate/share link.
 
     @classmethod
     def settings_customise_sources(

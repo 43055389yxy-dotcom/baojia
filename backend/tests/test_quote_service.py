@@ -1,8 +1,11 @@
 import pytest
 
 from app.core.errors import ManualConfirmationRequired
+from app.domain.component_integrity import ensure_component_keys
+from app.domain.fact_ledger import finalize_customer_fact_ledger
 from app.domain.models import (
     CandidateOption,
+    ConfirmationItem,
     ConfirmationOption,
     ParsedIntent,
     PreviewSelection,
@@ -21,12 +24,10 @@ from app.domain.pricing_issues import (
     should_retry_persisted_pricing_issue,
 )
 from app.integrations.aws import PricingCatalog
-from app.integrations.calculator_web import (
-    CalculatorGenericGroupResult,
-    CalculatorWebResult,
-    GenericCalculatorInput,
+from app.integrations.deepseek import (
+    OFFICIAL_CALCULATOR_SELECTED_CODE,
+    DeepSeekIntentParser,
 )
-from app.integrations.deepseek import DeepSeekIntentParser
 from app.services.bcm_estimator import BcmQuoteResult
 from app.services.confirmation_sessions import (
     CONFIGURATION_COMPONENT_FEEDBACK_PREFIX,
@@ -45,6 +46,151 @@ from app.services.plugins.minimum_services import WafPlugin
 from app.services.quote_service import QuoteService
 
 
+def test_official_parent_template_returns_customer_choices_before_pricing() -> None:
+    component = ServiceRequirement(
+        service="backup",
+        calculator_service_name="AWS Backup",
+        region="ap-southeast-1",
+        source_text="AWS Backup 5TB，恢复500GB",
+        field_sources={
+            "_official_calculator_status": "selection_required",
+            "_official_calculator_parent_service_code": "awsBackup",
+            "_official_calculator_options": (
+                '[{"service_code":"amazonEfsBackup","name":"EFS Backup"},'
+                '{"service_code":"rdsBackup","name":"RDS Backup"}]'
+            ),
+        },
+    )
+    intent = ParsedIntent(customer_summary="AWS Backup", services=[component])
+    service = QuoteService(object(), PluginRegistry(), object())
+
+    result = service._official_template_confirmation_preview(
+        request=QuoteRequest(
+            customer_request="AWS Backup 5TB，恢复500GB",
+            sales_region="ap-southeast-1",
+        ),
+        intent=intent,
+        pending=service._pending_official_template_components(intent),
+        ai_trace=[],
+    )
+
+    assert result.selections[0].status == "customer_issue"
+    assert result.selections[0].next_action == "request_customer"
+    assert [option.value for option in result.confirmation_items[0].options] == [
+        "official_template:amazonEfsBackup",
+        "official_template:rdsBackup",
+    ]
+    assert result.sales_validation_required is False
+
+
+@pytest.mark.asyncio
+async def test_official_child_answer_is_bound_to_the_exact_component() -> None:
+    first = ServiceRequirement(
+        service="backup",
+        calculator_service_name="AWS Backup",
+        field_sources={
+            "_official_calculator_status": "selection_required",
+            "_official_calculator_options": (
+                '[{"service_code":"amazonEfsBackup","name":"EFS Backup"}]'
+            ),
+        },
+    )
+    second = first.model_copy(deep=True)
+    intent = ParsedIntent(customer_summary="two backups", services=[first, second])
+    service = QuoteService(object(), PluginRegistry(), object())
+
+    await service._apply_confirmation_responses(
+        intent,
+        {"answer-for-second": "official_template:amazonEfsBackup"},
+        response_components={"answer-for-second": 1},
+    )
+
+    assert OFFICIAL_CALCULATOR_SELECTED_CODE not in first.field_sources
+    assert second.field_sources[OFFICIAL_CALCULATOR_SELECTED_CODE] == "amazonEfsBackup"
+
+
+def test_selected_official_child_reopens_intake_even_if_inventory_was_marked_clean() -> None:
+    component = ServiceRequirement(
+        service="backup",
+        field_sources={
+            "_official_calculator_status": "selection_required",
+            "_official_calculator_selected_service_code": "amazonEfsBackup",
+            "_semantic_fact_mapping": "ai_cleaning",
+        },
+    )
+
+    assert QuoteService._needs_official_intake_resume(component) is True
+
+
+def test_sealed_intent_validation_never_reopens_customer_prose(monkeypatch) -> None:
+    component = ServiceRequirement(
+        service="s3",
+        calculator_service_name="Amazon S3",
+        region="ap-southeast-1",
+        source_text="任意表达方式，Standard 存储10TB",
+        requirements={"storage_gib": 10240, "storage_class": "standard"},
+        field_sources={
+            "_semantic_fact_mapping": "ai_cleaning",
+            "requirements.storage_gib": "customer_text",
+            "requirements.storage_class": "customer_text",
+            "region": "customer_text",
+        },
+        field_evidence={
+            "requirements.storage_gib": "存储10TB",
+            "requirements.storage_class": "Standard",
+            "region": "ap-southeast-1",
+        },
+        locked_fields=[
+            "requirements.storage_gib",
+            "requirements.storage_class",
+            "region",
+        ],
+    )
+    intent = ParsedIntent(customer_summary="sealed", services=[component])
+    ensure_component_keys(intent)
+    finalize_customer_fact_ledger(component)
+    service = QuoteService(object(), PluginRegistry(), object())
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("sealed data reopened customer prose")
+
+    monkeypatch.setattr(
+        DeepSeekIntentParser, "_uncovered_quantitative_claim_issues", forbidden
+    )
+    monkeypatch.setattr(
+        DeepSeekIntentParser, "_reconcile_explicit_component_inventory", forbidden
+    )
+    monkeypatch.setattr(DeepSeekIntentParser, "_split_eks_worker_nodes", forbidden)
+    monkeypatch.setattr(DeepSeekIntentParser, "_reconcile_explicit_regions", forbidden)
+
+    service._validate_sealed_intent(intent)
+
+
+def test_stale_sealed_ledger_stops_instead_of_reparsing_source(monkeypatch) -> None:
+    component = ServiceRequirement(
+        service="s3",
+        component_key="cmp_stale_s3",
+        source_text="存储10TB",
+        requirements={"storage_gib": 10240},
+        field_sources={"_semantic_fact_mapping": "ai_cleaning"},
+    )
+    intent = ParsedIntent(customer_summary="sealed", services=[component])
+    service = QuoteService(object(), PluginRegistry(), object())
+
+    monkeypatch.setattr(
+        DeepSeekIntentParser,
+        "_uncovered_quantitative_claim_issues",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("sealed data reopened customer prose")
+        ),
+    )
+
+    with pytest.raises(ManualConfirmationRequired) as exc_info:
+        service._validate_sealed_intent(intent)
+
+    assert exc_info.value.code == "sealed_fact_ledger_stale"
+
+
 def test_alb_processed_traffic_never_gets_reference_only_default() -> None:
     source = "Application Load Balancer，2个ALB，每月处理流量5T"
     component = ServiceRequirement(
@@ -52,6 +198,10 @@ def test_alb_processed_traffic_never_gets_reference_only_default() -> None:
         calculator_service_name="Application Load Balancer",
         source_text=source,
         original_source_text=source,
+        quantity=2,
+        requirements={"processed_bytes_gib": 5120},
+        field_sources={"quantity": "customer_text", "requirements.processed_bytes_gib": "customer_text"},
+        field_evidence={"quantity": "2个ALB", "requirements.processed_bytes_gib": "每月处理流量5T"},
     )
     intent = ParsedIntent(customer_summary=source, services=[component])
 
@@ -95,10 +245,11 @@ def test_literal_coverage_validates_service_owned_slice_not_sibling_numbers() ->
         ],
     )
 
+    DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
     QuoteService._require_complete_literal_fact_coverage(intent)
 
 
-def test_literal_coverage_failure_exposes_the_exact_unmapped_fact() -> None:
+def test_unsealed_coverage_is_rejected_without_reopening_original_text() -> None:
     source = "Amazon MemoryDB for Redis，3个节点，单节点8核32G"
     intent = ParsedIntent(
         customer_summary=source,
@@ -119,7 +270,7 @@ def test_literal_coverage_failure_exposes_the_exact_unmapped_fact() -> None:
         QuoteService._require_complete_literal_fact_coverage(intent)
 
     component = exc_info.value.details["components"][0]
-    assert "8核" in component["reason"]
+    assert "事实表未封存" in component["reason"]
     assert component["facts"]
 
 
@@ -259,6 +410,72 @@ async def test_unconsumed_fact_is_repaired_by_ai_meaning_plus_official_catalog(
     ] == "storage_gib"
     assert repaired.usage_lines[0].source_fields == ["retained_logs_gib"]
     assert repaired.usage_lines[0].amount == 1024
+
+
+@pytest.mark.asyncio
+async def test_generic_component_can_supplement_its_own_cross_offer_usage() -> None:
+    class GenericPlugin:
+        @staticmethod
+        def supplement_selection(
+            requirement: ServiceRequirement,
+            selection: SelectedResource,
+            missing_paths: list[str],
+            default_region: str,
+        ) -> SelectedResource:
+            assert missing_paths == ["requirements.role_storage_gib"]
+            assert default_region == "ap-southeast-1"
+            return selection.model_copy(
+                update={
+                    "usage_lines": [
+                        UsageLine(
+                            key="shared",
+                            service_code="AmazonEC2",
+                            usage_type="EBS:VolumeUsage.gp3",
+                            operation="",
+                            amount=float(
+                                requirement.requirements["role_storage_gib"]
+                            ),
+                            source_fields=["role_storage_gib"],
+                        )
+                    ]
+                }
+            )
+
+    generic = GenericPlugin()
+    service = QuoteService(
+        object(),  # type: ignore[arg-type]
+        PluginRegistry([]),
+        FailingEstimator(),  # type: ignore[arg-type]
+        generic_plugin=generic,  # type: ignore[arg-type]
+    )
+    requirement = ServiceRequirement(
+        service="future_cluster",
+        requirements={"role_storage_gib": 500},
+        field_sources={"requirements.role_storage_gib": "customer_text"},
+        field_evidence={"requirements.role_storage_gib": "每节点500GB"},
+    )
+    base = SelectedResource(
+        service="future_cluster",
+        display_name="Future Cluster",
+        region="ap-southeast-1",
+        model="official",
+        architecture="managed",
+        specifications={},
+        official_product={"source": "AWS Price List"},
+        rationale="official",
+    )
+
+    repaired, remaining = await service._reconcile_unconsumed_component_facts(
+        component=requirement,
+        requirement=requirement,
+        selection=base,
+        plugin=generic,
+        component_index=0,
+        reporter=None,
+    )
+
+    assert remaining == []
+    assert repaired.usage_lines[0].service_code == "AmazonEC2"
 
 
 @pytest.mark.asyncio
@@ -573,8 +790,7 @@ async def test_preview_does_not_ask_for_a_model_when_an_exact_shape_exists() -> 
     service = QuoteService(
         ExactShapeParser(),  # type: ignore[arg-type]
         PluginRegistry([ExactShapePlugin(ServiceKind.EC2, "m7g.4xlarge")]),
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
     )
 
     preview = await service.preview(QuoteRequest(customer_request="应用服务器16核64G"))
@@ -1197,6 +1413,31 @@ def test_quicksight_without_usage_gets_smallest_subscription_default() -> None:
     assert any("1 位用户" in notice for notice in notices)
 
 
+def test_quicksight_role_counts_prevent_generic_one_user_default() -> None:
+    intent = ParsedIntent(
+        customer_summary="QuickSight 80 authors and 1200 readers",
+        services=[
+            ServiceRequirement(
+                service="quicksight",
+                calculator_service_name="Amazon QuickSight",
+                requirements={
+                    "edition": "enterprise",
+                    "author_users": 80,
+                    "reader_users": 1200,
+                    "session_capacity": 200000,
+                },
+            )
+        ],
+    )
+
+    notices = QuoteService._apply_calculator_minimum_defaults(intent)
+
+    requirements = intent.services[0].requirements
+    assert "users" not in requirements
+    assert "system_default_assumption" not in requirements
+    assert notices == []
+
+
 class MixedParser:
     async def parse(self, _: str) -> ParsedIntent:
         return ParsedIntent(
@@ -1217,7 +1458,8 @@ class MixedParser:
                 ),
                 ServiceRequirement(
                     service="elasticache",
-                    calculator_service_name="Amazon ElastiCache",
+                    calculator_service_name="Amazon ElastiCache for Redis",
+                    region="ap-northeast-1",
                     requirements={"engine": "redis", "memory_gib": 4},
                 ),
             ],
@@ -1559,30 +1801,6 @@ def reserved_api_registry() -> PluginRegistry:
     )
 
 
-class GenericCalculator:
-    def __init__(self) -> None:
-        self.inputs: list[GenericCalculatorInput] = []
-
-    async def quote_ai_groups(
-        self,
-        quote_inputs: list[GenericCalculatorInput],
-        reporter: object = None,
-    ) -> CalculatorWebResult:
-        self.inputs = quote_inputs
-        return CalculatorWebResult(
-            monthly_total=456.78,
-            upfront_total=123,
-            share_url="https://calculator.aws/#/estimate?id=generic-test",
-            details=["Amazon EC2", "Amazon RDS for PostgreSQL", "Amazon ElastiCache"],
-            steps=["三项服务已保存到同一个 Estimate"],
-            generic_groups=[
-                CalculatorGenericGroupResult("ec2", "Amazon EC2", "t4g.xlarge"),
-                CalculatorGenericGroupResult("rds", "Amazon RDS for PostgreSQL", "db.m7g.xlarge"),
-                CalculatorGenericGroupResult(
-                    "elasticache", "Amazon ElastiCache", "cache.t4g.medium"
-                ),
-            ],
-        )
 
 
 @pytest.mark.asyncio
@@ -1590,8 +1808,7 @@ async def test_mixed_services_use_one_bcm_estimate() -> None:
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         api_registry(),
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
     )
 
     quote = await service.create_quote(QuoteRequest(customer_request="混合报价"))
@@ -1637,8 +1854,7 @@ async def test_unpriceable_review_model_requires_customer_confirmation_before_re
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         PluginRegistry([plugin, ApiPlugin(ServiceKind.RDS, "db.m7g.large")]),
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
     )
     intent = ParsedIntent(
         customer_summary="EC2 and RDS",
@@ -1693,8 +1909,7 @@ async def test_one_catalog_failure_does_not_cancel_independent_components() -> N
                 ApiPlugin(ServiceKind.RDS, "db.m7g.large"),
             ]
         ),
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
     )
     intent = ParsedIntent(
         customer_summary="independent components",
@@ -1722,8 +1937,7 @@ async def test_identical_model_questions_update_only_their_bound_components() ->
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         api_registry(),
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
     )
     intent = ParsedIntent(
         customer_summary="two EC2 components",
@@ -1764,8 +1978,7 @@ async def test_rejected_bcm_component_does_not_cancel_other_prices() -> None:
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         api_registry(),
-        estimator,  # type: ignore[arg-type]
-        None,
+        estimator,
     )
 
     quote = await service.create_quote(QuoteRequest(customer_request="混合报价"))
@@ -1793,8 +2006,7 @@ async def test_all_rejected_bcm_components_return_reference_only_quote() -> None
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         api_registry(),
-        RejectAllComponentsEstimator(),  # type: ignore[arg-type]
-        None,
+        RejectAllComponentsEstimator(),
     )
 
     quote = await service.create_quote(QuoteRequest(customer_request="混合报价"))
@@ -1823,8 +2035,7 @@ async def test_reserved_one_and_three_year_terms_produce_two_scenarios_without_r
     service = QuoteService(
         parser,  # type: ignore[arg-type]
         reserved_api_registry(),
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
     )
 
     quote = await service.create_quote(
@@ -1849,8 +2060,7 @@ async def test_on_demand_and_reserved_terms_produce_three_comparison_scenarios()
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         reserved_api_registry(),
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
     )
 
     quote = await service.create_quote(
@@ -1879,8 +2089,7 @@ async def test_services_without_reserved_terms_do_not_show_duplicate_comparison_
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         api_registry(),
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
     )
 
     quote = await service.create_quote(
@@ -1909,8 +2118,7 @@ async def test_unavailable_reserved_offer_does_not_become_customer_question() ->
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         registry,
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
     )
 
     quote = await service.create_quote(
@@ -1926,6 +2134,103 @@ async def test_unavailable_reserved_offer_does_not_become_customer_question() ->
     assert [item.label for item in quote.pricing_scenarios] == ["按需"]
     assert len(quote.notices) == 2
     assert all("本方案暂不展示" in notice for notice in quote.notices)
+
+
+@pytest.mark.asyncio
+async def test_preview_uses_on_demand_catalog_when_reserved_offer_is_unavailable() -> None:
+    class RedisParser:
+        async def parse(self, _: str) -> ParsedIntent:
+            return ParsedIntent(
+                customer_summary="Redis",
+                services=[
+                    ServiceRequirement(
+                        service="redis",
+                        region="ap-southeast-6",
+                        requirements={"requested_model": "cache.r6g.xlarge"},
+                    )
+                ],
+            )
+
+    service = QuoteService(
+        RedisParser(),  # type: ignore[arg-type]
+        PluginRegistry(
+            [ReservedUnavailablePlugin(ServiceKind.REDIS, "cache.r6g.xlarge")]
+        ),
+        FailingEstimator(),
+    )
+
+    preview = await service.preview(
+        QuoteRequest(
+            customer_request="Redis cache.r6g.xlarge",
+            pricing_mode="standard_reserved",
+            reserved_term_years=1,
+            payment_option="all_upfront",
+        )
+    )
+
+    assert preview.selections[0].status == "ready"
+    assert preview.selections[0].selected_model == "cache.r6g.xlarge"
+    assert preview.selections[0].requirements["purchase_option"] == "reserved"
+
+
+@pytest.mark.asyncio
+async def test_preview_audit_uses_on_demand_catalog_when_reserved_offer_is_unavailable() -> None:
+    class RedisParser:
+        async def parse(self, _: str) -> ParsedIntent:
+            return ParsedIntent(
+                customer_summary="Redis",
+                services=[
+                    ServiceRequirement(
+                        service="redis",
+                        region="ap-southeast-6",
+                        requirements={"requested_model": "cache.r6g.xlarge"},
+                    )
+                ],
+            )
+
+    class AuditOnlyReservedUnavailablePlugin(ReservedUnavailablePlugin):
+        def preview(
+            self,
+            requirement: ServiceRequirement,
+            default_region: str,
+        ) -> PreviewSelection:
+            return PreviewSelection(
+                component_id="component",
+                service=self.kind,
+                display_name=self.display_name,
+                region=requirement.region or default_region,
+                selected_model=self.model,
+                selection_reason="official",
+                candidates=[
+                    CandidateOption(
+                        model=self.model,
+                        family="r6g",
+                        specifications={},
+                        rationale="official",
+                        is_default=True,
+                    )
+                ],
+            )
+
+    service = QuoteService(
+        RedisParser(),  # type: ignore[arg-type]
+        PluginRegistry(
+            [AuditOnlyReservedUnavailablePlugin(ServiceKind.REDIS, "cache.r6g.xlarge")]
+        ),
+        FailingEstimator(),
+    )
+
+    preview = await service.preview(
+        QuoteRequest(
+            customer_request="Redis cache.r6g.xlarge",
+            pricing_mode="standard_reserved",
+            reserved_term_years=1,
+            payment_option="all_upfront",
+        )
+    )
+
+    assert preview.selections[0].status == "ready"
+    assert preview.selections[0].requirements["purchase_option"] == "reserved"
 
 
 def test_official_reserved_price_amortizes_upfront_for_each_term() -> None:
@@ -1978,16 +2283,48 @@ def test_official_reserved_price_amortizes_upfront_for_each_term() -> None:
 
 
 @pytest.mark.asyncio
-async def test_missing_region_uses_api_default_region() -> None:
+async def test_quote_preserves_region_resolved_during_intake() -> None:
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         api_registry(),
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
     )
 
     quote = await service.create_quote(QuoteRequest(customer_request="混合报价"))
-    assert quote.selections[2].region == "ap-southeast-1"
+    assert quote.selections[2].region == "ap-northeast-1"
+
+
+@pytest.mark.asyncio
+async def test_sales_region_is_passed_into_parser_before_preview_and_quote_processing() -> None:
+    class RegionAwareParser:
+        def __init__(self) -> None:
+            self.received_regions: list[str | None] = []
+
+        async def parse(
+            self,
+            _: str,
+            default_region: str | None = None,
+        ) -> ParsedIntent:
+            self.received_regions.append(default_region)
+            raise RuntimeError("stop after parser boundary")
+
+    parser = RegionAwareParser()
+    service = QuoteService(
+        parser,  # type: ignore[arg-type]
+        PluginRegistry([]),
+        FailingEstimator(),  # type: ignore[arg-type]
+    )
+    request = QuoteRequest(
+        customer_request="1、Amazon EC2：新加坡 ap-southeast-1，3台",
+        sales_region="ap-southeast-1",
+    )
+
+    with pytest.raises(RuntimeError, match="stop after parser boundary"):
+        await service.preview(request)
+    with pytest.raises(RuntimeError, match="stop after parser boundary"):
+        await service.create_quote(request)
+
+    assert parser.received_regions == ["ap-southeast-1", "ap-southeast-1"]
 
 
 @pytest.mark.asyncio
@@ -2006,8 +2343,7 @@ async def test_reference_only_quote_never_calls_bcm_or_adds_fake_monthly_cost() 
     service = QuoteService(
         ReferenceParser(),  # type: ignore[arg-type]
         registry,
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
     )
 
     quote = await service.create_quote(QuoteRequest(customer_request="需要 S3，容量待定"))
@@ -2025,15 +2361,13 @@ async def test_preview_validates_plugins_without_calling_estimator() -> None:
         MixedParser(),  # type: ignore[arg-type]
         api_registry(),
         FailingEstimator(),  # type: ignore[arg-type]
-        GenericCalculator(),  # type: ignore[arg-type]
     )
 
     preview = await service.preview(QuoteRequest(customer_request="混合报价"))
 
     assert len(preview.selections) == 3
     assert preview.selections[2].display_name == "Amazon ElastiCache for Redis"
-    # When the whole request contains one explicit region, components without
-    # their own region inherit that quote-wide region.
+    # Region resolution belongs to intake; preview preserves the typed region.
     assert preview.selections[2].region == "ap-northeast-1"
 
 
@@ -2043,8 +2377,7 @@ async def test_customer_must_approve_complete_configuration_before_pricing(tmp_p
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         api_registry(),
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
         confirmation_sessions=store,
     )
     request = QuoteRequest(customer_request="混合报价")
@@ -2570,6 +2903,51 @@ async def test_customer_answers_are_ai_reviewed_before_configuration_review() ->
 
 
 @pytest.mark.asyncio
+async def test_component_bound_free_text_is_not_sent_to_whole_quote_finalizer(tmp_path) -> None:
+    class ScopedAnswerParser:
+        def __init__(self) -> None:
+            self.revised: list[str] = []
+
+        async def parse(self, _: str) -> ParsedIntent:
+            raise AssertionError("saved draft must be reused")
+
+        async def revise_component_from_feedback(
+            self, _original: str, component: ServiceRequirement, feedback: str,
+        ) -> ServiceRequirement:
+            self.revised.append(feedback)
+            return component.model_copy(update={"quantity": 3}, deep=True)
+
+        async def finalize_confirmed_intent(self, *args, **kwargs) -> ParsedIntent:
+            raise AssertionError("a component-bound answer must not re-run the whole quote")
+
+    parser = ScopedAnswerParser()
+    store = ConfirmationSessionStore(tmp_path / "scoped-answer.sqlite3")
+    service = QuoteService(
+        parser,  # type: ignore[arg-type]
+        PluginRegistry([ApiPlugin(ServiceKind.EC2, "m7i.xlarge")]),
+        FailingEstimator(),  # type: ignore[arg-type]
+        confirmation_sessions=store,
+    )
+    intent = ParsedIntent(customer_summary="EC2", services=[ServiceRequirement(
+        service="ec2", region="ap-southeast-1", quantity=2,
+        requirements={"requested_model": "m7i.xlarge"},
+    )])
+    question = "请确认服务器数量。"
+    item = ConfirmationItem(question=question, answer_key="component-0:0123456789abcdef",
+                            component_id="0", service="ec2")
+    draft_id = "scopeans0001"
+    service._drafts[draft_id] = ("EC2", intent.model_copy(deep=True))
+    store.create_or_replace(draft_id=draft_id, customer_request="EC2",
+        customer_summary="EC2", intent=intent, confirmation_text=question, items=[item])
+
+    await service.preview(QuoteRequest(customer_request="EC2", draft_id=draft_id,
+        confirmation_responses={item.answer_key or "": "改成三台"}))
+
+    assert len(parser.revised) == 1
+    assert "改成三台" in parser.revised[0]
+
+
+@pytest.mark.asyncio
 async def test_structured_catalog_answer_does_not_call_ai_finalizer() -> None:
     class StructuredAnswerParser:
         async def parse(self, _: str) -> ParsedIntent:
@@ -2908,7 +3286,7 @@ async def test_missing_region_precedes_redis_size_question() -> None:
                     ServiceRequirement(
                         service="elasticache",
                         calculator_service_name="Amazon ElastiCache",
-                        quantity=2,
+                        quantity=1,
                         requirements={"engine": "redis", "shards": 1, "replicas_per_shard": 1},
                     )
                 ],
@@ -2926,8 +3304,7 @@ async def test_missing_region_precedes_redis_size_question() -> None:
     service = QuoteService(
         RedisParser(),  # type: ignore[arg-type]
         registry,
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
     )
 
     preview = await service.preview(QuoteRequest(customer_request="Redis 1主1从"))
@@ -2990,8 +3367,7 @@ async def test_redis_capacity_confirmation_updates_saved_draft_without_looping()
     service = QuoteService(
         parser,  # type: ignore[arg-type]
         registry,
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
     )
 
     first = await service.preview(QuoteRequest(customer_request="Redis 1主1从"))
@@ -3235,8 +3611,7 @@ async def test_replacement_model_confirmation_targets_matching_duplicate_service
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         PluginRegistry([]),
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
     )
     question = "服务器没有 4核100G，选4核64G（偏低），还是4核122G（不低配）？"
 
@@ -3278,8 +3653,7 @@ async def test_region_and_redis_model_answers_resolve_confirmation_without_loop(
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         PluginRegistry([]),
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
     )
 
     await service._apply_confirmation_responses(
@@ -3332,8 +3706,7 @@ async def test_compact_cpu_memory_confirmation_is_applied_without_unit_expansion
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         PluginRegistry([]),
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
     )
 
     await service._apply_confirmation_responses(
@@ -3359,8 +3732,7 @@ async def test_confirmed_preview_draft_reuses_intent_without_second_ai_call() ->
     service = QuoteService(
         parser,  # type: ignore[arg-type]
         api_registry(),
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
     )
     request = QuoteRequest(customer_request="混合报价")
 
@@ -3423,8 +3795,7 @@ async def test_windows_arm_confirmation_updates_saved_draft_without_looping() ->
     service = QuoteService(
         parser,  # type: ignore[arg-type]
         registry,
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
     )
 
     first = await service.preview(QuoteRequest(customer_request="Windows c7g.xlarge"))
@@ -3500,8 +3871,7 @@ async def test_shape_only_requirement_does_not_trigger_legacy_nearest_shape_ques
     service = QuoteService(
         ShapeParser(),  # type: ignore[arg-type]
         registry,
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
     )
 
     preview = await service.preview(QuoteRequest(customer_request="EC2 2核45G"))
@@ -3695,7 +4065,9 @@ def test_special_instance_families_are_hidden_unless_customer_requests_them() ->
         ),
     ]
     ordinary = ServiceRequirement(service="ec2", source_text="应用服务器 16核64G")
-    gpu = ServiceRequirement(service="ec2", source_text="GPU 推理服务器 16核64G")
+    gpu = ServiceRequirement(service="ec2", source_text="GPU 推理服务器 16核64G",
+                             requirements={"business_type": "gpu"},
+                             field_sources={"requirements.business_type": "customer_text"})
 
     ordinary_models = {
         option.model
@@ -3750,8 +4122,7 @@ async def test_bcm_flow_does_not_require_browser_calculator() -> None:
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         api_registry(),
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
     )
     quote = await service.create_quote(QuoteRequest(customer_request="混合报价"))
     assert quote.status.value == "quoted"
@@ -3766,57 +4137,8 @@ def test_per_instance_transfer_is_converted_to_calculator_total() -> None:
     assert normalized["data_transfer_out_gib_per_instance"] == 1024
 
 
-def test_transfer_only_ec2_item_is_merged_into_single_compute_workload() -> None:
-    intent = ParsedIntent(
-        customer_summary="EC2 和公网流量",
-        services=[
-            ServiceRequirement(
-                service="ec2",
-                region="ap-southeast-1",
-                quantity=3,
-                requirements={"vcpu": 8, "memory_gib": 32, "system_disk_gib": 200},
-                source_text="应用层：新加坡区域，3 台 Linux，8 核 32G",
-            ),
-            ServiceRequirement(
-                service="ec2",
-                region="ap-southeast-1",
-                requirements={"data_transfer_out_gib": 1024},
-                source_text="公网流量：应用服务器额外约 1TB/月",
-            ),
-        ],
-    )
-
-    merged = QuoteService._merge_transfer_only_ec2_services(intent)
-
-    assert merged == 1
-    assert len(intent.services) == 1
-    assert intent.services[0].requirements["data_transfer_out_gib"] == 1024
-    assert "公网流量" in intent.services[0].source_text
 
 
-def test_transfer_only_ec2_item_is_not_guessed_across_multiple_compute_groups() -> None:
-    intent = ParsedIntent(
-        customer_summary="两个区域的 EC2 和未指定归属的流量",
-        services=[
-            ServiceRequirement(
-                service="ec2",
-                region="ap-southeast-1",
-                requirements={"vcpu": 4, "memory_gib": 16},
-            ),
-            ServiceRequirement(
-                service="ec2",
-                region="ap-northeast-1",
-                requirements={"vcpu": 8, "memory_gib": 32},
-            ),
-            ServiceRequirement(
-                service="ec2",
-                requirements={"data_transfer_out_gib": 1024},
-            ),
-        ],
-    )
-
-    assert QuoteService._merge_transfer_only_ec2_services(intent) == 0
-    assert len(intent.services) == 3
 
 
 @pytest.mark.parametrize(
@@ -4403,6 +4725,9 @@ def test_product_defaults_use_lowest_standard_billing_paths() -> None:
         services=[
             ServiceRequirement(service="elasticache", requirements={"shards": 2}),
             ServiceRequirement(service="msk", requirements={}),
+            ServiceRequirement(
+                service="msk", requirements={"cluster_type": "serverless"}
+            ),
             ServiceRequirement(service="apigateway", requirements={}),
         ],
     )
@@ -4416,7 +4741,8 @@ def test_product_defaults_use_lowest_standard_billing_paths() -> None:
         "cluster_type": "provisioned",
         "storage_type": "ebs",
     }
-    assert intent.services[2].requirements["api_type"] == "http"
+    assert intent.services[2].requirements == {"cluster_type": "serverless"}
+    assert intent.services[3].requirements["api_type"] == "http"
 
 
 @pytest.mark.asyncio
@@ -4692,33 +5018,6 @@ def test_final_component_purchase_correction_survives_sales_default_reapplicatio
     }
 
 
-def test_transfer_only_source_drops_inherited_ai_shape_before_merge() -> None:
-    intent = ParsedIntent(
-        customer_summary="EC2 与额外公网流量",
-        services=[
-            ServiceRequirement(
-                service="ec2",
-                region="ap-northeast-1",
-                quantity=3,
-                source_text="应用服务器 3 台 Linux，每台 8 核 32G。",
-                requirements={"requested_model": "m7i.xlarge"},
-            ),
-            ServiceRequirement(
-                service="ec2",
-                region="ap-northeast-1",
-                source_text="公网流量：应用服务器额外约 1TB/月。",
-                requirements={
-                    "vcpu": 8,
-                    "memory_gib": 32,
-                    "data_transfer_out_gib": 1024,
-                },
-            ),
-        ],
-    )
-
-    assert QuoteService._merge_transfer_only_ec2_services(intent) == 1
-    assert len(intent.services) == 1
-    assert intent.services[0].requirements["data_transfer_out_gib"] == 1024
 
 
 def test_cache_size_without_model_does_not_require_pre_quote_confirmation() -> None:
@@ -4758,15 +5057,6 @@ def test_missing_cache_size_uses_lowest_cost_default_without_question() -> None:
     assert notices == []
 
 
-def test_cache_memory_can_be_recovered_from_ai_detail_or_source_text() -> None:
-    requirement = ServiceRequirement(
-        service="elasticache",
-        calculator_service_name="Amazon ElastiCache",
-        source_text="客户说明每个节点内存不低于 8 GiB",
-        requirements={"engine": "redis"},
-    )
-
-    assert QuoteService._cache_requested_memory(requirement, []) == 8
 
 
 @pytest.mark.asyncio
@@ -4813,7 +5103,6 @@ async def test_generic_ai_cache_node_notice_does_not_block_preview() -> None:
         CacheParser(),  # type: ignore[arg-type]
         registry,
         FailingEstimator(),  # type: ignore[arg-type]
-        GenericCalculator(),  # type: ignore[arg-type]
     )
 
     preview = await service.preview(QuoteRequest(customer_request="Redis 8G"))
@@ -4868,8 +5157,7 @@ async def test_late_business_issue_creates_one_follow_up_confirmation(tmp_path) 
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         api_registry(),
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
         confirmation_sessions=store,
     )
     draft_id = "lateissue001"
@@ -4947,8 +5235,7 @@ async def test_late_finite_choice_recovers_catalog_options_when_error_has_none(
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         PluginRegistry([RecoverableRdsPlugin(ServiceKind.RDS, "unused")]),
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
         confirmation_sessions=ConfirmationSessionStore(tmp_path / "confirmations.sqlite3"),
     )
     intent = ParsedIntent(
@@ -5018,8 +5305,7 @@ async def test_late_business_issue_does_not_repeat_after_process_restart(tmp_pat
     first_service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         api_registry(),
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
         confirmation_sessions=store,
     )
     first_service._drafts[draft_id] = (
@@ -5039,8 +5325,7 @@ async def test_late_business_issue_does_not_repeat_after_process_restart(tmp_pat
     restarted_service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         api_registry(),
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
         confirmation_sessions=store,
     )
     repeated = await restarted_service._late_customer_confirmation(
@@ -5061,8 +5346,7 @@ async def test_late_technical_issue_is_never_turned_into_customer_question(tmp_p
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         api_registry(),
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
         confirmation_sessions=ConfirmationSessionStore(tmp_path / "confirmations.sqlite3"),
     )
     intent = ParsedIntent(
@@ -5090,8 +5374,7 @@ async def test_late_business_questions_are_batched_into_one_customer_page(tmp_pa
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         api_registry(),
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
         confirmation_sessions=ConfirmationSessionStore(tmp_path / "confirmations.sqlite3"),
     )
     intent = ParsedIntent(
@@ -5152,8 +5435,7 @@ async def test_late_bcm_failure_never_creates_customer_confirmation(
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         api_registry(),
-        ApiEstimator(),  # type: ignore[arg-type]
-        None,
+        ApiEstimator(),
         confirmation_sessions=store,
     )
     intent = ParsedIntent(
@@ -5342,6 +5624,162 @@ def test_s3_standard_labels_are_normalized_before_adapter_validation(label: str)
 
 def test_s3_non_standard_tier_is_not_silently_changed() -> None:
     assert _normalize_s3_storage_class("Standard-IA") == "standard_ia"
+
+
+@pytest.mark.parametrize(
+    "label",
+    ("INTELLIGENT_TIERING", "Intelligent-Tiering", "S3智能分层存储", "智能分层"),
+)
+def test_s3_intelligent_tiering_labels_share_one_storage_class(label: str) -> None:
+    assert _normalize_s3_storage_class(label) == "intelligent_tiering"
+
+
+def test_s3_intelligent_tiering_uses_frequent_access_and_int_request_dimensions() -> None:
+    class S3Catalog:
+        @staticmethod
+        def products(
+            service_code: str,
+            filters: dict[str, str],
+            *,
+            max_pages: int = 3,
+            refresh: bool = False,
+        ) -> list[dict[str, object]]:
+            del max_pages, refresh
+            assert service_code == "AmazonS3"
+            if filters.get("storageClass") == "Intelligent-Tiering":
+                assert "productFamily" not in filters
+                usage_type, unit, sku = (
+                    "USW2-TimedStorage-INT-FA-ByteHrs",
+                    "GB-Mo",
+                    "storage",
+                )
+            elif filters.get("group") == "S3-API-INT-Tier1":
+                usage_type, unit, sku = "USW2-Requests-INT-Tier1", "Requests", "put"
+            elif filters.get("group") == "S3-API-INT-Tier2":
+                usage_type, unit, sku = "USW2-Requests-INT-Tier2", "Requests", "get"
+            else:
+                return []
+            return [{
+                "serviceCode": "AmazonS3",
+                "product": {
+                    "sku": sku,
+                    "attributes": {
+                        "usagetype": usage_type,
+                        "operation": "",
+                        "regionCode": "us-west-2",
+                        "groupDescription": (
+                            "PUT, COPY, POST, LIST requests"
+                            if sku == "put"
+                            else "GET and all other requests"
+                        ),
+                    },
+                },
+                "terms": {
+                    "OnDemand": {
+                        "term": {
+                            "priceDimensions": {
+                                "dimension": {
+                                    "beginRange": "0",
+                                    "unit": unit,
+                                    "pricePerUnit": {"USD": "0.01"},
+                                }
+                            }
+                        }
+                    }
+                },
+            }]
+
+    selected = S3Plugin(None, S3Catalog()).select(  # type: ignore[arg-type]
+        ServiceRequirement(
+            service="s3",
+            region="us-west-2",
+            requirements={
+                "storage_class": "INTELLIGENT_TIERING",
+                "storage_gib": 300 * 1024,
+                "put_copy_post_list_requests": 50_000_000,
+                "get_select_requests": 800_000_000,
+            },
+        ),
+        "us-west-2",
+    )
+
+    assert selected.model == "S3 Intelligent-Tiering"
+    assert [line.usage_type for line in selected.usage_lines] == [
+        "USW2-TimedStorage-INT-FA-ByteHrs",
+        "USW2-Requests-INT-Tier1",
+        "USW2-Requests-INT-Tier2",
+    ]
+
+
+@pytest.mark.parametrize(
+    "label",
+    ("Express One Zone", "S3 Express One Zone", "express_one_zone", "高性能单区"),
+)
+def test_s3_express_one_zone_labels_share_one_storage_class(label: str) -> None:
+    assert _normalize_s3_storage_class(label) == "express_one_zone"
+
+
+def test_s3_express_one_zone_uses_xz_storage_and_request_dimensions() -> None:
+    class S3Catalog:
+        @staticmethod
+        def products(
+            service_code: str,
+            filters: dict[str, str],
+            *,
+            max_pages: int = 3,
+            refresh: bool = False,
+        ) -> list[dict[str, object]]:
+            del max_pages, refresh
+            assert service_code == "AmazonS3"
+            if filters.get("storageClass") == "High Performance":
+                usage_type, unit, sku = (
+                    "APN1-TimedStorage-XZ-ByteHrs",
+                    "GB-Mo",
+                    "storage",
+                )
+            elif filters.get("group") == "S3-API-XZ-Tier1":
+                usage_type, unit, sku = "APN1-Requests-XZ-Tier1", "Requests", "put"
+            elif filters.get("group") == "S3-API-XZ-Tier2":
+                usage_type, unit, sku = "APN1-Requests-XZ-Tier2", "Requests", "get"
+            else:
+                return []
+            return [{
+                "serviceCode": "AmazonS3",
+                "product": {
+                    "sku": sku,
+                    "attributes": {
+                        "usagetype": usage_type,
+                        "operation": "",
+                        "regionCode": "ap-northeast-1",
+                        "groupDescription": (
+                            "PUT, COPY, POST, LIST requests"
+                            if sku == "put"
+                            else "GET and all other requests"
+                        ),
+                    },
+                },
+            }]
+
+    selected = S3Plugin(None, S3Catalog()).select(  # type: ignore[arg-type]
+        ServiceRequirement(
+            service="s3",
+            region="ap-northeast-1",
+            requirements={
+                "storage_class": "S3 Express One Zone",
+                "storage_gib": 30 * 1024,
+                "put_copy_post_list_requests": 80_000_000,
+                "get_select_requests": 1_000_000_000,
+            },
+        ),
+        "ap-northeast-1",
+    )
+
+    assert selected.model == "S3 Express One Zone"
+    assert [line.usage_type for line in selected.usage_lines] == [
+        "APN1-TimedStorage-XZ-ByteHrs",
+        "APN1-Requests-XZ-Tier1",
+        "APN1-Requests-XZ-Tier2",
+    ]
 
 
 def test_s3_standard_official_label_produces_storage_usage_line() -> None:
@@ -5540,6 +5978,10 @@ def test_cloudfront_never_infers_traffic_geography_from_deployment_region() -> N
     assert error.value.code == "cloudfront_traffic_geography_required"
 
 
+def test_cloudfront_accepts_plain_asia_as_asia_pacific_geography() -> None:
+    assert CloudFrontPlugin._geography("Asia") == ("Asia Pacific", "AP")
+
+
 def test_invalid_internal_requirement_is_not_a_customer_question() -> None:
     error = ManualConfirmationRequired(
         "需求字段 https_requests 必须是数值",
@@ -5680,7 +6122,7 @@ def test_self_hosted_ec2_note_explains_original_product_and_purpose() -> None:
     assert "不是 AWS 托管版服务" in notes[0]
 
 
-def test_direct_application_server_and_explicit_service_purpose_survive_to_remarks() -> None:
+def test_remarks_do_not_reinterpret_purpose_or_customer_budget_from_prose() -> None:
     application = ServiceRequirement(
         service="ec2",
         source_text="应用服务器，3台，单台16核128G，磁盘1T",
@@ -5693,14 +6135,12 @@ def test_direct_application_server_and_explicit_service_purpose_survive_to_remar
         ),
     )
 
-    assert QuoteService._dependency_remarks(application, [application, s3]) == [
-        "本项用于部署客户所述的应用服务器；这里计算的是 EC2 实例与所列 EBS 存储资源。"
-    ]
-    assert QuoteService._dependency_remarks(s3, [application, s3]) == [
-        "客户说明本项用于冷数据存储、Flink快照、业务设备图片。",
-        "客户提供的预估费用 4608 美元未注明周期；"
-        "该金额仅作对比备注，不代替 AWS 官方计费结果。",
-    ]
+    assert QuoteService._dependency_remarks(application, [application, s3]) == []
+    assert QuoteService._dependency_remarks(s3, [application, s3]) == []
+    # Original context remains visible to the customer, without becoming a
+    # second late-stage semantic extraction or a quoted amount.
+    assert "用于冷数据存储" in s3.source_text
+    assert "4608美元" in s3.source_text
 
 
 def test_missing_rds_deployment_question_has_customer_choices() -> None:
@@ -5981,8 +6421,7 @@ async def test_rds_version_confirmation_updates_only_its_database_component() ->
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         PluginRegistry([]),
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
     )
 
     await service._apply_confirmation_responses(intent, {question: "engine_version:8.4.7"})
@@ -6016,8 +6455,7 @@ async def test_rds_chinese_engine_version_dropdown_is_applied_deterministically(
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         PluginRegistry([]),
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
     )
 
     await service._apply_confirmation_responses(intent, {question: "engine_version:8.4.11"})
@@ -6050,8 +6488,7 @@ async def test_rds_version_answer_updates_only_its_bound_component() -> None:
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         PluginRegistry([]),
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
     )
 
     await service._apply_confirmation_responses(
@@ -6096,8 +6533,7 @@ async def test_rds_engine_confirmation_updates_only_the_database_component() -> 
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         PluginRegistry([]),
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
     )
 
     await service._apply_confirmation_responses(intent, {question: "postgresql"})
@@ -6359,8 +6795,7 @@ async def test_nacos_confirmation_preserves_self_host_topology_or_splits_managed
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         PluginRegistry([]),
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
     )
 
     await service._apply_confirmation_responses(intent, {question: answer})
@@ -6397,8 +6832,7 @@ async def test_self_hosted_machine_selection_applies_model_and_machine_count() -
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         PluginRegistry([]),
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
     )
 
     await service._apply_confirmation_responses(
@@ -6433,8 +6867,7 @@ async def test_self_hosted_choice_and_machine_configuration_apply_in_one_answer(
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         PluginRegistry([]),
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
     )
 
     await service._apply_confirmation_responses(
@@ -6538,8 +6971,7 @@ async def test_selected_model_uses_confirmation_component_id_with_multiple_ec2()
     service = QuoteService(
         MixedParser(),  # type: ignore[arg-type]
         PluginRegistry([]),
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
     )
 
     await service._apply_confirmation_responses(
@@ -6620,8 +7052,7 @@ async def test_pending_managed_decision_embeds_self_hosted_configuration() -> No
     service = QuoteService(
         PendingArchitectureParser(),  # type: ignore[arg-type]
         PluginRegistry([ApiPlugin(ServiceKind.EC2, "t4g.small")]),
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
     )
 
     preview = await service.preview(QuoteRequest(customer_request="Nacos 3个节点"))
@@ -6689,7 +7120,9 @@ async def test_unknown_third_party_product_becomes_architecture_question() -> No
                         service="clickhouse",
                         calculator_service_name="ClickHouse",
                         region="ap-southeast-1",
-                        source_text="ClickHouse：",
+                        source_text=customer_request.splitlines()[1].removeprefix("5、"),
+                        quantity=3,
+                        requirements={"vcpu": 8, "memory_gib": 32, "system_disk_gib": 1024},
                         # Production identity resolution, rather than pricing,
                         # owns the third-party classification.
                         field_sources={
@@ -6710,8 +7143,7 @@ async def test_unknown_third_party_product_becomes_architecture_question() -> No
     service = QuoteService(
         ClickHouseParser(),  # type: ignore[arg-type]
         PluginRegistry([ApiPlugin(ServiceKind.EC2, "m6i.2xlarge")]),
-        FailingEstimator(),  # type: ignore[arg-type]
-        None,
+        FailingEstimator(),
         generic_plugin=MissingGenericCatalog(),  # type: ignore[arg-type]
     )
 

@@ -10,9 +10,10 @@ from pathlib import Path
 
 from app.core.data_paths import AWS_DATA_ROOT
 from app.domain.models import ServiceRequirement
+from app.domain.fact_ledger import customer_owned_source
 
 COMPONENT_RESULT_TTL_SECONDS = 90 * 24 * 60 * 60
-COMPONENT_RESULT_CACHE_VERSION = "component-template-v4-semantic-pricing-contract"
+COMPONENT_RESULT_CACHE_VERSION = "component-template-v24-cleaned-only"
 
 
 class ValidatedComponentResultCache:
@@ -64,6 +65,26 @@ class ValidatedComponentResultCache:
             "version": COMPONENT_RESULT_CACHE_VERSION,
             "model": model_name,
             "service": component.service,
+            # Several customer products share one runtime service/Price List
+            # offer (for example EBS volumes and EBS snapshots).  A catalog
+            # identity migration must invalidate an older component result
+            # even when the isolated customer sentence did not change.
+            "product_identity": component.product_identity,
+            "calculator_service_name": component.calculator_service_name,
+            "workload_identity_kind": component.workload_identity_kind,
+            "workload_name": component.workload_name,
+            "parent_component_key": component.parent_component_key,
+            "derived_from_service": component.derived_from_service,
+            "owned_source": cls._normalized_text(customer_owned_source(component)),
+            "official_service_code": component.official_calculator_service_code,
+            "official_template_id": component.official_calculator_template_id,
+            "official_schema_hash": component.official_calculator_schema_hash,
+            "confirmed_fields": {
+                path: source for path, source in component.field_sources.items()
+                if source in {"customer_confirmation", "customer_correction", "sales_confirmation",
+                              "customer_confirmation_removed"}
+            },
+            "official_configuration": component.official_calculator_configuration,
             "region": component.region,
             "quantity": component.quantity,
             "hours_per_month": component.hours_per_month,

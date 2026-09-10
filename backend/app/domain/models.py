@@ -69,10 +69,11 @@ class UnmappedPricingFact(BaseModel):
 class CustomerPricingFact(BaseModel):
     """One immutable customer-owned fact produced by the cleaning boundary.
 
-    The original component text remains available for audit, but pricing,
-    product matching and confirmation consume this table instead of parsing
-    prose again. ``fact_id`` is stable for the same component/path/evidence so
-    every downstream use can be traced without relying on row position.
+    Evidence is copied from the validated, cleaned component sentence; the raw
+    request has already been discarded. Pricing, product matching and
+    confirmation consume this table instead of parsing prose again. ``fact_id``
+    is stable for the same component/path/evidence so every downstream use can
+    be traced without relying on row position.
     """
 
     fact_id: str = Field(min_length=12, max_length=80, pattern=r"^fact_[a-f0-9]+$")
@@ -95,6 +96,20 @@ class ServiceRequirement(BaseModel):
     # newly-added AWS service without waiting for a backend enum release.
     service: str = Field(min_length=2, max_length=80, pattern=r"^[a-z0-9_\-]+$")
     calculator_service_name: str | None = Field(default=None, min_length=2, max_length=160)
+    # Exact AWS Calculator form identity read before component extraction.
+    # These fields are provider-contract metadata, not customer requirements
+    # and not a second pricing path.  They let the AI fill the live official
+    # form while RequirementIR keeps its stable normalized vocabulary.
+    official_calculator_service_code: str | None = Field(
+        default=None, min_length=1, max_length=240
+    )
+    official_calculator_template_id: str | None = Field(
+        default=None, min_length=1, max_length=240
+    )
+    official_calculator_schema_hash: str | None = Field(
+        default=None, min_length=64, max_length=64
+    )
+    official_calculator_configuration: dict[str, Any] = Field(default_factory=dict)
     # Internal identity is deliberately independent from list position and
     # mutable customer text.  It survives edits, AI cleanup, catalog repair and
     # pricing so a value can never be restored onto a neighbouring component.
@@ -134,9 +149,12 @@ class ServiceRequirement(BaseModel):
     hours_per_month: float = Field(default=730, gt=0, le=744)
     requirements: dict[str, Any] = Field(default_factory=dict)
     source_text: str = ""
-    # Immutable customer wording used for review, identity and reconciliation.
-    # ``source_text`` may contain later edit annotations for the AI audit trail.
+    # Transitional first-cleaning field only. It must be erased immediately
+    # after the raw-input losslessness check and is forbidden in saved drafts.
     original_source_text: str | None = None
+    # Transitional first-cleaner ownership only. These literal raw fragments
+    # are erased at the same boundary as ``original_source_text``.
+    intake_source_fragments: list[str] = Field(default_factory=list, max_length=100)
     query_action: str | None = None
     # Exact snippets copied from this component's customer text. Keys use
     # ``region``, ``quantity`` or ``requirements.<field>`` paths.  This is
@@ -255,12 +273,28 @@ class SalesRegionPreflightResponse(BaseModel):
     options: list[SalesRegionOption] = Field(default_factory=list)
 
 
+class BillingCalculationAudit(BaseModel):
+    """Calculation provenance, excluded from requests sent to AWS."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    rule_id: str
+    rule_version: str
+    unit: str
+    expression: str
+    amount: str
+    inputs: dict[str, str]
+    defaults: dict[str, str]
+    missing_fields: tuple[str, ...] = ()
+    scopes: dict[str, str] = Field(default_factory=dict)
+    item_index: int | None = Field(default=None, ge=0)
+
+
 class UsageLine(BaseModel):
     key: str = Field(pattern=r"^[A-Za-z0-9]{1,10}$")
     service_code: str
     usage_type: str
     operation: str
-    amount: float = Field(gt=0)
+    amount: float = Field(gt=0, allow_inf_nan=False)
     group: str | None = None
     # Requirement fields that produced this official charge.  This is audit
     # metadata only and is not submitted to AWS.  It lets the final quote
@@ -271,6 +305,7 @@ class UsageLine(BaseModel):
     # resolves those names to immutable facts.  Adapters must never invent
     # these IDs themselves.
     source_fact_ids: list[str] = Field(default_factory=list)
+    calculation: BillingCalculationAudit | None = None
 
 
 class ReferenceRate(BaseModel):
@@ -310,6 +345,13 @@ class SelectedResource(BaseModel):
     # it so a multi-instance total is never mistaken for a single-unit price.
     quantity: int = Field(default=1, ge=1)
     architecture: str
+    # The old ``specifications`` object is kept as a presentation-compatible
+    # merged view.  Pricing and reconciliation must use the two typed planes
+    # below instead: customer requirements are not AWS product attributes,
+    # and an official model attribute must never be sent back to the customer
+    # fact ledger as though the customer had written it.
+    requested_specifications: dict[str, Any] = Field(default_factory=dict)
+    official_specifications: dict[str, Any] = Field(default_factory=dict)
     specifications: dict[str, Any]
     official_product: dict[str, Any]
     rationale: str
@@ -451,6 +493,10 @@ class QuotePreviewResponse(BaseModel):
     sales_validation_message: str | None = None
     execution_trace: list[ExecutionEvent] = Field(default_factory=list)
     expert_review: ExpertReview | None = None
+    # Canonical text retained by the browser and draft after raw input is
+    # discarded. Present for AWS's cleaned-only intake; absent for providers
+    # that do not use this pipeline.
+    cleaned_request: str | None = None
 
 
 class ConfirmationSubmission(BaseModel):
@@ -460,6 +506,11 @@ class ConfirmationSubmission(BaseModel):
     # the confirmation so a refresh or a later pricing pass cannot silently
     # return to a different architecture.
     processor_architecture: Literal["arm64", "x86_64"] | None = None
+    # Exceptions are keyed by the opaque confirmation answer key. They never
+    # change the quote-wide default and are validated against that one item.
+    component_processor_architectures: dict[
+        str, Literal["arm64", "x86_64"]
+    ] = Field(default_factory=dict)
 
     @field_validator("answers")
     @classmethod
@@ -534,7 +585,7 @@ class ConfigurationFeedbackSubmission(BaseModel):
         return cleaned
 
     @model_validator(mode="after")
-    def has_feedback(self) -> "ConfigurationFeedbackSubmission":
+    def has_feedback(self) -> ConfigurationFeedbackSubmission:
         if not self.feedback and not self.component_feedback and not self.component_updates:
             raise ValueError("请至少填写一项需要修改的内容")
         return self

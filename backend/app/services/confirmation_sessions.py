@@ -12,7 +12,6 @@ from typing import Literal, cast
 
 from app.domain.component_hierarchy import component_hierarchy
 from app.domain.component_integrity import ensure_component_keys
-from app.domain.customer_configuration import preserve_customer_configuration
 from app.domain.models import (
     ConfigurationReviewItem,
     ConfirmationItem,
@@ -27,16 +26,22 @@ from app.domain.pricing_issues import (
     should_retry_persisted_pricing_issue,
 )
 from app.integrations.service_templates import billing_dimension_fields
+from app.services.confirmation_presentation import customer_confirmation_item
 
 CONFIGURATION_FEEDBACK_QUESTION = "【客户对最终配置表的修改意见】"
 CONFIGURATION_COMPONENT_FEEDBACK_PREFIX = "【组件修改】"
 CONFIGURATION_COMPONENT_UPDATE_PREFIX = "【组件字段修改】"
 CONFIGURATION_COMPONENT_DELETE = "__DELETE_COMPONENT__"
 PROCESSOR_ARCHITECTURE_ANSWER_KEY = "__processor_architecture__"
+COMPONENT_PROCESSOR_ARCHITECTURE_PREFIX = "__component_processor_architecture__:"
 # A large, fully independent component set can legitimately need 2-5 minutes.
 # The job runner restores the table immediately on a known failure, so this is
 # only a crash-recovery ceiling and must never interrupt a healthy quote.
 CONFIGURATION_REPROCESSING_STALE_SECONDS = 8 * 60
+# A live worker renews this value whenever the component pipeline reports
+# progress.  A shorter lease lets another worker resume after an abrupt crash;
+# it is intentionally longer than one AI/catalog attempt.
+CONFIGURATION_PROCESSING_LEASE_SECONDS = 2 * 60
 
 
 class ConfirmationSessionStore:
@@ -133,6 +138,12 @@ class ConfirmationSessionStore:
         requirements = getattr(item, "requirements", {})
         reason = str(requirements.get("_quote_skip_reason") or "")
         if not reason:
+            field_sources = getattr(item, "field_sources", {})
+            if (
+                "_official_calculator_status" in field_sources
+                and field_sources.get("_semantic_fact_mapping") != "ai_cleaning"
+            ):
+                return "该组件尚未完成 AWS 官方字段核验，不能进入报价。"
             return None
         category = cls._pricing_issue_category(item)
         retryable = category is not None and should_retry_persisted_pricing_issue(
@@ -188,6 +199,8 @@ class ConfirmationSessionStore:
                     confirmation_round INTEGER NOT NULL DEFAULT 0,
                     asked_questions_json TEXT NOT NULL DEFAULT '[]',
                     request_json TEXT NOT NULL DEFAULT '{}'
+                    , processing_owner TEXT
+                    , processing_heartbeat_at TEXT
                 )
                 """
             )
@@ -212,6 +225,14 @@ class ConfirmationSessionStore:
                     "ALTER TABLE confirmation_sessions "
                     "ADD COLUMN request_json TEXT NOT NULL DEFAULT '{}'"
                 )
+            if "processing_owner" not in columns:
+                connection.execute(
+                    "ALTER TABLE confirmation_sessions ADD COLUMN processing_owner TEXT"
+                )
+            if "processing_heartbeat_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE confirmation_sessions ADD COLUMN processing_heartbeat_at TEXT"
+                )
 
     def create_or_replace(
         self,
@@ -232,7 +253,6 @@ class ConfirmationSessionStore:
             # reopened prose interpretation after a customer link was created.
             from app.integrations.deepseek import DeepSeekIntentParser
 
-            preserve_customer_configuration(intent)
             DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
         now = datetime.now(UTC).isoformat()
         with self._lock, self._connect() as connection:
@@ -272,6 +292,24 @@ class ConfirmationSessionStore:
                 )
                 if architecture in {"arm64", "x86_64"}:
                     preserved_answers[PROCESSOR_ARCHITECTURE_ANSWER_KEY] = architecture
+                current_answer_keys = {
+                    str(item.answer_key or item.question)
+                    for item in items
+                }
+                if isinstance(previous_answers, dict):
+                    for key, value in previous_answers.items():
+                        if not str(key).startswith(
+                            COMPONENT_PROCESSOR_ARCHITECTURE_PREFIX
+                        ):
+                            continue
+                        answer_key = str(key).removeprefix(
+                            COMPONENT_PROCESSOR_ARCHITECTURE_PREFIX
+                        )
+                        if (
+                            answer_key in current_answer_keys
+                            and value in {"arm64", "x86_64"}
+                        ):
+                            preserved_answers[str(key)] = str(value)
             preserved_answers_json = json.dumps(preserved_answers, ensure_ascii=False)
             connection.execute(
                 """
@@ -297,6 +335,7 @@ class ConfirmationSessionStore:
                         ELSE excluded.answers_json
                     END,
                     status='pending', submitted_at=NULL,
+                    processing_owner=NULL, processing_heartbeat_at=NULL,
                     asked_questions_json=excluded.asked_questions_json,
                     request_json=CASE
                         WHEN excluded.request_json = '{}' THEN confirmation_sessions.request_json
@@ -326,10 +365,35 @@ class ConfirmationSessionStore:
         row = self._row(token)
         if row is None:
             return None
-        # A worker can be interrupted after the row was marked ``reviewing``.
-        # Never strand the customer on a permanent spinner: after the maximum
-        # bounded revision window, restore the same saved configuration table.
-        if str(row["status"]) in {"reviewing", "submitted", "processing"} and row["submitted_at"]:
+        # A dead worker must not leave the browser on an endless spinner.  Live
+        # workers renew their lease through progress events; an expired lease
+        # is returned to ``reviewing`` so the API can atomically claim and
+        # resume the same saved answers on another worker.
+        if str(row["status"]) == "processing":
+            lease_value = row["processing_heartbeat_at"] or row["submitted_at"]
+            lease_time = (
+                datetime.fromisoformat(str(lease_value)) if lease_value else None
+            )
+            if lease_time is None or (
+                datetime.now(UTC) - lease_time
+            ).total_seconds() > CONFIGURATION_PROCESSING_LEASE_SECONDS:
+                with self._lock, self._connect() as connection:
+                    connection.execute(
+                        """
+                        UPDATE confirmation_sessions
+                        SET status = 'reviewing', processing_owner = NULL,
+                            processing_heartbeat_at = NULL
+                        WHERE token = ? AND status = 'processing'
+                          AND COALESCE(processing_heartbeat_at, submitted_at, '') = ?
+                        """,
+                        (token, str(lease_value or "")),
+                    )
+                row = self._row(token)
+                if row is None:
+                    return None
+        # The older review/submission boundary has no active worker lease. If
+        # it was abandoned, restore the editable configuration table.
+        if str(row["status"]) in {"reviewing", "submitted"} and row["submitted_at"]:
             submitted_at = datetime.fromisoformat(str(row["submitted_at"]))
             if (
                 datetime.now(UTC) - submitted_at
@@ -339,8 +403,9 @@ class ConfirmationSessionStore:
                         """
                         UPDATE confirmation_sessions
                         SET status = 'configuration_review',
-                            confirmation_text = ?
-                        WHERE token = ? AND status IN ('reviewing', 'submitted', 'processing')
+                            confirmation_text = ?, processing_owner = NULL,
+                            processing_heartbeat_at = NULL
+                        WHERE token = ? AND status IN ('reviewing', 'submitted')
                         """,
                         ("这次修改没有完成，原配置已保留，请重新提交。", token),
                     )
@@ -348,44 +413,9 @@ class ConfirmationSessionStore:
                 if row is None:
                     return None
         intent = self._parse_persisted_intent(str(row["intent_json"]))
-        if self.cloud_provider == "aws":
-            # Keep old customer links consistent with the live quote boundary:
-            # derived EKS Worker rows are rebuilt from the parent source before
-            # they are displayed or edited.
-            from app.integrations.deepseek import DeepSeekIntentParser
-
-            numbered_blocks = DeepSeekIntentParser._numbered_requirement_blocks(
-                str(row["customer_request"])
-            )
-            top_level_components = [
-                item for item in intent.services if not item.derived_from_service
-            ]
-            if len(numbered_blocks) > len(top_level_components):
-                # Upgrade older drafts created when identical numbered rows
-                # were collapsed. The original request remains the source of
-                # truth, so each missing sales boundary can be restored without
-                # asking the customer to enter the same server again.
-                DeepSeekIntentParser._reconcile_explicit_component_inventory(
-                    str(row["customer_request"]), intent
-                )
-                DeepSeekIntentParser._reconcile_explicit_regions(
-                    str(row["customer_request"]), intent
-                )
-            preserve_customer_configuration(intent)
-            DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
-            DeepSeekIntentParser._split_eks_worker_nodes(intent)
-            self._normalize_review_group_quantities(intent)
-            normalized_intent_json = intent.model_dump_json()
-            if normalized_intent_json != str(row["intent_json"]):
-                # The customer must edit the exact list that will later be
-                # processed. Persist old-draft migration immediately; showing
-                # a repaired list while submitting indexes against stale JSON
-                # made Save appear unresponsive or modify the wrong row.
-                with self._lock, self._connect() as connection:
-                    connection.execute(
-                        "UPDATE confirmation_sessions SET intent_json = ? WHERE token = ?",
-                        (normalized_intent_json, str(row["token"])),
-                    )
+        # Reading a link is not another extraction pass. Old drafts are
+        # upgraded transactionally by official intake when submitted, never
+        # by source-scanning or changing component indexes on a GET request.
         hierarchy = component_hierarchy(intent.services)
         session_status = str(row["status"])
         stable_review_ids = session_status == "configuration_review"
@@ -489,6 +519,11 @@ class ConfirmationSessionStore:
                 pricing_status=(
                     "unpriced"
                     if item.requirements.get("_quote_skip_reason")
+                    or (
+                        "_official_calculator_status" in item.field_sources
+                        and item.field_sources.get("_semantic_fact_mapping")
+                        != "ai_cleaning"
+                    )
                     else "ready"
                 ),
                 pricing_notice=(
@@ -513,6 +548,8 @@ class ConfirmationSessionStore:
                 for item in json.loads(str(row["items_json"]))
             ]
         )
+        if self.cloud_provider == "aws":
+            confirmation_items = [customer_confirmation_item(item) for item in confirmation_items]
         return ConfirmationSessionResponse(
             token=str(row["token"]),
             cloud_provider=self.cloud_provider,
@@ -590,12 +627,25 @@ class ConfirmationSessionStore:
         items: list[dict[str, object]],
         answers: dict[str, str],
         architecture: str,
+        component_architectures: dict[str, str] | None = None,
     ) -> None:
-        """Reject a mixed model answer before it can mutate the saved draft."""
+        """Reject an unscoped mixed model answer before it mutates the draft."""
+
+        component_architectures = component_architectures or {}
+        valid_answer_keys = {
+            str(item.get("answer_key") or item.get("question") or "")
+            for item in items
+        }
+        unknown_keys = set(component_architectures).difference(valid_answer_keys)
+        if unknown_keys:
+            raise ValueError("单组件处理器架构绑定到了不存在的确认项")
 
         for item in items:
             question = str(item.get("question") or "")
             answer_key = str(item.get("answer_key") or question)
+            effective_architecture = component_architectures.get(
+                answer_key, architecture
+            )
             answer = answers.get(answer_key)
             if answer is None:
                 answer = answers.get(question)
@@ -609,13 +659,6 @@ class ConfirmationSessionStore:
                 ]
                 if isinstance(option, dict) and option.get("model")
             ]
-            supported = {
-                candidate_architecture
-                for option in options
-                if (
-                    candidate_architecture := cls._option_processor_architecture(option)
-                )
-            }
             selected_segments = {part.strip() for part in str(answer).split("；")}
             selected = next(
                 (
@@ -628,14 +671,14 @@ class ConfirmationSessionStore:
             if selected is None:
                 continue
             selected_architecture = cls._option_processor_architecture(selected)
-            # ARM may legitimately fall back for a product whose official
-            # catalogue is x86-only.  Whenever the requested family exists,
-            # mixing another family is never accepted silently.
             if (
                 selected_architecture
-                and selected_architecture != architecture
-                and architecture in supported
+                and selected_architecture != effective_architecture
             ):
+                if answer_key in component_architectures:
+                    raise ValueError(
+                        "所选型号与该组件指定的处理器架构不一致，请重新选择"
+                    )
                 raise ValueError(
                     "所选型号与整份报价的处理器架构不一致，请重新选择同一架构的型号"
                 )
@@ -646,6 +689,7 @@ class ConfirmationSessionStore:
         answers: dict[str, str],
         *,
         processor_architecture: str | None = None,
+        component_processor_architectures: dict[str, str] | None = None,
     ) -> ConfirmationSessionResponse | None:
         row = self._row(token)
         if row is None:
@@ -678,20 +722,33 @@ class ConfirmationSessionStore:
             cleaned[answer_key] = answer
         if missing:
             raise ValueError(f"尚有 {missing} 项未填写")
+        component_processor_architectures = {
+            str(answer_key): str(architecture)
+            for answer_key, architecture in (
+                component_processor_architectures or {}
+            ).items()
+            if architecture in {"arm64", "x86_64"}
+        }
         if processor_architecture in {"arm64", "x86_64"}:
             self._validate_processor_architecture(
                 items,
                 cleaned,
                 processor_architecture,
+                component_processor_architectures,
             )
             cleaned[PROCESSOR_ARCHITECTURE_ANSWER_KEY] = processor_architecture
+            for answer_key, architecture in component_processor_architectures.items():
+                cleaned[
+                    f"{COMPONENT_PROCESSOR_ARCHITECTURE_PREFIX}{answer_key}"
+                ] = architecture
         submitted_at = datetime.now(UTC).isoformat()
         with self._lock, self._connect() as connection:
             connection.execute(
                 """
                 UPDATE confirmation_sessions
                 SET answers_json = ?, status = 'reviewing', submitted_at = ?,
-                    confirmation_round = confirmation_round + 1
+                    confirmation_round = confirmation_round + 1,
+                    processing_owner = NULL, processing_heartbeat_at = NULL
                 WHERE token = ?
                 """,
                 (json.dumps(cleaned, ensure_ascii=False), submitted_at, token),
@@ -724,7 +781,8 @@ class ConfirmationSessionStore:
             connection.execute(
                 """
                 UPDATE confirmation_sessions
-                SET status = 'completed'
+                SET status = 'completed', processing_owner = NULL,
+                    processing_heartbeat_at = NULL
                 WHERE draft_id = ?
                   AND status IN ('submitted', 'reviewing', 'processing', 'approved')
                 """,
@@ -754,7 +812,8 @@ class ConfirmationSessionStore:
                 """
                 UPDATE confirmation_sessions
                 SET intent_json = ?, confirmation_text = ?,
-                    status = 'configuration_review', submitted_at = ?
+                    status = 'configuration_review', submitted_at = ?,
+                    processing_owner = NULL, processing_heartbeat_at = NULL
                 WHERE draft_id = ?
                 """,
                 (
@@ -775,12 +834,17 @@ class ConfirmationSessionStore:
             raise ValueError("当前确认单还没有进入最终配置确认阶段")
         with self._lock, self._connect() as connection:
             connection.execute(
-                "UPDATE confirmation_sessions SET status = 'approved' WHERE token = ?",
+                """UPDATE confirmation_sessions
+                   SET status = 'approved', processing_owner = NULL,
+                       processing_heartbeat_at = NULL
+                   WHERE token = ?""",
                 (token,),
             )
         return self.get(token)
 
-    def begin_configuration_reprocessing(self, token: str) -> QuoteRequest | None:
+    def begin_configuration_reprocessing(
+        self, token: str, *, owner_id: str | None = None,
+    ) -> QuoteRequest | None:
         """Claim a submitted AWS edit and build its self-contained preview request.
 
         Customer saves must not depend on a salesperson keeping another browser
@@ -811,12 +875,48 @@ class ConfirmationSessionStore:
             changed = connection.execute(
                 """
                 UPDATE confirmation_sessions
-                SET status = 'processing'
+                SET status = 'processing', processing_owner = ?, processing_heartbeat_at = ?
                 WHERE token = ? AND status IN ('reviewing', 'submitted')
                 """,
-                (token,),
+                (owner_id, datetime.now(UTC).isoformat(), token),
             ).rowcount
         return request if changed else None
+
+    def touch_configuration_reprocessing(self, draft_id: str, owner_id: str) -> bool:
+        """Renew only the lease owned by the currently running worker."""
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self._connect() as connection:
+            changed = connection.execute(
+                """
+                UPDATE confirmation_sessions SET processing_heartbeat_at = ?
+                WHERE draft_id = ? AND status = 'processing' AND processing_owner = ?
+                """,
+                (now, draft_id, owner_id),
+            ).rowcount
+        return bool(changed)
+
+    def release_configuration_reprocessing(self, owner_id: str) -> int:
+        """Make this process's unfinished work claimable after shutdown/reload."""
+        with self._lock, self._connect() as connection:
+            return connection.execute(
+                """
+                UPDATE confirmation_sessions
+                SET status='reviewing', processing_owner=NULL, processing_heartbeat_at=NULL
+                WHERE status='processing' AND processing_owner=?
+                """,
+                (owner_id,),
+            ).rowcount
+
+    def recover_unowned_configuration_reprocessing(self) -> int:
+        """Upgrade sessions claimed before processing leases were introduced."""
+        with self._lock, self._connect() as connection:
+            return connection.execute(
+                """
+                UPDATE confirmation_sessions
+                SET status='reviewing', processing_owner=NULL, processing_heartbeat_at=NULL
+                WHERE status='processing' AND (processing_owner IS NULL OR processing_owner='')
+                """
+            ).rowcount
 
     def submit_configuration_feedback(
         self,
@@ -836,9 +936,7 @@ class ConfirmationSessionStore:
         if self.cloud_provider == "aws":
             from app.integrations.deepseek import DeepSeekIntentParser
 
-            preserve_customer_configuration(intent)
             DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
-            DeepSeekIntentParser._split_eks_worker_nodes(intent)
             with self._lock, self._connect() as connection:
                 connection.execute(
                     "UPDATE confirmation_sessions SET intent_json = ? WHERE token = ?",
@@ -909,7 +1007,8 @@ class ConfirmationSessionStore:
             connection.execute(
                 """
                 UPDATE confirmation_sessions
-                SET answers_json = ?, status = 'reviewing', submitted_at = ?
+                SET answers_json = ?, status = 'reviewing', submitted_at = ?,
+                    processing_owner = NULL, processing_heartbeat_at = NULL
                 WHERE token = ?
                 """,
                 (json.dumps(answers, ensure_ascii=False), submitted_at, token),
@@ -934,12 +1033,6 @@ class ConfirmationSessionStore:
         if row is None:
             return None
         intent = self._parse_persisted_intent(str(row["intent_json"]))
-        if self.cloud_provider == "aws":
-            from app.integrations.deepseek import DeepSeekIntentParser
-
-            preserve_customer_configuration(intent)
-            DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
-            DeepSeekIntentParser._split_eks_worker_nodes(intent)
         return str(row["customer_request"]), intent
 
     def historical_answers_by_component(
@@ -1085,33 +1178,51 @@ class ConfirmationSessionStore:
                 global_answers[question] = answer
         return component_answers, global_answers
 
+    def extract_component_processor_architectures(
+        self,
+        draft_id: str,
+        answers: dict[str, str],
+    ) -> tuple[dict[int, str], dict[str, str]]:
+        """Remove architecture metadata and bind each exception to one component."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT items_json FROM confirmation_sessions WHERE draft_id = ?",
+                (draft_id,),
+            ).fetchone()
+        if row is None:
+            return {}, {
+                key: value
+                for key, value in answers.items()
+                if not key.startswith(COMPONENT_PROCESSOR_ARCHITECTURE_PREFIX)
+            }
+        component_by_answer_key = {
+            str(item.get("answer_key") or item.get("question") or ""): str(
+                item.get("component_id")
+            )
+            for item in json.loads(str(row["items_json"]))
+            if isinstance(item, dict)
+            and item.get("question")
+            and item.get("component_id") is not None
+        }
+        preferences: dict[int, str] = {}
+        remaining: dict[str, str] = {}
+        for key, value in answers.items():
+            if not key.startswith(COMPONENT_PROCESSOR_ARCHITECTURE_PREFIX):
+                remaining[key] = value
+                continue
+            answer_key = key.removeprefix(COMPONENT_PROCESSOR_ARCHITECTURE_PREFIX)
+            component_id = component_by_answer_key.get(answer_key)
+            if component_id and component_id.isdigit() and value in {"arm64", "x86_64"}:
+                preferences[int(component_id)] = value
+        return preferences, remaining
+
     def _row(self, token: str) -> sqlite3.Row | None:
         with self._connect() as connection:
             return connection.execute(
                 "SELECT * FROM confirmation_sessions WHERE token = ?",
                 (token,),
             ).fetchone()
-
-    @staticmethod
-    def _normalize_review_group_quantities(intent: ParsedIntent) -> None:
-        for item in intent.services:
-            if item.service.casefold() not in {"rds", "aurora"}:
-                continue
-            if item.requirements.get("aurora_cluster"):
-                continue
-            deployment = str(item.requirements.get("deployment") or "").casefold()
-            source = item.source_text or ""
-            if deployment not in {"multi_az", "multi-az"} and not re.search(
-                r"主备|高可用|multi[ -]?az", source, re.I
-            ):
-                continue
-            if not re.search(
-                r"(?:数据库|实例|集群)?数量\s*[:：]?\s*\d+|"
-                r"\d+\s*(?:套|个数据库|个集群)",
-                source,
-                re.I,
-            ):
-                item.quantity = 1
 
     @staticmethod
     def _configuration_summary(intent: ParsedIntent) -> str:

@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from app.domain.component_integrity import ensure_component_keys
 from app.domain.customer_facts import record_customer_fact_metadata
-from app.domain.models import ServiceRequirement
+from app.domain.fact_ledger import finalize_customer_fact_ledger
+from app.domain.models import ParsedIntent, ServiceRequirement
 
 SHAPE_FIELDS = {
     "vcpu",
@@ -254,8 +256,10 @@ def apply_component_update(
         locked.add(path)
     revised.locked_fields = sorted(locked)
     if changed_paths:
-        summary = "、".join(path.removeprefix("requirements.") for path in changed_paths)
-        revised.source_text = (
-            f"客户通过配置表直接修改：{summary}\n{component.source_text}"
-        ).strip()
+        # A form edit is already structured, component-scoped evidence.  Do
+        # not turn it back into prose and prepend it to ``source_text``: that
+        # used to make later compatibility scanners reinterpret both the old
+        # sentence and the new value.  Freeze the edited typed facts directly.
+        ensure_component_keys(ParsedIntent(customer_summary="structured edit", services=[revised]))
+        finalize_customer_fact_ledger(revised)
     return revised

@@ -23,6 +23,14 @@ from app.integrations.service_templates import (
 )
 
 
+def test_explicit_defaults_are_evidenced_in_every_component_prompt() -> None:
+    for service in ("ec2", "rds", "s3", "future_service"):
+        prompt = build_component_extraction_prompt(service)
+        assert "明确值即使等于默认值" in prompt
+        assert '"quantity":1' in prompt
+        assert "official_calculator_configuration" in prompt
+
+
 def test_intake_and_component_prompts_are_physically_separated() -> None:
     intake = build_intake_prompt()
     ec2 = build_service_prompt("ec2")
@@ -33,7 +41,10 @@ def test_intake_and_component_prompts_are_physically_separated() -> None:
     assert "replicas_per_shard" not in ec2
     assert "AWS 相邻档位确认" not in intake
     assert "客户问题识别" not in ec2
-    assert len(ec2) < len(intake)
+    # Standalone component prompts now include the complete typed schema,
+    # official sources and billing mapping, so size is no longer expected to
+    # be smaller than intake. Isolation is the contract that matters.
+    assert "Amazon RDS for MySQL pricing" not in ec2
 
 
 def test_component_extraction_loads_exactly_its_own_full_service_prompt() -> None:
@@ -173,7 +184,7 @@ def test_auxiliary_services_load_separate_prompt_modules() -> None:
         "global_accelerator",
     ]
     prompt = build_system_prompt(text)
-    assert "Amazon EBS 独立云盘" in prompt
+    assert "Amazon EBS 云盘 / EBS Snapshot" in prompt
     assert "AWS Data Transfer 独立公网流量" in prompt
     assert "AWS Global Accelerator" in prompt
 

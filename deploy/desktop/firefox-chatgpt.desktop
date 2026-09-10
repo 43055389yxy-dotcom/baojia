@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ChatGPT Browser
+Comment=Open the ChatGPT project list when the AstraQuote desktop starts
+Exec=/usr/bin/firefox --new-window https://chatgpt.com/projects
+Terminal=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true

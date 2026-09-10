@@ -12,6 +12,7 @@ from app.domain.models import (
     ServiceRequirement,
 )
 from app.services.confirmation_sessions import (
+    COMPONENT_PROCESSOR_ARCHITECTURE_PREFIX,
     CONFIGURATION_COMPONENT_DELETE,
     CONFIGURATION_COMPONENT_FEEDBACK_PREFIX,
     CONFIGURATION_COMPONENT_UPDATE_PREFIX,
@@ -84,6 +85,142 @@ def test_processor_architecture_is_validated_and_survives_the_next_round(
     next_round = store.get(token)
     assert next_round is not None
     assert next_round.answers == {PROCESSOR_ARCHITECTURE_ANSWER_KEY: "x86_64"}
+
+
+def test_component_processor_architecture_override_is_scoped_and_persisted(
+    tmp_path: Path,
+) -> None:
+    store = ConfirmationSessionStore(tmp_path / "component-architecture.sqlite3")
+    intent = ParsedIntent(
+        customer_summary="EC2 与 Redis",
+        services=[
+            ServiceRequirement(service="ec2"),
+            ServiceRequirement(service="elasticache"),
+        ],
+    )
+    ec2_item = ConfirmationItem(
+        question="请选择 EC2 型号",
+        answer_key="component-0:ec2-model",
+        component_id="0",
+        service="ec2",
+        options=[
+            ConfirmationOption(
+                label="m7i.xlarge",
+                value="选择 m7i.xlarge",
+                model="m7i.xlarge",
+                specifications={"processorArchitecture": "x86_64"},
+            )
+        ],
+    )
+    redis_item = ConfirmationItem(
+        question="请选择 Redis 型号",
+        answer_key="component-1:redis-model",
+        component_id="1",
+        service="elasticache",
+        options=[
+            ConfirmationOption(
+                label="cache.r7g.xlarge",
+                value="选择 cache.r7g.xlarge",
+                model="cache.r7g.xlarge",
+                specifications={"processorArchitecture": "arm64"},
+            )
+        ],
+    )
+    token = store.create_or_replace(
+        draft_id="draft-component-architecture",
+        customer_request="EC2 与 Redis",
+        customer_summary="EC2 与 Redis",
+        intent=intent,
+        confirmation_text="请选择",
+        items=[ec2_item, redis_item],
+    )
+
+    submitted = store.submit(
+        token,
+        {
+            ec2_item.answer_key or "": "选择 m7i.xlarge",
+            redis_item.answer_key or "": "选择 cache.r7g.xlarge",
+        },
+        processor_architecture="x86_64",
+        component_processor_architectures={
+            redis_item.answer_key or "": "arm64",
+        },
+    )
+
+    assert submitted is not None
+    stored_key = (
+        f"{COMPONENT_PROCESSOR_ARCHITECTURE_PREFIX}"
+        f"{redis_item.answer_key}"
+    )
+    assert submitted.answers[PROCESSOR_ARCHITECTURE_ANSWER_KEY] == "x86_64"
+    assert submitted.answers[stored_key] == "arm64"
+    component_preferences, remaining = store.extract_component_processor_architectures(
+        "draft-component-architecture",
+        submitted.answers,
+    )
+    assert component_preferences == {1: "arm64"}
+    assert stored_key not in remaining
+
+    store.create_or_replace(
+        draft_id="draft-component-architecture",
+        customer_request="EC2 与 Redis",
+        customer_summary="EC2 与 Redis",
+        intent=intent,
+        confirmation_text="再确认一次",
+        items=[ec2_item, redis_item],
+    )
+    next_round = store.get(token)
+    assert next_round is not None
+    assert next_round.answers == {
+        PROCESSOR_ARCHITECTURE_ANSWER_KEY: "x86_64",
+        stored_key: "arm64",
+    }
+
+
+def test_component_processor_architecture_override_rejects_wrong_model(
+    tmp_path: Path,
+) -> None:
+    store = ConfirmationSessionStore(tmp_path / "wrong-component-architecture.sqlite3")
+    intent = ParsedIntent(
+        customer_summary="Redis",
+        services=[ServiceRequirement(service="elasticache")],
+    )
+    item = ConfirmationItem(
+        question="请选择 Redis 型号",
+        answer_key="component-0:redis-model",
+        component_id="0",
+        service="elasticache",
+        options=[
+            ConfirmationOption(
+                label="cache.r7g.xlarge",
+                value="选择 cache.r7g.xlarge",
+                model="cache.r7g.xlarge",
+                specifications={"processorArchitecture": "arm64"},
+            ),
+            ConfirmationOption(
+                label="cache.r7i.xlarge",
+                value="选择 cache.r7i.xlarge",
+                model="cache.r7i.xlarge",
+                specifications={"processorArchitecture": "x86_64"},
+            ),
+        ],
+    )
+    token = store.create_or_replace(
+        draft_id="draft-wrong-component-architecture",
+        customer_request="Redis",
+        customer_summary="Redis",
+        intent=intent,
+        confirmation_text="请选择",
+        items=[item],
+    )
+
+    with pytest.raises(ValueError, match="该组件指定的处理器架构不一致"):
+        store.submit(
+            token,
+            {item.answer_key or "": "选择 cache.r7i.xlarge"},
+            processor_architecture="x86_64",
+            component_processor_architectures={item.answer_key or "": "arm64"},
+        )
 
 
 def test_confirmation_session_round_trip(tmp_path: Path) -> None:
@@ -170,7 +307,7 @@ def test_recoverable_old_system_mapping_is_not_presented_as_customer_work(
     assert session.configuration_items[0].pricing_notice is None
 
 
-def test_saved_eks_worker_quantity_is_reconciled_before_customer_display(
+def test_saved_eks_worker_quantity_is_not_reinterpreted_on_display(
     tmp_path: Path,
 ) -> None:
     store = ConfirmationSessionStore(tmp_path / "sessions.sqlite3")
@@ -181,10 +318,11 @@ def test_saved_eks_worker_quantity_is_reconciled_before_customer_display(
     intent = ParsedIntent(
         customer_summary="EKS",
         services=[
-            ServiceRequirement(service="eks", quantity=2, source_text=source),
+            ServiceRequirement(service="eks", component_key="cmp_parent", quantity=2, source_text=source),
             ServiceRequirement(
                 service="ec2",
                 derived_from_service="eks",
+                parent_component_key="cmp_parent",
                 calculator_service_name="Amazon EC2 (EKS Worker Nodes)",
                 quantity=2,
                 source_text=source,
@@ -206,7 +344,9 @@ def test_saved_eks_worker_quantity_is_reconciled_before_customer_display(
     worker = next(
         item for item in session.configuration_items if "Worker" in item.display_name
     )
-    assert worker.quantity == 6
+    # GET is read-only; old source cannot silently change 2 into 6. Re-extract
+    # this old draft at the official intake boundary before quoting instead.
+    assert worker.quantity == 2
     assert worker.component_number == "1.1"
     assert worker.parent_component_number == "1"
 
@@ -218,7 +358,11 @@ def test_configuration_review_uses_stable_ids_for_parent_and_child(
     source = "Amazon EKS：数量1，3个Worker节点，单台4核8GB/100GB存储"
     intent = ParsedIntent(
         customer_summary="EKS",
-        services=[ServiceRequirement(service="eks", quantity=1, source_text=source)],
+        services=[
+            ServiceRequirement(service="eks", component_key="cmp_parent", quantity=1, source_text="Amazon EKS：数量1"),
+            ServiceRequirement(service="ec2", component_key="cmp_worker", parent_component_key="cmp_parent",
+                               derived_from_service="eks", quantity=3, source_text="3个Worker节点，单台4核8GB/100GB存储"),
+        ],
     )
     token = store.create_or_replace(
         draft_id="stable-review-ids",
@@ -917,6 +1061,96 @@ def test_submitted_aws_edit_can_be_claimed_without_sales_browser(tmp_path: Path)
     assert store.begin_configuration_reprocessing(token) is None
 
 
+def test_processing_lease_preserves_answers_and_can_be_resumed_after_worker_restart(tmp_path: Path) -> None:
+    store = ConfirmationSessionStore(tmp_path / "processing-lease.sqlite3")
+    item = ConfirmationItem(
+        question="请补充记录数",
+        answer_key="component-0:records",
+        component_id="0",
+        service="kinesis",
+        options=[],
+    )
+    token = store.create_or_replace(
+        draft_id="lease-dft001",
+        customer_request="Kinesis",
+        customer_summary="Kinesis",
+        intent=ParsedIntent(customer_summary="Kinesis", services=[ServiceRequirement(service="kinesis")]),
+        confirmation_text=item.question,
+        items=[item],
+    )
+    store.submit(token, {item.answer_key or "": "5000000"})
+    assert store.begin_configuration_reprocessing(token, owner_id="worker-old") is not None
+    store.touch_configuration_reprocessing("lease-dft001", "worker-old")
+    assert store.release_configuration_reprocessing("worker-other") == 0
+    assert store.release_configuration_reprocessing("worker-old") == 1
+    resumed = store.begin_configuration_reprocessing(token, owner_id="worker-new")
+    assert resumed is not None
+    assert resumed.confirmation_responses[item.answer_key or ""] == "5000000"
+
+
+def test_legacy_unowned_processing_is_released_during_startup(tmp_path: Path) -> None:
+    store = ConfirmationSessionStore(tmp_path / "legacy-processing.sqlite3")
+    token = store.create_or_replace(
+        draft_id="legacy-process1",
+        customer_request="EC2",
+        customer_summary="EC2",
+        intent=ParsedIntent(customer_summary="EC2", services=[ServiceRequirement(service="ec2")]),
+        confirmation_text="确认",
+        items=[],
+    )
+    with store._connect() as connection:
+        connection.execute("UPDATE confirmation_sessions SET status='processing' WHERE token=?", (token,))
+    assert store.recover_unowned_configuration_reprocessing() == 1
+    with store._connect() as connection:
+        status = connection.execute("SELECT status FROM confirmation_sessions WHERE token=?", (token,)).fetchone()[0]
+    assert status == "reviewing"
+
+
+def test_expired_processing_lease_preserves_answers_for_automatic_resume(
+    tmp_path: Path,
+) -> None:
+    store = ConfirmationSessionStore(tmp_path / "expired-processing.sqlite3")
+    item = ConfirmationItem(
+        question="请补充记录数",
+        answer_key="component-0:records",
+        component_id="0",
+        service="kinesis",
+        options=[],
+    )
+    token = store.create_or_replace(
+        draft_id="expired00001",
+        customer_request="Kinesis",
+        customer_summary="Kinesis",
+        intent=ParsedIntent(
+            customer_summary="Kinesis",
+            services=[ServiceRequirement(service="kinesis")],
+        ),
+        confirmation_text=item.question,
+        items=[item],
+    )
+    store.submit(token, {item.answer_key or "": "5000000"})
+    assert (
+        store.begin_configuration_reprocessing(token, owner_id="dead-worker")
+        is not None
+    )
+    expired = (datetime.now(UTC) - timedelta(minutes=3)).isoformat()
+    with store._connect() as connection:
+        connection.execute(
+            """UPDATE confirmation_sessions
+               SET processing_heartbeat_at = ? WHERE token = ?""",
+            (expired, token),
+        )
+
+    recovered = store.get(token)
+
+    assert recovered is not None
+    assert recovered.status == "reviewing"
+    assert recovered.answers[item.answer_key or ""] == "5000000"
+    resumed = store.begin_configuration_reprocessing(token, owner_id="new-worker")
+    assert resumed is not None
+    assert resumed.confirmation_responses[item.answer_key or ""] == "5000000"
+
+
 def test_configuration_items_expose_service_specific_billing_fields(tmp_path: Path) -> None:
     store = ConfirmationSessionStore(tmp_path / "billing-fields.sqlite3")
     intent = ParsedIntent(
@@ -955,3 +1189,33 @@ def test_configuration_items_expose_service_specific_billing_fields(tmp_path: Pa
         "configuration_retrievals",
         "experiment_hours",
     ]
+
+
+def test_unsealed_component_is_never_presented_as_ready_for_pricing(tmp_path: Path) -> None:
+    store = ConfirmationSessionStore(tmp_path / "unsealed.sqlite3")
+    intent = ParsedIntent(
+        customer_summary="ALB",
+        services=[
+            ServiceRequirement(
+                service="elb",
+                calculator_service_name="Application Load Balancer",
+                source_text="Application Load Balancer：平均 1 LCU。",
+                field_sources={"_official_calculator_status": "ready"},
+            )
+        ],
+    )
+    token = store.create_or_replace(
+        draft_id="unsealed1",
+        customer_request="Application Load Balancer：平均 1 LCU。",
+        customer_summary=intent.customer_summary,
+        intent=intent,
+        confirmation_text="确认",
+        items=[],
+    )
+    store.prepare_configuration_review(draft_id="unsealed1", intent=intent)
+
+    session = store.get(token)
+
+    assert session is not None
+    assert session.configuration_items[0].pricing_status == "unpriced"
+    assert "尚未完成" in (session.configuration_items[0].pricing_notice or "")

@@ -46,6 +46,28 @@ def test_explicit_ec2_remains_a_top_level_component() -> None:
     assert hierarchy[1].parent_component_id is None
 
 
+def test_distinct_numbered_source_owners_are_never_inferred_as_parent_child() -> None:
+    services = [
+        ServiceRequirement(
+            service="ecs",
+            calculator_service_name="Amazon ECS",
+            source_text="Amazon ECS Fargate ARM服务：40个Task",
+            field_sources={"_source_block_key": "src_first_numbered_row"},
+        ),
+        ServiceRequirement(
+            service="ec2",
+            calculator_service_name="Amazon EC2（自建 ECS on Fargate x86服务）",
+            source_text="ECS on Fargate x86服务：25项任务",
+            field_sources={"_source_block_key": "src_second_numbered_row"},
+        ),
+    ]
+
+    hierarchy = component_hierarchy(services)
+
+    assert [item.component_number for item in hierarchy] == ["1", "2"]
+    assert hierarchy[1].parent_component_id is None
+
+
 def test_legacy_ecs_worker_is_displayed_under_its_cluster() -> None:
     source = (
         "Amazon ECS，1套集群，EC2 Worker节点4台，"

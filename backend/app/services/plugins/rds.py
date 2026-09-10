@@ -16,6 +16,7 @@ from app.domain.requirement_fields import canonicalize_requirement_fields
 from app.integrations.aws import PricingCatalog, parse_number
 from app.services.aws_query_executor import ReadOnlyAwsQueryExecutor
 from app.services.plugins.base import ServicePlugin, required_float
+from app.services.plugins.template_billing import template_usage, template_usage_values
 
 
 class RdsPlugin(ServicePlugin):
@@ -353,13 +354,19 @@ class RdsPlugin(ServicePlugin):
         upfront_commitment_cost = 0.0
         usage_lines: list[UsageLine] = []
         if purchase_option == "on_demand":
+            compute_usage = (
+                template_usage("rds", "db_instance_hours", requirement, requested)
+                if not _is_aurora_engine(engine)
+                else None
+            )
             usage_lines.append(
                 UsageLine(
                     key="rds",
                     service_code=service_code,
                     usage_type=usage_type,
                     operation=operation,
-                    amount=amount,
+                    amount=float(compute_usage.amount) if compute_usage else amount,
+                    calculation=compute_usage.audit() if compute_usage else None,
                     group="rds",
                     source_fields=[
                         "quantity",
@@ -553,7 +560,43 @@ class RdsPlugin(ServicePlugin):
             if edition := _pricing_edition(engine):
                 product_filters["databaseEdition"] = edition
             products = self.catalog.products("AmazonRDS", product_filters, max_pages=5)
-            storage_amount = quantity * storage_gib
+            if not products:
+                # Some RDS storage rows use a more specific explanatory
+                # deployment label than the instance row (for example a
+                # Multi-AZ engine implementation).  The label is optional
+                # catalog metadata, so retry without it and validate every
+                # returned row against the requested deployment semantics and
+                # the remaining exact official dimensions.  require_unique
+                # below still enforces one stable UsageType/Operation identity.
+                fallback_filters = {
+                    key: value
+                    for key, value in product_filters.items()
+                    if key != "deploymentOption"
+                }
+                fallback_products = self.catalog.products(
+                    "AmazonRDS", fallback_filters, max_pages=20
+                )
+                products = [
+                    product
+                    for product in fallback_products
+                    if _rds_storage_product_matches(
+                        product,
+                        region=region,
+                        engine=engine,
+                        deployment=deployment,
+                        storage_type=storage_type,
+                    )
+                ]
+            storage_usage = template_usage_values(
+                "rds",
+                "database_storage",
+                {
+                    **requested,
+                    "quantity": quantity,
+                    "storage_gib": storage_gib,
+                },
+            )
+            storage_amount = float(storage_usage.amount)
         product = PricingCatalog.require_unique(
             products, context=f"RDS {storage_type} 存储 ({region})"
         )
@@ -565,6 +608,7 @@ class RdsPlugin(ServicePlugin):
                 usage_type=usage_type,
                 operation=operation,
                 amount=storage_amount,
+                calculation=storage_usage.audit() if not _is_aurora_engine(engine) else None,
                 group="rds-storage",
                 source_fields=[
                     "quantity",
@@ -624,15 +668,49 @@ class RdsPlugin(ServicePlugin):
                     (
                         candidate
                         for candidate in maintained_versions
-                        if tuple(
-                            int(part) for part in re.findall(r"\d+", candidate)
-                        )[:family_width]
+                        if tuple(int(part) for part in re.findall(r"\d+", candidate))[:family_width]
                         == requested_family
                     ),
                     selected_version,
                 )
             if selected_version:
                 kwargs["EngineVersion"] = selected_version
+
+        def price_list_fallback() -> set[str]:
+            """Use active, narrowly matched official price rows during API outage."""
+
+            if self.catalog is None:
+                return set()
+            filters = {
+                "regionCode": region,
+                "productFamily": "Database Instance",
+                "databaseEngine": _pricing_engine(engine),
+            }
+            if edition := _pricing_edition(engine):
+                filters["databaseEdition"] = edition
+            if requested_model:
+                filters["instanceType"] = requested_model
+            try:
+                products = self.catalog.products(
+                    "AmazonRDS",
+                    filters,
+                    max_pages=5,
+                )
+            except (ManualConfirmationRequired, KeyError, TypeError, ValueError):
+                return set()
+            result: set[str] = set()
+            for product in products:
+                attrs = PricingCatalog.attributes(product)
+                model = _text(attrs.get("instanceType"))
+                if not model or (requested_model and model != requested_model):
+                    continue
+                if not _engine_matches(engine, _text(attrs.get("databaseEngine"))):
+                    continue
+                if PricingCatalog.on_demand_rate(product) is None:
+                    continue
+                result.add(model)
+            return result
+
         try:
             executor = ReadOnlyAwsQueryExecutor(self.clients)
 
@@ -670,6 +748,9 @@ class RdsPlugin(ServicePlugin):
                 "aws_region_not_enabled",
             }:
                 raise
+            fallback = price_list_fallback()
+            if fallback:
+                return fallback
             raise ManualConfirmationRequired(
                 f"RDS 官方 API 无法确认 {engine} 在 {region} 的可订购规格",
                 code="rds_discovery_failed",
@@ -996,6 +1077,37 @@ def _deployment_matches(requested: str, official: str) -> bool:
     if requested == "multi_az_cluster":
         return "multiaz" in value and "cluster" in value
     return "multiaz" in value and "cluster" not in value
+
+
+def _rds_storage_product_matches(
+    product: dict[str, Any],
+    *,
+    region: str,
+    engine: str,
+    deployment: str,
+    storage_type: str,
+) -> bool:
+    """Validate a storage row found without the optional deployment label."""
+
+    attrs = PricingCatalog.attributes(product)
+    edition = _pricing_edition(engine)
+    product_family = str(
+        product.get("product", {}).get("productFamily") or attrs.get("productFamily") or ""
+    )
+    if str(attrs.get("regionCode") or "") != region:
+        return False
+    if product_family != "Database Storage":
+        return False
+    if not _engine_matches(engine, str(attrs.get("databaseEngine") or "")):
+        return False
+    if edition and str(attrs.get("databaseEdition") or "") != edition:
+        return False
+    if _normalize(str(attrs.get("volumeType") or "")) != _normalize(storage_type):
+        return False
+    if not _deployment_matches(deployment, str(attrs.get("deploymentOption") or "")):
+        return False
+    service_code, usage_type, operation = PricingCatalog.billing_identity(product)
+    return bool(service_code and (usage_type or operation))
 
 
 def _text(value: object) -> str | None:

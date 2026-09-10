@@ -12,6 +12,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from app.core.diagnostics import diagnostic_log
+from app.services.confirmation_presentation import customer_confirmation_item
 from app.core.errors import ManualConfirmationRequired
 from app.domain.component_hierarchy import component_hierarchy
 from app.domain.component_integrity import (
@@ -22,9 +23,13 @@ from app.domain.component_integrity import (
 )
 from app.domain.customer_configuration import (
     customer_product_identity,
-    preserve_customer_configuration,
     preserve_service_configuration,
     restore_customer_authority,
+)
+from app.domain.cleaned_input import (
+    CLEANED_INPUT_POLICY_VERSION,
+    canonical_cleaned_request,
+    intent_is_cleaned_only,
 )
 from app.domain.customer_facts import customer_match_policy, record_customer_fact_metadata
 from app.domain.fact_ledger import (
@@ -62,6 +67,12 @@ from app.domain.pricing_contracts import (
     apply_pricing_contracts,
 )
 from app.domain.pricing_issues import should_retry_persisted_pricing_issue
+from app.domain.quote_compiler import (
+    QuoteCompilation,
+    QuoteCompilationViolation,
+    compile_quote_ir,
+    quote_ir_audit_metadata,
+)
 from app.domain.requirement_fields import (
     canonical_requirement_field_name,
     canonicalize_requirement_fields,
@@ -72,15 +83,22 @@ from app.domain.structured_component_updates import (
     bind_selected_model_specifications,
     decode_component_update,
 )
+from app.integrations.aws_calculator_shadow import AwsCalculatorShadowVerifier
 from app.integrations.aws_regions import (
     bilingual_aws_region_label,
     commercial_aws_region_options,
 )
-from app.integrations.calculator_web import (
-    AwsCalculatorWebAutomator,
-    GenericCalculatorInput,
+from app.integrations.deepseek import (
+    OFFICIAL_CALCULATOR_MISSING_FIELDS,
+    OFFICIAL_CALCULATOR_OPTIONS,
+    OFFICIAL_CALCULATOR_PARENT_CODE,
+    OFFICIAL_CALCULATOR_READY,
+    OFFICIAL_CALCULATOR_SELECTED_CODE,
+    OFFICIAL_CALCULATOR_SELECTION_SOURCE,
+    OFFICIAL_CALCULATOR_SELECTION_REQUIRED,
+    OFFICIAL_CALCULATOR_STATUS,
+    DeepSeekIntentParser,
 )
-from app.integrations.deepseek import DeepSeekIntentParser
 from app.integrations.service_templates import (
     safe_requirement_defaults,
     strip_non_pricing_context_fields,
@@ -107,20 +125,20 @@ class QuoteService:
         parser: DeepSeekIntentParser,
         plugins: PluginRegistry,
         estimator: BcmWorkloadEstimator,
-        calculator: AwsCalculatorWebAutomator | None = None,
         confirmation_sessions: ConfirmationSessionStore | None = None,
         ai_provider: str = "Configured AI",
         generic_plugin: GenericOfficialPlugin | None = None,
+        calculator_shadow_verifier: AwsCalculatorShadowVerifier | None = None,
     ):
         self._parser = parser
         self._plugins = plugins
         self._estimator = estimator
-        self._calculator = calculator
         self._confirmation_sessions = confirmation_sessions
         if confirmation_sessions is not None and confirmation_sessions.cloud_provider != "aws":
             raise ValueError("AWS 报价系统只能连接 AWS 专用确认存储")
         self._ai_provider = ai_provider
         self._generic_plugin = generic_plugin
+        self._calculator_shadow_verifier = calculator_shadow_verifier
         self._drafts: dict[str, tuple[str, ParsedIntent]] = {}
         # Customer confirmation is intentionally progressive: preview should
         # discover almost everything in one pass, while an official pricing
@@ -130,6 +148,322 @@ class QuoteService:
         self._asked_confirmation_questions: dict[str, set[str]] = {}
         self._confirmation_rounds: dict[str, int] = {}
         self._configuration_candidate_cache: dict[tuple[str, str, str], list[CandidateOption]] = {}
+
+    @staticmethod
+    def _semantic_mapping_is_sealed(intent: ParsedIntent) -> bool:
+        """Return whether every component crossed the one-way AI hand-off."""
+
+        return bool(intent.services) and all(
+            component.field_sources.get("_semantic_fact_mapping")
+            in {"ai_cleaning", "structured-gpt-v1"}
+            for component in intent.services
+        )
+
+    def _validate_sealed_intent(
+        self,
+        intent: ParsedIntent,
+        *,
+        sales_region: str | None = None,
+    ) -> None:
+        """Validate typed output without reopening the customer's prose.
+
+        Saved legacy drafts must first return through official intake.
+        Schema contracts may fold typed fields, but inventory, topology,
+        regions and quantities cannot be guessed again here.
+        """
+
+        self._apply_sales_region(intent, sales_region)
+        stale = [
+            component.calculator_service_name or component.service
+            for component in intent.services
+            if not customer_fact_ledger_is_current(component)
+        ]
+        if stale:
+            raise ManualConfirmationRequired(
+                "清洗结果的结构化事实表已失效，系统已停止，且不会回头重读客户原话",
+                code="sealed_fact_ledger_stale",
+                components=stale,
+            )
+        self._enforce_service_pricing_contracts(intent)
+        self._require_complete_literal_fact_coverage(intent)
+        enforce_component_integrity(intent)
+        DeepSeekIntentParser._normalize_invalid_global_regions(intent)
+        DeepSeekIntentParser._ensure_missing_region_ambiguity(intent)
+
+    @staticmethod
+    def _pending_official_template_components(
+        intent: ParsedIntent,
+    ) -> list[tuple[int, ServiceRequirement, list[dict[str, str]]]]:
+        pending: list[tuple[int, ServiceRequirement, list[dict[str, str]]]] = []
+        for index, component in enumerate(intent.services):
+            if component.field_sources.get(OFFICIAL_CALCULATOR_STATUS) != (
+                OFFICIAL_CALCULATOR_SELECTION_REQUIRED
+            ):
+                continue
+            try:
+                raw_options = json.loads(
+                    component.field_sources.get(OFFICIAL_CALCULATOR_OPTIONS, "[]")
+                )
+            except json.JSONDecodeError:
+                raw_options = []
+            options = [
+                {
+                    "service_code": str(item.get("service_code") or "").strip(),
+                    "name": str(item.get("name") or "").strip(),
+                }
+                for item in raw_options
+                if isinstance(item, dict)
+                and item.get("service_code")
+                and item.get("name")
+            ]
+            pending.append((index, component, options))
+        return pending
+
+    @staticmethod
+    def _needs_official_intake_resume(component: ServiceRequirement) -> bool:
+        """A newly selected official child must always run its own form pass.
+
+        The initial inventory can already carry the semantic-seal marker.  It
+        predates the customer's child-form choice and therefore cannot prove
+        that the newly selected AWS form was filled.
+        """
+
+        status = component.field_sources.get(OFFICIAL_CALCULATOR_STATUS)
+        if status == OFFICIAL_CALCULATOR_SELECTION_REQUIRED:
+            return bool(
+                component.field_sources.get(OFFICIAL_CALCULATOR_SELECTED_CODE)
+            )
+        return status in {OFFICIAL_CALCULATOR_READY, "price_list_ready"} and (
+            component.field_sources.get("_semantic_fact_mapping") != "ai_cleaning"
+        )
+
+    def _official_template_confirmation_preview(
+        self,
+        *,
+        request: QuoteRequest,
+        intent: ParsedIntent,
+        pending: list[tuple[int, ServiceRequirement, list[dict[str, str]]]],
+        ai_trace: list[ExecutionEvent],
+    ) -> QuotePreviewResponse:
+        """Publish official parent/child choices before component AI runs."""
+
+        pending_by_index = {index: (component, options) for index, component, options in pending}
+        items: list[ConfirmationItem] = []
+        notices: list[str] = []
+        selections: list[PreviewSelection] = []
+        for index, component in enumerate(intent.services):
+            entry = pending_by_index.get(index)
+            if entry is None:
+                selections.append(
+                    PreviewSelection(
+                        component_id=str(index),
+                        service=component.service,
+                        display_name=component.calculator_service_name or component.service,
+                        region=component.region or request.sales_region or "未指定区域",
+                        quantity=component.quantity,
+                        requirements=component.requirements,
+                        source_text=component.original_source_text or component.source_text,
+                        selection_reason="AWS 官方模板已读取，等待本页信息补齐后继续",
+                    )
+                )
+                continue
+            _, options = entry
+            display_name = component.calculator_service_name or component.service
+            question = (
+                f"{display_name} 在 AWS 官方报价器里分为多种类型，"
+                "请选择这项实际使用的服务。"
+            )
+            confirmation_options = [
+                ConfirmationOption(
+                    label=option["name"],
+                    value=f"official_template:{option['service_code']}",
+                    description="请选择实际使用的资源类型。",
+                )
+                for option in options
+            ]
+            items.append(
+                customer_confirmation_item(ConfirmationItem(
+                    question=question,
+                    answer_key=self._confirmation_answer_key(str(index), question),
+                    options=confirmation_options,
+                    component_id=str(index),
+                    service=component.service,
+                    selection_mode="buttons",
+                ))
+            )
+            question = items[-1].question
+            notices.append(question)
+            selections.append(
+                PreviewSelection(
+                    component_id=str(index),
+                    service=component.service,
+                    display_name=display_name,
+                    region=component.region or request.sales_region or "未指定区域",
+                    quantity=component.quantity,
+                    requirements=component.requirements,
+                    source_text=component.original_source_text or component.source_text,
+                    selection_reason="请先确认实际使用的资源类型",
+                    requires_confirmation=True,
+                    confirmation_reason=question,
+                    status="customer_issue",
+                    issue_message=question,
+                )
+            )
+
+        if any(not item.options for item in items):
+            raise ManualConfirmationRequired(
+                "AWS 官方子模板列表没有加载完整，请稍后重试",
+                code="official_calculator_subservice_options_unavailable",
+            )
+        draft_id = request.draft_id or f"aw{uuid.uuid4().hex[:10]}"
+        self._drafts[draft_id] = (
+            request.customer_request,
+            intent.model_copy(deep=True),
+        )
+        confirmation_text = self._confirmation_text(notices)
+        confirmation_token = None
+        if self._confirmation_sessions is not None:
+            confirmation_token = self._confirmation_sessions.create_or_replace(
+                draft_id=draft_id,
+                customer_request=request.customer_request,
+                customer_summary=intent.customer_summary,
+                intent=intent,
+                confirmation_text=confirmation_text or "请补充 AWS 官方模板类型。",
+                items=items,
+                quote_request=request,
+            )
+        return QuotePreviewResponse(
+            draft_id=draft_id,
+            customer_summary=intent.customer_summary,
+            selections=selections,
+            notices=notices,
+            confirmation_text=confirmation_text,
+            confirmation_items=items,
+            confirmation_token=confirmation_token,
+            execution_trace=[
+                *ai_trace,
+                ExecutionEvent(
+                    stage="aws",
+                    message="已先读取 AWS 官方模板；缺少具体子模板，已停止后续解析和报价",
+                    status="warning",
+                ),
+            ],
+            expert_review=ExpertReview(
+                run_id=f"expert-{uuid.uuid4().hex[:10]}",
+                provider=self._ai_provider,
+                status="awaiting_customer",
+                ai_calls=sum(event.stage == "ai_response" for event in ai_trace),
+                components=len(intent.services),
+                official_checks=len(intent.services),
+                customer_questions=len(items),
+                unsupported_components=0,
+                safeguards=[
+                    "先读取 AWS 官方报价器模板",
+                    "官方父模板未选子模板时禁止调用组件 AI",
+                    "关键信息未补齐时禁止报价",
+                ],
+            ),
+            cleaned_request=request.customer_request,
+        )
+
+    @staticmethod
+    def _official_missing_field_confirmation_data(
+        intent: ParsedIntent,
+    ) -> list[tuple[str, str, list[ConfirmationOption]]]:
+        """Expose required live-form fields without a hand-maintained schema."""
+
+        result: list[tuple[str, str, list[ConfirmationOption]]] = []
+        for index, component in enumerate(intent.services):
+            raw_missing = component.field_sources.get(
+                OFFICIAL_CALCULATOR_MISSING_FIELDS
+            )
+            if not raw_missing:
+                continue
+            try:
+                missing_fields = json.loads(raw_missing)
+            except json.JSONDecodeError:
+                continue
+            for field in missing_fields:
+                if not isinstance(field, dict) or not field.get("question"):
+                    continue
+                question = str(field["question"])
+                field_id = str(field.get("field_id") or "").strip()
+                options = [
+                    ConfirmationOption(
+                        label=str(option.get("label") or option.get("id")),
+                        value=f"official_field:{field_id}:{option.get('id')}",
+                        description="AWS 官方字段可选值",
+                    )
+                    for option in field.get("options", [])
+                    if isinstance(option, dict) and option.get("id") is not None
+                ]
+                result.append((str(index), question, options))
+        return result
+
+    @staticmethod
+    def _coerce_official_field_answer(
+        field: dict[str, object],
+        answer: str,
+    ) -> object:
+        """Parse one answer using only its AWS-published generic field type."""
+
+        field_type = str(field.get("field_type") or "input")
+        if answer.casefold().startswith("official_field:"):
+            parts = answer.split(":", 2)
+            if len(parts) != 3 or parts[1] != str(field.get("field_id") or ""):
+                raise ValueError("official field answer identity mismatch")
+            selected = parts[2]
+            allowed = {
+                str(option.get("id"))
+                for option in field.get("options", [])
+                if isinstance(option, dict) and option.get("id") is not None
+            }
+            if selected not in allowed:
+                raise ValueError("official field option is not published")
+            return selected
+        if field_type in {"numericInput", "input", "percentInput", "durationInput"}:
+            match = re.search(r"-?\d+(?:\.\d+)?", answer)
+            if match is None:
+                raise ValueError("official numeric field requires a number")
+            number = float(match.group(0))
+            return int(number) if number.is_integer() else number
+        if field_type == "fileSize":
+            match = re.search(
+                r"(\d+(?:\.\d+)?)\s*([a-zA-Z]+)",
+                answer,
+            )
+            if match is None:
+                raise ValueError("official size field requires a value and unit")
+            unit = match.group(2).casefold()
+            allowed_units = {
+                str(item).casefold()
+                for item in field.get("valid_size_units", [])
+                if str(item).strip()
+            }
+            if allowed_units and unit not in allowed_units:
+                raise ValueError("official size unit is not supported")
+            frequencies = [
+                str(item)
+                for item in field.get("valid_frequency_units", [])
+                if str(item).strip()
+            ]
+            frequency = frequencies[0] if len(frequencies) == 1 else "NA"
+            return {
+                "value": match.group(1),
+                "unit": f"{unit}|{frequency}",
+            }
+        if field_type == "frequency":
+            match = re.search(r"\d+(?:\.\d+)?", answer)
+            if match is None:
+                raise ValueError("official frequency field requires a number")
+            frequencies = [
+                str(item)
+                for item in field.get("valid_frequency_units", [])
+                if str(item).strip()
+            ]
+            unit = frequencies[0] if len(frequencies) == 1 else "perMonth"
+            return {"value": match.group(0), "unit": unit}
+        return answer.strip()
 
     async def identify_sales_region(self, text: str) -> dict[str, object]:
         identifier = getattr(self._parser, "identify_sales_region", None)
@@ -170,6 +504,17 @@ class QuoteService:
             intent=intent,
             confirmation_text="这次修改没有完成，原配置已保留，请重新提交。",
         )
+
+    def heartbeat_configuration_reprocessing(
+        self, draft_id: str | None, owner_id: str,
+    ) -> None:
+        if draft_id and self._confirmation_sessions is not None:
+            self._confirmation_sessions.touch_configuration_reprocessing(draft_id, owner_id)
+
+    def release_configuration_reprocessing(self, owner_id: str) -> int:
+        if self._confirmation_sessions is None:
+            return 0
+        return self._confirmation_sessions.release_configuration_reprocessing(owner_id)
 
     async def preview(
         self,
@@ -215,6 +560,11 @@ class QuoteService:
         ai_trace: list[ExecutionEvent] = []
 
         async def collect_ai_trace(stage: str, message: str) -> None:
+            if stage == "input_cleaned":
+                request.customer_request = message
+                if reporter is not None:
+                    await reporter(stage, message)
+                return
             ai_trace.append(ExecutionEvent(stage=stage, message=message))
             # Raw prompts/responses remain in the final audit trace. The live
             # sales screen receives only compact workflow events, never prompt
@@ -222,44 +572,66 @@ class QuoteService:
             if reporter is not None and stage in {
                 "intake_start",
                 "intake_done",
+                "intake_recovery",
+                "intake_retry",
+                "intake_schema_repair",
                 "component_plan",
                 "component_start",
                 "component_done",
                 "ai_repair",
                 "catalog",
+                "input_cleaned",
             }:
                 await reporter(stage, message)
 
         accepted_current_page = False
-        processor_architecture_preference = str(
-            request.confirmation_responses.get(
-                PROCESSOR_ARCHITECTURE_ANSWER_KEY,
-                "arm64",
+        processor_architecture_preference = (
+            str(
+                request.confirmation_responses.get(
+                    PROCESSOR_ARCHITECTURE_ANSWER_KEY,
+                    "arm64",
+                )
             )
-        ).strip().casefold()
+            .strip()
+            .casefold()
+        )
         if processor_architecture_preference not in {"arm64", "x86_64"}:
             processor_architecture_preference = "arm64"
         configuration_revision_requested = False
         configuration_revision_component_ids: set[int] = set()
         configuration_revision_scope_ids: set[int] | None = None
         configuration_revision_original_intent: ParsedIntent | None = None
+        component_processor_architectures: dict[int, str] = {}
         addition_only = False
         new_component_ids: set[int] = set()
         cached = self._drafts.get(request.draft_id) if request.draft_id else None
         if cached is None and request.draft_id and self._confirmation_sessions is not None:
             cached = self._confirmation_sessions.restore_draft(request.draft_id)
+        if (
+            cached
+            and callable(getattr(self._parser, "revalidate_saved_intent", None))
+            and not intent_is_cleaned_only(cached[1])
+        ):
+            raise ManualConfirmationRequired(
+                "该草稿来自旧版原文流程，请返回首页重新识别",
+                code="cleaned_input_upgrade_required",
+            )
         if cached and cached[0] == request.customer_request:
             intent = cached[1].model_copy(deep=True)
             confirmation_responses = dict(request.confirmation_responses)
-            submitted_confirmation_responses = dict(confirmation_responses)
+            if request.draft_id and self._confirmation_sessions is not None:
+                (
+                    component_processor_architectures,
+                    confirmation_responses,
+                ) = self._confirmation_sessions.extract_component_processor_architectures(
+                    request.draft_id,
+                    confirmation_responses,
+                )
             # Processor architecture is workflow metadata, not prose feedback
             # and not a component requirement by itself. The session store
             # validates every selected model against it before accepting the
             # form, so it must not enter AI revision or component routing.
             confirmation_responses.pop(PROCESSOR_ARCHITECTURE_ANSWER_KEY, None)
-            submitted_confirmation_responses.pop(
-                PROCESSOR_ARCHITECTURE_ANSWER_KEY, None
-            )
             structured_response_components: dict[str, int] = {}
             configuration_revision_requested = any(
                 question.startswith(CONFIGURATION_COMPONENT_FEEDBACK_PREFIX)
@@ -359,9 +731,7 @@ class QuoteService:
                         if self._is_structured_workflow_answer(answer)
                     }
                     for question, answer in structured_answers.items():
-                        response_key = self._scoped_confirmation_response_key(
-                            index, question
-                        )
+                        response_key = self._scoped_confirmation_response_key(index, question)
                         confirmation_responses[response_key] = answer
                         structured_response_components[response_key] = index
                         answers.pop(question, None)
@@ -479,9 +849,7 @@ class QuoteService:
                         **reviser_arguments,
                     )
                 if addition_only and len(intent.services) > previous_component_count:
-                    new_component_ids = set(
-                        range(previous_component_count, len(intent.services))
-                    )
+                    new_component_ids = set(range(previous_component_count, len(intent.services)))
                     configuration_revision_component_ids.update(new_component_ids)
                     # The existing rows have already passed customer review and
                     # official validation.  Only the newly appended rows may
@@ -511,17 +879,36 @@ class QuoteService:
                 confirmation_responses,
                 response_components=structured_response_components,
             )
+            resume_official_intake = getattr(
+                self._parser,
+                "resume_official_calculator_intake",
+                None,
+            )
+            if callable(resume_official_intake) and any(
+                self._needs_official_intake_resume(component)
+                for component in intent.services
+            ):
+                intent = await resume_official_intake(
+                    intent,
+                    reporter=collect_ai_trace,
+                )
             # Catalog buttons and other structured controls have already been
             # applied deterministically above. Sending those machine values to
             # the AI finalizer adds latency and can turn a valid answer into a
             # false "could not review" loop. Only genuinely free-form answers
             # need semantic review.
+            # Component-bound free-form answers were already handled by the
+            # isolated component reviser above. Only answers that remain
+            # unbound here may invoke the whole-intent finalizer. Using the
+            # original submitted map caused one Kinesis number to re-run all
+            # ten unrelated components and made the confirmation page appear
+            # stuck.
             needs_semantic_answer_review = any(
                 not self._is_structured_workflow_answer(answer)
-                for answer in submitted_confirmation_responses.values()
+                for answer in confirmation_responses.values()
             )
             if (
-                submitted_confirmation_responses
+                confirmation_responses
                 and needs_semantic_answer_review
                 and not configuration_revision_requested
             ):
@@ -536,12 +923,10 @@ class QuoteService:
                     intent = await finalizer(
                         request.customer_request,
                         intent,
-                        submitted_confirmation_responses,
+                        confirmation_responses,
                         **finalizer_arguments,
                     )
-                    for index, original_component in enumerate(
-                        intent_before_finalizer.services
-                    ):
+                    for index, original_component in enumerate(intent_before_finalizer.services):
                         if index >= len(intent.services):
                             break
                         intent.services[index] = restore_customer_authority(
@@ -565,55 +950,37 @@ class QuoteService:
                 request.customer_request
             )
             try:
-                parser_arguments = (
-                    {"reporter": collect_ai_trace}
-                    if "reporter" in inspect.signature(self._parser.parse).parameters
-                    else {}
-                )
+                parser_parameters = inspect.signature(self._parser.parse).parameters
+                parser_arguments: dict[str, object] = {}
+                if "reporter" in parser_parameters:
+                    parser_arguments["reporter"] = collect_ai_trace
+                if "default_region" in parser_parameters:
+                    parser_arguments["default_region"] = request.sales_region
                 intent = await self._parser.parse(request.customer_request, **parser_arguments)
+                if all(
+                    item.field_sources.get("_source_retention_policy")
+                    == CLEANED_INPUT_POLICY_VERSION
+                    for item in intent.services
+                ):
+                    request.customer_request = canonical_cleaned_request(intent)
             except ManualConfirmationRequired as exc:
                 exc.details["execution_trace"] = [event.model_dump() for event in ai_trace]
                 raise
-        # Restore customer-facing product identity before any pricing defaults
-        # or adapter conversion touches the working draft. This also upgrades
-        # older saved drafts created before customer/pricing separation.
-        numbered_blocks = DeepSeekIntentParser._numbered_requirement_blocks(
-            request.customer_request
-        )
-        top_level_components = [
-            item for item in intent.services if not item.derived_from_service
-        ]
-        if len(numbered_blocks) > len(top_level_components):
-            DeepSeekIntentParser._reconcile_explicit_component_inventory(
-                request.customer_request, intent
+        if cached:
+            upgrade = getattr(self._parser, "revalidate_saved_intent", None)
+            if callable(upgrade):
+                intent = await upgrade(intent, reporter=collect_ai_trace)
+        pending_official_templates = self._pending_official_template_components(intent)
+        if pending_official_templates:
+            return self._official_template_confirmation_preview(
+                request=request,
+                intent=intent,
+                pending=pending_official_templates,
+                ai_trace=ai_trace,
             )
-        preserve_customer_configuration(intent)
-        DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
-        self._enforce_service_pricing_contracts(intent)
-        self._require_complete_literal_fact_coverage(intent)
-        # Reconcile derived children on every draft boundary, not only during
-        # the first AI parse. Older/saved drafts may contain an EKS Worker row
-        # whose quantity copied the cluster count instead of
-        # ``clusters × workers_per_cluster``.
-        DeepSeekIntentParser._split_eks_worker_nodes(intent)
-        enforce_component_integrity(intent)
-        DeepSeekIntentParser._normalize_database_group_quantity(intent)
-        DeepSeekIntentParser._normalize_redis_topology(intent)
-        DeepSeekIntentParser._normalize_cluster_group_quantities(intent)
-        # Apply the region boundary on every preview, including restored drafts
-        # and customer-edited components.  Regional services such as S3 must
-        # never reach an AWS adapter with the human label ``global/全球``.
-        DeepSeekIntentParser._normalize_invalid_global_regions(intent)
-        # Only an explicit quote-wide ``区域：...`` may fill missing component
-        # regions.  A region written inside one numbered component must never
-        # overwrite another component's explicit region.
-        DeepSeekIntentParser._reconcile_explicit_regions(request.customer_request, intent)
-        self._apply_sales_region(intent, request.sales_region)
-        # Regional components without their own region inherit a deterministic
-        # quote region.  With several customer regions, use the first one in
-        # the original request; explicit component regions still win.
-        DeepSeekIntentParser._inherit_single_workload_region(intent, request.customer_request)
-        DeepSeekIntentParser._ensure_missing_region_ambiguity(intent)
+        if not self._semantic_mapping_is_sealed(intent):
+            DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
+        self._validate_sealed_intent(intent, sales_region=request.sales_region)
 
         # Product identity is the routing key for every later field template,
         # region check and price adapter.  An isolated AI identity lookup may
@@ -642,9 +1009,7 @@ class QuoteService:
                 code="service_identity_resolution_failed",
                 components=unresolved_identities,
             )
-        auto_self_hosted = self._resolve_architecture_questions_without_managed_alternative(
-            intent
-        )
+        auto_self_hosted = self._resolve_architecture_questions_without_managed_alternative(intent)
         if auto_self_hosted:
             logger.info(
                 "Resolved %d architecture question(s) to the customer's explicit EC2 "
@@ -654,7 +1019,6 @@ class QuoteService:
         self._apply_sales_pricing_choice(intent, request)
         parse_elapsed = time.perf_counter() - started_at
         logger.info("Quote preview AI parse completed in %.2fs", parse_elapsed)
-        self._merge_transfer_only_ec2_services(intent)
         self._strip_non_numeric_placeholders(intent)
         self._strip_non_pricing_context(intent)
         confirmed_before_defaults = self._customer_confirmed_snapshot(intent)
@@ -664,6 +1028,14 @@ class QuoteService:
         preflight_sizing_service_indexes: set[int] = set()
         confirmation_options: dict[str, list[ConfirmationOption]] = {}
         confirmation_components: dict[str, tuple[str, str]] = {}
+        for component_id, question, options in self._official_missing_field_confirmation_data(
+            intent
+        ):
+            confirmation_components[question] = (
+                component_id,
+                intent.services[int(component_id)].service,
+            )
+            confirmation_options[question] = options
         technical_errors: list[ManualConfirmationRequired] = []
         preflight_trace: list[ExecutionEvent] = []
         try:
@@ -767,7 +1139,7 @@ class QuoteService:
             *ai_trace,
             ExecutionEvent(
                 stage="ai",
-                message=f"系统已把客户原话拆成逐条报价任务（{parse_elapsed:.1f} 秒）",
+                message=f"系统已把清洗后配置拆成逐条报价任务（{parse_elapsed:.1f} 秒）",
             ),
         ]
         trace.extend(preflight_trace)
@@ -822,7 +1194,10 @@ class QuoteService:
             assert plugin is not None
             current = service.model_copy(deep=True)
             current.field_sources["_processor_architecture_preference"] = (
-                processor_architecture_preference
+                component_processor_architectures.get(
+                    index,
+                    processor_architecture_preference,
+                )
             )
             if pending_architecture:
                 # Fetch the official EC2 catalog during the first page load so
@@ -832,12 +1207,23 @@ class QuoteService:
                 current.field_sources["_customer_select_configuration"] = "customer_confirmation"
             repair_count = 0
             catalog_retry_count = 0
+            pricing_preview_fallback = False
             while True:
                 failure: ManualConfirmationRequired | None = None
                 service_key = kind.value if kind is not None else current.service
                 normalized = self._calculator_requirements(
                     current.requirements, current.quantity, service_key
                 )
+                if pricing_preview_fallback:
+                    # Configuration review proves product identity, shape and
+                    # usage dimensions.  A missing Reserved offer is a later
+                    # commercial-scenario result, not an invalid workload.
+                    # Retry only this preview/audit copy as on-demand while
+                    # retaining the salesperson's original commitment choice
+                    # on ``current`` for final scenario pricing.
+                    normalized["purchase_option"] = "on_demand"
+                    normalized.pop("reserved_term_years", None)
+                    normalized.pop("payment_option", None)
                 requirement = self._pricing_requirement_copy(
                     current, service_key=service_key, requirements=normalized
                 )
@@ -878,20 +1264,20 @@ class QuoteService:
                             for candidate in selection.candidates
                             if self._candidate_is_selectable_instance_model(candidate)
                         ]
-                        exact_candidates = [
-                            candidate
-                            for candidate in selectable_candidates
-                            if candidate.specifications.get("vCPU") == requested_vcpu
-                            and candidate.specifications.get("memoryGiB")
-                            == requested_memory
-                        ] if has_requested_shape else []
+                        exact_candidates = (
+                            [
+                                candidate
+                                for candidate in selectable_candidates
+                                if candidate.specifications.get("vCPU") == requested_vcpu
+                                and candidate.specifications.get("memoryGiB") == requested_memory
+                            ]
+                            if has_requested_shape
+                            else []
+                        )
                         supported_architectures = {
                             architecture
                             for candidate in selectable_candidates
-                            if (
-                                architecture
-                                := self._candidate_processor_architecture(candidate)
-                            )
+                            if (architecture := self._candidate_processor_architecture(candidate))
                         }
                         if processor_architecture_preference in supported_architectures:
                             exact_candidates = [
@@ -941,9 +1327,7 @@ class QuoteService:
                                 }
                             )
                             break
-                        expanded = await self._configuration_candidates(
-                            selection, current
-                        )
+                        expanded = await self._configuration_candidates(selection, current)
                         expanded = self._safe_instance_candidates(expanded, current)
                         instance_candidates = [
                             candidate
@@ -975,6 +1359,22 @@ class QuoteService:
                     break
                 except ManualConfirmationRequired as exc:
                     failure = exc
+                    if (
+                        not pricing_preview_fallback
+                        and exc.code
+                        in {
+                            "reserved_term_not_found",
+                            "reserved_price_dimensions_missing",
+                        }
+                        and normalized.get("purchase_option") != "on_demand"
+                    ):
+                        pricing_preview_fallback = True
+                        await collect_ai_trace(
+                            "pricing_preview_fallback",
+                            f"组件 {index + 1}｜{display_name}｜当前预留方案暂无官方条款，"
+                            "配置校验改用按需目录继续；最终报价将单独判断预留方案可用性",
+                        )
+                        continue
                     if repair_count < 3 and self._is_ai_repairable_component_error(exc):
                         repair_count += 1
                         await collect_ai_trace(
@@ -1003,9 +1403,8 @@ class QuoteService:
                             current = repaired
                             intent.services[index] = repaired.model_copy(deep=True)
                             continue
-                    if (
-                        catalog_retry_count < 2
-                        and self._should_auto_retry_component_error(failure, current)
+                    if catalog_retry_count < 2 and self._should_auto_retry_component_error(
+                        failure, current
                     ):
                         catalog_retry_count += 1
                         await collect_ai_trace(
@@ -1041,11 +1440,6 @@ class QuoteService:
                     # is a customer architecture decision, not an AWS outage.
                     # Recover the customer's full numbered block because some
                     # model responses keep only the product heading here.
-                    self._recover_third_party_deployment(
-                        current,
-                        request.customer_request,
-                        display_name,
-                    )
                     product_name = self._third_party_product_name(current, display_name)
                     current.field_sources["_pending_architecture_decision"] = "system_policy"
                     current.field_sources["_third_party_product"] = product_name
@@ -1119,13 +1513,11 @@ class QuoteService:
                     "service_retired",
                     "unsupported_service",
                 }:
-                    confirmation_candidates = (
-                        await self._confirmation_candidates_for_failure(
-                            plugin=plugin,
-                            component=current,
-                            failure=failure,
-                            display_name=display_name,
-                        )
+                    confirmation_candidates = await self._confirmation_candidates_for_failure(
+                        plugin=plugin,
+                        component=current,
+                        failure=failure,
+                        display_name=display_name,
                     )
                     if not confirmation_candidates and failure.code == "unsupported_service":
                         confirmation_candidates = [
@@ -1259,10 +1651,7 @@ class QuoteService:
                     ),
                     None,
                 )
-            if (
-                not selection.requires_confirmation
-                and not pending_architecture
-            ):
+            if not selection.requires_confirmation and not pending_architecture:
                 # A successful shape preview is not enough. Before the
                 # customer ever sees the confirmation page, run the selected
                 # adapter and prove that every locked numeric fact has a
@@ -1270,24 +1659,59 @@ class QuoteService:
                 # official-catalog resolver instead of waiting for final quote.
                 audit_failure: ManualConfirmationRequired | None = None
                 try:
-                    audited_selection = await asyncio.to_thread(
-                        plugin.select,
-                        requirement,
-                        "ap-southeast-1",
-                    )
-                    audited_selection, missing_fact_paths = (
-                        await self._reconcile_unconsumed_component_facts(
-                            component=current,
-                            requirement=requirement,
-                            selection=audited_selection,
-                            plugin=plugin,
-                            component_index=index,
-                            reporter=collect_ai_trace,
+                    audit_requirement = requirement
+                    try:
+                        audited_selection = await asyncio.to_thread(
+                            plugin.select,
+                            audit_requirement,
+                            "ap-southeast-1",
                         )
+                    except ManualConfirmationRequired as exc:
+                        if (
+                            not pricing_preview_fallback
+                            and exc.code
+                            in {
+                                "reserved_term_not_found",
+                                "reserved_price_dimensions_missing",
+                            }
+                            and normalized.get("purchase_option") != "on_demand"
+                        ):
+                            pricing_preview_fallback = True
+                            audit_requirements = dict(normalized)
+                            audit_requirements["purchase_option"] = "on_demand"
+                            audit_requirements.pop("reserved_term_years", None)
+                            audit_requirements.pop("payment_option", None)
+                            audit_requirement = self._pricing_requirement_copy(
+                                current,
+                                service_key=service_key,
+                                requirements=audit_requirements,
+                            )
+                            await collect_ai_trace(
+                                "pricing_preview_fallback",
+                                f"组件 {index + 1}｜{display_name}｜当前预留方案暂无官方条款，"
+                                "用途对账改用按需目录继续；最终报价将单独判断预留方案可用性",
+                            )
+                            audited_selection = await asyncio.to_thread(
+                                plugin.select,
+                                audit_requirement,
+                                "ap-southeast-1",
+                            )
+                        else:
+                            raise
+                    (
+                        audited_selection,
+                        missing_fact_paths,
+                    ) = await self._reconcile_unconsumed_component_facts(
+                        component=current,
+                        requirement=audit_requirement,
+                        selection=audited_selection,
+                        plugin=plugin,
+                        component_index=index,
+                        reporter=collect_ai_trace,
                     )
                     if missing_fact_paths:
                         evidence = {
-                            path: requirement.field_evidence.get(path, "")
+                            path: audit_requirement.field_evidence.get(path, "")
                             for path in missing_fact_paths
                         }
                         audit_failure = ManualConfirmationRequired(
@@ -1298,7 +1722,7 @@ class QuoteService:
                         )
                     else:
                         contract_violations = selection_fact_contract_violations(
-                            requirement,
+                            audit_requirement,
                             audited_selection,
                         )
                         if contract_violations:
@@ -1308,7 +1732,7 @@ class QuoteService:
                                 code=code,
                                 fields=paths,
                                 evidence={
-                                    path: requirement.field_evidence.get(path, "")
+                                    path: audit_requirement.field_evidence.get(path, "")
                                     for path in paths
                                 },
                             )
@@ -1444,8 +1868,7 @@ class QuoteService:
                         error_type=type(exc).__name__,
                     )
                     issue_message = (
-                        "该组件内部校验本次失败，系统只会重试这一项，"
-                        "不会让整份报价重新运行。"
+                        "该组件内部校验本次失败，系统只会重试这一项，不会让整份报价重新运行。"
                     )
                     result = (
                         index,
@@ -1775,9 +2198,7 @@ class QuoteService:
                 )
                 # Never replace a named model in the background, and never
                 # manufacture a model when there is no exact customer shape.
-                if requested_model or (
-                    requested_vcpu is None and requested_memory is None
-                ):
+                if requested_model or (requested_vcpu is None and requested_memory is None):
                     continue
                 exact_shape = [
                     candidate
@@ -1905,9 +2326,9 @@ class QuoteService:
                 intent.services[selected_component_index].requirements[
                     "_review_product_identity"
                 ] = customer_product_identity(intent.services[selected_component_index])
-                intent.services[selected_component_index].requirements[
-                    "_review_service"
-                ] = intent.services[selected_component_index].service
+                intent.services[selected_component_index].requirements["_review_service"] = (
+                    intent.services[selected_component_index].service
+                )
                 billing_fields, billing_labels = self._configuration_billing_metadata(
                     intent.services[selected_component_index]
                 )
@@ -1919,17 +2340,14 @@ class QuoteService:
                     intent.services[selected_component_index].requirements[
                         "_review_billing_labels"
                     ] = billing_labels
-                component_requirements = intent.services[
-                    selected_component_index
-                ].requirements
+                component_requirements = intent.services[selected_component_index].requirements
                 component_requirements["_review_status"] = selection.status
                 if selection.status == "customer_issue" and selection.confirmation_reason:
                     component_requirements["_review_confirmation_reason"] = (
                         selection.confirmation_reason
                     )
                     component_requirements["_review_confirmation_candidates"] = [
-                        candidate.model_dump(mode="json")
-                        for candidate in selection.candidates
+                        candidate.model_dump(mode="json") for candidate in selection.candidates
                     ]
                 else:
                     component_requirements.pop("_review_confirmation_reason", None)
@@ -2017,9 +2435,7 @@ class QuoteService:
                 component = intent.services[selected_component_index]
                 kind = self._service_kind(component.service)
                 option_plugin = self._plugins.get(kind) if kind is not None else None
-                option_provider = getattr(
-                    option_plugin, "configuration_field_options", None
-                )
+                option_provider = getattr(option_plugin, "configuration_field_options", None)
                 if callable(option_provider) and not field_options.get("engine_version"):
                     try:
                         official_field_options = await asyncio.wait_for(
@@ -2200,9 +2616,7 @@ class QuoteService:
             # Keep only questions produced by the newly appended component(s).
             added_component_ids = {str(index) for index in new_component_ids}
             confirmation_items = [
-                item
-                for item in confirmation_items
-                if item.component_id in added_component_ids
+                item for item in confirmation_items if item.component_id in added_component_ids
             ]
             notices = [item.question for item in confirmation_items]
         unavailable_choices = [
@@ -2233,8 +2647,7 @@ class QuoteService:
         # Internal catalog/system failures are handled on the sales side and
         # must not consume a customer question before a safe link exists.
         internal_validation_failed = any(
-            selection.status in {"technical_issue", "unsupported"}
-            for selection in selections
+            selection.status in {"technical_issue", "unsupported"} for selection in selections
         )
         if confirmation_items and (
             self._confirmation_sessions is None or not internal_validation_failed
@@ -2385,8 +2798,7 @@ class QuoteService:
             # Re-validate after all model_copy updates so ``next_action`` is
             # always derived from the final status sent to the browser.
             selections=[
-                PreviewSelection.model_validate(selection.model_dump())
-                for selection in selections
+                PreviewSelection.model_validate(selection.model_dump()) for selection in selections
             ],
             notices=notices,
             confirmation_text=confirmation_text,
@@ -2397,6 +2809,7 @@ class QuoteService:
             sales_validation_message=sales_validation_message,
             execution_trace=trace,
             expert_review=expert_review,
+            cleaned_request=request.customer_request,
         )
 
     @staticmethod
@@ -2416,6 +2829,8 @@ class QuoteService:
             if component.region is None:
                 component.region = sales_region
                 component.field_sources["region"] = "sales_confirmation"
+                if component.field_sources.get("_semantic_fact_mapping") == "ai_cleaning":
+                    finalize_customer_fact_ledger(component)
         regional = [
             component
             for component in intent.services
@@ -2529,9 +2944,7 @@ class QuoteService:
         return "x86_64"
 
     @classmethod
-    def _candidate_processor_architecture(
-        cls, candidate: CandidateOption
-    ) -> str | None:
+    def _candidate_processor_architecture(cls, candidate: CandidateOption) -> str | None:
         specifications = candidate.specifications
         declared = specifications.get("processorArchitecture") or specifications.get(
             "processor_architecture"
@@ -2539,9 +2952,7 @@ class QuoteService:
         declared_values: list[object] = []
         if declared not in (None, ""):
             declared_values.append(declared)
-        plural = specifications.get("processorArchitectures") or specifications.get(
-            "architectures"
-        )
+        plural = specifications.get("processorArchitectures") or specifications.get("architectures")
         if isinstance(plural, (list, tuple, set)):
             declared_values.extend(plural)
         elif plural not in (None, ""):
@@ -2554,9 +2965,7 @@ class QuoteService:
         return cls._model_processor_architecture(candidate.model)
 
     @classmethod
-    def _candidate_is_selectable_instance_model(
-        cls, candidate: CandidateOption
-    ) -> bool:
+    def _candidate_is_selectable_instance_model(cls, candidate: CandidateOption) -> bool:
         return bool(
             cls._candidate_processor_architecture(candidate)
             and (
@@ -2671,46 +3080,14 @@ class QuoteService:
                 return True
 
         business_type = str(requirements.get("business_type") or "").casefold()
-        business_source = str(
-            field_sources.get("requirements.business_type") or ""
-        ).casefold()
+        business_source = str(field_sources.get("requirements.business_type") or "").casefold()
         if (
-            business_type
-            in {"gpu", "accelerated", "storage_optimized", "加速计算", "存储优化"}
+            business_type in {"gpu", "accelerated", "storage_optimized", "加速计算", "存储优化"}
             and business_source in authoritative_sources
         ):
             return True
 
-        source_text = " ".join(
-            str(value or "")
-            for value in (
-                getattr(requirement, "original_source_text", ""),
-                getattr(requirement, "source_text", ""),
-            )
-        )
-        for explicit_model in re.findall(
-            r"(?:db\.|cache\.|express\.)?"
-            r"[a-z][a-z0-9-]*\d[a-z0-9-]*\.[a-z0-9-]+(?:\.search)?",
-            source_text,
-            re.I,
-        ):
-            probe = CandidateOption(
-                model=explicit_model,
-                family="customer_requested",
-                specifications={},
-                rationale="customer requested",
-            )
-            if cls._candidate_uses_special_hardware(probe):
-                return True
-        return bool(
-            re.search(
-                r"gpu|显卡|ai\s*加速|人工智能加速|推理加速|训练加速|"
-                r"inferentia|trainium|fpga|本地\s*(?:nvme|ssd|盘)|"
-                r"实例存储|instance\s*store|storage[- ]optimized|存储优化",
-                source_text,
-                re.I,
-            )
-        )
+        return False
 
     @classmethod
     def _safe_instance_candidates(
@@ -2766,9 +3143,7 @@ class QuoteService:
     @staticmethod
     def _customer_already_selected_model(requirement: ServiceRequirement) -> bool:
         model = str(requirement.requirements.get("requested_model") or "").strip()
-        source = str(
-            requirement.field_sources.get("requirements.requested_model") or ""
-        ).casefold()
+        source = str(requirement.field_sources.get("requirements.requested_model") or "").casefold()
         return bool(
             model
             and source
@@ -2795,13 +3170,18 @@ class QuoteService:
         if not isinstance(requested_memory, (int, float)):
             requested_memory = None
 
-        business_type = str(
-            requirements.get("business_type") if isinstance(requirements, dict) else ""
-        ).strip().casefold()
+        business_type = (
+            str(requirements.get("business_type") if isinstance(requirements, dict) else "")
+            .strip()
+            .casefold()
+        )
         if business_type in {"compute_optimized", "计算优化"}:
             preferred_family = "compute_optimized"
         elif business_type in {
-            "memory_optimized", "database", "cache", "内存优化",
+            "memory_optimized",
+            "database",
+            "cache",
+            "内存优化",
         }:
             preferred_family = "memory_optimized"
         elif business_type in {"storage_optimized", "存储优化"}:
@@ -2833,9 +3213,7 @@ class QuoteService:
         def is_underprovisioned(candidate: CandidateOption) -> bool:
             vcpu, memory = candidate_shape(candidate)
             return bool(
-                requested_vcpu is not None
-                and vcpu is not None
-                and vcpu < float(requested_vcpu)
+                requested_vcpu is not None and vcpu is not None and vcpu < float(requested_vcpu)
             ) or bool(
                 requested_memory is not None
                 and memory is not None
@@ -2858,13 +3236,11 @@ class QuoteService:
         def upward_excess(candidate: CandidateOption) -> float:
             vcpu, memory = candidate_shape(candidate)
             return (
-                max((vcpu or 0) - float(requested_vcpu), 0)
-                / max(float(requested_vcpu), 1)
+                max((vcpu or 0) - float(requested_vcpu), 0) / max(float(requested_vcpu), 1)
                 if requested_vcpu is not None and vcpu is not None
                 else 0
             ) + (
-                max((memory or 0) - float(requested_memory), 0)
-                / max(float(requested_memory), 1)
+                max((memory or 0) - float(requested_memory), 0) / max(float(requested_memory), 1)
                 if requested_memory is not None and memory is not None
                 else 0
             )
@@ -2942,9 +3318,7 @@ class QuoteService:
                             candidate.model,
                             (
                                 f"{candidate.specifications.get('vCPU'):g} vCPU"
-                                if isinstance(
-                                    candidate.specifications.get("vCPU"), (int, float)
-                                )
+                                if isinstance(candidate.specifications.get("vCPU"), (int, float))
                                 else None
                             ),
                             (
@@ -2966,11 +3340,7 @@ class QuoteService:
                         ),
                         "belowRequestedMinimum": is_underprovisioned(candidate),
                         "exactRequestedShape": is_exact(candidate),
-                        **(
-                            {"requestedVCPU": requested_vcpu}
-                            if requested_vcpu is not None
-                            else {}
-                        ),
+                        **({"requestedVCPU": requested_vcpu} if requested_vcpu is not None else {}),
                         **(
                             {"requestedMemoryGiB": requested_memory}
                             if requested_memory is not None
@@ -3012,15 +3382,11 @@ class QuoteService:
             selected_was_removed = bool(
                 selection.selected_model
                 and any(
-                    QuoteService._models_equivalent(
-                        candidate.model, str(selection.selected_model)
-                    )
+                    QuoteService._models_equivalent(candidate.model, str(selection.selected_model))
                     for candidate in original_candidates
                 )
                 and not any(
-                    QuoteService._models_equivalent(
-                        candidate.model, str(selection.selected_model)
-                    )
+                    QuoteService._models_equivalent(candidate.model, str(selection.selected_model))
                     for candidate in safe_candidates
                 )
             )
@@ -3050,9 +3416,7 @@ class QuoteService:
             service=requirement.service,
         )
         requested_model = str(requested.get("requested_model") or "").strip().casefold()
-        requested_model_source = requirement.field_sources.get(
-            "requirements.requested_model"
-        )
+        requested_model_source = requirement.field_sources.get("requirements.requested_model")
         # Only an explicit choice from the official catalogue can make a model
         # authoritative over an earlier descriptive CPU/memory request. A
         # stale or system-generated model string must still pass the shared
@@ -3062,7 +3426,8 @@ class QuoteService:
             and QuoteService._models_equivalent(
                 str(selection.selected_model or ""), requested_model
             )
-            and requested_model_source in {
+            and requested_model_source
+            in {
                 "customer_confirmation",
                 "customer_correction",
                 "sales_confirmation",
@@ -3083,13 +3448,9 @@ class QuoteService:
             synchronized = dict(requirement.requirements)
             official_vcpu = chosen.specifications.get("vCPU")
             official_memory = chosen.specifications.get("memoryGiB")
-            if isinstance(official_vcpu, (int, float)) and not isinstance(
-                official_vcpu, bool
-            ):
+            if isinstance(official_vcpu, (int, float)) and not isinstance(official_vcpu, bool):
                 synchronized["vcpu"] = official_vcpu
-            if isinstance(official_memory, (int, float)) and not isinstance(
-                official_memory, bool
-            ):
+            if isinstance(official_memory, (int, float)) and not isinstance(official_memory, bool):
                 synchronized["memory_gib"] = official_memory
             return selection.model_copy(update={"requirements": synchronized})
 
@@ -3156,9 +3517,11 @@ class QuoteService:
             if not matches:
                 continue
             eligible.append(candidate)
-        preferred_architecture = str(
-            requirement.field_sources.get("_processor_architecture_preference") or "arm64"
-        ).strip().casefold()
+        preferred_architecture = (
+            str(requirement.field_sources.get("_processor_architecture_preference") or "arm64")
+            .strip()
+            .casefold()
+        )
         supported_architectures = {
             architecture
             for candidate in selection.candidates
@@ -3263,12 +3626,17 @@ class QuoteService:
             component.requirements.get(field) not in (None, "")
             for field in ("requested_model", "vcpu", "memory_gib")
         )
-        if kind is None and not has_requested_shape and selection.selected_model in {
-            None,
-            "",
-            "AWS 官方计费维度",
-            "官方单位参考价",
-        }:
+        if (
+            kind is None
+            and not has_requested_shape
+            and selection.selected_model
+            in {
+                None,
+                "",
+                "AWS 官方计费维度",
+                "官方单位参考价",
+            }
+        ):
             return selection.candidates
         discovery = component.model_copy(deep=True)
         for field in (
@@ -3508,9 +3876,7 @@ class QuoteService:
 
         if session.status != "pending":
             return session
-        configurations = {
-            item.component_id: item for item in session.configuration_items
-        }
+        configurations = {item.component_id: item for item in session.configuration_items}
         hydrated: list[ConfirmationItem] = []
         changed = False
 
@@ -3535,10 +3901,7 @@ class QuoteService:
             enriched: list[ConfirmationOption] = []
             for option in complete:
                 model_key = str(option.model or "").strip().casefold()
-                if (
-                    option.monthly_catalog_cost is None
-                    and model_key in known_costs
-                ):
+                if option.monthly_catalog_cost is None and model_key in known_costs:
                     option = option.model_copy(
                         update={"monthly_catalog_cost": known_costs[model_key]}
                     )
@@ -3588,9 +3951,7 @@ class QuoteService:
             candidates = [
                 CandidateOption(
                     model=str(option.model),
-                    family=str(
-                        option.specifications.get("instanceFamily") or "official"
-                    ),
+                    family=str(option.specifications.get("instanceFamily") or "official"),
                     specifications=dict(option.specifications),
                     monthly_catalog_cost=option.monthly_catalog_cost,
                     rationale="AWS 当前区域支持的官方型号。",
@@ -3630,9 +3991,7 @@ class QuoteService:
             # labels on read without changing the official supported-region
             # list or the stored decision value.
             localized_options = [
-                option.model_copy(
-                    update={"label": self._localized_region_label(option.value)}
-                )
+                option.model_copy(update={"label": self._localized_region_label(option.value)})
                 if re.fullmatch(r"[a-z]{2}(?:-[a-z0-9]+)+-\d+", option.value)
                 else option
                 for option in item.options
@@ -3649,14 +4008,10 @@ class QuoteService:
             if "自建" in item.question and any(
                 marker in item.question.casefold() for marker in ("托管", "managed", "aws")
             ):
-                architecture_options = self._default_confirmation_options(
-                    item.question, component
-                )
+                architecture_options = self._default_confirmation_options(item.question, component)
                 dependent_options = item.dependent_options
                 if component is not None and configuration is not None:
-                    complete_options = await complete_model_options(
-                        component, configuration
-                    )
+                    complete_options = await complete_model_options(component, configuration)
                     if complete_options:
                         dependent_options = preserve_known_catalog_costs(
                             complete_options,
@@ -3689,9 +4044,7 @@ class QuoteService:
                 and configuration is not None
                 and any(option.model for option in item.options)
             ):
-                complete_options = await complete_model_options(
-                    component, configuration
-                )
+                complete_options = await complete_model_options(component, configuration)
                 complete_options = preserve_known_catalog_costs(
                     complete_options,
                     item.options,
@@ -3700,10 +4053,7 @@ class QuoteService:
                 normalized_question = current_model_question(
                     component, configuration, displayed_options
                 )
-                if (
-                    displayed_options != item.options
-                    or normalized_question != item.question
-                ):
+                if displayed_options != item.options or normalized_question != item.question:
                     changed = True
                     hydrated.append(
                         item.model_copy(
@@ -3720,9 +4070,7 @@ class QuoteService:
                 hydrated.append(item)
                 continue
             if component is None:
-                hydrated.append(
-                    item.model_copy(update={"selection_mode": "buttons"})
-                )
+                hydrated.append(item.model_copy(update={"selection_mode": "buttons"}))
                 continue
             kind = self._service_kind(component.service)
             plugin = self._plugins.get(kind) if kind is not None else self._generic_plugin
@@ -3744,9 +4092,7 @@ class QuoteService:
             if not options:
                 hydrated.append(item.model_copy(update={"selection_mode": "buttons"}))
                 continue
-            normalized_question = current_model_question(
-                component, configuration, options
-            )
+            normalized_question = current_model_question(component, configuration, options)
             changed = True
             hydrated.append(
                 item.model_copy(
@@ -3835,9 +4181,7 @@ class QuoteService:
         # here gives every architecture question one shared presentation and
         # submission path instead of product-specific UI branches.
         folded = re.sub(r"[^a-z0-9]+", "", f"{subject} {notice}".casefold())
-        alternatives: tuple[
-            tuple[tuple[str, ...], str, str, str, str], ...
-        ] = (
+        alternatives: tuple[tuple[tuple[str, ...], str, str, str, str], ...] = (
             (
                 ("doris", "apachedoris"),
                 "redshift",
@@ -3883,9 +4227,7 @@ class QuoteService:
         )
         for aliases, service_key, display_name, feature, difference in alternatives:
             if any(alias in folded for alias in aliases):
-                recommendations.append(
-                    (service_key, display_name, feature, difference)
-                )
+                recommendations.append((service_key, display_name, feature, difference))
                 break
         return recommendations
 
@@ -3906,11 +4248,17 @@ class QuoteService:
             marker in folded for marker in ("流量地区", "访问者", "traffic geography")
         ):
             return [
-                ConfirmationOption(label="亚太地区（Asia Pacific）", value="traffic_geography:Asia Pacific"),
-                ConfirmationOption(label="美国（United States）", value="traffic_geography:United States"),
+                ConfirmationOption(
+                    label="亚太地区（Asia Pacific）", value="traffic_geography:Asia Pacific"
+                ),
+                ConfirmationOption(
+                    label="美国（United States）", value="traffic_geography:United States"
+                ),
                 ConfirmationOption(label="欧洲（Europe）", value="traffic_geography:Europe"),
                 ConfirmationOption(label="日本（Japan）", value="traffic_geography:Japan"),
-                ConfirmationOption(label="澳大利亚（Australia）", value="traffic_geography:Australia"),
+                ConfirmationOption(
+                    label="澳大利亚（Australia）", value="traffic_geography:Australia"
+                ),
                 ConfirmationOption(label="加拿大（Canada）", value="traffic_geography:Canada"),
             ]
         if any(marker in folded for marker in ("rds", "数据库", "mysql")) and any(
@@ -3971,9 +4319,7 @@ class QuoteService:
             marker in folded for marker in ("可选版本", "支持的版本", "引擎版本")
         ):
             version_text = (
-                notice.split("可选版本：", 1)[1].split("。", 1)[0]
-                if "可选版本：" in notice
-                else ""
+                notice.split("可选版本：", 1)[1].split("。", 1)[0] if "可选版本：" in notice else ""
             )
             versions = list(
                 dict.fromkeys(
@@ -4023,13 +4369,9 @@ class QuoteService:
             # choice to the customer.
             if not managed_choices:
                 return []
-            managed_service, managed_display, managed_func, managed_difference = (
-                managed_choices[0]
-            )
+            managed_service, managed_display, managed_func, managed_difference = managed_choices[0]
             managed_label = f"采用 {managed_display}"
-            managed_description = (
-                f"主要用途：{managed_func}。与原方案的差别：{managed_difference}"
-            )
+            managed_description = f"主要用途：{managed_func}。与原方案的差别：{managed_difference}"
             managed_value = (
                 f"managed:{cls._sanitize_choice_value(managed_service)}:"
                 f"{cls._sanitize_choice_value(managed_display)}:"
@@ -4127,16 +4469,14 @@ class QuoteService:
                 retained.append(notice)
                 continue
             component = intent.services[component_index]
-            is_explicit_ec2_deployment = (
-                cls._service_kind(component.service) == ServiceKind.EC2
-                and (
-                    component.field_sources.get("_pending_architecture_decision")
-                    or "自建" in str(component.calculator_service_name or "")
-                )
+            is_explicit_ec2_deployment = cls._service_kind(
+                component.service
+            ) == ServiceKind.EC2 and (
+                component.field_sources.get("_pending_architecture_decision")
+                or "自建" in str(component.calculator_service_name or "")
             )
-            if (
-                not is_explicit_ec2_deployment
-                or cls._default_confirmation_options(notice, component)
+            if not is_explicit_ec2_deployment or cls._default_confirmation_options(
+                notice, component
             ):
                 retained.append(notice)
                 continue
@@ -4149,9 +4489,7 @@ class QuoteService:
             )
             if not component.requirements.get("operating_system"):
                 component.requirements["operating_system"] = "linux"
-                component.field_sources["requirements.operating_system"] = (
-                    "system_default"
-                )
+                component.field_sources["requirements.operating_system"] = "system_default"
             component.query_action = None
             resolved_components.add(component_index)
 
@@ -4239,6 +4577,128 @@ class QuoteService:
                 return self._service_for_confirmation(intent, kind, current_question)
 
             component_index = response_components.get(response_key)
+            official_field_component = (
+                intent.services[component_index]
+                if component_index is not None
+                and 0 <= component_index < len(intent.services)
+                else None
+            )
+            if official_field_component is not None:
+                try:
+                    official_missing = json.loads(
+                        official_field_component.field_sources.get(
+                            OFFICIAL_CALCULATOR_MISSING_FIELDS,
+                            "[]",
+                        )
+                    )
+                except json.JSONDecodeError:
+                    official_missing = []
+                official_field = next(
+                    (
+                        item
+                        for item in official_missing
+                        if isinstance(item, dict)
+                        and (
+                            str(item.get("question") or "") == question
+                            or (
+                                answer_folded.startswith("official_field:")
+                                and len(answer.split(":", 2)) == 3
+                                and str(item.get("field_id") or "")
+                                == answer.split(":", 2)[1]
+                            )
+                        )
+                    ),
+                    None,
+                )
+                if official_field is not None:
+                    try:
+                        value = self._coerce_official_field_answer(
+                            official_field,
+                            answer,
+                        )
+                    except ValueError as exc:
+                        raise ManualConfirmationRequired(
+                            f"{official_field.get('label') or '该官方字段'}填写格式不正确，请按页面提示重新填写",
+                            code="official_calculator_field_answer_invalid",
+                            component_id=str(component_index),
+                            field_id=official_field.get("field_id"),
+                        ) from exc
+                    field_id = str(official_field["field_id"])
+                    official_field_component.official_calculator_configuration[
+                        field_id
+                    ] = value
+                    official_path = f"official_calculator_configuration.{field_id}"
+                    official_field_component.field_sources[official_path] = "customer_confirmation"
+                    official_field_component.field_evidence[official_path] = answer
+                    official_field_component.locked_fields = sorted(
+                        set(official_field_component.locked_fields) | {official_path}
+                    )
+                    remaining = [
+                        item for item in official_missing if item is not official_field
+                    ]
+                    if remaining:
+                        official_field_component.field_sources[
+                            OFFICIAL_CALCULATOR_MISSING_FIELDS
+                        ] = json.dumps(
+                            remaining,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    else:
+                        official_field_component.field_sources.pop(
+                            OFFICIAL_CALCULATOR_MISSING_FIELDS,
+                            None,
+                        )
+                    resolved_markers.append((question_folded,))
+                    continue
+
+            if answer_folded.startswith("official_template:"):
+                selected_code = answer.split(":", 1)[1].strip()
+                if (
+                    component_index is not None
+                    and 0 <= component_index < len(intent.services)
+                    and selected_code
+                ):
+                    component = intent.services[component_index]
+                    try:
+                        stored_options = json.loads(
+                            component.field_sources.get(
+                                OFFICIAL_CALCULATOR_OPTIONS,
+                                "[]",
+                            )
+                        )
+                    except json.JSONDecodeError:
+                        stored_options = []
+                    allowed = {
+                        str(item.get("service_code") or "").casefold()
+                        for item in stored_options
+                        if isinstance(item, dict) and item.get("service_code")
+                    }
+                    if selected_code.casefold() not in allowed:
+                        raise ManualConfirmationRequired(
+                            "所选类型不在 AWS 当前官方子模板列表中，请重新选择",
+                            code="official_calculator_subservice_invalid",
+                            component_id=str(component_index),
+                        )
+                    component.field_sources[OFFICIAL_CALCULATOR_SELECTED_CODE] = (
+                        selected_code
+                    )
+                    component.field_sources[OFFICIAL_CALCULATOR_SELECTION_SOURCE] = (
+                        "customer_confirmation"
+                    )
+                    component.field_sources[OFFICIAL_CALCULATOR_STATUS] = (
+                        OFFICIAL_CALCULATOR_SELECTION_REQUIRED
+                    )
+                    component.field_evidence[OFFICIAL_CALCULATOR_SELECTED_CODE] = (
+                        "客户从 AWS 官方子模板列表中选择"
+                    )
+                    component.locked_fields = sorted(
+                        set(component.locked_fields)
+                        | {OFFICIAL_CALCULATOR_SELECTED_CODE}
+                    )
+                    resolved_markers.append((question_folded,))
+                continue
+
             if answer_folded == "exclude_component":
                 if component_index is not None and 0 <= component_index < len(intent.services):
                     excluded_component_ids.add(component_index)
@@ -4274,9 +4734,7 @@ class QuoteService:
                             "_replacement_source_service": previous_service,
                         }
                         component.field_sources["service"] = "customer_confirmation"
-                        component.field_sources["requirements.engine"] = (
-                            "customer_confirmation"
-                        )
+                        component.field_sources["requirements.engine"] = "customer_confirmation"
                         resolved_markers.append(("停止服务",))
                     elif target_service == "ec2":
                         retained_fields = {
@@ -4305,9 +4763,7 @@ class QuoteService:
             if answer_folded.startswith("managed:"):
                 parts = answer.split(":", 3)
                 managed_service = parts[1].strip().casefold() if len(parts) > 1 else ""
-                managed_display = (
-                    parts[2].strip() if len(parts) > 2 else "AWS 托管服务"
-                )
+                managed_display = parts[2].strip() if len(parts) > 2 else "AWS 托管服务"
                 component = (
                     intent.services[component_index]
                     if component_index is not None and 0 <= component_index < len(intent.services)
@@ -4359,12 +4815,8 @@ class QuoteService:
                         component = intent.services[component_index]
                         key = f"_billing_variant_{field}"
                         component.requirements[key] = usage_type
-                        component.field_sources[f"requirements.{key}"] = (
-                            "customer_confirmation"
-                        )
-                        component.field_evidence[f"requirements.{key}"] = (
-                            "客户选择了实际收费方式"
-                        )
+                        component.field_sources[f"requirements.{key}"] = "customer_confirmation"
+                        component.field_evidence[f"requirements.{key}"] = "客户选择了实际收费方式"
                         component.locked_fields = sorted(
                             set(component.locked_fields) | {f"requirements.{key}"}
                         )
@@ -4399,9 +4851,7 @@ class QuoteService:
                 selected_version = answer.split(":", 1)[1].strip()
                 if service is not None and selected_version:
                     service.requirements["engine_version"] = selected_version
-                    service.field_sources["requirements.engine_version"] = (
-                        "customer_confirmation"
-                    )
+                    service.field_sources["requirements.engine_version"] = "customer_confirmation"
                     service.field_evidence["requirements.engine_version"] = (
                         "客户从当前区域支持的 Redis 版本中选择"
                     )
@@ -4469,9 +4919,7 @@ class QuoteService:
                             dict.fromkeys([selected_version, *official_versions])
                         )
                     if official_versions:
-                        existing_options = service.requirements.get(
-                            "_review_field_options", {}
-                        )
+                        existing_options = service.requirements.get("_review_field_options", {})
                         if not isinstance(existing_options, dict):
                             existing_options = {}
                         service.requirements["_review_field_options"] = {
@@ -4551,8 +4999,7 @@ class QuoteService:
                             "客户从官方可用型号中选择"
                         )
                         current.locked_fields = sorted(
-                            set(current.locked_fields)
-                            | {"requirements.requested_model"}
+                            set(current.locked_fields) | {"requirements.requested_model"}
                         )
                         record_customer_fact_metadata(
                             current,
@@ -4717,22 +5164,15 @@ class QuoteService:
                     resolved_markers.append(("部署方式",))
                     continue
 
-            if any(
-                marker in question_folded
-                for marker in ("地区", "区域", "地域", "region")
-            ):
+            if any(marker in question_folded for marker in ("地区", "区域", "地域", "region")):
                 region = self._region_from_confirmation(answer)
                 if region:
                     if component_index is not None and 0 <= component_index < len(intent.services):
                         component = intent.services[component_index]
                         component.region = region
                         component.field_sources["region"] = "customer_confirmation"
-                        component.field_evidence["region"] = (
-                            "客户从该服务实际支持的 AWS 地区中选择"
-                        )
-                        component.locked_fields = sorted(
-                            set(component.locked_fields) | {"region"}
-                        )
+                        component.field_evidence["region"] = "客户从该服务实际支持的 AWS 地区中选择"
+                        component.locked_fields = sorted(set(component.locked_fields) | {"region"})
                     else:
                         # A service-availability answer carries a component id
                         # and changes that row only. Quote-wide region questions
@@ -4745,9 +5185,7 @@ class QuoteService:
                             }:
                                 service.region = region
                                 service.field_sources["region"] = "customer_confirmation"
-                                service.field_evidence["region"] = (
-                                    "客户确认本次方案的公共 AWS 地区"
-                                )
+                                service.field_evidence["region"] = "客户确认本次方案的公共 AWS 地区"
                                 service.locked_fields = sorted(
                                     set(service.locked_fields) | {"region"}
                                 )
@@ -4844,9 +5282,7 @@ class QuoteService:
                 if service is not None:
                     service.requirements["vcpu"] = float(shape_match.group(1))
                     service.requirements["memory_gib"] = float(shape_match.group(2))
-                    service.field_sources.pop(
-                        "_customer_shape_replaced_by_model", None
-                    )
+                    service.field_sources.pop("_customer_shape_replaced_by_model", None)
                     resolved_markers.append(("核", "内存"))
                 continue
 
@@ -4900,9 +5336,7 @@ class QuoteService:
                     service = staged_service
                 if service is not None:
                     service.requirements["requested_model"] = selected_model
-                    service.field_sources["requirements.requested_model"] = (
-                        "customer_confirmation"
-                    )
+                    service.field_sources["requirements.requested_model"] = "customer_confirmation"
                     service.field_evidence["requirements.requested_model"] = (
                         "客户从官方可用型号中选择"
                     )
@@ -4946,9 +5380,7 @@ class QuoteService:
                         for replaced_field in ("vcpu", "memory_gib"):
                             service.requirements.pop(replaced_field, None)
                             replaced_path = f"requirements.{replaced_field}"
-                            service.field_sources[replaced_path] = (
-                                "customer_confirmation_removed"
-                            )
+                            service.field_sources[replaced_path] = "customer_confirmation_removed"
                             service.field_evidence[replaced_path] = (
                                 "客户已选择官方型号，以该型号规格替代原 CPU/内存约束"
                             )
@@ -4956,9 +5388,9 @@ class QuoteService:
                         # CPU/memory sentence. Keep the source text for audit,
                         # but do not let literal recovery restore the rejected
                         # shape on the next preview/quote pass.
-                        service.field_sources[
-                            "_customer_shape_replaced_by_model"
-                        ] = "customer_confirmation"
+                        service.field_sources["_customer_shape_replaced_by_model"] = (
+                            "customer_confirmation"
+                        )
                     if kind == ServiceKind.REDIS:
                         resolved_markers.append(("redis", "相邻"))
                     elif kind == ServiceKind.RDS:
@@ -5061,6 +5493,8 @@ class QuoteService:
         folded = answer.strip().casefold()
         return bool(
             folded.startswith("engine_version:")
+            or folded.startswith("official_template:")
+            or folded.startswith("official_field:")
             or folded.startswith("cache_engine_version:")
             or folded.startswith("traffic_geography:")
             or folded.startswith("billing_variant:")
@@ -5170,16 +5604,6 @@ class QuoteService:
             return ServiceKind.EC2
         return None
 
-    @staticmethod
-    def _first_service(intent: ParsedIntent, kind: ServiceKind):
-        return next(
-            (
-                service
-                for service in intent.services
-                if QuoteService._service_kind(service.service) == kind
-            ),
-            None,
-        )
 
     @staticmethod
     def _service_for_confirmation(intent: ParsedIntent, kind: ServiceKind, question: str):
@@ -5277,9 +5701,7 @@ class QuoteService:
             for item in intent.ambiguities
             if item.strip()
             and cls._is_customer_decision_notice(item)
-            and not (
-                all_regional_services_resolved and cls._is_region_confirmation_notice(item)
-            )
+            and not (all_regional_services_resolved and cls._is_region_confirmation_notice(item))
             and not cls._is_optional_opensearch_role_notice(item)
         ]
         component_scopes: dict[str, tuple[str, str]] = {}
@@ -5412,15 +5834,17 @@ class QuoteService:
                 ),
             )
         ).casefold()
-        source_identity = str(requirement.source_text or "").casefold()
-        identity = f"{primary_identity} {source_identity}"
+        identity = primary_identity
         # Resolve the purchased component before inspecting free-form source
         # text. A DMS migration sentence naturally mentions PostgreSQL or
         # MySQL, but those are migration endpoints, not the DMS product name.
-        if any(
-            marker in primary_identity
-            for marker in ("database migration", "databasemigration", "aws dms")
-        ) or selection.service == "dms":
+        if (
+            any(
+                marker in primary_identity
+                for marker in ("database migration", "databasemigration", "aws dms")
+            )
+            or selection.service == "dms"
+        ):
             return "AWS DMS"
         if "eks worker" in identity or "worker nodes" in identity:
             return "EKS 工作节点"
@@ -5458,7 +5882,6 @@ class QuoteService:
         requested_model = str(
             requirement.requirements.get("requested_model")
             or selection.requested_model
-            or cls._model_from_confirmation_answer(requirement.source_text or "")
             or ""
         ).strip()
         if requested_model:
@@ -5481,11 +5904,7 @@ class QuoteService:
             )
         if service_name == "EKS 工作节点" and not vcpu and not memory:
             return "EKS 工作节点还没写需要几核、多少内存。请在下面选择。"
-        subject = (
-            f"{service_name} 每个节点"
-            if service_name == "OpenSearch"
-            else service_name
-        )
+        subject = f"{service_name} 每个节点" if service_name == "OpenSearch" else service_name
         if vcpu and memory:
             requested_vcpu = float(vcpu)
             requested_memory = float(memory)
@@ -5879,28 +6298,6 @@ class QuoteService:
     async def _enriched_confirmation_notices(self, intent: ParsedIntent) -> list[str]:
         return self._confirmation_notices(intent)
 
-    @staticmethod
-    def _cache_requested_memory(service: object, notices: list[str]) -> float | None:
-        requirements = getattr(service, "requirements", {})
-        value = requirements.get("memory_gib") if isinstance(requirements, dict) else None
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return float(value)
-        source = str(getattr(service, "source_text", "") or "")
-        related_notices = " ".join(
-            item
-            for item in notices
-            if any(marker in item.lower() for marker in ("缓存", "redis", "elasticache"))
-        )
-        text = f"{source} {related_notices}"
-        patterns = (
-            r"(?:每个?节点|节点|内存)[^\d]{0,18}(\d+(?:\.\d+)?)\s*(?:gib|gb|g)(?![a-z])",
-            r"(\d+(?:\.\d+)?)\s*(?:gib|gb|g)(?![a-z])[^。；,，]{0,18}(?:内存|节点)",
-        )
-        for pattern in patterns:
-            match = re.search(pattern, text, re.I)
-            if match:
-                return float(match.group(1))
-        return None
 
     @staticmethod
     def _confirmation_text(notices: list[str]) -> str | None:
@@ -5938,6 +6335,7 @@ class QuoteService:
         notices: list[str] = []
         lcu_fields = {
             "processed_bytes_gib",
+            "processed_bytes_gib_per_load_balancer",
             "data_processed_gib",
             "processed_bytes_ec2_ip_gib_per_hour",
             "new_connections_per_second",
@@ -5977,9 +6375,15 @@ class QuoteService:
                 # Missing broker count uses the smallest supported base layout
                 # instead of becoming a question or leaking prose into a
                 # numeric field.
-                requirements.setdefault("broker_count", 2)
                 requirements.setdefault("cluster_type", "provisioned")
-                requirements.setdefault("storage_type", "ebs")
+                if str(requirements.get("cluster_type") or "").casefold() == "serverless":
+                    storage_path = "requirements.storage_type"
+                    if service.field_sources.get(storage_path) == "system_minimum":
+                        requirements.pop("storage_type", None)
+                        service.field_sources.pop(storage_path, None)
+                else:
+                    requirements.setdefault("broker_count", 2)
+                    requirements.setdefault("storage_type", "ebs")
                 continue
 
             if service.service.lower() in {"apigateway", "api_gateway"}:
@@ -5992,12 +6396,24 @@ class QuoteService:
                 # smallest useful official subscription instead of mislabeling
                 # the missing quantity as an AWS timeout.
                 requirements.setdefault("edition", "enterprise")
-                requirements.setdefault("users", max(1, int(service.quantity or 1)))
-                requirements.setdefault(
-                    "system_default_assumption",
-                    "客户未说明 QuickSight 用户数；按 Enterprise 版 1 位用户估算",
+                has_role_counts = any(
+                    isinstance(requirements.get(field), (int, float))
+                    and not isinstance(requirements.get(field), bool)
+                    and float(requirements[field]) > 0
+                    for field in ("author_users", "reader_users")
                 )
-                notices.append(str(requirements["system_default_assumption"]))
+                if has_role_counts:
+                    requirements.pop("users", None)
+                    default_note = requirements.get("system_default_assumption")
+                    if isinstance(default_note, str) and "用户数" in default_note:
+                        requirements.pop("system_default_assumption", None)
+                else:
+                    requirements.setdefault("users", max(1, int(service.quantity or 1)))
+                    requirements.setdefault(
+                        "system_default_assumption",
+                        "客户未说明 QuickSight 用户数；按 Enterprise 版 1 位用户估算",
+                    )
+                    notices.append(str(requirements["system_default_assumption"]))
                 continue
 
             is_load_balancer = any(
@@ -6027,6 +6443,12 @@ class QuoteService:
                         f"客户未提供 {acronym} 容量单位业务量；"
                         "仅展示容量单位官方单位价，不计入月费合计"
                     )
+                else:
+                    # A newly supplied typed usage invalidates the old
+                    # missing-usage display flag; never leave both active.
+                    was_reference = requirements.pop("reference_lcu_unit_only", False)
+                    if was_reference:
+                        requirements.pop("system_default_assumption", None)
                 if requirements.get("system_default_assumption"):
                     notices.append(str(requirements["system_default_assumption"]))
                 continue
@@ -6036,20 +6458,20 @@ class QuoteService:
                 # even when the customer never mentioned requests; that parser
                 # defect must never become a customer-facing question.
                 request_keys = ("https_requests", "https_requests_per_month", "request_count")
-                source = (service.source_text or "").casefold()
-                customer_mentioned_requests = bool(
-                    re.search(r"(?:https\s*)?(?:请求|requests?)", source, re.IGNORECASE)
+                customer_mentioned_requests = any(
+                    (QuoteService._numeric_requirement(service, key) or 0) > 0
+                    and service.field_sources.get(f"requirements.{key}")
+                    in {
+                        "customer_text",
+                        "customer_confirmation",
+                        "customer_correction",
+                        "sales_confirmation",
+                    }
+                    for key in request_keys
                 )
                 if not customer_mentioned_requests:
                     for key in request_keys:
                         requirements.pop(key, None)
-                customer_supplied_transfer = bool(
-                    re.search(
-                        r"\d+(?:\.\d+)?\s*(?:gib|gb|g|tib|tb|t)(?:\s*/?月)?",
-                        service.source_text or "",
-                        re.IGNORECASE,
-                    )
-                )
                 # The component parser may already have recovered the usage
                 # from a neighbouring line in the same numbered block.  Do
                 # not erase that structured customer value merely because the
@@ -6062,6 +6484,7 @@ class QuoteService:
                         "transfer_gib",
                     )
                 )
+                customer_supplied_transfer = structured_transfer
                 if not customer_supplied_transfer and not structured_transfer:
                     for key in ("data_transfer_out_gib", "data_transfer_gib", "transfer_gib"):
                         requirements.pop(key, None)
@@ -6079,16 +6502,10 @@ class QuoteService:
                 continue
 
             if service.service.lower() in {"s3", "amazon_s3"}:
-                customer_supplied_storage = bool(
-                    re.search(
-                        r"\d+(?:\.\d+)?\s*(?:个|块|条|份)?\s*(?:gib|gb|g|tib|tb|t)",
-                        service.source_text or "",
-                        re.IGNORECASE,
-                    )
-                )
                 structured_storage = (
                     QuoteService._numeric_requirement(service, "storage_gib") or 0
                 ) > 0
+                customer_supplied_storage = structured_storage
                 if not customer_supplied_storage and not structured_storage:
                     requirements.pop("storage_gib", None)
                     requirements["reference_unit_only"] = True
@@ -6135,11 +6552,7 @@ class QuoteService:
             components = []
             for key, issues in failures.items():
                 service = next(
-                    (
-                        item
-                        for item in intent.services
-                        if (item.component_key or "") == key
-                    ),
+                    (item for item in intent.services if (item.component_key or "") == key),
                     None,
                 )
                 components.append(
@@ -6153,9 +6566,7 @@ class QuoteService:
                         "reason": "；".join(issue.message for issue in issues),
                         "fields": [issue.field for issue in issues],
                         "evidence": {
-                            issue.field: issue.evidence
-                            for issue in issues
-                            if issue.evidence
+                            issue.field: issue.evidence for issue in issues if issue.evidence
                         },
                     }
                 )
@@ -6183,41 +6594,21 @@ class QuoteService:
             if service.component_key
         }
         for index, service in enumerate(intent.services, start=1):
-            # ``source_text`` is the service-owned slice after a compound row
-            # has been split (for example ECS + EC2 Worker).  The immutable
-            # ``original_source_text`` still contains the whole customer row
-            # for audit, but validating every child number against every
-            # sibling creates false failures and duplicate questions.
-            source = customer_owned_source(service)
-            # A finalized ledger is the workflow contract. Re-reading the
-            # prose here previously caused new regex rules to invalidate an
-            # already reviewed quote. Only legacy/stale components receive the
-            # one-time source upgrade performed by
-            # ``reconcile_customer_pricing_facts``.
-            issues = (
-                []
-                if customer_fact_ledger_is_current(service)
-                else DeepSeekIntentParser._uncovered_quantitative_claim_issues(
-                    source,
-                    service,
-                )
-            )
+            issues = [] if customer_fact_ledger_is_current(service) else [
+                "当前组件事实表未封存，请通过官方模板重新核验"
+            ]
             if issues:
                 failures.append(
                     {
                         "component_id": str(index),
                         "display_name": service.calculator_service_name or service.service,
-                        "source_text": source,
                         "facts": issues,
                         "reason": "；".join(issues),
                     }
                 )
         for duplicate_group in duplicate_customer_fact_ownership(intent.services):
             component_ids = sorted(
-                {
-                    component_index_by_key.get(record.component_key, 0)
-                    for record in duplicate_group
-                }
+                {component_index_by_key.get(record.component_key, 0) for record in duplicate_group}
                 - {0}
             )
             first = duplicate_group[0]
@@ -6270,6 +6661,7 @@ class QuoteService:
             "data_transfer_gib",
             "transfer_gib",
             "processed_bytes_gib",
+            "processed_bytes_gib_per_load_balancer",
             "processed_bytes_ec2_ip_gib_per_hour",
             "new_connections_per_second",
             "average_connection_duration_seconds",
@@ -6347,9 +6739,7 @@ class QuoteService:
             component.requirements = strip_non_pricing_context_fields(
                 component.service, component.requirements
             )
-            retained_paths = {
-                f"requirements.{field}" for field in component.requirements
-            }
+            retained_paths = {f"requirements.{field}" for field in component.requirements}
             component.field_sources = {
                 path: value
                 for path, value in component.field_sources.items()
@@ -6406,6 +6796,15 @@ class QuoteService:
             # restarted.  Restore the exact reviewed draft instead of parsing
             # the original prose again and losing the reviewed model locks.
             cached = self._confirmation_sessions.restore_draft(request.draft_id)
+        if (
+            cached
+            and callable(getattr(self._parser, "revalidate_saved_intent", None))
+            and not intent_is_cleaned_only(cached[1])
+        ):
+            raise ManualConfirmationRequired(
+                "该草稿来自旧版原文流程，请返回首页重新识别",
+                code="cleaned_input_upgrade_required",
+            )
         if cached:
             # A final pricing request carrying a reviewed draft must use that
             # draft's exact original evidence. Presentation-layer text can gain
@@ -6418,9 +6817,7 @@ class QuoteService:
             intent = cached[1].model_copy(deep=True)
             if request.draft_id and self._confirmation_sessions is not None:
                 component_answers, global_answers = (
-                    self._confirmation_sessions.historical_answers_by_component(
-                        request.draft_id
-                    )
+                    self._confirmation_sessions.historical_answers_by_component(request.draft_id)
                 )
                 replay_responses = dict(global_answers)
                 replay_components: dict[str, int] = {}
@@ -6445,7 +6842,7 @@ class QuoteService:
                 await reporter(
                     "ai",
                     (
-                        "提交文本与已审核草稿不同，已沿用草稿中的原始事实，不再重复解析"
+                        "提交文本与已审核草稿不同，已沿用草稿中的清洗后事实，不再重复解析"
                         if submitted_customer_request != draft_customer_request
                         else "已使用通过 AWS 官方预检的需求，不再重复解析"
                     ),
@@ -6453,40 +6850,45 @@ class QuoteService:
         else:
             if reporter:
                 await reporter("ai", "系统正在拆分客户报价任务")
-            parser_arguments = (
-                {"reporter": reporter}
-                if "reporter" in inspect.signature(self._parser.parse).parameters
-                else {}
-            )
+            parser_parameters = inspect.signature(self._parser.parse).parameters
+            parser_arguments: dict[str, object] = {}
+            if "reporter" in parser_parameters:
+                parser_arguments["reporter"] = reporter
+            if "default_region" in parser_parameters:
+                parser_arguments["default_region"] = request.sales_region
             intent = await self._parser.parse(request.customer_request, **parser_arguments)
+            if all(
+                item.field_sources.get("_source_retention_policy")
+                == CLEANED_INPUT_POLICY_VERSION
+                for item in intent.services
+            ):
+                request.customer_request = canonical_cleaned_request(intent)
             # A fresh final-quote request must honor the region already chosen
             # on the sales page just like preview does. Previously only the
             # validation copy received pricing choices, so the same request
             # could incorrectly ask for region again after preview.
             self._apply_sales_region(intent, request.sales_region)
-            merged_transfer_items = self._merge_transfer_only_ec2_services(intent)
             if reporter:
                 await reporter("ai", f"已整理 {len(intent.services)} 项 AWS 配置")
-                if merged_transfer_items:
-                    await reporter(
-                        "ai",
-                        f"已将 {merged_transfer_items} 项独立公网流量合并到对应 EC2 配置",
-                    )
             validation_intent = intent.model_copy(deep=True)
             self._apply_sales_pricing_choice(validation_intent, request)
             await self._require_official_spec_confirmation(validation_intent)
 
-        # Saved drafts and fresh parser output use the same product-identity
-        # guard. A pricing-family adapter must not relabel an approved product.
-        preserve_customer_configuration(intent)
-        DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
-        self._enforce_service_pricing_contracts(intent)
-        self._require_complete_literal_fact_coverage(intent)
-        DeepSeekIntentParser._split_eks_worker_nodes(intent)
-        enforce_component_integrity(intent)
-        DeepSeekIntentParser._normalize_database_group_quantity(intent)
-        DeepSeekIntentParser._normalize_redis_topology(intent)
-        DeepSeekIntentParser._normalize_cluster_group_quantities(intent)
+        if cached:
+            upgrade = getattr(self._parser, "revalidate_saved_intent", None)
+            if callable(upgrade):
+                intent = await upgrade(intent, reporter=reporter)
+        official_validator = getattr(
+            self._parser,
+            "validate_official_calculator_configurations",
+            None,
+        )
+        if callable(official_validator):
+            await asyncio.to_thread(official_validator, intent)
+
+        if not self._semantic_mapping_is_sealed(intent):
+            DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
+        self._validate_sealed_intent(intent, sales_region=request.sales_region)
         self._strip_non_numeric_placeholders(intent)
         self._strip_non_pricing_context(intent)
 
@@ -6584,12 +6986,9 @@ class QuoteService:
         # misleading.  Omit those duplicate columns when an on-demand column
         # already exists, otherwise keep one clearly labelled fallback.
         has_on_demand_scenario = any(
-            scenario_request.pricing_mode == "on_demand"
-            for scenario_request, _ in scenario_quotes
+            scenario_request.pricing_mode == "on_demand" for scenario_request, _ in scenario_quotes
         )
-        scenario_records: list[
-            tuple[QuoteRequest, QuoteResponse, dict[str, str]]
-        ] = []
+        scenario_records: list[tuple[QuoteRequest, QuoteResponse, dict[str, str]]] = []
         kept_on_demand_fallback = False
         for scenario_request, quote in scenario_quotes:
             basis = self._component_pricing_basis(
@@ -6597,10 +6996,7 @@ class QuoteService:
                 quote.priced_lines,
                 scenario_request.pricing_mode,
             )
-            if (
-                scenario_request.pricing_mode != "on_demand"
-                and "reserved" not in basis.values()
-            ):
+            if scenario_request.pricing_mode != "on_demand" and "reserved" not in basis.values():
                 original_label = self._pricing_scenario_label(scenario_request)
                 unavailable_scenario_notices.append(
                     f"{original_label}：本单没有服务取得这种官方预留价格，"
@@ -6679,6 +7075,62 @@ class QuoteService:
             self._confirmation_sessions.complete_by_draft(request.draft_id)
         return result
 
+    async def create_quote_from_structured_intent(
+        self,
+        intent: ParsedIntent,
+        request: QuoteRequest,
+        reporter: ProgressReporter | None = None,
+    ) -> QuoteResponse:
+        """Price a server-validated, cleaned-only intent without invoking AI.
+
+        This is the public bridge for the AstraQuote MCP path.  It deliberately
+        enters through the existing reviewed-draft branch so the mature AWS
+        selection, BCM pricing and four-layer compiler remain the only pricing
+        implementation.  The parser attached to this service must not expose
+        repair/revalidation methods; any invalid structured value therefore
+        returns to web ChatGPT as a precise error instead of opening a second
+        model loop inside the backend.
+        """
+
+        if not intent_is_cleaned_only(intent):
+            raise ManualConfirmationRequired(
+                "结构化报价没有通过 cleaned-only 边界",
+                code="structured_intake_not_cleaned_only",
+            )
+        invalid_seals = [
+            component.component_key or str(index)
+            for index, component in enumerate(intent.services)
+            if component.field_sources.get("_semantic_fact_mapping")
+            != "structured-gpt-v1"
+        ]
+        if invalid_seals:
+            raise ManualConfirmationRequired(
+                "结构化报价语义映射未封存",
+                code="structured_intake_not_sealed",
+                components=invalid_seals,
+            )
+        cleaned_request = canonical_cleaned_request(intent)
+        if not cleaned_request:
+            raise ManualConfirmationRequired(
+                "结构化报价没有可用的清洗配置",
+                code="structured_intake_empty",
+            )
+        draft_id = f"aw{uuid.uuid4().hex[:10]}"
+        structured_request = request.model_copy(
+            update={
+                "cloud_provider": "aws",
+                "customer_request": cleaned_request,
+                "draft_id": draft_id,
+                "confirmation_responses": {},
+                "retry_component_ids": [],
+            }
+        )
+        self._drafts[draft_id] = (cleaned_request, intent.model_copy(deep=True))
+        try:
+            return await self.create_quote(structured_request, reporter=reporter)
+        finally:
+            self._drafts.pop(draft_id, None)
+
     @staticmethod
     def _component_costs(
         selections: list[SelectedResource],
@@ -6695,9 +7147,7 @@ class QuoteService:
                 ordinal = fallback_index + 1
             pattern = re.compile(rf"^(?:s|az){ordinal}(?:l\d+|commit)$")
             costs[component_id] = sum(
-                float(line.cost)
-                for line in priced_lines
-                if pattern.fullmatch(line.key)
+                float(line.cost) for line in priced_lines if pattern.fullmatch(line.key)
             )
         return costs
 
@@ -6720,13 +7170,10 @@ class QuoteService:
             except ValueError:
                 ordinal = fallback_index + 1
             has_reserved_line = any(
-                line.key == f"s{ordinal}commit"
-                and line.operation.casefold() == "reserved"
+                line.key == f"s{ordinal}commit" and line.operation.casefold() == "reserved"
                 for line in priced_lines
             )
-            basis[component_id] = (
-                "reserved" if has_reserved_line else "on_demand_fallback"
-            )
+            basis[component_id] = "reserved" if has_reserved_line else "on_demand_fallback"
         return basis
 
     @staticmethod
@@ -6737,8 +7184,7 @@ class QuoteService:
         """Refuse a final table whose independent component ledger is incomplete."""
 
         component_ids = [
-            selection.component_id or str(index)
-            for index, selection in enumerate(selections)
+            selection.component_id or str(index) for index, selection in enumerate(selections)
         ]
         expected = set(component_ids)
         if len(expected) != len(component_ids):
@@ -6898,11 +7344,7 @@ class QuoteService:
             candidates = self._candidate_options_from_error(current_error)
             if not candidates and service is not None:
                 kind = self._service_kind(service.service)
-                plugin = (
-                    self._plugins.get(kind)
-                    if kind is not None
-                    else self._generic_plugin
-                )
+                plugin = self._plugins.get(kind) if kind is not None else self._generic_plugin
                 if plugin is not None:
                     candidates = await self._confirmation_candidates_for_failure(
                         plugin=plugin,
@@ -7199,13 +7641,6 @@ class QuoteService:
         compact = notice.strip().rstrip("。；; ")
         return f"{compact}？"
 
-    @staticmethod
-    def _compact_customer_source(requirement: object) -> str:
-        source = str(getattr(requirement, "source_text", "") or "")
-        source = re.sub(r"\s+", " ", source).strip()
-        if len(source) > 140:
-            return source[:137].rstrip() + "…"
-        return source
 
     @classmethod
     def _customer_confirmation_question(
@@ -7260,10 +7695,7 @@ class QuoteService:
             question = f"{display_name} 已经停止提供。您想换成其他服务，还是不报这一项？"
             return cls._customer_confirmation_question(display_name, requirement, question)
         if code == "unsupported_service":
-            question = (
-                "AWS 没有直接对应的服务。您想改用 AWS 上的自建方案，"
-                "还是不报这一项？"
-            )
+            question = "AWS 没有直接对应的服务。您想改用 AWS 上的自建方案，还是不报这一项？"
             return cls._customer_confirmation_question(display_name, requirement, question)
         if code == "unsupported_rds_engine_or_region":
             engine = str(
@@ -7335,9 +7767,7 @@ class QuoteService:
                     f"不能使用。您想改用哪个版本？可选：{'、'.join(supported_versions)}。"
                 )
             else:
-                question = (
-                    f"{engine.title()} 在 {region} 不能购买。您想改到哪个地区？"
-                )
+                question = f"{engine.title()} 在 {region} 不能购买。您想改到哪个地区？"
             return cls._customer_confirmation_question(display_name, requirement, question)
         if code == "insufficient_ec2_requirements":
             question = "还缺少处理器或内存要求，请补充每台需要几核、多少内存。"
@@ -7362,10 +7792,7 @@ class QuoteService:
                 )
                 if part
             )
-            question = (
-                f"您填写的{supplied or '几项配置'}对不上。"
-                "请从下面选择这次要使用的配置。"
-            )
+            question = f"您填写的{supplied or '几项配置'}对不上。请从下面选择这次要使用的配置。"
             return cls._customer_confirmation_question(display_name, requirement, question)
         if code == "billing_variant_required":
             # This adapter already supplies a short, customer-facing question
@@ -7397,8 +7824,7 @@ class QuoteService:
                     )
                     return cls._customer_confirmation_question(display_name, requirement, question)
             question = (
-                "没有和您填写的数据库核数、内存完全一样的型号，"
-                "请从下面选择一个合适的配置。"
+                "没有和您填写的数据库核数、内存完全一样的型号，请从下面选择一个合适的配置。"
                 if code == "rds_specification_not_found"
                 else "请确认数据库大概需要几核、多少内存。"
             )
@@ -7637,74 +8063,6 @@ class QuoteService:
             return False
         return True
 
-    @classmethod
-    def _recover_third_party_deployment(
-        cls,
-        requirement: ServiceRequirement,
-        customer_request: str,
-        display_name: str,
-    ) -> None:
-        """Restore explicit node/shape/storage values from one customer block.
-
-        This is deliberately literal extraction only.  It never borrows data
-        from another component and therefore preserves the per-component data
-        boundary when the intake model returned just ``ClickHouse：``.
-        """
-
-        product_name = cls._third_party_product_name(requirement, display_name)
-        blocks = re.split(
-            r"(?m)(?=^\s*(?:\d+\s*[、.)）]|[-*]\s+))",
-            customer_request or "",
-        )
-        block = next(
-            (
-                item.strip()
-                for item in blocks
-                if item.strip() and product_name.casefold() in item.casefold()
-            ),
-            "",
-        )
-        if not block:
-            block = str(requirement.source_text or "").strip()
-        if block:
-            requirement.source_text = block
-
-        node_match = re.search(
-            r"(?:部署数量|节点数量|机器数量|机器台数|数量)\s*[:：]?\s*"
-            r"(\d+)\s*(?:个|台)?\s*(?:节点|机器|实例|台)",
-            block,
-            re.I,
-        )
-        if node_match:
-            requirement.quantity = max(int(node_match.group(1)), 1)
-            requirement.field_sources["quantity"] = "customer_text"
-
-        shape_match = re.search(
-            r"(?:每\s*节点配置|每节点配置|每台配置|配置)\s*[:：]?\s*"
-            r"(\d+(?:\.\d+)?)\s*(?:核|c|vcpu)\s*"
-            r"(\d+(?:\.\d+)?)\s*(?:gib|gb|g)",
-            block,
-            re.I,
-        )
-        if shape_match:
-            requirement.requirements["vcpu"] = float(shape_match.group(1))
-            requirement.requirements["memory_gib"] = float(shape_match.group(2))
-            requirement.field_sources["requirements.vcpu"] = "customer_text"
-            requirement.field_sources["requirements.memory_gib"] = "customer_text"
-
-        storage_match = re.search(
-            r"(?:存储容量|存储)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*"
-            r"(tib|tb|gib|gb|g)\s*(?:/|每)?\s*(?:节点|台)?",
-            block,
-            re.I,
-        )
-        if storage_match:
-            value = float(storage_match.group(1))
-            unit = storage_match.group(2).casefold()
-            if unit in {"tb", "tib"}:
-                value *= 1024
-            requirement.requirements["system_disk_gib"] = value
-            requirement.field_sources["requirements.system_disk_gib"] = "customer_text"
 
     @classmethod
     def _architecture_notice_component_id(
@@ -7729,10 +8087,14 @@ class QuoteService:
         matches: list[str] = []
         for component_id in sorted(pending_component_ids, key=int):
             component = intent.services[int(component_id)]
-            product_name = cls._third_party_product_name(
-                component,
-                component.calculator_service_name or component.service,
-            ).strip().casefold()
+            product_name = (
+                cls._third_party_product_name(
+                    component,
+                    component.calculator_service_name or component.service,
+                )
+                .strip()
+                .casefold()
+            )
             if product_name and product_name in folded_notice:
                 matches.append(component_id)
         if len(matches) == 1:
@@ -7807,11 +8169,7 @@ class QuoteService:
 
         missing = unconsumed_customer_pricing_facts(requirement, selection)
         supplementer = getattr(self._generic_plugin, "supplement_selection", None)
-        if (
-            missing
-            and plugin is not self._generic_plugin
-            and callable(supplementer)
-        ):
+        if missing and callable(supplementer):
             selection = await asyncio.to_thread(
                 supplementer,
                 requirement,
@@ -7829,9 +8187,7 @@ class QuoteService:
             "official_field_candidates",
             None,
         )
-        if not callable(resolver) or not callable(candidate_getter) or not callable(
-            supplementer
-        ):
+        if not callable(resolver) or not callable(candidate_getter) or not callable(supplementer):
             return selection, missing
         try:
             candidates = await asyncio.to_thread(
@@ -7866,9 +8222,7 @@ class QuoteService:
             if path not in missing or not path.startswith("requirements."):
                 continue
             source_field = path.split(".", 1)[1]
-            trial_requirement.field_sources[
-                f"_fact_purpose_alias.{source_field}"
-            ] = str(target)
+            trial_requirement.field_sources[f"_fact_purpose_alias.{source_field}"] = str(target)
         trial_selection = await asyncio.to_thread(
             supplementer,
             trial_requirement,
@@ -7905,130 +8259,6 @@ class QuoteService:
             )
         return trial_selection, remaining
 
-    @classmethod
-    def _merge_transfer_only_ec2_services(cls, intent: ParsedIntent) -> int:
-        """Merge an AI-created transfer-only EC2 item into its compute workload.
-
-        Customers often put public egress on a separate line.  The parser can
-        interpret that line as another EC2 service even though it contains no
-        instance request.  A transfer-only line is a child cost of an existing
-        EC2 workload, not a second server group.
-        """
-
-        transfer_fields = {
-            "data_transfer_in_gib",
-            "data_transfer_regional_gib",
-            "data_transfer_out_gib",
-            "data_transfer_in_gib_per_instance",
-            "data_transfer_regional_gib_per_instance",
-            "data_transfer_out_gib_per_instance",
-        }
-        compute_fields = {"requested_model", "vcpu", "memory_gib"}
-        # Some models copy the preceding EC2 shape onto a later line such as
-        # “公网流量：应用服务器额外 1TB/月”.  The source line itself is the
-        # authority: when it only describes transfer, remove those inherited
-        # shape fields before deciding whether this is another server group.
-        for item in intent.services:
-            if cls._service_kind(item.service) != ServiceKind.EC2:
-                continue
-            source = (item.source_text or "").casefold()
-            has_transfer = bool(re.search(r"(?:公网|出站|下行|流量|transfer|egress)", source, re.I))
-            has_shape = bool(
-                re.search(
-                    r"(?:\d+\s*(?:核|vcpu)|\d+(?:\.\d+)?\s*(?:gib|gb|g)\s*(?:内存)?|"
-                    r"(?:型号|实例型号|instance\s*type)|\d+\s*台\s*(?:linux|windows|ec2|服务器))",
-                    source,
-                    re.I,
-                )
-            )
-            has_transfer_value = any(
-                item.requirements.get(key) is not None for key in transfer_fields
-            )
-            if has_transfer and has_transfer_value and not has_shape:
-                for key in compute_fields:
-                    item.requirements.pop(key, None)
-        ec2_indexes = [
-            index
-            for index, item in enumerate(intent.services)
-            if cls._service_kind(item.service) == ServiceKind.EC2
-        ]
-        compute_indexes = [
-            index
-            for index in ec2_indexes
-            if any(
-                intent.services[index].requirements.get(key) is not None for key in compute_fields
-            )
-        ]
-        remove_indexes: set[int] = set()
-
-        for index in ec2_indexes:
-            item = intent.services[index]
-            present_transfer_fields = {
-                key for key in transfer_fields if item.requirements.get(key) is not None
-            }
-            if not present_transfer_fields or any(
-                item.requirements.get(key) is not None for key in compute_fields
-            ):
-                continue
-
-            candidates = [candidate for candidate in compute_indexes if candidate != index]
-            if item.region:
-                same_region = [
-                    candidate
-                    for candidate in candidates
-                    if intent.services[candidate].region == item.region
-                ]
-                if same_region:
-                    candidates = same_region
-            if len(candidates) != 1:
-                has_explicit_transfer = any(
-                    cls._service_kind(candidate.service) == ServiceKind.DATA_TRANSFER
-                    for candidate in intent.services
-                )
-                if has_explicit_transfer:
-                    remove_indexes.add(index)
-                else:
-                    # Aggregate egress across several workload regions cannot
-                    # be attached to an arbitrary EC2 group.  Quote it through
-                    # the dedicated Data Transfer adapter, which applies the
-                    # disclosed lowest-rate assumption when no split is given.
-                    intent.services[index] = item.model_copy(
-                        update={
-                            "service": ServiceKind.DATA_TRANSFER.value,
-                            "calculator_service_name": "AWS Data Transfer",
-                        }
-                    )
-                continue
-
-            target = intent.services[candidates[0]]
-            merged = dict(target.requirements)
-            for key in present_transfer_fields:
-                incoming = item.requirements[key]
-                existing = merged.get(key)
-                if (
-                    isinstance(existing, (int, float))
-                    and not isinstance(existing, bool)
-                    and isinstance(incoming, (int, float))
-                    and not isinstance(incoming, bool)
-                ):
-                    merged[key] = float(existing) + float(incoming)
-                elif existing is None:
-                    merged[key] = incoming
-            intent.services[candidates[0]] = target.model_copy(
-                update={
-                    "requirements": merged,
-                    "source_text": "\n".join(
-                        part for part in (target.source_text, item.source_text) if part
-                    ),
-                }
-            )
-            remove_indexes.add(index)
-
-        if remove_indexes:
-            intent.services = [
-                item for index, item in enumerate(intent.services) if index not in remove_indexes
-            ]
-        return len(remove_indexes)
 
     async def _create_api_quote(
         self,
@@ -8084,6 +8314,7 @@ class QuoteService:
                 or service.requirements.get("_review_selected_model")
                 or ""
             ).strip()
+            requested_specifications = self._complete_selection_specifications(service, {})
             return SelectedResource(
                 component_id=str(index),
                 component_number=item_hierarchy.component_number,
@@ -8096,7 +8327,9 @@ class QuoteService:
                 model=requested_model or "暂未取得官方计费项",
                 quantity=service.quantity,
                 architecture="组件已独立保留；当前金额未计入合计",
-                specifications=self._complete_selection_specifications(service, {}),
+                requested_specifications=requested_specifications,
+                official_specifications={},
+                specifications=requested_specifications,
                 official_product={"source": "AWS official catalog", "status": "unpriced"},
                 rationale=message,
                 pricing_status="unpriced",
@@ -8178,8 +8411,7 @@ class QuoteService:
             if kind is None and self._generic_plugin is None:
                 issue_message = "该服务尚未接入官方报价适配器"
                 notices.append(
-                    f"{display_name} {issue_message}，本次未计入总价；"
-                    "其他已支持组件已正常核价。"
+                    f"{display_name} {issue_message}，本次未计入总价；其他已支持组件已正常核价。"
                 )
                 trace.append(
                     ExecutionEvent(
@@ -8245,27 +8477,20 @@ class QuoteService:
                         selection = await asyncio.to_thread(
                             plugin.select, requirement, "ap-southeast-1"
                         )
-                    selection, unconsumed = (
-                        await self._reconcile_unconsumed_component_facts(
-                            component=service,
-                            requirement=requirement,
-                            selection=selection,
-                            plugin=plugin,
-                            component_index=index,
-                            reporter=reporter,
-                        )
+                    selection, unconsumed = await self._reconcile_unconsumed_component_facts(
+                        component=service,
+                        requirement=requirement,
+                        selection=selection,
+                        plugin=plugin,
+                        component_index=index,
+                        reporter=reporter,
                     )
                     if unconsumed:
                         evidence = {
-                            path: requirement.field_evidence.get(path, "")
-                            for path in unconsumed
+                            path: requirement.field_evidence.get(path, "") for path in unconsumed
                         }
                         unresolved_descriptions = [
-                            (
-                                f"{path}（{evidence[path]}）"
-                                if evidence[path]
-                                else path
-                            )
+                            (f"{path}（{evidence[path]}）" if evidence[path] else path)
                             for path in unconsumed
                         ]
                         raise ManualConfirmationRequired(
@@ -8278,10 +8503,9 @@ class QuoteService:
                                     "component_id": str(index + 1),
                                     "display_name": display_name,
                                     "reason": (
-                                        "尚未登记用途的字段："
-                                        + "；".join(unresolved_descriptions)
+                                        "尚未登记用途的字段：" + "；".join(unresolved_descriptions)
                                     ),
-                                    "source_text": requirement.source_text,
+                                    "source_text": service.source_text,
                                     "fields": unconsumed,
                                 }
                             ],
@@ -8300,19 +8524,15 @@ class QuoteService:
                             code=code,
                             fields=paths,
                             evidence={
-                                path: requirement.field_evidence.get(path, "")
-                                for path in paths
+                                path: requirement.field_evidence.get(path, "") for path in paths
                             },
                         )
                     # Cache only a fully reconciled selection.  Caching before
                     # the ledger check could preserve a partial result and
                     # replay the same missing-field failure after AI repair.
-                    if (
-                        cached_selection is None
-                        and component_selection_cache is not None
-                    ):
-                        component_selection_cache[selection_cache_key] = (
-                            selection.model_copy(deep=True)
+                    if cached_selection is None and component_selection_cache is not None:
+                        component_selection_cache[selection_cache_key] = selection.model_copy(
+                            deep=True
                         )
                     break
                 except ManualConfirmationRequired as exc:
@@ -8320,10 +8540,7 @@ class QuoteService:
                     # If it no longer has an official billing product, do not
                     # remove it and silently substitute another model. Return
                     # this component to the customer with official choices.
-                    if (
-                        confirmed_model
-                        and self._is_stale_model_pricing_error(exc)
-                    ):
+                    if confirmed_model and self._is_stale_model_pricing_error(exc):
                         exc.details.setdefault("service_index", index)
                         exc.details.setdefault("component_id", str(index))
                         exc.details.setdefault("service", service_key)
@@ -8447,12 +8664,16 @@ class QuoteService:
                     allow_system_substitution=False,
                 )
             derived_pricing_status = selection.pricing_status
-            if derived_pricing_status == "priced" and not selection.usage_lines and not (
-                selection.monthly_commitment_cost or selection.upfront_commitment_cost
+            if (
+                derived_pricing_status == "priced"
+                and not selection.usage_lines
+                and not (selection.monthly_commitment_cost or selection.upfront_commitment_cost)
             ):
-                derived_pricing_status = (
-                    "reference_only" if selection.reference_rates else "free"
-                )
+                derived_pricing_status = "reference_only" if selection.reference_rates else "free"
+            official_specifications = dict(
+                selection.official_specifications or selection.specifications
+            )
+            requested_specifications = self._complete_selection_specifications(service, {})
             selection = selection.model_copy(
                 update={
                     "component_id": str(index),
@@ -8463,9 +8684,11 @@ class QuoteService:
                     "display_name": display_name,
                     "quantity": service.quantity,
                     "pricing_status": derived_pricing_status,
+                    "requested_specifications": requested_specifications,
+                    "official_specifications": official_specifications,
                     "specifications": self._complete_selection_specifications(
                         service,
-                        selection.specifications,
+                        official_specifications,
                     ),
                     "remarks": list(
                         dict.fromkeys(
@@ -8504,11 +8727,7 @@ class QuoteService:
                         if selection.pricing_status != "unpriced"
                         else f"已保留 {selection.display_name}；当前金额未计入"
                     ),
-                    status=(
-                        "completed"
-                        if selection.pricing_status != "unpriced"
-                        else "warning"
-                    ),
+                    status=("completed" if selection.pricing_status != "unpriced" else "warning"),
                 )
             )
             if selection.usage_lines:
@@ -8567,8 +8786,7 @@ class QuoteService:
                 failed_component_ids = {
                     str(int(group.removeprefix("service-")) - 1)
                     for group in result.failed_groups
-                    if group.startswith("service-")
-                    and group.removeprefix("service-").isdigit()
+                    if group.startswith("service-") and group.removeprefix("service-").isdigit()
                 }
                 selections = [
                     (
@@ -8648,6 +8866,32 @@ class QuoteService:
             for index, selection in enumerate(selections)
             if selection.pricing_status == "unpriced"
         ]
+        try:
+            compiled_quote = compile_quote_ir(
+                requirements=intent.services,
+                selections=selections,
+                usage_lines=usage_lines,
+                priced_lines=priced_lines,
+                total_cost=total_cost,
+                is_partial=bool(incomplete_component_ids),
+            )
+        except QuoteCompilationViolation as exc:
+            diagnostic_log.record_exception(
+                "quote_compiler_contract_failed",
+                exc,
+                context={"violations": exc.violations},
+            )
+            raise ManualConfirmationRequired(
+                "报价四层数据契约没有通过，系统已阻止发布不一致报价",
+                code="quote_compiler_contract_failed",
+                violations=exc.violations,
+            ) from exc
+        compiler_audit = quote_ir_audit_metadata(compiled_quote)
+        calculator_contract_shadow = await self._run_calculator_contract_shadow(
+            compiled_quote,
+            trace,
+            reporter,
+        )
         return QuoteResponse(
             quote_id=quote_id,
             status=QuoteStatus.QUOTED,
@@ -8686,8 +8930,80 @@ class QuoteService:
                 "catalog_regions": sorted(
                     {selection.region for selection in selections if selection.region}
                 ),
+                "quote_compiler": compiler_audit,
+                "calculator_contract_shadow": calculator_contract_shadow,
             },
         )
+
+    async def _run_calculator_contract_shadow(
+        self,
+        compilation: QuoteCompilation,
+        trace: list[ExecutionEvent],
+        reporter: ProgressReporter | None,
+    ) -> dict[str, Any]:
+        """Run the independent Calculator schema path without mutating PriceIR."""
+
+        verifier = self._calculator_shadow_verifier
+        if verifier is None:
+            return {
+                "mode": "official_calculator_contract_shadow",
+                "published_pricing_authority": "aws_bcm_price_ir",
+                "price_comparison_status": "not_run",
+                "promotion_ready": False,
+                "status": "disabled",
+                "attempted_component_count": 0,
+                "validated_component_count": 0,
+                "failed_component_count": 0,
+                "skipped_component_count": len(compilation.requirements),
+                "components": [],
+            }
+        if reporter:
+            await reporter("verification", "正在用 AWS Calculator 官方字段做第二路校验")
+        try:
+            audit = await verifier.verify(compilation)
+        except Exception as exc:  # noqa: BLE001 - the primary compiler stays authoritative
+            diagnostic_log.record_exception(
+                "calculator_contract_shadow_failed",
+                exc,
+                context={"component_count": len(compilation.requirements)},
+            )
+            trace.append(
+                ExecutionEvent(
+                    stage="verification",
+                    status="warning",
+                    message="AWS Calculator 第二路校验暂时不可用；正式金额仍由四层编译器核验",
+                )
+            )
+            return {
+                "mode": "official_calculator_contract_shadow",
+                "published_pricing_authority": "aws_bcm_price_ir",
+                "price_comparison_status": "not_run",
+                "promotion_ready": False,
+                "status": "unavailable",
+                "attempted_component_count": 0,
+                "validated_component_count": 0,
+                "failed_component_count": 0,
+                "skipped_component_count": len(compilation.requirements),
+                "components": [],
+                "reason": str(exc)[:600] or exc.__class__.__name__,
+            }
+
+        message = (
+            "AWS Calculator 官方字段影子校验完成："
+            f"{audit.validated_component_count}/{audit.attempted_component_count} 个已验证"
+        )
+        if audit.failed_component_count:
+            message += f"，{audit.failed_component_count} 个未通过，尚未切换为正式路径"
+        trace.append(
+            ExecutionEvent(
+                stage="verification",
+                status="warning" if audit.failed_component_count else "completed",
+                message=message,
+            )
+        )
+        if reporter:
+            await reporter("verification", message)
+        return audit.model_dump(mode="json")
 
     async def _quote_bcm_with_component_fallback(
         self,
@@ -8750,9 +9066,7 @@ class QuoteService:
                             "component_name": component_name,
                             "error_code": error.code,
                             "error_details": error.details,
-                            "usage_lines": [
-                                line.model_dump(mode="json") for line in lines
-                            ],
+                            "usage_lines": [line.model_dump(mode="json") for line in lines],
                         },
                     )
                     return group, None, error
@@ -8876,17 +9190,6 @@ class QuoteService:
             "too_many_usage_lines",
         }
 
-    @staticmethod
-    def _bcm_rejected_groups(
-        error: ManualConfirmationRequired,
-        usage_lines: list[UsageLine],
-    ) -> set[str]:
-        rejected_keys = {
-            str(item.get("key"))
-            for item in error.details.get("errors", [])
-            if isinstance(item, dict) and item.get("key")
-        }
-        return {line.group or line.key for line in usage_lines if line.key in rejected_keys}
 
     @staticmethod
     async def _record_bcm_component_fallback(
@@ -8983,7 +9286,8 @@ class QuoteService:
         if (
             "load_balanc" in normalized
             or "loadbalanc" in canonical
-            or canonical in {
+            or canonical
+            in {
                 "alb",
                 "nlb",
                 "gwlb",
@@ -9025,234 +9329,6 @@ class QuoteService:
             return ServiceKind.NAT_GATEWAY
         return None
 
-    async def _create_calculator_quote(
-        self,
-        intent: ParsedIntent,
-        request: QuoteRequest,
-        reporter: ProgressReporter | None,
-        default_notices: list[str] | None = None,
-    ) -> QuoteResponse:
-        calculator = self._require_calculator()
-        quote_inputs: list[GenericCalculatorInput] = []
-        non_pricing_notices: list[str] = []
-        for index, service in enumerate(intent.services):
-            requirements = self._calculator_requirements(
-                service.requirements, service.quantity, service.service
-            )
-            if service.service == "ec2" and requirements.get("ebs_storage_breakdown") is not None:
-                non_pricing_notices.append(str(requirements["ebs_storage_breakdown"]))
-            if (
-                service.service == "rds"
-                and service.requirements.get("backup_retention_days") is not None
-            ):
-                days = service.requirements["backup_retention_days"]
-                non_pricing_notices.append(
-                    f"RDS 自动备份保留 {days} 天已保留为部署要求；Calculator 按实际备份"
-                    "存储量（GB-month）计费，客户未提供额外备份存储量，因此未添加猜测费用"
-                )
-            if (
-                service.service in {"elasticache", "redis"}
-                and service.requirements.get("source_storage_gib_per_node") is not None
-            ):
-                source_storage = service.requirements["source_storage_gib_per_node"]
-                if isinstance(source_storage, (int, float)):
-                    non_pricing_notices.append(
-                        f"Redis 原环境每节点 {source_storage:g} GiB 存储仅作为迁移容量参考；"
-                        "标准 Amazon ElastiCache 节点不配置同等 EBS 数据盘，"
-                        "本项未作为节点磁盘计费"
-                    )
-                else:
-                    non_pricing_notices.append(
-                        "Redis 原环境存储仅作为迁移容量参考；标准 Amazon ElastiCache "
-                        "节点不配置同等 EBS 数据盘，本项未作为节点磁盘计费"
-                    )
-            confirmed_model = self._confirmed_pricing_model(
-                service,
-                request.selected_models.get(str(index)),
-            )
-            if confirmed_model:
-                requirements["requested_model"] = confirmed_model
-            quote_inputs.append(
-                GenericCalculatorInput(
-                    service=service.service,
-                    calculator_service_name=self._calculator_service_name(
-                        service.service, service.calculator_service_name
-                    ),
-                    region=service.region,
-                    quantity=service.quantity,
-                    requirements=requirements,
-                    source_text=service.source_text,
-                )
-            )
-
-        web_result = await calculator.quote_ai_groups(quote_inputs, reporter)
-        if len(web_result.generic_groups) != len(intent.services):
-            raise ManualConfirmationRequired(
-                "Calculator 保存的项目数量与客户需求不一致",
-                code="calculator_result_group_mismatch",
-            )
-
-        for quote_input in quote_inputs:
-            adjustments = quote_input.requirements.get("calculator_adjustment_notices")
-            if isinstance(adjustments, list):
-                non_pricing_notices.extend(str(item) for item in adjustments if item)
-
-        selections: list[SelectedResource] = []
-        for index, (service, group, quote_input) in enumerate(
-            zip(intent.services, web_result.generic_groups, quote_inputs, strict=True),
-            start=1,
-        ):
-            requested_model = quote_input.requirements.get("requested_model")
-            self._require_confirmed_model_match(
-                str(requested_model) if requested_model else None,
-                group.selected_model,
-                component_id=str(index - 1),
-                service=service.service,
-                display_name=quote_input.calculator_service_name,
-            )
-            # The Calculator agent returns the model name, while the preview
-            # stage has already verified that model's CPU and memory against
-            # the official regional catalog. Never display the customer's
-            # requested shape beside the selected model: that produced false
-            # combinations such as ``m7g.xlarge · 8C/16G`` and
-            # ``cache.m5.4xlarge · 64G``. Official model specifications always
-            # overwrite presentation aliases in the final quote.
-            reviewed_model = str(
-                service.requirements.get("_review_selected_model") or ""
-            ).strip()
-            reviewed_specifications = service.requirements.get(
-                "_review_selected_specifications"
-            )
-            official_specifications = (
-                dict(reviewed_specifications)
-                if (
-                    isinstance(reviewed_specifications, dict)
-                    and reviewed_model
-                    and self._models_equivalent(reviewed_model, group.selected_model)
-                )
-                else {}
-            )
-            if not official_specifications:
-                seed = PreviewSelection(
-                    component_id=str(index - 1),
-                    service=service.service,
-                    display_name=quote_input.calculator_service_name,
-                    region=service.region or request.region or "ap-southeast-1",
-                    quantity=service.quantity,
-                    requirements=dict(service.requirements),
-                    source_text=service.source_text,
-                    candidates=[],
-                )
-                candidates = await self._configuration_candidates(seed, service)
-                official_candidate = next(
-                    (
-                        candidate
-                        for candidate in candidates
-                        if self._models_equivalent(candidate.model, group.selected_model)
-                    ),
-                    None,
-                )
-                if official_candidate is not None:
-                    official_specifications = dict(official_candidate.specifications)
-            requested_shape_present = any(
-                isinstance(service.requirements.get(field), (int, float))
-                and not isinstance(service.requirements.get(field), bool)
-                for field in ("vcpu", "memory_gib")
-            )
-            model_looks_sized = bool(
-                re.fullmatch(
-                    r"(?:db\.|cache\.)?[a-z][a-z0-9-]*\.[a-z0-9-]+(?:\.search)?",
-                    group.selected_model.casefold(),
-                )
-            )
-            if requested_shape_present and model_looks_sized and not {
-                "vCPU",
-                "memoryGiB",
-            }.issubset(official_specifications):
-                raise ManualConfirmationRequired(
-                    f"{quote_input.calculator_service_name} 已选中 {group.selected_model}，"
-                    "但系统尚未取得该型号对应的官方处理器和内存，已停止生成报价",
-                    code="calculator_model_specifications_unverified",
-                    service=service.service,
-                    model=group.selected_model,
-                    region=service.region or request.region,
-                )
-            specifications = {
-                "quantity": quote_input.quantity,
-                **self._complete_selection_specifications(
-                    service, official_specifications
-                ),
-            }
-            for key in (
-                "storage_iops",
-                "storage_throughput_mbps",
-                "requested_storage_iops",
-                "requested_storage_throughput_mbps",
-            ):
-                if key in quote_input.requirements:
-                    specifications[key] = quote_input.requirements[key]
-            selections.append(
-                SelectedResource(
-                    service=service.service,
-                    display_name=quote_input.calculator_service_name,
-                    region=quote_input.region or "Calculator 默认区域",
-                    model=group.selected_model,
-                    architecture="已按客户需求填写并保存到 Calculator",
-                    specifications=specifications,
-                    official_product={"source": "AWS Pricing Calculator Web"},
-                    rationale=(
-                        "使用客户指定型号。"
-                        if requested_model
-                        else "由 Calculator 当前页面完成配置。"
-                    ),
-                    usage_lines=[
-                        UsageLine(
-                            key=f"g{index}",
-                            service_code=quote_input.calculator_service_name,
-                            usage_type="CalculatorPageResult",
-                            operation="BrowserEstimate",
-                            amount=1,
-                            group=f"g{index}",
-                        )
-                    ],
-                )
-            )
-
-        return QuoteResponse(
-            quote_id=uuid.uuid4().hex[:12],
-            status=QuoteStatus.QUOTED,
-            customer_summary=intent.customer_summary,
-            selections=selections,
-            priced_lines=[
-                PricedLine(
-                    key="webtotal",
-                    service_code="AWSCalculator",
-                    usage_type="AWS-Calculator-Web-Total",
-                    operation="BrowserEstimate",
-                    amount=1,
-                    unit="MonthlyEstimate",
-                    cost=web_result.monthly_total,
-                )
-            ],
-            total_cost=web_result.monthly_total,
-            upfront_cost=web_result.upfront_total,
-            currency=web_result.currency,
-            rate_type="AWS_CALCULATOR_WEB",
-            execution_trace=[
-                ExecutionEvent(stage="calculator", message=step) for step in web_result.steps
-            ],
-            pricing_source="AWS Pricing Calculator Web",
-            source_url=web_result.source_url,
-            share_url=web_result.share_url,
-            calculator_details=web_result.details,
-            notices=list(dict.fromkeys((default_notices or []) + non_pricing_notices)),
-            audit_metadata={
-                "fact_ledger_schema_version": FACT_LEDGER_SCHEMA_VERSION,
-                "pricing_contract_version": PRICING_CONTRACT_VERSION,
-                "component_count": len(intent.services),
-                "pricing_path": "aws_calculator_web",
-            },
-        )
 
     @staticmethod
     def _dependency_remarks(
@@ -9262,16 +9338,12 @@ class QuoteService:
 
         key = str(service.service).casefold()
         present = {str(item.service).casefold() for item in all_services}
-        source = service.source_text or ""
         notes: list[str] = []
         calculator_name = str(service.calculator_service_name or "").casefold()
         is_eks_worker = key == "ec2" and (
-            "eks worker" in calculator_name
-            or "eks 工作节点" in calculator_name
-            or (
-                bool(re.search(r"\beks\b|kubernetes|k8s|k8s", source, re.I))
-                and bool(re.search(r"worker|工作节点", source, re.I))
-            )
+            str(service.derived_from_service or "").casefold() == "eks"
+            or bool(service.parent_component_key and "eks worker" in calculator_name)
+            or bool(service.parent_component_key and "eks 工作节点" in calculator_name)
         )
         if is_eks_worker:
             notes.append(
@@ -9290,15 +9362,11 @@ class QuoteService:
                     f"本项由“{product}”部署需求衍生，用于在 Amazon EC2 上运行 {product}；"
                     "这里计算的是所列云服务器与磁盘资源，不是 AWS 托管版服务。"
                 )
-        elif key == "ec2" and re.search(
-            r"应用服务器|application\s+server", source, re.I
-        ):
-            notes.append(
-                "本项用于部署客户所述的应用服务器；这里计算的是 EC2 实例与所列 EBS 存储资源。"
-            )
         elif key == "eks":
-            has_explicit_workers = bool(
-                re.search(r"(?:工作|worker)?节点(?:数量|规格)|node\s*group", source, re.I)
+            has_explicit_workers = any(
+                item.parent_component_key == service.component_key
+                and str(item.derived_from_service or "").casefold() == "eks"
+                for item in all_services
             )
             if not has_explicit_workers:
                 notes.append(
@@ -9323,28 +9391,6 @@ class QuoteService:
             notes.append("本项不自动包含域名注册、健康检查等客户未指定的附加费用。")
         elif key == "nat_gateway":
             notes.append("NAT Gateway 后端工作负载及其公网数据传输费用独立计算，不在本项重复计费。")
-        purpose_match = re.search(
-            r"(?:用于|用途\s*[:：])\s*([^。；\n]+)", source, re.I
-        )
-        if purpose_match:
-            purpose = purpose_match.group(1).strip(" ，,。；;")
-            if purpose and not any(purpose in note for note in notes):
-                notes.append(f"客户说明本项用于{purpose}。")
-        estimate_match = re.search(
-            r"预估费用\s*[:：]?\s*(?:usd|us\$|\$)?\s*"
-            r"(\d+(?:\.\d+)?)\s*(?:美元|usd)?",
-            source,
-            re.I,
-        )
-        if estimate_match and not re.search(
-            r"(?:每月|月费|/月|每年|年费|/年|monthly|annual|yearly)",
-            source,
-            re.I,
-        ):
-            notes.append(
-                f"客户提供的预估费用 {estimate_match.group(1)} 美元未注明周期；"
-                "该金额仅作对比备注，不代替 AWS 官方计费结果。"
-            )
         return notes
 
     @staticmethod
@@ -9380,6 +9426,7 @@ class QuoteService:
             "connection_minutes": "connectionMinutes",
             "throughput_mbps_per_tib": "throughputMbpsPerTiB",
             "processed_bytes_gib": "processedBytesGiB",
+            "processed_bytes_gib_per_load_balancer": "processedBytesGiBPerLoadBalancer",
             "system_disk_gib": "systemDiskGiB",
             "volume_type": "volumeType",
             "web_acls": "webACLs",
@@ -9480,10 +9527,9 @@ class QuoteService:
         pricing_copy.service = service_key
         pricing_copy.requirements = dict(requirements)
 
-        if (
-            service.field_sources.get("_customer_shape_replaced_by_model")
-            and pricing_copy.requirements.get("requested_model")
-        ):
+        if service.field_sources.get(
+            "_customer_shape_replaced_by_model"
+        ) and pricing_copy.requirements.get("requested_model"):
             # Compatibility for both current and already-issued drafts: once
             # the customer chose an official model as the replacement, the old
             # descriptive CPU/memory sentence is audit history, not a second
@@ -9544,13 +9590,17 @@ class QuoteService:
                 for path in pricing_copy.locked_fields
                 if (
                     not path.startswith("requirements.")
-                    or canonical_requirement_field_name(
-                        path.split(".", 1)[1], service=service_key
-                    )
+                    or canonical_requirement_field_name(path.split(".", 1)[1], service=service_key)
                     in pricing_copy.requirements
                 )
             }
         )
+        # This is the hard compiler boundary: natural language belongs to the
+        # intake/requirement stage only.  Product selection and pricing receive
+        # typed values plus provenance, never prose that they could reinterpret
+        # differently from the cleaning pass.
+        pricing_copy.source_text = ""
+        pricing_copy.original_source_text = None
         return pricing_copy
 
     @staticmethod
@@ -9668,33 +9718,6 @@ class QuoteService:
             )
         )
 
-    @staticmethod
-    def _requirement_without_stale_model(
-        requirement: ServiceRequirement,
-        original: ServiceRequirement,
-    ) -> ServiceRequirement:
-        """Rebuild one pricing request after its cached model became invalid."""
-
-        requirements = dict(requirement.requirements)
-        for field in (
-            "requested_model",
-            "_review_selected_model",
-            "_review_selected_specifications",
-        ):
-            requirements.pop(field, None)
-        specifications = original.requirements.get("_review_selected_specifications")
-        if isinstance(specifications, dict):
-            for official_field, requirement_field in {
-                "vCPU": "vcpu",
-                "memoryGiB": "memory_gib",
-                "storageGiB": "storage_gib",
-                "storageGiBPerNode": "storage_gib_per_node",
-                "storageGiBPerBroker": "storage_gib_per_broker",
-            }.items():
-                value = specifications.get(official_field)
-                if value not in (None, ""):
-                    requirements.setdefault(requirement_field, value)
-        return requirement.model_copy(update={"requirements": requirements})
 
     @classmethod
     def _require_confirmed_model_match(
@@ -9735,13 +9758,6 @@ class QuoteService:
 
         return normalized(left) == normalized(right)
 
-    def _require_calculator(self) -> AwsCalculatorWebAutomator:
-        if self._calculator is None:
-            raise ManualConfirmationRequired(
-                "AWS Pricing Calculator 浏览器服务尚未启动",
-                code="calculator_unavailable",
-            )
-        return self._calculator
 
     @staticmethod
     def _calculator_service_name(service: str, explicit_name: str | None) -> str:

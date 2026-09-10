@@ -1,11 +1,15 @@
 import asyncio
+import json
 import re
 
 import pytest
 
 from app.core.config import Settings
+from app.core.errors import ManualConfirmationRequired
+from app.domain.pricing_contracts import apply_pricing_contract
 from app.domain.customer_configuration import (
     aurora_cluster_member_count,
+    enforce_reclassified_product_schema,
     preserve_customer_configuration,
 )
 from app.domain.fact_ledger import customer_fact_ledger_is_current, customer_owned_source
@@ -17,17 +21,219 @@ from app.integrations.deepseek import (
 )
 from app.integrations.service_templates import (
     SERVICE_TEMPLATE_FIELDS,
+    allowed_requirement_fields,
     requirement_fields,
     safe_requirement_defaults,
 )
 
 
+def _validated_template_component(service: str, source: str, requirements: dict[str, object],
+                                  *, quantity: int = 1, hours_evidence: str | None = None) -> ServiceRequirement:
+    """Inject a model response at intake, never ask the ledger to interpret prose."""
+    original = ServiceRequirement(service=service, source_text=source, original_source_text=source)
+    evidence = {f"requirements.{key}": source for key in requirements}
+    if quantity != 1:
+        evidence["quantity"] = source
+    if hours_evidence:
+        evidence["hours_per_month"] = hours_evidence
+    parser = DeepSeekIntentParser(Settings(ai_api_key="test"))
+    filled = parser._component_from_template_output(
+        {"component": {"requirements": requirements, "quantity": quantity,
+                       "hours_per_month": 730, "field_evidence": evidence}},
+        original, allowed_fields=set(requirements) | allowed_requirement_fields(service),
+    )
+    parser._mark_component_field_sources(original, filled, runtime_defaults={})
+    return filled
+
+
 def test_known_service_aliases_share_one_runtime_contract() -> None:
     assert "read_request_units" in requirement_fields("dynamo_db")
     assert "write_request_units" in requirement_fields("amazon_dynamodb")
-    assert "storage_type" not in safe_requirement_defaults(
-        "rds", {"engine": "aurora_mysql"}
+    assert "storage_type" not in safe_requirement_defaults("rds", {"engine": "aurora_mysql"})
+
+
+def test_ebs_snapshot_policy_has_a_closed_template_and_complete_fact_ledger() -> None:
+    source = "Amazon EBS Snapshot：新加坡 ap-southeast-1，每日快照，保留7天。"
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid")
     )
+    original = ServiceRequirement(
+        service="ebs",
+        calculator_service_name="Amazon EBS Snapshot",
+        source_text=source,
+        original_source_text=source,
+    )
+    raw = {
+        "component": {
+            "service": "ebs",
+            "calculator_service_name": "Amazon EBS Snapshot",
+            "region": "ap-southeast-1",
+            "quantity": 1,
+            "hours_per_month": 730,
+            "requirements": {
+                "product_variant": "snapshot",
+                "snapshot_frequency": "daily",
+                "snapshot_retention_days": 7,
+            },
+            "unmapped_pricing_facts": [],
+            "field_evidence": {
+                "region": "新加坡 ap-southeast-1",
+                "requirements.product_variant": "Amazon EBS Snapshot",
+                "requirements.snapshot_frequency": "每日快照",
+                "requirements.snapshot_retention_days": "保留7天",
+            },
+            "source_text": source,
+            "query_action": None,
+        }
+    }
+
+    parsed = parser._component_from_template_output(raw, original)
+    parser._mark_component_field_sources(original, parsed, runtime_defaults={})
+    intent = ParsedIntent(customer_summary=source, services=[parsed])
+    DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
+
+    assert parsed.requirements == {
+        "product_variant": "snapshot",
+        "snapshot_frequency": "daily",
+        "snapshot_retention_days": 7,
+    }
+    assert parsed.unmapped_pricing_facts == []
+    assert DeepSeekIntentParser._uncovered_quantitative_claim_issues(source, parsed) == []
+    assert customer_fact_ledger_is_current(parsed)
+
+
+def test_ebs_snapshot_contract_keeps_volume_and_snapshot_capacity_separate() -> None:
+    fields = set(requirement_fields("ebs"))
+
+    assert {
+        "product_variant",
+        "storage_gib",
+        "backup_storage_gib",
+        "snapshot_changed_gib",
+        "snapshot_frequency",
+        "snapshot_retention_days",
+    } <= fields
+
+
+@pytest.mark.parametrize(
+    ("product", "target_service", "display_name", "source", "target_field"),
+    [
+        (
+            "Kafka",
+            "msk",
+            "Amazon MSK",
+            "Kafka，3个节点，单节点8核32G，每节点存储1T",
+            "storage_gib_per_broker",
+        ),
+        (
+            "Elasticsearch",
+            "opensearch",
+            "Amazon OpenSearch Service",
+            "Elasticsearch，3个节点，单节点8核32G，每节点存储1T",
+            "storage_gib_per_node",
+        ),
+        (
+            "RabbitMQ",
+            "mq",
+            "Amazon MQ for RabbitMQ",
+            "RabbitMQ，3个节点，单节点4核16G，每节点存储1T",
+            "storage_gib_per_broker",
+        ),
+    ],
+)
+def test_product_reclassification_atomically_migrates_target_schema_facts(
+    product: str,
+    target_service: str,
+    display_name: str,
+    source: str,
+    target_field: str,
+) -> None:
+    component = ServiceRequirement(
+        service="ec2",
+        calculator_service_name=f"Amazon EC2（自建 {product}）",
+        source_text=source,
+        original_source_text=source,
+        requirements={
+            "vcpu": 8,
+            "memory_gib": 32,
+            "system_disk_gib": 1024,
+            "_review_service": "ec2",
+        },
+        field_sources={
+            "requirements.vcpu": "customer_text",
+            "requirements.memory_gib": "customer_text",
+            "requirements.system_disk_gib": "customer_text",
+            "requirements._review_service": "system_policy",
+        },
+        field_evidence={
+            "requirements.vcpu": "单节点8核32G",
+            "requirements.memory_gib": "单节点8核32G",
+            "requirements.system_disk_gib": "每节点存储1T",
+        },
+        locked_fields=[
+            "requirements.vcpu",
+            "requirements.memory_gib",
+            "requirements.system_disk_gib",
+        ],
+    )
+
+    DeepSeekIntentParser._apply_fully_managed_equivalent(
+        component,
+        product,
+        source,
+        (target_service, display_name),
+    )
+    assert "_review_service" not in component.requirements
+
+    # The target official template supplies the target field. The typed
+    # boundary only folds equivalent facts; it must not reread the prose.
+    component.requirements[target_field] = 1024
+    component.field_sources[f"requirements.{target_field}"] = "customer_text"
+    component.field_evidence[f"requirements.{target_field}"] = "每节点存储1T"
+    parsed = ParsedIntent(customer_summary=source, services=[component])
+    DeepSeekIntentParser.reconcile_customer_pricing_facts(parsed)
+
+    assert "system_disk_gib" not in component.requirements
+    assert component.requirements[target_field] == 1024
+    assert component.field_sources[f"requirements.{target_field}"] == "customer_text"
+    assert (
+        sum(
+            fact.path == f"requirements.{target_field}" for fact in component.customer_pricing_facts
+        )
+        == 1
+    )
+
+
+def test_product_schema_boundary_preserves_unmatched_customer_fact() -> None:
+    component = ServiceRequirement(
+        service="msk",
+        source_text="Kafka，每节点旧磁盘900G，新托管存储1T",
+        requirements={
+            "system_disk_gib": 900,
+            "storage_gib_per_broker": 1024,
+            "_review_service": "ec2",
+        },
+        field_sources={
+            "requirements.system_disk_gib": "customer_text",
+            "requirements.storage_gib_per_broker": "customer_text",
+            "requirements._review_service": "system_policy",
+        },
+        field_evidence={
+            "requirements.system_disk_gib": "旧磁盘900G",
+            "requirements.storage_gib_per_broker": "托管存储1T",
+        },
+        locked_fields=[
+            "requirements.system_disk_gib",
+            "requirements.storage_gib_per_broker",
+        ],
+    )
+
+    changed = enforce_reclassified_product_schema(component, discard_derived_results=True)
+
+    assert changed is True
+    assert component.requirements["system_disk_gib"] == 900
+    assert component.requirements["storage_gib_per_broker"] == 1024
+    assert "_review_service" not in component.requirements
 
 
 def test_official_hourly_profile_does_not_duplicate_top_level_runtime() -> None:
@@ -89,18 +295,276 @@ def test_dynamic_processing_hours_literal_is_kept_as_aggregate_usage() -> None:
     )
 
     assert component.requirements["processing_hours"] == 5000
-    assert component.field_evidence["requirements.processing_hours"].endswith(
-        "5000小时"
-    )
+    assert component.field_evidence["requirements.processing_hours"].endswith("5000小时")
     assert "hours_per_month" not in component.requirements
 
 
-def test_reconcile_upgrades_alb_and_dynamodb_without_losing_numbers() -> None:
-    alb_source = "Application Load Balancer，2个ALB，每月处理流量5T"
-    dynamodb_source = (
-        "Amazon DynamoDB，按需模式，存储500G，"
-        "每月读取请求2亿次，每月写入请求5000万次"
+def test_dynamic_processing_minutes_literal_is_normalized_to_processing_hours() -> None:
+    source = "AWS Elemental MediaConvert：每月转码10万分钟，1080p基础层输出"
+    component = ServiceRequirement(
+        service="elemental_media_convert",
+        source_text=source,
     )
+
+    DeepSeekIntentParser._overlay_literal_component_facts(
+        source,
+        component,
+        extra_fields=("processing_hours",),
+    )
+
+    assert component.requirements["processing_hours"] == pytest.approx(100_000 / 60)
+    assert component.field_evidence["requirements.processing_hours"].endswith("10万分钟")
+    assert "hours_per_month" not in component.requirements
+
+
+def test_ecr_same_region_transfer_is_preserved_with_a_structured_scope() -> None:
+    source = "Amazon ECR：镜像存储2TB，每月向同区域任务传输20TB。"
+    component = ServiceRequirement(service="ecr", source_text=source)
+
+    DeepSeekIntentParser._overlay_literal_component_facts(
+        source,
+        component,
+        extra_fields=("storage_gib", "data_transfer_out_gib", "transfer_scope"),
+    )
+
+    assert component.requirements["data_transfer_out_gib"] == 20 * 1024
+    assert component.requirements["transfer_scope"] == "same_region"
+    assert component.field_evidence["requirements.transfer_scope"] == "同区域"
+
+
+def test_alb_explicit_average_lcu_is_preserved_by_the_shared_literal_ledger() -> None:
+    source = "Application Load Balancer：1 个 ALB，平均 1 LCU，数量 1。"
+    component = ServiceRequirement(service="elb", source_text=source)
+
+    DeepSeekIntentParser._overlay_literal_component_facts(source, component)
+
+    assert component.requirements["lcu_count"] == 1
+    assert component.field_evidence["requirements.lcu_count"] == "平均 1 LCU"
+    assert DeepSeekIntentParser._uncovered_quantitative_claim_issues(
+        "平均 1 LCU", component
+    ) == []
+
+
+def test_ecr_image_storage_is_preserved_by_the_shared_literal_ledger() -> None:
+    source = "Amazon ECR：20GB 镜像存储。"
+    component = ServiceRequirement(service="ecr", source_text=source)
+
+    DeepSeekIntentParser._overlay_literal_component_facts(source, component)
+
+    assert component.requirements["storage_gib"] == 20
+    assert "20GB" in component.field_evidence["requirements.storage_gib"]
+
+
+def test_logs_only_component_without_volume_uses_official_minimum_unit() -> None:
+    component = ServiceRequirement(
+        service="cloudwatch",
+        calculator_service_name="Amazon CloudWatch",
+        source_text="CloudWatch Logs：收集容器和平台日志。",
+        requirements={"include_logs": True, "include_metrics": False},
+    )
+    parsed = ParsedIntent(customer_summary="logs", services=[component])
+
+    DeepSeekIntentParser._append_missing_required_choice_questions(parsed)
+
+    assert parsed.ambiguities == []
+
+
+def test_missing_usage_does_not_create_a_question_for_duplicate_service_components() -> None:
+    parsed = ParsedIntent(
+        customer_summary="two independent log workloads",
+        services=[
+            ServiceRequirement(
+                service="cloudwatch",
+                calculator_service_name="Amazon CloudWatch",
+                source_text="VPC Flow Logs + S3：100GB/月，保留 30 天。",
+                requirements={
+                    "include_logs": True,
+                    "log_delivery_to_s3_gib": 100,
+                    "log_destination": "s3",
+                },
+            ),
+            ServiceRequirement(
+                service="cloudwatch",
+                calculator_service_name="Amazon CloudWatch",
+                source_text="CloudWatch Logs：收集容器和平台日志。",
+                requirements={"include_logs": True},
+            ),
+        ],
+    )
+
+    DeepSeekIntentParser._append_missing_required_choice_questions(parsed)
+
+    assert parsed.ambiguities == []
+
+
+def test_structured_quote_region_is_reapplied_after_ecs_parent_child_split() -> None:
+    source = (
+        "Amazon ECS on EC2：1 × m7g.2xlarge（8 vCPU、32 GiB），"
+        "新加坡区域，数量 1。"
+    )
+    parsed = DeepSeekIntentParser._intent_from_lossless_sales_numbering(
+        f"1、{source}"
+    )
+    assert parsed is not None
+
+    DeepSeekIntentParser._reconcile_explicit_regions(source, parsed)
+    DeepSeekIntentParser._apply_structured_quote_region(
+        parsed,
+        "ap-southeast-1",
+        source_kind="sales_confirmation",
+    )
+    DeepSeekIntentParser._link_ecs_worker_nodes(parsed)
+    # Parent/child source isolation may move the region evidence to only one
+    # owner. The already verified sales region must still be applied before
+    # either component reads its official provider contract.
+    DeepSeekIntentParser._reconcile_explicit_regions(source, parsed)
+    DeepSeekIntentParser._apply_structured_quote_region(
+        parsed,
+        "ap-southeast-1",
+        source_kind="sales_confirmation",
+    )
+
+    assert {item.service: item.region for item in parsed.services} == {
+        "ecs": "ap-southeast-1",
+        "ec2": "ap-southeast-1",
+    }
+
+
+def test_missing_official_fields_ignore_an_unselected_independent_card() -> None:
+    component = ServiceRequirement(
+        service="nat_gateway",
+        official_calculator_template_id="combined",
+        official_calculator_configuration={
+            "numberOfGateways": {"value": "2"},
+            "dataProcessedPerNATGateway": {
+                "value": "100",
+                "unit": "gb|month",
+            },
+        },
+        field_sources={
+            "_official_calculator_prompt_contract": json.dumps(
+                {
+                    "service_name": "Network Address Translation (NAT) Gateway",
+                    "templates": [
+                        {
+                            "template_id": "combined",
+                            "fields": [
+                                {
+                                    "field_id": "numberOfGateways",
+                                    "required": True,
+                                    "section_id": "card:0",
+                                },
+                                {
+                                    "field_id": "dataProcessedPerNATGateway",
+                                    "required": True,
+                                    "section_id": "card:0",
+                                },
+                                {
+                                    "field_id": "regionalNatGatewayCount",
+                                    "required": True,
+                                    "section_id": "card:1",
+                                },
+                                {
+                                    "field_id": "regionalNatGatewayDataProcessed",
+                                    "required": True,
+                                    "section_id": "card:1",
+                                },
+                            ],
+                        }
+                    ],
+                }
+            )
+        },
+    )
+
+    questions = DeepSeekIntentParser._record_missing_official_calculator_fields(
+        component
+    )
+
+    assert questions == []
+    assert "_official_calculator_missing_fields" not in component.field_sources
+
+
+@pytest.mark.asyncio
+async def test_pending_official_child_does_not_leave_ready_siblings_uncleaned() -> None:
+    class RecordingParser(DeepSeekIntentParser):
+        def __init__(self) -> None:
+            super().__init__(
+                Settings(ai_api_key="test", ai_base_url="https://example.invalid")
+            )
+            self.cleaned_keys: list[str] = []
+
+        async def _cleanup_components(  # type: ignore[override]
+            self, original_text: str, intent: ParsedIntent, *, reporter=None
+        ) -> ParsedIntent:
+            self.cleaned_keys = [item.component_key or "" for item in intent.services]
+            cleaned = intent.model_copy(deep=True)
+            for item in cleaned.services:
+                item.field_sources["_semantic_fact_mapping"] = "ai_cleaning"
+            return cleaned
+
+    pending = ServiceRequirement(
+        service="backup",
+        component_key="cmp_pending_1",
+        field_sources={"_official_calculator_status": "selection_required"},
+    )
+    alb = ServiceRequirement(service="elb", component_key="cmp_alb_1")
+    parsed = ParsedIntent(customer_summary="mixed", services=[pending, alb])
+    parser = RecordingParser()
+
+    cleaned = await parser._cleanup_unsealed_components(parsed)
+
+    assert parser.cleaned_keys == ["cmp_alb_1"]
+    assert cleaned.services[0].field_sources["_official_calculator_status"] == (
+        "selection_required"
+    )
+    assert "_semantic_fact_mapping" not in cleaned.services[0].field_sources
+    assert cleaned.services[1].field_sources["_semantic_fact_mapping"] == "ai_cleaning"
+
+
+def test_ecs_on_ec2_row_links_the_billed_compute_child_without_worker_word() -> None:
+    source = (
+        "Amazon ECS on EC2：1 × m7g.2xlarge（8 vCPU、32 GiB），"
+        "新加坡区域，数量 1。"
+    )
+    parsed = DeepSeekIntentParser._intent_from_lossless_sales_numbering(
+        f"1、{source}"
+    )
+    assert parsed is not None
+
+    DeepSeekIntentParser._link_ecs_worker_nodes(parsed)
+
+    ecs = next(item for item in parsed.services if item.service == "ecs")
+    ec2 = next(item for item in parsed.services if item.service == "ec2")
+    assert ec2.parent_component_key == ecs.component_key
+    assert ec2.derived_from_service == "ecs"
+    assert ec2.requirements["requested_model"] == "m7g.2xlarge"
+    assert ec2.quantity == 1
+    assert ecs.requirements["launch_type"] == "ec2"
+    assert "vcpu" not in ecs.requirements
+    assert "memory_gib" not in ecs.requirements
+
+
+def test_vpc_flow_logs_to_s3_uses_cloudwatch_official_log_delivery_contract() -> None:
+    source = "VPC Flow Logs + S3：100GB/月，保留 30 天。"
+    parsed = DeepSeekIntentParser._intent_from_lossless_sales_numbering(
+        f"1、{source}"
+    )
+    assert parsed is not None
+    assert [item.service for item in parsed.services] == ["cloudwatch"]
+
+    component = parsed.services[0]
+    DeepSeekIntentParser._overlay_literal_component_facts(source, component)
+
+    assert component.requirements["include_logs"] is True
+    assert component.requirements["log_delivery_to_s3_gib"] == 100
+    assert component.requirements["log_retention_days"] == 30
+    assert component.requirements["log_destination"] == "s3"
+
+
+def test_reconcile_canonicalizes_typed_alb_and_dynamodb_without_losing_numbers() -> None:
+    alb_source = "Application Load Balancer，2个ALB，每月处理流量5T"
+    dynamodb_source = "Amazon DynamoDB，按需模式，存储500G，每月读取请求2亿次，每月写入请求5000万次"
     parsed = ParsedIntent(
         customer_summary="pricing facts",
         services=[
@@ -138,7 +602,20 @@ def test_reconcile_upgrades_alb_and_dynamodb_without_losing_numbers() -> None:
         ],
     )
 
+    # These values must arrive from official-template extraction, not be
+    # reconstructed by the ledger from a previous raw draft.
+    parsed.services[0].quantity = 2
+    parsed.services[0].field_sources["quantity"] = "customer_text"
+    parsed.services[0].field_evidence["quantity"] = "2个ALB"
+    parsed.services[1] = _validated_template_component("dynamodb", dynamodb_source, {
+        "read_request_units": 200_000_000, "write_request_units": 50_000_000,
+        "capacity_mode": "on_demand", "storage_gib": 500,
+    })
+    for item in parsed.services:
+        apply_pricing_contract(item)
     DeepSeekIntentParser.reconcile_customer_pricing_facts(parsed)
+    from app.services.quote_service import QuoteService
+    QuoteService._apply_calculator_minimum_defaults(parsed)
 
     alb, dynamodb = parsed.services
     assert alb.quantity == 2
@@ -150,12 +627,12 @@ def test_reconcile_upgrades_alb_and_dynamodb_without_losing_numbers() -> None:
     assert dynamodb.requirements["read_request_units"] == 200_000_000
     assert dynamodb.requirements["write_request_units"] == 50_000_000
     assert "requests" not in dynamodb.requirements
-    assert DeepSeekIntentParser._uncovered_quantitative_claim_issues(
-        dynamodb_source, dynamodb
-    ) == []
+    assert (
+        DeepSeekIntentParser._uncovered_quantitative_claim_issues(dynamodb_source, dynamodb) == []
+    )
 
 
-def test_reconcile_removes_only_system_owned_gp3_from_aurora() -> None:
+def test_typed_pricing_contract_removes_only_system_owned_gp3_from_aurora() -> None:
     source = "Aurora MySQL，1个Writer+2个Reader，存储2T"
     component = ServiceRequirement(
         service="rds",
@@ -165,6 +642,7 @@ def test_reconcile_removes_only_system_owned_gp3_from_aurora() -> None:
     )
     parsed = ParsedIntent(customer_summary=source, services=[component])
 
+    apply_pricing_contract(component)
     DeepSeekIntentParser.reconcile_customer_pricing_facts(parsed)
 
     assert "storage_type" not in component.requirements
@@ -221,7 +699,9 @@ def test_dynamic_literal_ledger_preserves_all_customer_pricing_facts() -> None:
             "Timestream for LiveAnalytics每月写入约4亿条时序数据，"
             "内存存储保留24小时，磁性存储保留180天",
             (
-                "product_variant", "write_records", "memory_retention_hours",
+                "product_variant",
+                "write_records",
+                "memory_retention_hours",
                 "magnetic_retention_days",
             ),
             {
@@ -376,10 +856,7 @@ async def test_unconsumed_fact_resolver_rejects_non_catalog_target() -> None:
 
 
 def test_kinesis_literal_ledger_preserves_mode_shards_and_monthly_write_volume() -> None:
-    source = (
-        "Amazon Kinesis Data Streams：数量1，Provisioned模式，"
-        "配置12个Shard，每月写入数据约5TB"
-    )
+    source = "Amazon Kinesis Data Streams：数量1，Provisioned模式，配置12个Shard，每月写入数据约5TB"
     parsed = ParsedIntent(
         customer_summary=source,
         services=[
@@ -492,9 +969,7 @@ async def test_sales_region_preflight_never_substitutes_an_unsupported_location(
     )
     parser._gateway = GuessingRegionGateway()  # type: ignore[assignment]
 
-    result = await parser.identify_sales_region(
-        f"{heading}\n1、Amazon EC2：数量1，4核16GB"
-    )
+    result = await parser.identify_sales_region(f"{heading}\n1、Amazon EC2：数量1，4核16GB")
 
     assert result["regions"] == []
     assert result["requires_confirmation"] is True
@@ -508,9 +983,7 @@ async def test_every_current_official_region_code_is_accepted_from_the_live_allo
     )
 
     for code in parser.official_aws_region_labels():
-        result = await parser.identify_sales_region(
-            f"地区：{code}\n1、Amazon EC2：数量1，4核16GB"
-        )
+        result = await parser.identify_sales_region(f"地区：{code}\n1、Amazon EC2：数量1，4核16GB")
         assert result["regions"] == [code]
         assert result["requires_confirmation"] is False
 
@@ -535,18 +1008,110 @@ async def test_sales_region_preflight_accepts_one_region_per_numbered_component(
 
 
 @pytest.mark.asyncio
-async def test_sales_region_preflight_asks_for_public_region_when_one_row_is_missing_it() -> None:
+async def test_sales_region_preflight_uses_the_only_literal_region_as_quote_default() -> None:
     parser = DeepSeekIntentParser(
         Settings(ai_api_key="test", ai_base_url="https://example.invalid")
     )
 
     result = await parser.identify_sales_region(
-        "1、Amazon DocumentDB：区域ap-southeast-1（新加坡），数量1。\n"
-        "2、Amazon Neptune：数量1。"
+        "1、Amazon DocumentDB：区域ap-southeast-1（新加坡），数量1。\n2、Amazon Neptune：数量1。"
     )
 
-    assert result["regions"] == []
-    assert result["requires_confirmation"] is True
+    assert result == {
+        "regions": ["ap-southeast-1"],
+        "requires_confirmation": False,
+        "reason": "客户原文中只有一个明确的 AWS 地区，已作为整单默认地区。",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("heading", "region_label", "region_code"),
+    [
+        ("方案1｜新加坡", "新加坡", "ap-southeast-1"),
+        ("方案2｜东京", "东京", "ap-northeast-1"),
+        ("方案3｜孟买", "孟买", "ap-south-1"),
+        ("方案4｜香港", "香港", "ap-east-1"),
+        ("方案5｜首尔", "首尔", "ap-northeast-2"),
+        ("方案6｜悉尼", "悉尼", "ap-southeast-2"),
+        ("方案7｜美国弗吉尼亚", "美国弗吉尼亚", "us-east-1"),
+        ("方案8｜美国俄勒冈", "美国俄勒冈", "us-west-2"),
+        ("方案9｜法兰克福", "法兰克福", "eu-central-1"),
+        ("方案10｜新加坡大型业务", "新加坡", "ap-southeast-1"),
+    ],
+)
+async def test_sales_region_preflight_accepts_proposal_heading_plus_one_literal_code(
+    heading: str,
+    region_label: str,
+    region_code: str,
+) -> None:
+    class FailingRegionGateway:
+        async def complete_json(self, **_: object) -> dict[str, object]:
+            raise AssertionError("唯一官方地区已能确定整单默认，不应再调用 AI")
+
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid")
+    )
+    parser._gateway = FailingRegionGateway()  # type: ignore[assignment]
+
+    result = await parser.identify_sales_region(
+        f"## {heading}\n"
+        f"1、Amazon EC2：{region_label} {region_code}，3台，m6a.2xlarge。\n"
+        "2、Amazon RDS for MySQL：1套主备，存储1TB。"
+    )
+
+    assert result["regions"] == [region_code]
+    assert result["requires_confirmation"] is False
+
+
+def test_structured_quote_region_is_applied_only_to_unresolved_regional_components() -> None:
+    local_source = "Amazon RDS for MySQL：东京 ap-northeast-1，1套主备"
+    conflict_source = "Amazon S3：新加坡 ap-southeast-1 和东京 ap-northeast-1"
+    cloudfront_requirements = {"data_transfer_out_gib": 5120}
+    intent = ParsedIntent(
+        customer_summary="regional quote",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                source_text="Amazon EC2：3台，m6a.2xlarge",
+            ),
+            ServiceRequirement(
+                service="rds",
+                region="ap-northeast-1",
+                source_text=local_source,
+                field_sources={"region": "customer_text"},
+                field_evidence={"region": local_source},
+                locked_fields=["region"],
+            ),
+            ServiceRequirement(
+                service="s3",
+                source_text=conflict_source,
+                field_sources={"region": "customer_region_conflict"},
+            ),
+            ServiceRequirement(
+                service="cloudfront",
+                source_text="Amazon CloudFront：每月下行5TB",
+                requirements=cloudfront_requirements,
+            ),
+        ],
+    )
+
+    DeepSeekIntentParser._apply_structured_quote_region(
+        intent,
+        "ap-southeast-1",
+        source_kind="sales_confirmation",
+    )
+
+    ec2, rds, s3, cloudfront = intent.services
+    assert ec2.region == "ap-southeast-1"
+    assert ec2.field_sources["region"] == "sales_confirmation"
+    assert rds.region == "ap-northeast-1"
+    assert rds.field_sources["region"] == "customer_text"
+    assert s3.region is None
+    assert s3.field_sources["region"] == "customer_region_conflict"
+    assert cloudfront.region is None
+    assert cloudfront.requirements == {"data_transfer_out_gib": 5120}
+    assert "traffic_geography" not in cloudfront.requirements
 
 
 def test_literal_region_replay_never_overwrites_customer_confirmed_replacement() -> None:
@@ -554,9 +1119,7 @@ def test_literal_region_replay_never_overwrites_customer_confirmed_replacement()
         service="amazon_timestream_for_liveanalytics",
         calculator_service_name="Amazon Timestream for LiveAnalytics",
         region="ap-south-1",
-        source_text=(
-            "Amazon Timestream for LiveAnalytics：区域eu-west-2（伦敦），数量1。"
-        ),
+        source_text=("Amazon Timestream for LiveAnalytics：区域eu-west-2（伦敦），数量1。"),
         field_sources={"region": "customer_confirmation"},
         field_evidence={"region": "客户从该服务实际支持的 AWS 地区中选择"},
         locked_fields=["region"],
@@ -622,7 +1185,6 @@ async def test_official_catalog_identity_precedes_closed_ai_service_classifier()
     parsed = ParsedIntent(customer_summary="Neptune", services=[component])
     parser._reconcile_explicit_models(component.source_text, parsed)
     parser._reconcile_explicit_service_architecture(component.source_text, parsed)
-    parser._append_third_party_managed_decisions(parsed, component.source_text)
     assert parsed.services[0].service == "neptune"
     assert parsed.services[0].requirements["requested_model"] == "db.r6g.large"
     assert parsed.services[0].requirements["writer_nodes"] == 1
@@ -654,7 +1216,7 @@ def test_provider_name_with_chinese_role_suffix_resolves_without_ai_guessing(
                     service_code,
                     service_key,
                     display_name,
-                    '[\"' + display_name + '\"]',
+                    '["' + display_name + '"]',
                     now,
                 ),
             )
@@ -666,12 +1228,35 @@ def test_provider_name_with_chinese_role_suffix_resolves_without_ai_guessing(
     assert result["identity_match_source"] == "provider_word_identity"
 
 
+def test_provider_product_version_survives_chinese_role_suffix(tmp_path) -> None:
+    from app.integrations.aws_product_registry import AwsProductRegistry
+
+    registry = AwsProductRegistry(database_path=tmp_path / "products.sqlite3")
+    with registry._connect() as connection:
+        for service_code, service_key, display_name in (
+            ("AmazonInspector", "inspector", "Amazon Inspector"),
+            ("AmazonInspectorV2", "inspector_v2", "Amazon Inspector V2"),
+        ):
+            connection.execute(
+                "INSERT INTO aws_product_registry ("
+                "service_code, service_key, display_name, aliases_json, "
+                "offer_json, field_template_json, policy_json, identity_status, "
+                "profile_status, schema_version, updated_at"
+                ") VALUES (?, ?, ?, ?, '{}', '{}', '{}', 'official', "
+                "'identity_ready', 3, 1)",
+                (service_code, service_key, display_name, f'["{display_name}"]'),
+            )
+
+    result = registry.resolve_product("Inspector v2漏洞检查")
+
+    assert result is not None
+    assert result["service_code"] == "AmazonInspectorV2"
+    assert result["identity_match_source"] == "provider_word_identity"
+
+
 @pytest.mark.asyncio
 async def test_comma_delimited_s3_heading_resolves_against_official_directory() -> None:
-    source = (
-        "S3，容量15T，预估费用4608美元，替换OSS，"
-        "用于冷数据存储、Flink快照、业务设备图片"
-    )
+    source = "S3，容量15T，预估费用4608美元，替换OSS，用于冷数据存储、Flink快照、业务设备图片"
 
     class OfficialDiscovery:
         @staticmethod
@@ -707,6 +1292,40 @@ async def test_comma_delimited_s3_heading_resolves_against_official_directory() 
     assert component.service == "s3"
     assert component.calculator_service_name == "Amazon Simple Storage Service (S3)"
     assert component.field_sources["_official_service_code"] == "AmazonS3"
+
+
+@pytest.mark.asyncio
+async def test_declared_rds_variant_is_resolved_before_third_party_compute_route() -> None:
+    source = "RDS MySQL，2台，单台8核32G，存储1T，主备部署"
+
+    class MissingOfficialDiscovery:
+        @staticmethod
+        def resolve_official_product(*labels: str) -> None:
+            assert labels == ("RDS MySQL",)
+            return None
+
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        auto_discovery=MissingOfficialDiscovery(),  # type: ignore[arg-type]
+    )
+    component = ServiceRequirement(
+        service="ec2",
+        calculator_service_name="Amazon EC2（自建 RDS MySQL）",
+        source_text=source,
+        requirements={"vcpu": 8, "memory_gib": 32, "system_disk_gib": 1024},
+    )
+
+    await parser._resolve_unknown_component_service(
+        component,
+        semaphore=asyncio.Semaphore(1),
+        reporter=None,
+        component_number=2,
+    )
+
+    assert component.service == "rds"
+    assert component.workload_identity_kind == "official_aws_service"
+    assert component.requirements["engine"] == "mysql"
+    assert "_pending_architecture_decision" not in component.field_sources
 
 
 def test_reference_quote_money_is_not_an_unmapped_pricing_dimension() -> None:
@@ -752,8 +1371,7 @@ async def test_official_offer_code_is_routed_to_existing_dms_adapter() -> None:
         service="database_migration_svc",
         calculator_service_name="AWS Database Migration Svc",
         source_text=(
-            "AWS Database Migration Svc：复制节点4核16GB、200GB存储，"
-            "同时运行3个迁移任务。"
+            "AWS Database Migration Svc：复制节点4核16GB、200GB存储，同时运行3个迁移任务。"
         ),
     )
 
@@ -766,6 +1384,40 @@ async def test_official_offer_code_is_routed_to_existing_dms_adapter() -> None:
 
     assert component.service == "dms"
     assert component.product_identity == "AWSDatabaseMigrationSvc"
+
+
+@pytest.mark.asyncio
+async def test_unique_official_offer_reverse_mapping_normalizes_generic_service_key() -> None:
+    class OfficialDiscovery:
+        @staticmethod
+        def resolve_official_product(*labels: str) -> dict[str, object] | None:
+            assert labels == ("Amazon SQS",)
+            return {
+                "service_code": "AWSQueueService",
+                "service_key": "queue_service",
+                "display_name": "Amazon Simple Queue Service (SQS)",
+                "aliases": ["Amazon SQS", "Simple Queue Service"],
+            }
+
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        auto_discovery=OfficialDiscovery(),  # type: ignore[arg-type]
+    )
+    component = ServiceRequirement(
+        service="queue_service",
+        calculator_service_name="Amazon SQS",
+        source_text="Amazon SQS：每月请求 2500 万次。",
+    )
+
+    await parser._resolve_unknown_component_service(
+        component,
+        semaphore=asyncio.Semaphore(1),
+        reporter=None,
+        component_number=1,
+    )
+
+    assert component.service == "sqs"
+    assert component.product_identity == "AWSQueueService"
 
 
 @pytest.mark.asyncio
@@ -804,9 +1456,7 @@ async def test_known_generic_service_loads_official_field_profile_before_ai_clea
     )
 
     assert profile is not None and profile["status"] == "verified"
-    assert RecordingDiscovery.calls == [
-        ("lambda", "AWS Lambda", "ap-southeast-1")
-    ]
+    assert RecordingDiscovery.calls == [("lambda", "AWS Lambda", "ap-southeast-1")]
 
 
 @pytest.mark.asyncio
@@ -876,10 +1526,7 @@ def test_efs_throughput_and_backup_usage_are_not_dropped_by_literal_recovery() -
 
 
 def test_efs_component_template_preserves_class_region_and_read_write_usage() -> None:
-    source = (
-        "Amazon EFS：新加坡，EFS Standard（Regional），容量6TB，"
-        "每月读取12TB、写入5TB。"
-    )
+    source = "Amazon EFS：新加坡，EFS Standard（Regional），容量6TB，每月读取12TB、写入5TB。"
     parsed = ParsedIntent(
         customer_summary=source,
         services=[ServiceRequirement(service="efs", source_text=source)],
@@ -896,10 +1543,7 @@ def test_efs_component_template_preserves_class_region_and_read_write_usage() ->
 
 
 def test_documentdb_node_count_and_labelled_disk_do_not_get_confused_with_memory() -> None:
-    source = (
-        "MongoDB集群：现网3节点，单节点4核32GB，单节点数据盘500GB，"
-        "迁云后优先考虑托管方案。"
-    )
+    source = "MongoDB集群：现网3节点，单节点4核32GB，单节点数据盘500GB，迁云后优先考虑托管方案。"
     parsed = ParsedIntent(
         customer_summary=source,
         services=[ServiceRequirement(service="documentdb", source_text=source)],
@@ -915,7 +1559,7 @@ def test_documentdb_node_count_and_labelled_disk_do_not_get_confused_with_memory
     }
 
 
-def test_numbered_unknown_heading_owns_row_instead_of_destination_service() -> None:
+def test_numbered_firehose_heading_owns_row_instead_of_destination_service() -> None:
     source = (
         "5、Amazon Data Firehose：区域ap-southeast-2（悉尼），数量1，"
         "每月摄入数据约10TB，目标端写入Amazon S3。"
@@ -925,21 +1569,41 @@ def test_numbered_unknown_heading_owns_row_instead_of_destination_service() -> N
 
     assert parsed is not None
     assert len(parsed.services) == 1
-    assert parsed.services[0].service == "amazon_data_firehose"
-    assert parsed.services[0].calculator_service_name == "Amazon Data Firehose"
+    assert parsed.services[0].service == "kinesis_firehose"
+    assert parsed.services[0].calculator_service_name == "Amazon Kinesis Firehose"
     assert "Amazon S3" in parsed.services[0].source_text
 
 
 def test_numbered_conversational_row_does_not_promote_origin_to_second_component() -> None:
     source = (
-        "7、静态资源和下载文件要做CDN，用户主要在东南亚，每月下行8TB，"
-        "源站是上面的Amazon S3对象存储"
+        "7、静态资源和下载文件要做CDN，用户主要在东南亚，每月下行8TB，源站是上面的Amazon S3对象存储"
     )
 
     parsed = DeepSeekIntentParser._intent_from_numbered_blocks(source)
 
     assert parsed is not None
     assert [item.service for item in parsed.services] == ["cloudfront"]
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "Amazon Data Firehose",
+        "Amazon Kinesis Data Firehose",
+        "Kinesis Data Firehose",
+        "Kinesis-Firehose",
+    ],
+)
+def test_firehose_current_and_legacy_names_are_not_swallowed_by_data_streams(
+    heading: str,
+) -> None:
+    source = f"1、{heading}：每月摄入10TB，目标端写入Amazon S3。"
+
+    parsed = DeepSeekIntentParser._intent_from_numbered_blocks(source)
+
+    assert parsed is not None
+    assert len(parsed.services) == 1
+    assert parsed.services[0].service == "kinesis_firehose"
 
 
 @pytest.mark.asyncio
@@ -1413,8 +2077,7 @@ async def test_official_versioned_product_survives_second_inventory_pass() -> No
         auto_discovery=OfficialDiscovery(),  # type: ignore[arg-type]
     )
     component_text = (
-        "5、Amazon AppStream 2.0：数量1，常驻用户约80人，"
-        "每人每天使用6小时，实例配置4核16GB"
+        "5、Amazon AppStream 2.0：数量1，常驻用户约80人，每人每天使用6小时，实例配置4核16GB"
     )
     component = ServiceRequirement(
         service="ec2",
@@ -1433,7 +2096,6 @@ async def test_official_versioned_product_survives_second_inventory_pass() -> No
     )
     parsed = ParsedIntent(customer_summary="AppStream", services=[component])
     parser._reconcile_explicit_component_inventory(component_text, parsed)
-    parser._append_third_party_managed_decisions(parsed, component_text)
     parser._reconcile_explicit_capacities(component_text, parsed)
 
     assert len(parsed.services) == 1
@@ -1465,8 +2127,7 @@ async def test_official_heading_removed_by_inventory_is_restored_before_classifi
         auto_discovery=OfficialDiscovery(),  # type: ignore[arg-type]
     )
     full_source = (
-        "Amazon Neptune：数量1，1个Writer节点+2个Reader节点，"
-        "单节点8核32GB，实例规格db.r6g.large"
+        "Amazon Neptune：数量1，1个Writer节点+2个Reader节点，单节点8核32GB，实例规格db.r6g.large"
     )
     component = ServiceRequirement(
         service="ec2",
@@ -1513,10 +2174,7 @@ def test_embedded_note_before_real_numbered_service_is_still_supported() -> None
 
 
 def test_generic_official_component_recovers_separate_system_and_user_volumes() -> None:
-    source = (
-        "Amazon WorkSpaces：数量50，单用户配置2核8GB/80GB系统盘/"
-        "50GB用户盘，按月计费"
-    )
+    source = "Amazon WorkSpaces：数量50，单用户配置2核8GB/80GB系统盘/50GB用户盘，按月计费"
     component = ServiceRequirement(
         service="work_spaces",
         calculator_service_name="Amazon WorkSpaces",
@@ -1559,12 +2217,201 @@ def test_component_cache_key_is_isolated_by_active_service_prompt() -> None:
     assert ec2_key == _component_prompt_cache_model("deepseek-chat", "ec2", "EC2 m6i.xlarge 4C16G")
 
 
+def test_component_cache_key_changes_with_official_calculator_schema() -> None:
+    old_key = _component_prompt_cache_model(
+        "deepseek-chat",
+        "backup",
+        "AWS Backup 备份容量 5TB",
+        official_calculator_schema_hash="old-schema",
+    )
+    current_key = _component_prompt_cache_model(
+        "deepseek-chat",
+        "backup",
+        "AWS Backup 备份容量 5TB",
+        official_calculator_schema_hash="current-schema",
+    )
+
+    assert old_key is not None
+    assert current_key is not None
+    assert old_key != current_key
+
+
+def test_official_calculator_scalar_defaults_are_not_submitted_as_widget_values() -> None:
+    from app.integrations.aws_calculator_contracts import (
+        CalculatorFieldContract,
+        CalculatorServiceContract,
+        CalculatorTemplateContract,
+    )
+
+    contract = CalculatorServiceContract(
+        service_code="sampleBackup",
+        name="Sample Backup",
+        definition_url="https://official.example/sample-backup.json",
+        schema_hash="a" * 64,
+        cache_status="fresh",
+        templates=(
+            CalculatorTemplateContract(
+                template_id="backup",
+                fields=(
+                    CalculatorFieldContract(
+                        field_id="retention",
+                        field_type="durationInput",
+                        default_value=0,
+                        valid_frequency_units=("day",),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    class Catalog:
+        @staticmethod
+        def get_contract(_: str) -> CalculatorServiceContract:
+            return contract
+
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        calculator_contract_catalog=Catalog(),  # type: ignore[arg-type]
+    )
+    component = ServiceRequirement(
+        service="backup",
+        official_calculator_service_code="sampleBackup",
+        official_calculator_template_id="backup",
+        official_calculator_configuration={"retention": 0},
+    )
+
+    parser.validate_official_calculator_configurations(
+        ParsedIntent(customer_summary="backup", services=[component])
+    )
+
+    assert component.official_calculator_configuration == {}
+
+
+def test_component_cleaning_rejects_malformed_official_widget_before_pricing() -> None:
+    from app.integrations.aws_calculator_contracts import (
+        CalculatorFieldContract,
+        CalculatorServiceContract,
+        CalculatorTemplateContract,
+    )
+
+    contract = CalculatorServiceContract(
+        service_code="applicationLoadBalancer",
+        name="Application Load Balancer",
+        definition_url="https://official.example/alb.json",
+        schema_hash="b" * 64,
+        cache_status="fresh",
+        templates=(
+            CalculatorTemplateContract(
+                template_id="template_0",
+                fields=(
+                    CalculatorFieldContract(
+                        field_id="processedBytes",
+                        field_type="fileSize",
+                        valid_size_units=("gb", "tb"),
+                        valid_frequency_units=("hour", "month"),
+                        default_unit="gb|hour",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    class Catalog:
+        @staticmethod
+        def get_contract(_: str) -> CalculatorServiceContract:
+            return contract
+
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        calculator_contract_catalog=Catalog(),  # type: ignore[arg-type]
+    )
+    component = ServiceRequirement(
+        service="elb",
+        official_calculator_service_code="applicationLoadBalancer",
+        official_calculator_template_id="template_0",
+        official_calculator_schema_hash="b" * 64,
+        requirements={"processed_bytes_gib": 3072},
+        field_evidence={
+            "requirements.processed_bytes_gib": "每月处理流量3T"
+        },
+        source_text="负载均衡（ALB），2个，每月处理流量3T",
+        original_source_text="负载均衡（ALB），2个，每月处理流量3T",
+    )
+
+    with pytest.raises(ValueError, match="expected \\{value, unit\\}"):
+        parser._component_from_template_output(
+            {
+                "component": {
+                    "official_calculator_configuration": {"processedBytes": 3072}
+                }
+            },
+            component,
+        )
+
+    normalized_period = parser._component_from_template_output(
+        {
+            "component": {
+                "requirements": {"processed_bytes_gib": 3072},
+                "field_evidence": {
+                    "requirements.processed_bytes_gib": "每月处理流量3T"
+                },
+                "official_calculator_configuration": {
+                    "processedBytes": {"value": 3072, "unit": "gb|hour"}
+                },
+            }
+        },
+        component,
+    )
+
+    assert normalized_period.official_calculator_configuration["processedBytes"] == {
+        "value": "3072",
+        "unit": "gb|month",
+    }
+
+    cleaned = parser._component_from_template_output(
+        {
+            "component": {
+                "requirements": {"processed_bytes_gib": 3072},
+                "field_evidence": {
+                    "requirements.processed_bytes_gib": "每月处理流量3T"
+                },
+                "official_calculator_configuration": {
+                    "processedBytes": {"value": 3, "unit": "tb|month"}
+                }
+            }
+        },
+        component,
+    )
+
+    assert cleaned.official_calculator_configuration["processedBytes"] == {
+        "value": "3",
+        "unit": "tb|month",
+    }
+
+
+def _valid_intake_fixture(content: str) -> dict[str, object]:
+    """An extraction fake must return the per-component evidence contract."""
+    source = content.split("\n\n", 1)[0].split("\n", 1)[1]
+    if "S3" in source:
+        size = 1024 if "1TB" in source else 500
+        requirements = {"storage_gib": size}
+        evidence = {"requirements.storage_gib": "1TB" if size == 1024 else "500GB"}
+    else:
+        requirements = {"engine": "redis", "memory_gib": 8, "shards": 1, "replicas_per_shard": 1}
+        evidence = {"requirements.engine": "Redis", "requirements.memory_gib": "8 GiB",
+                    "requirements.shards": "一主一从", "requirements.replicas_per_shard": "一主一从"}
+    evidence["quantity"] = "system_minimum"
+    return {"component": {"quantity": 1, "requirements": requirements, "field_evidence": evidence}}
+
+
 class RepairingGateway:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def complete_json(self, **_: object) -> dict[str, object]:
+    async def complete_json(self, **kwargs: object) -> dict[str, object]:
         self.calls += 1
+        if "完整固定模板：" in str(kwargs.get("user_content", "")):
+            return _valid_intake_fixture(str(kwargs["user_content"]))
         if self.calls == 1:
             return {
                 "customer_summary": "Redis 报价",
@@ -1602,8 +2449,10 @@ class MissingSummaryGateway:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def complete_json(self, **_: object) -> dict[str, object]:
+    async def complete_json(self, **kwargs: object) -> dict[str, object]:
         self.calls += 1
+        if "完整固定模板：" in str(kwargs.get("user_content", "")):
+            return _valid_intake_fixture(str(kwargs["user_content"]))
         return {
             "services": [
                 {
@@ -1627,7 +2476,60 @@ class CapturingWorkloadGateway(MissingSummaryGateway):
     async def complete_json(self, **kwargs: object) -> dict[str, object]:
         self.system_prompts.append(str(kwargs.get("system_prompt", "")))
         self.user_contents.append(str(kwargs.get("user_content", "")))
+        if "完整固定模板：" not in str(kwargs.get("user_content", "")):
+            self.calls += 1
+            return {
+                "customer_summary": "Redis 与 S3 配置",
+                "services": [
+                    {
+                        "service": "elasticache",
+                        "calculator_service_name": "Amazon ElastiCache",
+                        "component_key": "cmp_clean_redis",
+                        "quantity": 1,
+                        "requirements": {"engine": "redis", "memory_gib": 8},
+                        "source_text": "Redis｜一主一从｜每节点内存：8 GiB",
+                        "original_source_text": "Redis 一主一从，每节点 8 GiB",
+                    },
+                    {
+                        "service": "s3",
+                        "calculator_service_name": "Amazon S3",
+                        "component_key": "cmp_clean_s3",
+                        "quantity": 1,
+                        "requirements": {"storage_gib": 500},
+                        "source_text": "S3｜对象存储容量：500GB",
+                        "original_source_text": "S3 对象存储 500GB",
+                    },
+                ],
+                "ambiguities": [],
+            }
         return await super().complete_json(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_derived_component_identity_is_never_reclassified_from_parent_text() -> None:
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid")
+    )
+    child = ServiceRequirement(
+        service="ec2",
+        component_key="cmp_parent_eks:worker",
+        parent_component_key="cmp_parent_eks",
+        derived_from_service="eks",
+        calculator_service_name="Amazon EC2 (EKS Worker Nodes)",
+        source_text="Amazon EKS：Worker节点6台，单台8核32G",
+        requirements={"vcpu": 8, "memory_gib": 32},
+    )
+
+    await parser._resolve_unknown_component_service(
+        child,
+        semaphore=asyncio.Semaphore(1),
+        reporter=None,
+        component_number=2,
+    )
+
+    assert child.service == "ec2"
+    assert child.calculator_service_name == "Amazon EC2 (EKS Worker Nodes)"
+    assert "_identity_resolution_status" not in child.field_sources
 
 
 class NumberedCleaningGateway:
@@ -1655,6 +2557,11 @@ class NumberedCleaningGateway:
                         "additional_ebs_volumes": [
                             {"size_gib": 500, "volume_type": "gp3", "count_per_instance": 1}
                         ],
+                    },
+                    "field_evidence": {
+                        "quantity": "数量：3台", "requirements.vcpu": "每台CPU：8核",
+                        "requirements.memory_gib": "每台内存：32GB", "requirements.system_disk_gib": "每台系统盘：200GB",
+                        "requirements.additional_ebs_volumes": "每台数据盘：500GB",
                     },
                     "source_text": (
                         "应用服务器（Amazon EC2）｜数量：3台｜每台CPU：8核｜"
@@ -1829,6 +2736,23 @@ def test_component_feedback_uses_stable_ai_before_independent_fallbacks() -> Non
     ) == len(gateways)
 
 
+def test_component_cleaning_keeps_an_independent_bedrock_fallback() -> None:
+    parser = DeepSeekIntentParser(
+        Settings(
+            ai_provider="bedrock",
+            bedrock_api_key="test",
+            bedrock_model="deepseek.v3.2",
+            component_revision_model="deepseek.v3.2",
+            deepseek_api_key="",
+        )
+    )
+
+    assert [gateway._settings.ai_model for gateway in parser._component_ai_gateways()] == [
+        "deepseek.v3.2",
+        "zai.glm-4.7-flash",
+    ]
+
+
 def test_service_identity_uses_independent_configured_ai_routes() -> None:
     parser = DeepSeekIntentParser(
         Settings(
@@ -1854,30 +2778,6 @@ def test_legacy_official_amazon_es_identity_routes_to_opensearch() -> None:
     assert DeepSeekIntentParser._service_key("ElasticsearchService") == "opensearch"
 
 
-def test_failed_product_identity_is_not_rewritten_as_self_hosted_ec2() -> None:
-    component = ServiceRequirement(
-        service="unknown_component_search",
-        calculator_service_name="日志检索",
-        source_text=(
-            "日志检索：计划部署3个数据节点，单节点8核32GB，"
-            "单节点存储500GB，日志保留约30天。"
-        ),
-        requirements={"vcpu": 8, "memory_gib": 32, "storage_gib": 500},
-        field_sources={
-            "_identity_resolution_status": "failed",
-            "_identity_resolution_reason": "服务名称识别线路暂时无法连接",
-        },
-    )
-    parsed = ParsedIntent(customer_summary="日志检索", services=[component])
-
-    DeepSeekIntentParser._append_third_party_managed_decisions(
-        parsed,
-        component.source_text,
-    )
-
-    assert component.service == "unknown_component_search"
-    assert component.calculator_service_name == "日志检索"
-    assert "自建" not in component.calculator_service_name
 
 
 @pytest.mark.asyncio
@@ -1901,9 +2801,7 @@ async def test_named_third_party_workload_survives_official_catalog_miss(
             return None
 
         @staticmethod
-        def candidate_official_products(
-            *_labels: str, limit: int = 12
-        ) -> list[dict[str, object]]:
+        def candidate_official_products(*_labels: str, limit: int = 12) -> list[dict[str, object]]:
             return []
 
         @staticmethod
@@ -1917,6 +2815,7 @@ async def test_named_third_party_workload_survives_official_catalog_miss(
     component = ServiceRequirement(
         service=f"unknown_component_{product.casefold()}",
         calculator_service_name=product,
+        quantity=expected_quantity,
         source_text=source,
         requirements={"vcpu": 16, "memory_gib": 128 if product == "Doris" else 64},
     )
@@ -1933,7 +2832,6 @@ async def test_named_third_party_workload_survives_official_catalog_miss(
         component_number=1,
     )
     parsed = ParsedIntent(customer_summary=product, services=[component])
-    parser._append_third_party_managed_decisions(parsed, source)
 
     assert component.service == "ec2"
     assert component.calculator_service_name == f"Amazon EC2（自建 {product}）"
@@ -1941,8 +2839,30 @@ async def test_named_third_party_workload_survives_official_catalog_miss(
     assert component.field_sources["_identity_resolution_status"] == "third_party"
     assert component.field_sources["_third_party_product"] == product
     assert component.field_sources["_pending_architecture_decision"] == "system_policy"
-    assert len(parsed.ambiguities) == 1
-    assert product in parsed.ambiguities[0]
+    assert parsed.ambiguities == []  # Identity routing does not ask pricing questions.
+
+
+def test_component_template_restore_preserves_owned_source_boundary_payload() -> None:
+    original = ServiceRequirement(
+        service="future_parent",
+        component_key="cmp_future_parent",
+        source_text="未来集群1套；工作节点6台",
+        original_source_text="未来集群1套；工作节点6台",
+        field_sources={"_owned_source_slice": "system_policy"},
+        field_evidence={"_owned_source_slice_text": "未来集群1套"},
+    )
+    filled = ServiceRequirement(
+        service="future_parent",
+        component_key="cmp_future_parent",
+        source_text=original.source_text,
+        original_source_text=original.original_source_text,
+    )
+
+    DeepSeekIntentParser._restore_authoritative_component_fields(original, filled)
+
+    assert filled.field_sources["_owned_source_slice"] == "system_policy"
+    assert filled.field_evidence["_owned_source_slice_text"] == "未来集群1套"
+    assert customer_owned_source(filled) == "未来集群1套"
 
 
 def test_generic_capability_heading_is_not_treated_as_named_third_party_product() -> None:
@@ -1997,6 +2917,35 @@ async def test_learned_ec2_alias_cannot_overwrite_named_software_identity() -> N
 
 
 @pytest.mark.asyncio
+async def test_known_numbered_owner_bypasses_conflicting_discovery_alias() -> None:
+    class ConflictingDiscovery:
+        @staticmethod
+        def resolve_official_product(*_labels: str) -> dict[str, object] | None:
+            raise AssertionError("与编号标题一致的正式产品身份不应再次交给可污染的别名目录")
+
+    component = ServiceRequirement(
+        service="elasticache",
+        calculator_service_name="Amazon ElastiCache",
+        source_text=("ElastiCache for Redis：4个节点，1主3从，单节点8核、32GiB内存。"),
+    )
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        auto_discovery=ConflictingDiscovery(),  # type: ignore[arg-type]
+    )
+
+    await parser._resolve_unknown_component_service(
+        component,
+        semaphore=asyncio.Semaphore(1),
+        reporter=None,
+        component_number=1,
+    )
+
+    assert component.service == "elasticache"
+    assert component.calculator_service_name == "Amazon ElastiCache"
+    assert component.field_sources.get("_third_party_product") is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("product", "source", "expected_quantity"),
     [
@@ -2029,6 +2978,8 @@ async def test_pipe_cleaned_third_party_name_cannot_reuse_learned_ec2_alias(
     component = ServiceRequirement(
         service="unknown_" + re.sub(r"[^a-z0-9]+", "_", product.casefold()).strip("_"),
         calculator_service_name=product,
+        quantity=expected_quantity,
+        requirements={"vcpu": 16, "memory_gib": 128 if product == "Doris" else 64},
         source_text=source,
     )
     parser = DeepSeekIntentParser(
@@ -2043,7 +2994,6 @@ async def test_pipe_cleaned_third_party_name_cannot_reuse_learned_ec2_alias(
         component_number=1,
     )
     parsed = ParsedIntent(customer_summary=product, services=[component])
-    parser._append_third_party_managed_decisions(parsed, f"1、{source}")
 
     assert component.service == "ec2"
     assert component.calculator_service_name == f"Amazon EC2（自建 {product}）"
@@ -2052,29 +3002,9 @@ async def test_pipe_cleaned_third_party_name_cannot_reuse_learned_ec2_alias(
     assert component.requirements["memory_gib"] in {64, 128}
     assert component.field_sources["_pending_architecture_decision"] == "system_policy"
     assert component.field_sources.get("_official_service_code") is None
-    assert len(parsed.ambiguities) == 1
-    assert product in parsed.ambiguities[0]
+    assert parsed.ambiguities == []
 
 
-def test_pipe_cleaned_flink_fixed_nodes_require_managed_or_self_hosted_choice() -> None:
-    source = "Flink｜3个节点｜单台24核64G｜磁盘500G"
-    parsed = DeepSeekIntentParser._intent_from_numbered_blocks(f"1、{source}")
-
-    assert parsed is not None
-    component = parsed.services[0]
-    assert component.service.startswith("flink") or component.service.startswith("unknown")
-    assert DeepSeekIntentParser._route_named_third_party_workload(component) is True
-
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, f"1、{source}")
-
-    assert component.service == "ec2"
-    assert component.calculator_service_name == "Amazon EC2（自建 Flink）"
-    assert component.quantity == 3
-    assert component.requirements["vcpu"] == 24
-    assert component.requirements["memory_gib"] == 64
-    assert component.requirements["system_disk_gib"] == 500
-    assert len(parsed.ambiguities) == 1
-    assert "EC2 上自建 Flink" in parsed.ambiguities[0]
 
 
 @pytest.mark.parametrize(
@@ -2230,9 +3160,7 @@ async def test_new_configuration_parses_only_added_text_and_preserves_existing_r
     )
     received: list[str] = []
 
-    async def parse_addition(
-        text: str, reporter: object | None = None
-    ) -> ParsedIntent:
+    async def parse_addition(text: str, reporter: object | None = None) -> ParsedIntent:
         received.append(text)
         return ParsedIntent(
             customer_summary="新增 S3",
@@ -2326,7 +3254,9 @@ async def test_audit_early_return_cannot_replace_official_component_identity() -
             field_evidence={"requirements.storage_gib": "数据存储2T"},
         )
 
+    audited_identities = []
     async def unresolved_audit(*args: object, **kwargs: object) -> list[str]:
+        audited_identities.append(kwargs["filled"].service)
         return ["一个计价字段仍需确认"]
 
     parser._resolve_unknown_component_service = keep_identity  # type: ignore[method-assign]
@@ -2343,18 +3273,67 @@ async def test_audit_early_return_cannot_replace_official_component_identity() -
         field_sources={"_official_service_code": "AmazonTimestream"},
     )
 
-    cleaned = await parser._cleanup_components(
-        component.source_text,
-        ParsedIntent(customer_summary="时序数据", services=[component]),
+    with pytest.raises(ManualConfirmationRequired):
+        await parser._cleanup_components(
+            component.source_text,
+            ParsedIntent(customer_summary="时序数据", services=[component]),
+        )
+    assert audited_identities == ["timestream", "timestream"]
+    assert component.service == "timestream"
+    assert component.calculator_service_name == "Amazon Timestream"
+    assert component.product_identity == "amazon_timestream"
+    assert component.field_sources["_official_service_code"] == "AmazonTimestream"
+    assert "_semantic_fact_mapping" not in component.field_sources
+
+
+@pytest.mark.asyncio
+async def test_cached_component_reuse_registers_legacy_evidence_in_fact_table() -> None:
+    """A correct cached value cannot remain invisible to the fact ledger."""
+
+    class LegacyCache:
+        def get(self, *_: object) -> ServiceRequirement:
+            return ServiceRequirement(
+                service="ecs",
+                calculator_service_name="Amazon ECS",
+                source_text="容器服务（ECS），1套",
+                original_source_text="容器服务（ECS），1套",
+                requirements={"cluster_count": 1},
+                field_evidence={"requirements.cluster_count": "1套"},
+            )
+
+        def put(self, *_: object) -> None:
+            return None
+
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid"),
+        component_result_cache=LegacyCache(),  # type: ignore[arg-type]
     )
 
-    assert cleaned.services[0].service == "timestream"
-    assert cleaned.services[0].calculator_service_name == "Amazon Timestream"
-    assert cleaned.services[0].product_identity == "amazon_timestream"
-    assert (
-        cleaned.services[0].field_sources["_official_service_code"]
-        == "AmazonTimestream"
+    async def keep_identity(*args: object, **kwargs: object) -> None:
+        return None
+
+    async def no_profile(*args: object, **kwargs: object) -> None:
+        return None
+
+    parser._resolve_unknown_component_service = keep_identity  # type: ignore[method-assign]
+    parser._auto_discover_component = no_profile  # type: ignore[method-assign]
+    source = "容器服务（ECS），1套"
+    component = ServiceRequirement(
+        service="ecs",
+        calculator_service_name="Amazon ECS",
+        source_text=source,
+        original_source_text=source,
     )
+
+    cleaned = await parser._cleanup_components(
+        source,
+        ParsedIntent(customer_summary=source, services=[component]),
+    )
+
+    result = cleaned.services[0]
+    assert result.requirements["cluster_count"] == 1
+    assert result.field_sources["requirements.cluster_count"] == "customer_text"
+    assert "requirements.cluster_count" in result.locked_fields
 
 
 def test_legacy_component_field_is_normalized_without_retry() -> None:
@@ -2993,12 +3972,13 @@ async def test_component_template_cannot_overwrite_customer_locked_fields() -> N
         source_text="新加坡 2 台 Linux EC2，每台 4 核 16G",
     )
 
-    cleaned = await parser._cleanup_components(
-        component.source_text,
-        ParsedIntent(customer_summary="原始摘要", services=[component]),
-    )
-
-    result = cleaned.services[0]
+    with pytest.raises(ManualConfirmationRequired) as error:
+        await parser._cleanup_components(
+            component.source_text,
+            ParsedIntent(customer_summary="原始摘要", services=[component]),
+        )
+    assert error.value.code == "official_template_extraction_failed"
+    result = component  # Rejected AI output cannot mutate the original.
     assert result.calculator_service_name == "Amazon EC2"
     assert result.region == "ap-southeast-1"
     assert result.quantity == 2
@@ -3041,6 +4021,50 @@ def test_customer_correction_is_restored_after_a_stale_result() -> None:
     assert stale.field_sources["requirements.total_storage_gib"] == "customer_correction"
 
 
+def test_cleaned_component_overrides_wrong_intake_field_interpretation() -> None:
+    """Only explicit later corrections, not intake guesses, are immutable."""
+
+    source = "容器服务（ECS），1套，EC2工作节点5台，单台8核32G，磁盘400G"
+    original = ServiceRequirement(
+        service="ecs",
+        calculator_service_name="Amazon ECS",
+        source_text=source,
+        original_source_text=source,
+        requirements={"cluster_count": 5, "task_vcpu": 8},
+        field_sources={
+            "_source_block_key": "src_ecs",
+            "requirements.cluster_count": "customer_text",
+            "requirements.task_vcpu": "customer_text",
+        },
+        field_evidence={
+            "requirements.cluster_count": "5台",
+            "requirements.task_vcpu": "8核",
+        },
+        locked_fields=[
+            "requirements.cluster_count",
+            "requirements.task_vcpu",
+        ],
+    )
+    cleaned = ServiceRequirement(
+        service="ecs",
+        calculator_service_name="Amazon ECS",
+        source_text=source,
+        requirements={"cluster_count": 1, "launch_type": "EC2"},
+        field_evidence={
+            "requirements.cluster_count": "1套",
+            "requirements.launch_type": "EC2工作节点5台",
+        },
+    )
+
+    DeepSeekIntentParser._restore_authoritative_component_fields(original, cleaned)
+
+    assert cleaned.requirements["cluster_count"] == 1
+    assert "task_vcpu" not in cleaned.requirements
+    assert cleaned.field_evidence["requirements.cluster_count"] == "1套"
+    assert "requirements.task_vcpu" not in cleaned.field_evidence
+    assert cleaned.field_sources["_source_block_key"] == "src_ecs"
+
+
 @pytest.mark.asyncio
 async def test_initial_intake_then_each_component_gets_its_own_prompt() -> None:
     parser = DeepSeekIntentParser(
@@ -3051,7 +4075,7 @@ async def test_initial_intake_then_each_component_gets_its_own_prompt() -> None:
 
     await parser.parse("Redis 一主一从，每节点 8 GiB；S3 对象存储 500GB")
 
-    assert gateway.calls >= 5
+    assert gateway.calls == 3  # One inventory call and one valid extraction per service.
     assert "第一步数据清洗员" in gateway.system_prompts[0]
     assert "拆分、去除干扰、统一格式" in gateway.system_prompts[0]
     assert "requirements 必须填写" in gateway.system_prompts[0]
@@ -3062,30 +4086,23 @@ async def test_initial_intake_then_each_component_gets_its_own_prompt() -> None:
 
 
 @pytest.mark.asyncio
-async def test_numbered_request_skips_workload_ai_and_keeps_lossless_component_source() -> None:
+async def test_numbered_request_discards_original_after_workload_cleaning() -> None:
     parser = DeepSeekIntentParser(
         Settings(ai_api_key="test", ai_base_url="https://example.invalid")
     )
     gateway = NumberedCleaningGateway()
     parser._gateway = gateway  # type: ignore[assignment]
 
-    async def keep_first_pass(
-        _original_text: str,
-        intent: ParsedIntent,
-        *,
-        reporter: object | None = None,
-    ) -> ParsedIntent:
-        return intent
-
-    parser._cleanup_components = keep_first_pass  # type: ignore[method-assign]
     raw = "1、应用服务器：预计部署3台Linux服务器，单台8核32GB，系统盘200GB，数据盘500GB。"
 
     parsed = await parser.parse(raw)
 
-    assert gateway.calls == 0
+    assert gateway.calls >= 2
+    assert "第一步数据清洗员" in gateway.system_prompts[0]
     component = parsed.services[0]
-    assert component.source_text == raw.removeprefix("1、")
-    assert component.original_source_text == raw.removeprefix("1、")
+    assert component.source_text.startswith("应用服务器（Amazon EC2）｜数量：3台")
+    assert component.original_source_text is None
+    assert component.intake_source_fragments == []
     assert component.quantity == 3
     assert component.requirements["system_disk_gib"] == 200
     assert component.requirements["additional_ebs_volumes"][0]["size_gib"] == 500
@@ -3093,10 +4110,7 @@ async def test_numbered_request_skips_workload_ai_and_keeps_lossless_component_s
 
 def test_fast_numbered_path_requires_a_real_sequence_starting_at_one() -> None:
     assert (
-        DeepSeekIntentParser._intent_from_lossless_sales_numbering(
-            "3、Broker节点\n4核16G"
-        )
-        is None
+        DeepSeekIntentParser._intent_from_lossless_sales_numbering("3、Broker节点\n4核16G") is None
     )
     parsed = DeepSeekIntentParser._intent_from_lossless_sales_numbering(
         "新加坡地区\n1、Amazon EC2：4核16GB\n2、Amazon S3：10TB"
@@ -3106,7 +4120,7 @@ def test_fast_numbered_path_requires_a_real_sequence_starting_at_one() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unusable_numbered_intake_falls_back_without_aborting_quote() -> None:
+async def test_unusable_numbered_intake_never_silently_skips_ai_cleaning() -> None:
     class EmptyInventoryGateway:
         async def complete_json(self, **_: object) -> dict[str, object]:
             return {"customer_summary": "", "services": [], "ambiguities": []}
@@ -3125,14 +4139,12 @@ async def test_unusable_numbered_intake_falls_back_without_aborting_quote() -> N
         return intent
 
     parser._cleanup_components = keep_inventory  # type: ignore[method-assign]
-    parsed = await parser.parse(
-        "1、Doris：每节点16核128GB，4TB磁盘，共3节点。\n"
-        "2、DolphinScheduler：每节点16核64GB，1TB磁盘，共2节点。"
-    )
-
-    assert len(parsed.services) == 2
-    assert "Doris" in parsed.services[0].source_text
-    assert "DolphinScheduler" in parsed.services[1].source_text
+    with pytest.raises(ManualConfirmationRequired) as error:
+        await parser.parse(
+            "1、Doris：每节点16核128GB，4TB磁盘，共3节点。\n"
+            "2、DolphinScheduler：每节点16核64GB，1TB磁盘，共2节点。"
+        )
+    assert error.value.code == "intent_parse_failed"
 
 
 def test_legacy_product_label_is_not_mistaken_for_product_name() -> None:
@@ -3153,84 +4165,10 @@ def test_legacy_product_label_is_not_mistaken_for_product_name() -> None:
     assert component.calculator_service_name == "Amazon EC2（自建 Doris）"
 
 
-@pytest.mark.parametrize(
-    ("product", "source", "expected_quantity"),
-    [
-        ("Doris", "Doris，3台，单台16核128G，磁盘4T", 3),
-        ("TBMQ/EMQX", "TBMQ/EMQX，2个节点，单台16核64G，磁盘500G", 2),
-        ("DolphinScheduler", "DolphinScheduler，2个节点，单台16核64G，磁盘1T", 2),
-    ],
-)
-def test_comma_cleaned_named_workload_keeps_self_hosted_identity(
-    product: str, source: str, expected_quantity: int
-) -> None:
-    component = ServiceRequirement(
-        service="ec2",
-        calculator_service_name="Amazon EC2",
-        source_text=source,
-        requirements={"vcpu": 16, "memory_gib": 64},
-    )
-    parsed = ParsedIntent(customer_summary=product, services=[component])
-
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, f"1、{source}")
-
-    assert component.calculator_service_name == f"Amazon EC2（自建 {product}）"
-    assert component.field_sources["_third_party_product"] == product
-    assert component.quantity == expected_quantity
-    assert any(product in notice and "自建" in notice for notice in parsed.ambiguities)
 
 
-@pytest.mark.parametrize("product", ["Doris", "Flink", "TBMQ/EMQX", "DolphinScheduler"])
-def test_explicit_ec2_self_hosted_row_keeps_the_software_identity(product: str) -> None:
-    source = (
-        f"{product}，Amazon EC2 自建，m6i.4xlarge，16 vCPU，64 GiB，Linux，数量3"
-    )
-    component = ServiceRequirement(
-        service="ec2",
-        calculator_service_name="Amazon EC2 云服务器",
-        quantity=3,
-        source_text=source,
-        requirements={"vcpu": 16, "memory_gib": 64, "operating_system": "linux"},
-    )
-    parsed = ParsedIntent(customer_summary=product, services=[component])
-
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, f"1、{source}")
-
-    assert component.service == "ec2"
-    assert component.calculator_service_name == f"Amazon EC2（自建 {product}）"
-    assert component.field_sources["_third_party_product"] == product
-    assert component.field_sources["_pending_architecture_decision"] == "system_policy"
-    assert "_architecture_decision" not in component.field_sources
-    assert len(parsed.ambiguities) == 1
-    assert product in parsed.ambiguities[0]
-    assert "托管" in parsed.ambiguities[0]
-    assert "自建" in parsed.ambiguities[0]
 
 
-def test_sales_self_hosted_plan_rows_all_become_customer_architecture_questions() -> None:
-    source = """1、Doris，Amazon EC2 自建，r6i.4xlarge，16 vCPU，128 GiB，Linux，数量3
-2、Flink，Amazon EC2 自建，c6a.8xlarge，32 vCPU，64 GiB，Linux，数量3
-3、TBMQ/EMQX，Amazon EC2 自建，m6i.4xlarge，16 vCPU，64 GiB，Linux，数量2
-4、应用服务器，Amazon EC2，r6i.4xlarge，16 vCPU，128 GiB，Linux，数量3
-5、DolphinScheduler，Amazon EC2 自建，m6i.4xlarge，16 vCPU，64 GiB，Linux，数量2"""
-    parsed = DeepSeekIntentParser._intent_from_lossless_sales_numbering(source)
-
-    assert parsed is not None
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, source)
-
-    assert [item.calculator_service_name for item in parsed.services] == [
-        "Amazon EC2（自建 Doris）",
-        "Amazon EC2（自建 Flink）",
-        "Amazon EC2（自建 TBMQ/EMQX）",
-        "Amazon EC2 云服务器",
-        "Amazon EC2（自建 DolphinScheduler）",
-    ]
-    assert len(parsed.ambiguities) == 4
-    for product in ("Doris", "Flink", "TBMQ/EMQX", "DolphinScheduler"):
-        assert any(
-            product in question and "托管" in question and "自建" in question
-            for question in parsed.ambiguities
-        )
 
 
 def test_component_cleanup_keeps_numbered_owner_and_cannot_duplicate_row() -> None:
@@ -3263,22 +4201,34 @@ def test_numbered_owner_joins_ai_identity_without_a_service_alias() -> None:
         calculator_service_name="Amazon EC2（自建 Nginx）",
         component_key="cmp_source_0001",
         source_text=(
-            "Nginx｜数量：4台｜每台CPU：8核｜每台内存：32GB｜"
-            "系统盘：100GB｜数据盘：500GB"
+            "Nginx｜数量：4台｜每台CPU：8核｜每台内存：32GB｜系统盘：100GB｜数据盘：500GB"
         ),
         original_source_text=raw,
         field_sources={"_intake_ai_identity": "ai_cleaning"},
     )
     parsed = ParsedIntent(customer_summary="Nginx", services=[cleaned])
 
-    DeepSeekIntentParser._reconcile_explicit_component_inventory(
-        f"1、{raw}", parsed
-    )
+    DeepSeekIntentParser._reconcile_explicit_component_inventory(f"1、{raw}", parsed)
 
     assert len(parsed.services) == 1
     assert parsed.services[0].service == "ec2"
     assert parsed.services[0].calculator_service_name == "Amazon EC2（自建 Nginx）"
     assert parsed.services[0].component_key.startswith("cmp_sales_")
+
+
+def test_minimum_service_recovery_cannot_duplicate_an_owned_unknown_numbered_block() -> None:
+    source = "1、S3 Glacier Flexible Retrieval：归档100TB，每月取回4TB。"
+    parsed = DeepSeekIntentParser._intent_from_lossless_sales_numbering(source)
+
+    assert parsed is not None
+    assert len(parsed.services) == 1
+    assert parsed.services[0].service == "s3_glacier_flexible_retrieval"
+
+    DeepSeekIntentParser._reconcile_explicit_component_inventory(source, parsed)
+    DeepSeekIntentParser._append_explicit_minimum_services(source, parsed)
+
+    assert len(parsed.services) == 1
+    assert parsed.services[0].original_source_text == source.split("、", 1)[1]
 
 
 def test_numbered_ai_source_is_bound_even_without_local_fast_path() -> None:
@@ -3287,8 +4237,7 @@ def test_numbered_ai_source_is_bound_even_without_local_fast_path() -> None:
         service="rds",
         component_key="cmp_source_0001",
         source_text=(
-            "RDS MySQL主备｜数量：2个实例｜每实例CPU：8核｜"
-            "每实例内存：32GB｜每实例存储：1TB"
+            "RDS MySQL主备｜数量：2个实例｜每实例CPU：8核｜每实例内存：32GB｜每实例存储：1TB"
         ),
     )
     parsed = ParsedIntent(customer_summary="RDS", services=[cleaned])
@@ -3313,7 +4262,7 @@ async def test_invalid_ai_structure_is_repaired_once() -> None:
 
     parsed = await parser.parse("Redis 一主一从，每节点 8 GiB")
 
-    # Invalid intake gets one repair, then one validated component extraction.
+    # Invalid inventory gets one repair; the valid isolated extraction needs no fallback.
     assert gateway.calls == 3
     assert parsed.services[0].quantity == 1
 
@@ -3332,7 +4281,7 @@ async def test_missing_ai_summary_uses_customer_text_after_component_cleanup() -
     assert gateway.calls == 2
     assert (
         parsed.customer_summary
-        == "已识别 1 项 AWS 配置；区域：待确认；Amazon ElastiCache for Redis × 1。"
+        == "已识别 1 项 AWS 配置；区域：待确认；Amazon ElastiCache × 1。"
     )
 
 
@@ -3344,13 +4293,13 @@ async def test_schema_repair_does_not_add_services_after_ai_cleanup() -> None:
     gateway = RepairStillMissingServiceGateway()
     parser._gateway = gateway  # type: ignore[assignment]
 
-    parsed = await parser.parse("Redis 一主一从，每节点 8 GiB；对象存储使用 S3 1TB")
+    with pytest.raises(ManualConfirmationRequired) as error:
+        await parser.parse("Redis 一主一从，每节点 8 GiB；对象存储使用 S3 1TB")
 
-    # Intake repair plus extraction and audit for each explicit component.
-    assert gateway.calls >= 6
-    # AI owns interpretation, while the lossless completeness guard preserves
-    # an explicitly named service if a cleanup pass accidentally drops it.
-    assert {item.service for item in parsed.services} == {"elasticache", "s3"}
+    assert error.value.code == "intent_parse_failed"
+    # One initial attempt plus one JSON repair. Missing components are never
+    # recreated by a downstream raw-text scanner.
+    assert gateway.calls == 2
 
 
 def test_compact_mixed_service_capacities_and_annual_transfer_are_lossless() -> None:
@@ -3382,10 +4331,7 @@ def test_compact_mixed_service_capacities_and_annual_transfer_are_lossless() -> 
 
 
 def test_ec2_label_first_data_disk_is_preserved_losslessly() -> None:
-    text = (
-        "应用服务器：预计部署3台Linux服务器，单台8核32GB，"
-        "系统盘200GB，数据盘500GB。"
-    )
+    text = "应用服务器：预计部署3台Linux服务器，单台8核32GB，系统盘200GB，数据盘500GB。"
     parsed = ParsedIntent(
         customer_summary="ec2 disks",
         services=[ServiceRequirement(service="ec2", quantity=3, source_text=text)],
@@ -3398,9 +4344,7 @@ def test_ec2_label_first_data_disk_is_preserved_losslessly() -> None:
     assert component.requirements["additional_ebs_volumes"] == [
         {"size_gib": 500, "volume_type": "gp3", "count_per_instance": 1}
     ]
-    assert component.field_sources["requirements.additional_ebs_volumes"] == (
-        "customer_text"
-    )
+    assert component.field_sources["requirements.additional_ebs_volumes"] == ("customer_text")
 
 
 def test_modern_service_audit_preserves_identity_units_and_eks_workers() -> None:
@@ -3570,33 +4514,8 @@ def test_explicit_rds_storage_deployment_and_cache_topology_survive_cleanup() ->
     assert parsed.services[1].requirements["replicas_per_shard"] == 1
 
 
-def test_explicit_load_balancer_omission_is_detected() -> None:
-    parsed = ParsedIntent(
-        customer_summary="EC2 和静态文件",
-        services=[
-            ServiceRequirement(
-                service="ec2",
-                calculator_service_name="Amazon EC2",
-            )
-        ],
-    )
-
-    assert DeepSeekIntentParser._missing_explicit_services("前面需要一个负载均衡", parsed) == [
-        "elastic-load-balancing"
-    ]
 
 
-def test_explicit_ec2_and_rds_omission_is_detected() -> None:
-    parsed = ParsedIntent(
-        customer_summary="Redis",
-        services=[
-            ServiceRequirement(service="elasticache", calculator_service_name="Amazon ElastiCache")
-        ],
-    )
-
-    assert DeepSeekIntentParser._missing_explicit_services(
-        "应用服务器：新加坡区域，3 台 Linux；数据库：MySQL 8.0", parsed
-    ) == ["ec2", "rds"]
 
 
 def test_explicit_capacities_override_wrong_model_values() -> None:
@@ -3631,67 +4550,8 @@ def test_explicit_capacities_override_wrong_model_values() -> None:
     assert parsed.services[2].requirements["data_transfer_out_gib"] == 5120
 
 
-def test_named_models_do_not_create_unstated_cpu_or_memory_constraints() -> None:
-    parsed = ParsedIntent(
-        customer_summary="测试",
-        services=[
-            ServiceRequirement(
-                service="ec2",
-                source_text="应用服务器：型号 m7i.xlarge，每台 150GB gp3 系统盘",
-                requirements={
-                    "requested_model": "m7i.xlarge",
-                    "vcpu": 8,
-                    "memory_gib": 32,
-                },
-            ),
-            ServiceRequirement(
-                service="rds",
-                source_text="数据库：型号 db.m7i.2xlarge，Multi-AZ",
-                requirements={
-                    "requested_model": "db.m7i.2xlarge",
-                    "vcpu": 8,
-                    "memory_gib": 64,
-                },
-            ),
-            ServiceRequirement(
-                service="elasticache",
-                source_text="Redis：型号 cache.r7g.large",
-                requirements={
-                    "requested_model": "cache.r7g.large",
-                    "vcpu": 2,
-                    "memory_gib": 8,
-                },
-            ),
-        ],
-    )
-
-    DeepSeekIntentParser._drop_specs_inferred_from_models("", parsed)
-
-    for service in parsed.services:
-        assert "vcpu" not in service.requirements
-        assert "memory_gib" not in service.requirements
 
 
-def test_named_model_keeps_explicit_customer_shape() -> None:
-    parsed = ParsedIntent(
-        customer_summary="测试",
-        services=[
-            ServiceRequirement(
-                service="ec2",
-                source_text="应用服务器：型号 m7i.xlarge，客户明确要求 4 核 16G 内存",
-                requirements={
-                    "requested_model": "m7i.xlarge",
-                    "vcpu": 4,
-                    "memory_gib": 16,
-                },
-            )
-        ],
-    )
-
-    DeepSeekIntentParser._drop_specs_inferred_from_models("", parsed)
-
-    assert parsed.services[0].requirements["vcpu"] == 4
-    assert parsed.services[0].requirements["memory_gib"] == 16
 
 
 def test_single_workload_region_is_inherited_by_regional_services() -> None:
@@ -3917,234 +4777,18 @@ def test_explicit_self_hosted_kafka_still_uses_managed_msk_policy() -> None:
     assert [key for key, _ in keys] == ["msk"]
 
 
-def test_kafka_architecture_regression_is_repaired_to_managed_msk() -> None:
-    source = (
-        "4、Apache Kafka：区域：新加坡（ap-southeast-1），"
-        "用途：业务消息队列和实时数据流处理，部署数量：3个Broker节点"
-    )
-    parsed = ParsedIntent(
-        customer_summary="Kafka",
-        services=[
-            ServiceRequirement(
-                service="ec2",
-                calculator_service_name="Amazon EC2（自建 Apache Kafka）",
-                region="ap-southeast-1",
-                quantity=1,
-                source_text="Apache Kafka：",
-                field_sources={"_pending_architecture_decision": "system_policy"},
-            )
-        ],
-        ambiguities=["AWS 没有与 Apache Kafka 完全等价的托管服务，采用托管还是自建？"],
-    )
-
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, source)
-    DeepSeekIntentParser._normalize_cluster_group_quantities(parsed)
-
-    item = parsed.services[0]
-    assert item.service == "msk"
-    assert item.calculator_service_name == "Amazon MSK"
-    assert item.quantity == 1
-    assert item.requirements["broker_count"] == 3
-    assert "_pending_architecture_decision" not in item.field_sources
-    assert parsed.ambiguities == []
 
 
-@pytest.mark.parametrize(
-    ("product", "expected_service"),
-    [
-        ("Redis", "elasticache"),
-        ("Valkey", "elasticache"),
-        ("Memcached", "elasticache"),
-        ("MySQL", "rds"),
-        ("PostgreSQL", "rds"),
-        ("MariaDB", "rds"),
-        ("Prometheus", "amp"),
-        ("RabbitMQ", "mq"),
-        ("ActiveMQ", "mq"),
-        ("MongoDB", "documentdb"),
-        ("Elasticsearch", "opensearch"),
-        ("Kubernetes", "eks"),
-    ],
-)
-def test_known_full_managed_equivalents_never_become_self_hosted_questions(
-    product: str, expected_service: str
-) -> None:
-    source = f"1、{product}：部署数量：3个节点"
-    parsed = ParsedIntent(
-        customer_summary=product,
-        services=[
-            ServiceRequirement(
-                service="ec2",
-                calculator_service_name=f"Amazon EC2（自建 {product}）",
-                source_text=f"{product}：",
-            )
-        ],
-        ambiguities=[f"{product} 采用 AWS 托管还是自建？"],
-    )
-
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, source)
-
-    assert parsed.services[0].service == expected_service
-    assert "_pending_architecture_decision" not in parsed.services[0].field_sources
-    assert parsed.ambiguities == []
 
 
-@pytest.mark.parametrize(
-    ("product", "expected_service", "expected_engine"),
-    [
-        ("Redis缓存", "elasticache", "redis"),
-        ("MySQL数据库", "rds", "mysql"),
-        ("PostgreSQL数据库", "rds", "postgresql"),
-    ],
-)
-def test_native_managed_database_and_cache_names_never_ask_for_self_hosting(
-    product: str, expected_service: str, expected_engine: str
-) -> None:
-    source = f"1、{product}：部署数量：1个节点"
-    parsed = ParsedIntent(
-        customer_summary=product,
-        services=[
-            ServiceRequirement(
-                service="ec2",
-                calculator_service_name=f"Amazon EC2（自建 {product}）",
-                source_text=f"{product}：",
-                field_sources={"_pending_architecture_decision": "system_policy"},
-            )
-        ],
-        ambiguities=[f"AWS 没有与 {product} 完全等价的托管服务，采用托管还是自建？"],
-    )
-
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, source)
-
-    item = parsed.services[0]
-    assert item.service == expected_service
-    assert item.requirements["engine"] == expected_engine
-    assert "_pending_architecture_decision" not in item.field_sources
-    assert parsed.ambiguities == []
 
 
-@pytest.mark.parametrize(
-    "heading",
-    ["Web应用服务器", "后端计算池", "线上业务承载节点", "海星订单前台"],
-)
-def test_generic_application_server_is_plain_ec2_not_a_managed_architecture_question(
-    heading: str,
-) -> None:
-    source = f"1、{heading}预计3台，单台16核128G，磁盘1T。"
-    parsed = ParsedIntent(
-        customer_summary=heading,
-        services=[
-            ServiceRequirement(
-                service="ec2",
-                calculator_service_name=f"Amazon EC2（自建 {heading}）",
-                source_text=f"{heading}预计3台，单台16核128G，磁盘1T。",
-                workload_identity_kind="generic_compute",
-                field_sources={
-                    "_pending_architecture_decision": "system_policy",
-                    "_third_party_product": heading,
-                },
-            )
-        ],
-        ambiguities=[
-            f"AWS 没有与 {heading} 完全等价的托管服务。采用托管还是在 EC2 自建？"
-        ],
-    )
-
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, source)
-
-    item = parsed.services[0]
-    assert item.service == "ec2"
-    assert item.calculator_service_name == "Amazon EC2 云服务器"
-    assert "_pending_architecture_decision" not in item.field_sources
-    assert "_third_party_product" not in item.field_sources
-    assert parsed.ambiguities == []
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("kind", "workload_name"),
-    [
-        ("generic_compute", None),
-        ("named_third_party_software", "FutureFabric"),
-    ],
-)
-async def test_pending_ec2_identity_comes_from_ai_contract_not_name_rules(
-    monkeypatch: pytest.MonkeyPatch,
-    kind: str,
-    workload_name: str | None,
-) -> None:
-    heading = workload_name or "任意未来业务承载角色"
-    source = f"{heading}，3台，单台8核32G，磁盘100G"
-    component = ServiceRequirement(
-        service="ec2",
-        calculator_service_name=f"Amazon EC2（自建 {heading}）",
-        source_text=source,
-        original_source_text=source,
-        quantity=3,
-        requirements={"vcpu": 8, "memory_gib": 32, "system_disk_gib": 100},
-        field_sources={
-            "_identity_resolution_status": "third_party",
-            "_pending_architecture_decision": "system_policy",
-            "_third_party_product": heading,
-        },
-    )
-    parser = DeepSeekIntentParser(Settings(ai_api_key="test"))
-
-    async def classify(**_: object) -> dict[str, object]:
-        return {
-            "kind": kind,
-            "workload_name": workload_name,
-            "evidence": heading,
-            "confidence": "high",
-        }
-
-    monkeypatch.setattr(parser, "_complete_component_json", classify)
-    parsed = ParsedIntent(customer_summary=source, services=[component])
-
-    await parser._resolve_pending_ec2_workload_identities(parsed)
-
-    assert component.workload_identity_kind == kind
-    assert component.workload_name == workload_name
-    assert component.field_evidence["workload_identity_kind"] == heading
-    if kind == "generic_compute":
-        DeepSeekIntentParser._append_third_party_managed_decisions(parsed, source)
-        assert component.calculator_service_name == "Amazon EC2 云服务器"
-        assert "_pending_architecture_decision" not in component.field_sources
-        assert "_third_party_product" not in component.field_sources
-    else:
-        assert component.field_sources["_third_party_product"] == "FutureFabric"
 
 
-@pytest.mark.parametrize(
-    ("expected_service", "product"),
-    [
-        (service, display_name)
-        for service, display_name, _markers in DeepSeekIntentParser._INVENTORY_DEFINITIONS
-        if service != "ec2" and service in SERVICE_TEMPLATE_FIELDS
-    ],
-)
-def test_every_native_aws_inventory_product_bypasses_self_hosting_question(
-    expected_service: str, product: str
-) -> None:
-    parsed = ParsedIntent(
-        customer_summary=product,
-        services=[
-            ServiceRequirement(
-                service="ec2",
-                calculator_service_name=f"Amazon EC2（自建 {product}）",
-                source_text=f"{product}：数量 1",
-                field_sources={"_pending_architecture_decision": "system_policy"},
-            )
-        ],
-        ambiguities=[f"{product} 采用 AWS 托管还是自建？"],
-    )
 
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed)
 
-    item = parsed.services[0]
-    assert item.service == expected_service
-    assert "_pending_architecture_decision" not in item.field_sources
-    assert parsed.ambiguities == []
 
 
 @pytest.mark.parametrize(
@@ -4552,106 +5196,14 @@ def test_single_service_returned_at_root_is_wrapped_as_services_list() -> None:
     assert parsed.services[0].service == "ec2"
 
 
-def test_alb_backend_reference_does_not_create_extra_ec2_workload() -> None:
-    parsed = ParsedIntent(
-        customer_summary="负载均衡",
-        services=[
-            ServiceRequirement(
-                service="elastic-load-balancing",
-                calculator_service_name="Elastic Load Balancing",
-            ),
-            ServiceRequirement(
-                service="ec2",
-                calculator_service_name="Amazon EC2",
-                source_text="后端挂 3 台应用服务器",
-            ),
-        ],
-    )
-
-    DeepSeekIntentParser._drop_referenced_only_ec2(
-        "负载均衡：1 个 ALB，后端挂 3 台应用服务器，HTTPS 访问。",
-        parsed,
-    )
-
-    assert [item.service for item in parsed.services] == ["elastic-load-balancing"]
 
 
-def test_explicit_architecture_conflicts_survive_small_model_output() -> None:
-    parsed = ParsedIntent(
-        customer_summary="测试",
-        services=[
-            ServiceRequirement(service="rds", requirements={"deployment": "single_az"}),
-            ServiceRequirement(service="elasticache", requirements={"memory_gib": 8}),
-            ServiceRequirement(service="elb", requirements={"load_balancer_type": "application"}),
-        ],
-    )
-    text = (
-        "数据库用 Single-AZ，但要求主备自动故障切换。"
-        "Redis 整套缓存只需要 1G，但每个节点至少 8G。"
-        "使用 Application Load Balancer，固定一个公网 IP，IP 永远不变。"
-    )
-
-    DeepSeekIntentParser._append_explicit_design_conflicts(text, parsed)
-
-    assert parsed.ambiguities == [
-        "RDS Single-AZ 与主备自动故障切换冲突",
-        "ALB 不支持固定公网 IP",
-        "Redis 整套 1G 与每节点 8G 的要求冲突",
-    ]
 
 
-def test_cross_service_design_conflicts_are_detected_before_pricing() -> None:
-    parsed = ParsedIntent(
-        customer_summary="测试",
-        services=[ServiceRequirement(service="ec2", requirements={"vcpu": 4})],
-    )
-    text = (
-        "服务器全部放在一个可用区，同时要求可用区故障时切到另一个可用区。"
-        "RDS 使用 Multi-AZ，并让备用库跑只读查询。"
-        "Redis 两节点部署在同一个可用区，但要求可用区故障时自动切换。"
-        "NLB 按 URL 路径把 /api 和 /static 转发到不同目标。"
-        "S3 Standard 七天后自动转成 S3 Express One Zone。"
-        "CloudFront 要求固定不变的公网 IP。"
-    )
-
-    DeepSeekIntentParser._append_explicit_design_conflicts(text, parsed)
-
-    assert len(parsed.ambiguities) == 6
-    assert "NLB 不支持按 URL 路径转发" in parsed.ambiguities
-    assert any("Anycast Static IP" in item for item in parsed.ambiguities)
 
 
-def test_ec2_availability_zone_conflict_is_not_assigned_to_redis() -> None:
-    parsed = ParsedIntent(
-        customer_summary="测试",
-        services=[
-            ServiceRequirement(service="ec2", requirements={"vcpu": 4}),
-            ServiceRequirement(service="elasticache", requirements={"memory_gib": 8}),
-        ],
-    )
-    text = (
-        "Redis 一主一从，共 2 个节点，单节点 8G 内存。\n"
-        "3 台 EC2 全部放在同一个可用区，但希望单个可用区故障时应用自动保持高可用。"
-    )
-
-    DeepSeekIntentParser._append_explicit_design_conflicts(text, parsed)
-
-    assert parsed.ambiguities == ["EC2 单可用区部署与跨可用区自动切换要求冲突"]
 
 
-def test_numbered_customer_acceptance_resolves_the_matching_question() -> None:
-    parsed = ParsedIntent(
-        customer_summary="测试",
-        services=[ServiceRequirement(service="ec2", requirements={"vcpu": 4})],
-    )
-    text = (
-        "3 台 EC2 全部放在同一个可用区，但希望单个可用区故障时应用自动保持高可用。\n\n"
-        "【客户确认回复】\n1 同意"
-    )
-
-    DeepSeekIntentParser._append_explicit_design_conflicts(text, parsed)
-
-    assert parsed.ambiguities == []
 
 
 def test_plain_customer_acceptance_resolves_all_questions_on_current_page() -> None:
@@ -4680,52 +5232,8 @@ def test_customer_reply_with_new_configuration_is_kept_as_supplement() -> None:
     )
 
 
-def test_model_added_services_are_removed_when_customer_only_asks_for_ec2() -> None:
-    parsed = ParsedIntent(
-        customer_summary="错误地带入旧需求",
-        services=[
-            ServiceRequirement(
-                service="ec2",
-                quantity=3,
-                requirements={"vcpu": 1, "memory_gib": 8, "system_disk_gib": 100},
-                source_text="旧的 EC2 需求",
-            ),
-            ServiceRequirement(service="rds", requirements={"engine": "mysql"}),
-            ServiceRequirement(service="elasticache", requirements={"engine": "redis"}),
-            ServiceRequirement(service="elastic-load-balancing"),
-            ServiceRequirement(service="s3", requirements={"storage_gib": 2048}),
-            ServiceRequirement(service="cloudfront", requirements={"data_transfer_out_gib": 5120}),
-        ],
-    )
-    text = "东京区域需要 2 台 Linux EC2，4核16G，每台 200GB gp3 系统盘，按需运行整月。"
-
-    DeepSeekIntentParser._drop_unrequested_services(text, parsed)
-    DeepSeekIntentParser._reconcile_explicit_capacities(text, parsed)
-
-    assert [item.service for item in parsed.services] == ["ec2"]
-    assert parsed.services[0].quantity == 2
-    assert parsed.services[0].requirements["vcpu"] == 4
-    assert parsed.services[0].requirements["memory_gib"] == 16
-    assert parsed.services[0].requirements["system_disk_gib"] == 200
 
 
-def test_bare_ec2_instance_models_count_as_explicit_ec2_request() -> None:
-    text = (
-        "开发环境：m6g.large，2核8G，100G 存储，1 台\n生产环境：c6g.xlarge，4核8G，100G 存储，2 台"
-    )
-    parsed = ParsedIntent(
-        customer_summary=text,
-        services=[
-            ServiceRequirement(service="amazon_ec2", source_text=text.splitlines()[0]),
-            ServiceRequirement(service="ec2", source_text=text.splitlines()[1]),
-        ],
-    )
-
-    DeepSeekIntentParser._drop_unrequested_services(text, parsed)
-    DeepSeekIntentParser._drop_referenced_only_ec2(text, parsed)
-
-    assert len(parsed.services) == 2
-    assert DeepSeekIntentParser._service_key("amazon_ec2") == "ec2"
 
 
 def test_compact_architecture_list_preserves_each_ec2_disk_and_kinesis_component() -> None:
@@ -4812,39 +5320,9 @@ async def test_ai_valid_cannot_waive_literal_component_fact() -> None:
         reporter=None,
     )
 
-    assert any("system_disk_gib=200" in issue for issue in issues)
+    assert any("200G" in issue for issue in issues)
 
 
-def test_environment_lines_with_bare_models_survive_full_service_filter() -> None:
-    text = (
-        "开发环境：m6g.large，2核8G，100G 存储，1 台\n"
-        "测试环境：m6g.large，2核8G，100G 存储，1 台\n"
-        "生产环境：c6g.xlarge，4核8G，100G 存储，2 台"
-    )
-    parsed = ParsedIntent(
-        customer_summary=text,
-        services=[
-            ServiceRequirement(
-                service="compute",
-                source_text=line,
-                requirements={"requested_model": line.split("：", 1)[1].split("，", 1)[0]},
-            )
-            for line in text.splitlines()
-        ],
-    )
-
-    DeepSeekIntentParser._drop_unrequested_services(text, parsed)
-    DeepSeekIntentParser._drop_referenced_only_ec2(text, parsed)
-    DeepSeekIntentParser._reconcile_explicit_models(text, parsed)
-    DeepSeekIntentParser._reconcile_explicit_capacities(text, parsed)
-
-    assert [item.service for item in parsed.services] == ["ec2", "ec2", "ec2"]
-    assert [item.quantity for item in parsed.services] == [1, 1, 2]
-    assert [item.requirements["requested_model"] for item in parsed.services] == [
-        "m6g.large",
-        "m6g.large",
-        "c6g.xlarge",
-    ]
 
 
 def test_ai_ec2_disk_alias_is_canonicalized_before_validation() -> None:
@@ -5149,6 +5627,38 @@ def test_component_evidence_rejects_capacity_used_as_node_count() -> None:
 
 
 @pytest.mark.parametrize(
+    ("quantity", "evidence"),
+    [(3, "3 x c7g.large instances"), (2, "2 pcs m7i.large")],
+)
+def test_component_evidence_accepts_english_instance_quantity_notation(
+    quantity: int,
+    evidence: str,
+) -> None:
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid")
+    )
+    component = ServiceRequirement(
+        service="ec2",
+        source_text=f"Amazon EC2：{evidence}",
+    )
+    raw = {
+        "component": {
+            "service": "ec2",
+            "region": None,
+            "quantity": quantity,
+            "requirements": {},
+            "field_evidence": {"quantity": evidence},
+            "source_text": component.source_text,
+            "query_action": None,
+        }
+    }
+
+    parsed = parser._component_from_template_output(raw, component)
+
+    assert parsed.quantity == quantity
+
+
+@pytest.mark.parametrize(
     ("field", "value", "snippet"),
     [
         ("master_nodes", 1, "1个主节点"),
@@ -5180,6 +5690,75 @@ def test_component_evidence_accepts_generic_role_node_counts(
     parsed = parser._component_from_template_output(raw, component)
 
     assert parsed.requirements[field] == value
+
+
+def test_ai_normalized_explicit_single_deployment_is_not_discarded_as_default() -> None:
+    """An explicit 1 and an implementation default of 1 are not the same fact."""
+
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid")
+    )
+    source = "PostgreSQL数据库（Aurora），1套，1主2只读"
+    original = ServiceRequirement(service="rds", source_text=source)
+    raw = {
+        "component": {
+            "service": "rds",
+            "region": None,
+            "quantity": 1,
+            "requirements": {
+                "engine": "aurora_postgresql",
+                "aurora_cluster": True,
+                "cluster_members": 3,
+            },
+            "field_evidence": {
+                "quantity": "1套",
+                "requirements.engine": "PostgreSQL数据库（Aurora）",
+                "requirements.aurora_cluster": "Aurora",
+                "requirements.cluster_members": "1主2只读",
+            },
+            "source_text": source,
+            "query_action": None,
+        }
+    }
+
+    parsed = parser._component_from_template_output(raw, original)
+
+    assert parsed.quantity == 1
+    assert parsed.field_evidence["quantity"] == "1套"
+    parser._mark_component_field_sources(original, parsed, runtime_defaults={})
+    intent = ParsedIntent(customer_summary=source, services=[parsed])
+    DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
+    assert customer_fact_ledger_is_current(parsed)
+    assert any(
+        fact.path == "quantity" and fact.value == 1 and fact.evidence == "1套"
+        for fact in parsed.customer_pricing_facts
+    )
+
+
+def test_ai_normalized_bare_classifier_proves_cluster_count() -> None:
+    """The validator checks the normalized unit, not a product-name phrase."""
+
+    parser = DeepSeekIntentParser(
+        Settings(ai_api_key="test", ai_base_url="https://example.invalid")
+    )
+    source = "容器服务（ECS），1套"
+    original = ServiceRequirement(service="ecs", source_text=source)
+    raw = {
+        "component": {
+            "service": "ecs",
+            "region": None,
+            "quantity": None,
+            "requirements": {"cluster_count": 1},
+            "field_evidence": {"requirements.cluster_count": "1套"},
+            "source_text": source,
+            "query_action": None,
+        }
+    }
+
+    parsed = parser._component_from_template_output(raw, original)
+
+    assert parsed.requirements["cluster_count"] == 1
+    assert parsed.field_evidence["requirements.cluster_count"] == "1套"
 
 
 def test_selective_audit_only_flags_suspicious_incomplete_repeated_component() -> None:
@@ -5523,10 +6102,7 @@ def test_neptune_topology_and_backup_storage_survive_literal_recovery() -> None:
 
 
 def test_quicksight_roles_sessions_and_spice_do_not_collapse_into_generic_fields() -> None:
-    source = (
-        "Amazon QuickSight：企业版，10名作者、120名读者，"
-        "每月2万次读者会话，SPICE容量200GB"
-    )
+    source = "Amazon QuickSight：企业版，10名作者、120名读者，每月2万次读者会话，SPICE容量200GB"
     component = ServiceRequirement(
         service="quick_sight",
         calculator_service_name="Amazon QuickSight",
@@ -5610,101 +6186,259 @@ def test_explicit_platform_services_are_never_lost_when_ai_omits_them() -> None:
     assert services["secrets_manager"].requirements["secret_count"] == 5
 
 
-def test_worker_node_root_disk_is_not_duplicated_as_standalone_ebs() -> None:
-    source = "EKS Worker Node：t3.xlarge，2 个节点，每节点 gp3 100GB，Managed Node Group。"
-    parsed = ParsedIntent(
-        customer_summary="EKS",
-        services=[
-            ServiceRequirement(
-                service="ec2",
-                source_text=source,
-                requirements={"requested_model": "t3.xlarge", "system_disk_gib": 100},
-            ),
-            ServiceRequirement(
-                service="ebs",
-                source_text=source,
-                requirements={"storage_gib": 100, "volume_type": "gp3"},
-            ),
-        ],
+
+
+
+
+
+
+def test_msk_serverless_literal_throughput_uses_internal_service_meters() -> None:
+    source = "Amazon MSK Serverless：每月写入20TiB、读取40TiB。"
+    component = ServiceRequirement(
+        service="msk",
+        source_text=source,
+        original_source_text=source,
+        requirements={"cluster_type": "serverless"},
     )
 
-    DeepSeekIntentParser._drop_embedded_ebs_duplicates(parsed)
-
-    assert [item.service for item in parsed.services] == ["ec2"]
-
-
-def test_single_aggregate_auxiliary_line_is_not_multiplied_by_regions() -> None:
-    text = (
-        "云硬盘：全球，gp3，共 1000GB\n"
-        "公网出网流量：新加坡、悉尼、香港合计 1000GB/月\n"
-        "WAF：1 个 Web ACL，1000 万次请求/月"
-    )
-    parsed = ParsedIntent(
-        customer_summary="测试",
-        services=[
-            ServiceRequirement(service="ebs", region="ap-southeast-1"),
-            ServiceRequirement(service="ebs", region="ap-southeast-2"),
-            ServiceRequirement(service="data_transfer", region="ap-southeast-1"),
-            ServiceRequirement(service="data_transfer", region="ap-southeast-2"),
-            ServiceRequirement(service="waf", region="global"),
-        ],
+    DeepSeekIntentParser._overlay_literal_component_facts(
+        source,
+        component,
+        extra_fields=SERVICE_TEMPLATE_FIELDS["msk"],
     )
 
-    DeepSeekIntentParser._reconcile_explicit_capacities(text, parsed)
-    DeepSeekIntentParser._collapse_explicit_auxiliary_duplicates(text, parsed)
-
-    assert [item.service for item in parsed.services] == ["ebs", "data_transfer", "waf"]
-    assert parsed.services[0].region == "global"
-    assert parsed.services[0].requirements["storage_gib"] == 1000
-    assert parsed.services[1].requirements["data_transfer_out_gib"] == 1000
-    assert parsed.services[2].requirements["requests"] == 10_000_000
+    assert component.requirements["data_in_gib"] == 20 * 1024
+    assert component.requirements["data_out_gib"] == 40 * 1024
+    assert component.field_evidence["requirements.data_in_gib"] == "每月写入20TiB"
+    assert component.field_evidence["requirements.data_out_gib"] == "读取40TiB"
 
 
-def test_compact_redis_msk_and_s3_rows_preserve_literal_customer_fields() -> None:
-    text = (
-        "Amazon ElastiCache for Redis｜8GB × 2分片\n"
-        "Amazon MSK｜3 Broker节点 m7g.large｜存储510GB\n"
-        "Amazon S3｜500GB"
-    )
-    parsed = ParsedIntent(
-        customer_summary="compact rows",
-        services=[
-            ServiceRequirement(
-                service="elasticache",
-                source_text=text.splitlines()[0],
-                requirements={"requested_model": "8gb × 2分片", "engine": "redis"},
-            ),
-            ServiceRequirement(
-                service="msk",
-                source_text=text.splitlines()[1],
-                requirements={"storage_gib": 510},
-            ),
-            ServiceRequirement(service="s3", source_text=text.splitlines()[2]),
-        ],
+@pytest.mark.parametrize(
+    ("service", "source", "field", "expected"),
+    (
+        ("textract", "Amazon Textract：每月分析500万页文档。", "document_pages", 5_000_000),
+        ("comprehend", "Amazon Comprehend：每月处理2亿字符文本。", "characters", 200_000_000),
+        ("rekognition", "Amazon Rekognition：每月分析3000万张图片。", "images", 30_000_000),
+        ("transcribe", "Amazon Transcribe：每月转写120万分钟音频。", "audio_minutes", 1_200_000),
+        ("translate", "Amazon Translate：每月翻译5亿字符。", "characters", 500_000_000),
+        ("polly", "Amazon Polly：每月合成3亿字符。", "characters", 300_000_000),
+    ),
+)
+def test_managed_ai_literal_usage_is_preserved_by_declared_unit_contract(
+    service: str,
+    source: str,
+    field: str,
+    expected: float,
+) -> None:
+    component = ServiceRequirement(
+        service=service,
+        source_text=source,
+        original_source_text=source,
     )
 
-    DeepSeekIntentParser._reconcile_explicit_capacities(text, parsed)
-    DeepSeekIntentParser._drop_specs_inferred_from_models(text, parsed)
+    DeepSeekIntentParser._overlay_literal_component_facts(
+        source,
+        component,
+        extra_fields=SERVICE_TEMPLATE_FIELDS[service],
+    )
 
-    redis = parsed.services[0].requirements
-    assert redis["memory_gib"] == 8
-    assert redis["shards"] == 2
-    assert "requested_model" not in redis
+    assert component.requirements[field] == expected
+    assert component.field_sources[f"requirements.{field}"] == "customer_text"
 
-    msk = parsed.services[1].requirements
-    assert msk["requested_model"] == "m7g.large"
-    assert msk["broker_count"] == 3
-    assert msk["storage_gib_per_broker"] == 510
-    assert "storage_gib" not in msk
 
-    assert parsed.services[2].requirements["storage_gib"] == 500
+def test_unlabeled_monthly_lambda_invocations_and_x86_alias_are_preserved() -> None:
+    source = "Lambda编排器：x86_64，内存2048MB，每月5000万次，平均1.2秒。"
+    component = ServiceRequirement(
+        service="lambda",
+        source_text=source,
+        original_source_text=source,
+    )
+
+    DeepSeekIntentParser._overlay_literal_component_facts(
+        source,
+        component,
+        extra_fields=SERVICE_TEMPLATE_FIELDS["lambda"],
+    )
+
+    assert component.requirements["architecture"] == "x86_64"
+    assert component.requirements["requests"] == 50_000_000
+    assert component.field_evidence["requirements.requests"] == "每月5000万次"
+
+
+def test_transit_gateway_attachment_count_and_processed_volume_are_preserved() -> None:
+    source = "AWS Transit Gateway：20个VPC Attachment，每月处理100TB。"
+    component = ServiceRequirement(
+        service="transit_gateway",
+        source_text=source,
+        original_source_text=source,
+    )
+
+    DeepSeekIntentParser._overlay_literal_component_facts(
+        source,
+        component,
+        extra_fields=SERVICE_TEMPLATE_FIELDS["transit_gateway"],
+    )
+
+    assert component.requirements["attachments"] == 20
+    assert component.requirements["attachment_type"] == "vpc"
+    assert component.requirements["data_processed_gib"] == 100 * 1024
+
+
+@pytest.mark.parametrize(
+    ("service", "source", "expected"),
+    [
+        (
+            "direct_connect",
+            "AWS Direct Connect：2条10Gbps专线，每月出站80TB。",
+            {
+                "connection_count": 2,
+                "port_speed_gbps": 10,
+                "data_transfer_out_gib": 80 * 1024,
+            },
+        ),
+        (
+            "site_to_site_vpn",
+            "AWS Site-to-Site VPN：4条连接，整月在线，12TB流量。",
+            {"connection_count": 4, "data_processed_gib": 12 * 1024},
+        ),
+        (
+            "vpc_endpoint",
+            "Interface VPC Endpoint：30个端点，每月处理25TB。",
+            {"endpoint_count": 30, "data_processed_gib": 25 * 1024},
+        ),
+        (
+            "route53",
+            "Route 53 Resolver：6个入站/出站Endpoint，每月8亿次DNS查询。",
+            {
+                "route53_type": "resolver",
+                "resolver_endpoints": 6,
+                "dns_queries": 800_000_000,
+            },
+        ),
+    ],
+)
+def test_network_component_literals_are_preserved_by_declared_contract(
+    service: str,
+    source: str,
+    expected: dict[str, object],
+) -> None:
+    component = ServiceRequirement(
+        service=service,
+        source_text=source,
+        original_source_text=source,
+    )
+
+    DeepSeekIntentParser._overlay_literal_component_facts(
+        source,
+        component,
+        extra_fields=SERVICE_TEMPLATE_FIELDS[service],
+    )
+
+    for field, value in expected.items():
+        assert component.requirements[field] == value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            assert component.field_sources[f"requirements.{field}"] == "customer_text"
+
+
+@pytest.mark.parametrize(
+    ("service", "source", "expected"),
+    [
+        (
+            "s3_glacier_deep_archive",
+            "S3 Glacier Deep Archive：归档500TiB，每月恢复2TiB。",
+            {"storage_gib": 500 * 1024, "data_retrieval_gib": 2 * 1024},
+        ),
+        (
+            "storage_gateway",
+            "AWS Storage Gateway File Gateway：缓存容量10TiB，每月写入40TiB。",
+            {
+                "gateway_type": "file_gateway",
+                "cache_storage_gib": 10 * 1024,
+                "data_processed_gib": 40 * 1024,
+            },
+        ),
+        (
+            "data_sync",
+            "AWS DataSync：每月向AWS传输80TiB数据。",
+            {"data_processed_gib": 80 * 1024},
+        ),
+        (
+            "transfer",
+            "AWS Transfer Family SFTP：3个端点，每月传输30TiB。",
+            {
+                "protocol": "sftp",
+                "endpoint_count": 3,
+                "data_processed_gib": 30 * 1024,
+            },
+        ),
+    ],
+)
+def test_storage_transfer_literals_use_one_declared_owner_per_customer_fact(
+    service: str,
+    source: str,
+    expected: dict[str, object],
+) -> None:
+    component = ServiceRequirement(
+        service=service,
+        source_text=source,
+        original_source_text=source,
+    )
+
+    DeepSeekIntentParser._overlay_literal_component_facts(
+        source,
+        component,
+        extra_fields=SERVICE_TEMPLATE_FIELDS[service],
+    )
+
+    assert component.requirements == expected
+    assert "resolver_endpoints" not in component.requirements
+    assert "data_transfer_out_gib" not in component.requirements
+
+
+def test_narrow_s3_products_do_not_collapse_into_the_broad_s3_component() -> None:
+    glacier = DeepSeekIntentParser._inventory_keys_for_line(
+        "S3 Glacier Deep Archive：归档500TiB，每月恢复2TiB。"
+    )
+    express = DeepSeekIntentParser._inventory_keys_for_line(
+        "Amazon S3 Express One Zone：存储30TiB，每月PUT 8000万、GET 10亿。"
+    )
+
+    assert glacier == [("s3_glacier_deep_archive", "Amazon S3 Glacier Deep Archive")]
+    assert express == [("s3", "Amazon Simple Storage Service (S3)")]
+
+
+@pytest.mark.parametrize(
+    ("service", "field", "value", "evidence"),
+    [
+        ("storage_gateway", "gateway_type", "file_gateway", "File Gateway"),
+        ("transfer", "protocol", "sftp", "SFTP"),
+    ],
+)
+def test_literal_value_equal_to_system_default_remains_customer_owned(
+    service: str,
+    field: str,
+    value: str,
+    evidence: str,
+) -> None:
+    original = ServiceRequirement(service=service)
+    filled = ServiceRequirement(
+        service=service,
+        requirements={field: value},
+        field_evidence={f"requirements.{field}": evidence},
+    )
+
+    DeepSeekIntentParser._mark_component_field_sources(
+        original,
+        filled,
+        runtime_defaults={field: value},
+    )
+
+    assert filled.field_sources[f"requirements.{field}"] == "customer_text"
+    assert f"requirements.{field}" in filled.locked_fields
 
 
 def test_official_redis_shape_memory_with_literal_evidence_survives_cleanup() -> None:
-    source = (
-        "Redis，Amazon ElastiCache for Redis，cache.m4.4xlarge，"
-        "16 vCPU，60.78 GiB，3个节点"
-    )
+    source = "Redis，Amazon ElastiCache for Redis，cache.m4.4xlarge，16 vCPU，60.78 GiB，3个节点"
     parsed = ParsedIntent(
         customer_summary="Redis official shape",
         services=[
@@ -5736,11 +6470,36 @@ def test_official_redis_shape_memory_with_literal_evidence_survives_cleanup() ->
     assert "requirements.memory_gib" in redis.locked_fields
 
 
-def test_repaired_component_rejects_a_stale_ai_missing_field_finding() -> None:
-    source = (
-        "Redis，Amazon ElastiCache for Redis，cache.m4.4xlarge，"
-        "16 vCPU，60.78 GiB，3个节点"
+def test_capacity_reader_never_treats_a_sku_generation_as_memory() -> None:
+    source = "Redis，Amazon ElastiCache for Redis，cache.r6g.xlarge，4 vCPU，约26 GiB，2个节点"
+    component = ServiceRequirement(
+        service="elasticache",
+        calculator_service_name="Amazon ElastiCache for Redis",
+        source_text=source,
+        requirements={
+            "requested_model": "cache.r6g.xlarge",
+            "vcpu": 4,
+            "memory_gib": 26,
+            "node_count": 2,
+        },
+        field_evidence={
+            "requirements.requested_model": "cache.r6g.xlarge",
+            "requirements.vcpu": "4 vCPU",
+            "requirements.memory_gib": "约26 GiB",
+            "requirements.node_count": "2个节点",
+        },
     )
+    parsed = ParsedIntent(customer_summary="Redis official shape", services=[component])
+
+    DeepSeekIntentParser._reconcile_explicit_capacities(source, parsed)
+
+    assert component.requirements["memory_gib"] == 26
+    assert component.field_evidence["requirements.memory_gib"] == "约26 GiB"
+    assert "requirements.memory_gib" in component.locked_fields
+
+
+def test_repaired_component_rejects_a_stale_ai_missing_field_finding() -> None:
+    source = "Redis，Amazon ElastiCache for Redis，cache.m4.4xlarge，16 vCPU，60.78 GiB，3个节点"
     repaired = ServiceRequirement(
         service="elasticache",
         source_text=source,
@@ -5794,6 +6553,34 @@ def test_inventory_preserves_mongodb_and_keeps_elk_separate_from_es() -> None:
     assert documentdb.requirements["storage_gib"] == 2048
     assert "MongoDB" in documentdb.source_text
     assert "ELK" in parsed.services[2].source_text
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_service"),
+    [
+        ("Fargate容器任务：Linux ARM64，持续运行60个task。", "fargate"),
+        ("DocDB兼容Mongo：3个节点，每节点4核16GiB。", "documentdb"),
+        ("AMD64 Elastic Compute Cloud VM：2台 m7i.xlarge。", "ec2"),
+        ("Elastic Block Store / EBS：gp3 capacity 12.5 TiB。", "ebs"),
+    ],
+)
+def test_explicit_managed_service_aliases_keep_their_native_identity(
+    source: str,
+    expected_service: str,
+) -> None:
+    """Common product aliases must not fall through to self-hosted EC2."""
+
+    identities = DeepSeekIntentParser._inventory_keys_for_line(source)
+
+    assert [service for service, _display in identities] == [expected_service]
+
+
+def test_ebs_attachment_word_does_not_split_an_explicit_ec2_component() -> None:
+    identities = DeepSeekIntentParser._inventory_keys_for_line(
+        "Amazon EC2：2台m7i.large，每台100GiB EBS gp3系统盘。"
+    )
+
+    assert [service for service, _display in identities] == ["ec2"]
 
 
 def test_explicit_inventory_preserves_every_named_component_and_removes_msk_as_ec2() -> None:
@@ -5989,15 +6776,15 @@ def test_memorydb_identity_and_explicit_capacity_survive_redis_normalization() -
                 "connection_minutes": 15_000_000.0,
             },
         ),
-            (
-                "global_accelerator",
-                "AWS Global Accelerator：数量1，配置2个Listener、4个Endpoint，每月通过加速器传输约3TB数据",
-                {
-                    "listener_count": 2,
-                    "endpoint_count": 4,
-                    "data_transfer_out_gib": 3072.0,
-                },
-            ),
+        (
+            "global_accelerator",
+            "AWS Global Accelerator：数量1，配置2个Listener、4个Endpoint，每月通过加速器传输约3TB数据",
+            {
+                "listener_count": 2,
+                "endpoint_count": 4,
+                "data_transfer_out_gib": 3072.0,
+            },
+        ),
     ],
 )
 def test_universal_pricing_fact_ledger_preserves_official_dimensions(
@@ -6085,8 +6872,7 @@ def test_customer_edits_outrank_original_rds_quantity_version_model_and_storage(
                 service="rds",
                 quantity=3,
                 source_text=(
-                    "RDS MySQL：数量1，MySQL 5.7.44，单实例4核16GB/40GB存储，"
-                    "实例规格db.m4.xlarge"
+                    "RDS MySQL：数量1，MySQL 5.7.44，单实例4核16GB/40GB存储，实例规格db.m4.xlarge"
                 ),
                 requirements={
                     "engine": "mysql",
@@ -6326,10 +7112,7 @@ def test_customer_quantity_and_rhel_are_locked_from_original_text() -> None:
             ),
             ServiceRequirement(
                 service="ec2",
-                source_text=(
-                    "Amazon EC2跳板服务器：数量1，2C2G/40G，"
-                    "Red Hat 9，实例类型t3.small"
-                ),
+                source_text=("Amazon EC2跳板服务器：数量1，2C2G/40G，Red Hat 9，实例类型t3.small"),
                 requirements={"operating_system": "linux"},
             ),
         ],
@@ -6349,10 +7132,7 @@ def test_customer_quantity_and_rhel_are_locked_from_original_text() -> None:
 
 
 def test_chinese_labels_cannot_hide_customer_ec2_model_or_compact_disk() -> None:
-    source = (
-        "Amazon EC2：数量5，单台8核32GB/250GB存储，"
-        "实例类型m6i.2xlarge，Ubuntu 22.04"
-    )
+    source = "Amazon EC2：数量5，单台8核32GB/250GB存储，实例类型m6i.2xlarge，Ubuntu 22.04"
     parsed = ParsedIntent(
         customer_summary="EC2",
         services=[
@@ -6383,11 +7163,38 @@ def test_chinese_labels_cannot_hide_customer_ec2_model_or_compact_disk() -> None
     assert "requirements.requested_model" in component.locked_fields
 
 
-def test_waf_keeps_per_acl_rules_and_request_scope_independent_from_quantity() -> None:
-    source = (
-        "AWS WAF：数量2，每个Web ACL配置12条规则，"
-        "每个Web ACL每月处理约6000万次请求"
+def test_product_identity_repairs_a_stale_generic_adapter_route() -> None:
+    parsed = ParsedIntent(
+        customer_summary="MSK",
+        services=[
+            ServiceRequirement(
+                service="ec2",
+                calculator_service_name="Amazon EC2 云服务器",
+                product_identity="amazon_msk_provisioned",
+                source_text=(
+                    "Kafka，Amazon MSK，m7g.xlarge，4 vCPU，16 GiB，3个 Broker，1 TiB/Broker"
+                ),
+                requirements={
+                    "cluster_type": "provisioned",
+                    "requested_model": "m7g.xlarge",
+                    "broker_count": 3,
+                    "storage_gib_per_broker": 1024,
+                },
+            )
+        ],
     )
+
+    preserve_customer_configuration(parsed)
+
+    component = parsed.services[0]
+    assert component.service == "msk"
+    assert component.product_identity == "amazon_msk_provisioned"
+    assert component.calculator_service_name == "Amazon MSK Provisioned"
+    assert component.requirements["requested_model"] == "m7g.xlarge"
+
+
+def test_waf_keeps_per_acl_rules_and_request_scope_independent_from_quantity() -> None:
+    source = "AWS WAF：数量2，每个Web ACL配置12条规则，每个Web ACL每月处理约6000万次请求"
     parsed = ParsedIntent(
         customer_summary="WAF",
         services=[
@@ -6434,8 +7241,7 @@ def test_rds_model_and_version_survive_chinese_text_without_ascii_separator() ->
             ServiceRequirement(
                 service="rds",
                 source_text=(
-                    "Amazon RDS for MySQL：数量1，MySQL 5.7.44，"
-                    "实例规格db.m4.xlarge，单实例4核16GB"
+                    "Amazon RDS for MySQL：数量1，MySQL 5.7.44，实例规格db.m4.xlarge，单实例4核16GB"
                 ),
                 requirements={"engine": "mysql", "vcpu": 4, "memory_gib": 16},
             )
@@ -6500,114 +7306,12 @@ def test_nacos_product_identity_beats_partial_capability_match() -> None:
     assert keys == [("ec2", "Amazon EC2")]
 
 
-def test_nacos_requires_clear_managed_or_self_hosted_decision_and_keeps_nodes() -> None:
-    parsed = ParsedIntent(
-        customer_summary="Nacos",
-        services=[
-            ServiceRequirement(
-                service="cloud_map",
-                calculator_service_name="AWS Cloud Map",
-                quantity=1,
-                region="ap-southeast-1",
-                source_text="Nacos：服务注册发现和配置中心，部署数量：3个节点",
-            )
-        ],
-    )
-
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed)
-
-    assert parsed.services[0].service == "ec2"
-    assert parsed.services[0].quantity == 3
-    assert parsed.services[0].requirements["operating_system"] == "linux"
-    assert parsed.services[0].field_sources["_pending_architecture_decision"] == "system_policy"
-    assert len(parsed.ambiguities) == 1
-    assert "Cloud Map + AppConfig" in parsed.ambiguities[0]
-    assert "3 个节点" in parsed.ambiguities[0]
 
 
-def test_all_named_self_hosted_partial_replacements_enter_staged_workflow() -> None:
-    parsed = ParsedIntent(
-        customer_summary="XXL-JOB",
-        services=[
-            ServiceRequirement(
-                service="ec2",
-                calculator_service_name="Amazon EC2（自建 XXL-JOB）",
-                quantity=2,
-                source_text="XXL-JOB 调度中心，部署 2 个节点",
-            )
-        ],
-        ambiguities=[
-            "XXL-JOB 没有完全等价的 AWS 托管服务，请选择 AWS 托管方案还是保留原产品自建。"
-        ],
-    )
-
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed)
-
-    assert parsed.services[0].field_sources["_pending_architecture_decision"] == "system_policy"
 
 
-def test_named_clickhouse_ec2_cannot_skip_self_hosted_architecture_decision() -> None:
-    parsed = ParsedIntent(
-        customer_summary="ClickHouse",
-        services=[
-            ServiceRequirement(
-                service="ec2",
-                calculator_service_name="Amazon EC2",
-                quantity=3,
-                source_text=(
-                    "ClickHouse：用途：实时数据分析和报表查询，部署数量：3个节点，"
-                    "每节点配置：8核32GB，存储容量：1TB/节点"
-                ),
-                requirements={
-                    "vcpu": 8,
-                    "memory_gib": 32,
-                    "system_disk_gib": 1024,
-                },
-            )
-        ],
-    )
-
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed)
-
-    component = parsed.services[0]
-    assert component.calculator_service_name == "Amazon EC2（自建 ClickHouse）"
-    assert component.field_sources["_pending_architecture_decision"] == "system_policy"
-    assert len(parsed.ambiguities) == 1
-    assert "3 个节点" in parsed.ambiguities[0]
-    assert "每节点 8 核 32 GiB" in parsed.ambiguities[0]
-    assert "每节点 1024 GiB 存储" in parsed.ambiguities[0]
 
 
-def test_explicit_clickhouse_ec2_is_already_a_self_hosted_decision() -> None:
-    source = "ClickHouse：EC2 m6i.xlarge (4C16G) + gp3 500GB，数量1"
-    parsed = ParsedIntent(
-        customer_summary="ClickHouse",
-        services=[
-            ServiceRequirement(
-                service="ec2",
-                calculator_service_name="Amazon EC2",
-                source_text=source,
-                requirements={},
-            )
-        ],
-        ambiguities=["AWS 没有与 ClickHouse 完全等价的托管服务，请选择托管还是自建。"],
-    )
-
-    DeepSeekIntentParser._reconcile_explicit_models(source, parsed)
-    DeepSeekIntentParser._reconcile_explicit_capacities(source, parsed)
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, source)
-
-    component = parsed.services[0]
-    assert component.calculator_service_name == "Amazon EC2（自建 ClickHouse）"
-    assert component.field_sources["_architecture_decision"] == "customer_text"
-    assert "_pending_architecture_decision" not in component.field_sources
-    assert parsed.ambiguities == []
-    assert component.requirements["requested_model"] == "m6i.xlarge"
-    assert component.requirements["vcpu"] == 4
-    assert component.requirements["memory_gib"] == 16
-    assert component.requirements["system_disk_gib"] == 500
-    assert component.requirements["volume_type"] == "gp3"
-    assert "requirements.system_disk_gib" in component.locked_fields
 
 
 def test_explicit_quicksight_is_routed_to_its_native_component_template() -> None:
@@ -6624,7 +7328,6 @@ def test_explicit_quicksight_is_routed_to_its_native_component_template() -> Non
     )
 
     DeepSeekIntentParser._reconcile_explicit_component_inventory(source, parsed)
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, source)
 
     component = parsed.services[0]
     assert component.service == "quicksight"
@@ -6635,64 +7338,8 @@ def test_explicit_quicksight_is_routed_to_its_native_component_template() -> Non
     assert parsed.ambiguities == []
 
 
-def test_literal_clickhouse_service_key_still_requires_architecture_decision() -> None:
-    parsed = ParsedIntent(
-        customer_summary="ClickHouse",
-        services=[
-            ServiceRequirement(
-                service="clickhouse",
-                calculator_service_name="ClickHouse",
-                quantity=3,
-                source_text=(
-                    "ClickHouse：用途：实时数据分析和报表查询，部署数量：3个节点，"
-                    "每节点配置：8核32GB，存储容量：1TB/节点"
-                ),
-                requirements={
-                    "vcpu": 8,
-                    "memory_gib": 32,
-                    "system_disk_gib": 1024,
-                },
-            )
-        ],
-    )
-
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed)
-
-    component = parsed.services[0]
-    assert component.service == "ec2"
-    assert component.calculator_service_name == "Amazon EC2（自建 ClickHouse）"
-    assert component.field_sources["_pending_architecture_decision"] == "system_policy"
-    assert len(parsed.ambiguities) == 1
-    assert "托管方案" in parsed.ambiguities[0]
-    assert "EC2 上自建 ClickHouse" in parsed.ambiguities[0]
 
 
-def test_clickhouse_header_only_recovers_full_numbered_block_before_decision() -> None:
-    parsed = ParsedIntent(
-        customer_summary="ClickHouse",
-        services=[
-            ServiceRequirement(
-                service="clickhouse",
-                calculator_service_name="ClickHouse",
-                source_text="ClickHouse：",
-            )
-        ],
-    )
-    original = (
-        "1、Amazon EC2：数量 2 台\n"
-        "2、ClickHouse：用途：实时分析，部署数量：3个节点，"
-        "每节点配置：8核32GB，存储容量：1TB/节点\n"
-        "3、Amazon S3：标准存储"
-    )
-
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, original)
-
-    component = parsed.services[0]
-    assert component.service == "ec2"
-    assert component.quantity == 3
-    assert "每节点配置：8核32GB" in (component.source_text or "")
-    assert component.field_sources["_pending_architecture_decision"] == "system_policy"
-    assert "3 个节点" in parsed.ambiguities[0]
 
 
 def test_multiline_blocks_repair_units_and_split_eks_worker_nodes() -> None:
@@ -7000,41 +7647,9 @@ def test_customer_selected_model_outweighs_older_model_in_original_text() -> Non
     DeepSeekIntentParser._drop_unwritten_requested_models(source, parsed)
 
     assert component.requirements["requested_model"] == "db.r7g.xlarge"
-    assert (
-        component.field_sources["requirements.requested_model"]
-        == "customer_confirmation"
-    )
+    assert component.field_sources["requirements.requested_model"] == "customer_confirmation"
 
 
-def test_colon_labeled_memory_survives_when_customer_also_gives_model() -> None:
-    rds_source = """Amazon RDS PostgreSQL
-规格：db.m6g.large
-CPU：2 vCPU
-内存：8 GiB
-存储：300GB"""
-    redis_source = """Amazon ElastiCache Redis
-规格：cache.r7g.large
-内存：13GB"""
-    parsed = ParsedIntent(
-        customer_summary="x",
-        services=[
-            ServiceRequirement(
-                service="rds",
-                source_text=rds_source,
-                requirements={"requested_model": "db.m6g.large", "vcpu": 2, "memory_gib": 8},
-            ),
-            ServiceRequirement(
-                service="elasticache",
-                source_text=redis_source,
-                requirements={"requested_model": "cache.r7g.large", "memory_gib": 13},
-            ),
-        ],
-    )
-
-    DeepSeekIntentParser._drop_specs_inferred_from_models(f"{rds_source}\n\n{redis_source}", parsed)
-
-    assert parsed.services[0].requirements["memory_gib"] == 8
-    assert parsed.services[1].requirements["memory_gib"] == 13
 
 
 def test_aurora_cluster_members_and_opensearch_nodes_are_lossless() -> None:
@@ -7165,6 +7780,32 @@ def test_lambda_total_invocations_keep_aggregate_scope_during_reconciliation() -
     assert requirement.requirements["requests"] == 20_000_000
     assert requirement.field_scopes["requests"] == "aggregate"
     assert requirement.field_match_policies["requests"] == "approximate"
+
+
+@pytest.mark.parametrize(
+    ("duration_phrase", "expected_ms"),
+    [
+        ("单次400ms", 400),
+        ("每次耗时250毫秒", 250),
+        ("平均执行0.75秒", 750),
+    ],
+)
+def test_lambda_duration_paraphrases_bind_to_one_duration_field(
+    duration_phrase: str,
+    expected_ms: float,
+) -> None:
+    source = f"事件处理函数：每月调用300万次，{duration_phrase}，内存768MB。"
+    parsed = ParsedIntent(
+        customer_summary="lambda",
+        services=[ServiceRequirement(service="lambda", source_text=source)],
+    )
+
+    DeepSeekIntentParser._reconcile_explicit_capacities(source, parsed)
+
+    requirement = parsed.services[0]
+    assert requirement.requirements["duration_ms"] == expected_ms
+    assert requirement.field_sources["requirements.duration_ms"] == "customer_text"
+    assert "duration_ms" not in {fact.field_hint for fact in requirement.unmapped_pricing_facts}
 
 
 def test_aurora_high_availability_uses_minimum_members_without_rewriting_product() -> None:
@@ -7627,10 +8268,7 @@ def test_numbered_shorthand_blocks_restore_opensearch_storage_and_unsized_eks_wo
 
 
 def test_compound_ecs_worker_row_keeps_distinct_products_and_owned_facts() -> None:
-    source = (
-        "1、Amazon ECS，1套集群，EC2 Worker节点4台，"
-        "单台8核16G，磁盘300G"
-    )
+    source = "1、Amazon ECS，1套集群，EC2 Worker节点4台，单台8核16G，磁盘300G"
     parsed = ParsedIntent(
         customer_summary=source,
         services=[
@@ -7646,6 +8284,17 @@ def test_compound_ecs_worker_row_keeps_distinct_products_and_owned_facts() -> No
 
     DeepSeekIntentParser._reconcile_explicit_component_inventory(source, parsed)
     DeepSeekIntentParser._isolate_shared_component_sources(parsed)
+    DeepSeekIntentParser._link_ecs_worker_nodes(parsed)
+    # Inventory binds ownership; isolated AI owns fields inside each slice.
+    parent, child = parsed.services
+    parent.requirements = {"cluster_count": 1, "launch_type": "ec2"}
+    parent.field_evidence = {**parent.field_evidence, "requirements.cluster_count": "1套集群"}
+    parent.field_sources["requirements.cluster_count"] = "customer_text"
+    cleaned_child = _validated_template_component("ec2", customer_owned_source(child),
+        {"vcpu": 8, "memory_gib": 16, "system_disk_gib": 300}, quantity=4)
+    DeepSeekIntentParser._restore_authoritative_component_fields(child, cleaned_child)
+    cleaned_child.calculator_service_name = child.calculator_service_name
+    parsed.services[1] = cleaned_child
     DeepSeekIntentParser.reconcile_customer_pricing_facts(parsed)
 
     assert [item.service for item in parsed.services] == ["ecs", "ec2"]
@@ -7659,9 +8308,111 @@ def test_compound_ecs_worker_row_keeps_distinct_products_and_owned_facts() -> No
     assert worker.requirements["vcpu"] == 8
     assert worker.requirements["memory_gib"] == 16
     assert worker.requirements["system_disk_gib"] == 300
-    assert not DeepSeekIntentParser._uncovered_quantitative_claim_issues(
-        worker.source_text, worker
+    assert not DeepSeekIntentParser._uncovered_quantitative_claim_issues(worker.source_text, worker)
+
+
+def test_ecs_worker_topology_isolated_before_component_template_cleanup() -> None:
+    """A parent template must never be asked to consume its child's shape."""
+
+    source = "容器服务（ECS），1套，EC2工作节点5台，单台8核32G，磁盘400G"
+    parsed = ParsedIntent(
+        customer_summary=source,
+        services=[
+            ServiceRequirement(
+                service="ecs",
+                calculator_service_name="Amazon ECS",
+                source_text=source,
+                original_source_text=source,
+            )
+        ],
     )
+
+    DeepSeekIntentParser._link_ecs_worker_nodes(parsed)
+
+    parent = next(item for item in parsed.services if item.service == "ecs")
+    worker = next(item for item in parsed.services if item.service == "ec2")
+    assert "1套" in customer_owned_source(parent)
+    assert "32G" not in customer_owned_source(parent)
+    assert "400G" not in customer_owned_source(parent)
+    assert "5台" in customer_owned_source(worker)
+    assert "32G" in customer_owned_source(worker)
+    assert "400G" in customer_owned_source(worker)
+    assert worker.parent_component_key == parent.component_key
+    assert worker.quantity == 5
+    assert worker.requirements["vcpu"] == 8
+    assert worker.requirements["memory_gib"] == 32
+    assert worker.requirements["system_disk_gib"] == 400
+    assert not DeepSeekIntentParser._uncovered_quantitative_claim_issues(
+        customer_owned_source(worker), worker
+    )
+
+
+def test_ai_cleaned_ecs_facts_are_not_reparsed_from_full_customer_sentence() -> None:
+    """Later compatibility code cannot change AI-reviewed field ownership."""
+
+    source = "容器服务（ECS），1套，EC2工作节点5台，单台8核32G，磁盘400G"
+    parent = ServiceRequirement(
+        service="ecs",
+        calculator_service_name="Amazon ECS",
+        source_text=source,
+        original_source_text=source,
+        requirements={"cluster_count": 1, "launch_type": "EC2"},
+        field_sources={
+            "requirements.cluster_count": "customer_text",
+            "requirements.launch_type": "customer_text",
+            "_semantic_fact_mapping": "ai_cleaning",
+        },
+        field_evidence={
+            "requirements.cluster_count": "1套",
+            "requirements.launch_type": "EC2工作节点",
+        },
+        locked_fields=[
+            "requirements.cluster_count",
+            "requirements.launch_type",
+        ],
+        unmapped_pricing_facts=[
+            UnmappedPricingFact(
+                field_hint="工作节点数量",
+                value=5,
+                unit="台",
+                scope="aggregate",
+                evidence="EC2工作节点5台",
+            ),
+            UnmappedPricingFact(
+                field_hint="单工作节点CPU核心数",
+                value=8,
+                unit="核",
+                scope="per_node",
+                evidence="单台8核",
+            ),
+            UnmappedPricingFact(
+                field_hint="单工作节点内存容量",
+                value=32,
+                unit="GiB",
+                scope="per_node",
+                evidence="32G",
+            ),
+            UnmappedPricingFact(
+                field_hint="单工作节点磁盘容量",
+                value=400,
+                unit="GiB",
+                scope="per_node",
+                evidence="磁盘400G",
+            ),
+        ],
+    )
+    parsed = ParsedIntent(customer_summary=source, services=[parent])
+
+    DeepSeekIntentParser.reconcile_customer_pricing_facts(parsed)
+
+    ecs = next(item for item in parsed.services if item.service == "ecs")
+    # A sealed component is never expanded by rereading its sentence. The
+    # parent/child split belongs to the pre-clean ownership stage.
+    assert [item.service for item in parsed.services] == ["ecs"]
+    assert ecs.requirements["cluster_count"] == 1
+    assert ecs.field_evidence["requirements.cluster_count"] == "1套"
+    assert "task_vcpu" not in ecs.requirements
+    assert customer_fact_ledger_is_current(ecs)
 
 
 def test_product_identifier_digit_is_not_reinterpreted_as_worker_count() -> None:
@@ -7685,13 +8436,8 @@ def test_product_identifier_digit_is_not_reinterpreted_as_worker_count() -> None
 
 
 def test_rds_instance_count_and_memorydb_shape_use_shared_fact_contract() -> None:
-    rds_source = (
-        "Amazon RDS PostgreSQL，2个实例，单实例8核32G，"
-        "存储1.5T，Multi-AZ部署"
-    )
-    memorydb_source = (
-        "Amazon MemoryDB for Redis，1套集群，3个节点，单节点8核32G"
-    )
+    rds_source = "Amazon RDS PostgreSQL，2个实例，单实例8核32G，存储1.5T，Multi-AZ部署"
+    memorydb_source = "Amazon MemoryDB for Redis，1套集群，3个节点，单节点8核32G"
     parsed = ParsedIntent(
         customer_summary="test",
         services=[
@@ -7700,6 +8446,12 @@ def test_rds_instance_count_and_memorydb_shape_use_shared_fact_contract() -> Non
         ],
     )
 
+    parsed.services = [
+        _validated_template_component("rds", rds_source, {"instance_count": 2, "vcpu": 8, "memory_gib": 32, "storage_gib": 1536}),
+        _validated_template_component("memorydb", memorydb_source, {"node_count": 3, "vcpu": 8, "memory_gib": 32}),
+    ]
+    parsed.services[1].field_evidence["quantity"] = "1套集群"
+    parsed.services[1].field_sources["quantity"] = "customer_text"
     DeepSeekIntentParser.reconcile_customer_pricing_facts(parsed)
 
     rds, memorydb = parsed.services
@@ -7712,12 +8464,9 @@ def test_rds_instance_count_and_memorydb_shape_use_shared_fact_contract() -> Non
     assert memorydb.requirements["node_count"] == 3
     assert memorydb.requirements["vcpu"] == 8
     assert memorydb.requirements["memory_gib"] == 32
-    assert not DeepSeekIntentParser._uncovered_quantitative_claim_issues(
-        rds_source, rds
-    )
-    assert not DeepSeekIntentParser._uncovered_quantitative_claim_issues(
-        memorydb_source, memorydb
-    )
+    assert not DeepSeekIntentParser._uncovered_quantitative_claim_issues(rds_source, rds)
+    assert not DeepSeekIntentParser._uncovered_quantitative_claim_issues(memorydb_source, memorydb)
+
 
 
 def test_rds_standardized_node_count_survives_template_and_fact_ledger() -> None:
@@ -7736,8 +8485,11 @@ def test_rds_standardized_node_count_survives_template_and_fact_ledger() -> None
             "storage_gib": 800,
             "deployment": "primary_standby",
         },
-        field_sources={"requirements.node_count": "customer_text"},
-        field_evidence={"requirements.node_count": "节点数量：2台"},
+        field_sources={f"requirements.{field}": "customer_text" for field in
+                       ("node_count", "vcpu", "memory_gib", "storage_gib", "deployment")},
+        field_evidence={"requirements.node_count": "节点数量：2台",
+                        "requirements.vcpu": "4核", "requirements.memory_gib": "16GB",
+                        "requirements.storage_gib": "800GB", "requirements.deployment": "主备"},
         locked_fields=["requirements.node_count"],
     )
     parsed = ParsedIntent(customer_summary=source, services=[component])
@@ -7749,9 +8501,7 @@ def test_rds_standardized_node_count_survives_template_and_fact_ledger() -> None
     assert component.requirements["instance_count"] == 2
     assert component.field_evidence["requirements.instance_count"] == "节点数量：2台"
     assert "requirements.instance_count" in component.locked_fields
-    assert DeepSeekIntentParser._uncovered_quantitative_claim_issues(
-        source, component
-    ) == []
+    assert DeepSeekIntentParser._uncovered_quantitative_claim_issues(source, component) == []
     assert customer_fact_ledger_is_current(component)
 
 
@@ -7882,16 +8632,13 @@ def test_edited_eks_worker_is_reused_by_stable_parent_and_duplicate_is_removed()
     assert workers[0].parent_component_key == "cmp_parent_eks"
     assert workers[0].quantity == 6
     assert workers[0].requirements["system_disk_gib"] == 6776
-    assert workers[0].field_sources["requirements.system_disk_gib"] == (
-        "customer_confirmation"
-    )
+    assert workers[0].field_sources["requirements.system_disk_gib"] == ("customer_confirmation")
     assert "total_worker_system_disk_gib" not in parsed.services[0].requirements
 
 
 def test_eks_worker_disk_and_total_are_derived_from_per_worker_customer_value() -> None:
     source = (
-        "Amazon EKS：数量2，每个集群配置3个Worker节点，"
-        "Worker节点单台4核8GB/100GB存储，Linux系统"
+        "Amazon EKS：数量2，每个集群配置3个Worker节点，Worker节点单台4核8GB/100GB存储，Linux系统"
     )
     parsed = ParsedIntent(
         customer_summary="EKS",
@@ -7910,6 +8657,9 @@ def test_eks_worker_disk_and_total_are_derived_from_per_worker_customer_value() 
     parent = next(item for item in parsed.services if item.service == "eks")
     worker = next(item for item in parsed.services if item.service == "ec2")
     assert worker.quantity == 6
+    assert worker.field_sources["quantity"] == "system_derived"
+    assert worker.field_evidence["quantity"] == "system_derived"
+    assert "quantity" not in worker.locked_fields
     assert worker.requirements["system_disk_gib"] == 100
     assert worker.parent_component_key == parent.component_key
     assert not any(field.startswith("requirements.worker_") for field in parent.locked_fields)
@@ -8283,10 +9033,7 @@ def test_s3_capacity_is_recovered_from_natural_numbered_wording() -> None:
 def test_pricing_fact_conservation_recovers_s3_cloudfront_and_ec2_disk() -> None:
     """Every literal pricing dimension survives isolated component cleanup."""
 
-    s3_source = (
-        "Amazon S3：S3 Standard，存储容量20TB，"
-        "每月PUT请求约500万次，GET请求约8000万次"
-    )
+    s3_source = "Amazon S3：S3 Standard，存储容量20TB，每月PUT请求约500万次，GET请求约8000万次"
     cloudfront_source = (
         "Amazon CloudFront：数量1，每月公网下行流量10TB，"
         "每月HTTPS请求约2亿次，访问区域以亚太地区为主"
@@ -8324,10 +9071,7 @@ def test_pricing_fact_conservation_recovers_s3_cloudfront_and_ec2_disk() -> None
 
 
 def test_literal_recovery_never_overwrites_a_later_customer_edit() -> None:
-    source = (
-        "Amazon CloudFront：每月公网下行流量10TB，"
-        "每月HTTPS请求约2亿次，访问区域以亚太地区为主"
-    )
+    source = "Amazon CloudFront：每月公网下行流量10TB，每月HTTPS请求约2亿次，访问区域以亚太地区为主"
     component = ServiceRequirement(
         service="cloudfront",
         source_text=source,
@@ -8342,16 +9086,12 @@ def test_literal_recovery_never_overwrites_a_later_customer_edit() -> None:
 
     assert parsed.services[0].requirements["traffic_geography"] == "Europe"
     assert (
-        parsed.services[0].field_sources["requirements.traffic_geography"]
-        == "customer_correction"
+        parsed.services[0].field_sources["requirements.traffic_geography"] == "customer_correction"
     )
 
 
-def test_saved_draft_pricing_ledger_is_upgraded_and_stale_review_is_removed() -> None:
-    source = (
-        "Amazon CloudFront：每月公网下行流量10TB，"
-        "每月HTTPS请求约2亿次，访问区域以亚太地区为主"
-    )
+def test_typed_ledger_cannot_reinterpret_saved_customer_confirmation() -> None:
+    source = "Amazon CloudFront：每月公网下行流量10TB，每月HTTPS请求约2亿次，访问区域以亚太地区为主"
     component = ServiceRequirement(
         service="cloudfront",
         source_text=source,
@@ -8379,13 +9119,12 @@ def test_saved_draft_pricing_ledger_is_upgraded_and_stale_review_is_removed() ->
     DeepSeekIntentParser.reconcile_customer_pricing_facts(parsed)
 
     requirements = parsed.services[0].requirements
-    assert requirements["https_requests"] == 200_000_000
-    assert requirements["traffic_geography"] == "Asia Pacific"
-    assert not any(field.startswith("_review_") for field in requirements)
-    assert (
-        parsed.services[0].field_sources["requirements.traffic_geography"]
-        == "customer_text"
-    )
+    assert "https_requests" not in requirements
+    assert requirements["traffic_geography"] == "United States"
+    assert parsed.services[0].field_sources["requirements.traffic_geography"] == "customer_confirmation"
+    assert not parsed.services[0].field_sources.get("_intake_pipeline_version")
+    # Missing facts require official intake migration, not a synchronous ledger patch.
+    assert DeepSeekIntentParser._uncovered_quantitative_claim_issues(source, component)
 
 
 def test_request_claims_are_detected_when_label_precedes_the_number() -> None:
@@ -8488,10 +9227,7 @@ def test_repeated_resource_count_and_capacity_are_registered_independently() -> 
 
 
 def test_mysql_bare_primary_replica_requires_topology_confirmation() -> None:
-    source = (
-        "MySQL：每个数据库节点16核CPU、64GB内存、2TB磁盘，"
-        "共2个节点，采用1主1从。"
-    )
+    source = "MySQL：每个数据库节点16核CPU、64GB内存、2TB磁盘，共2个节点，采用1主1从。"
     parsed = ParsedIntent(
         customer_summary="MySQL",
         services=[
@@ -8518,35 +9254,14 @@ def test_mysql_bare_primary_replica_requires_topology_confirmation() -> None:
         path="quantity",
         snippet="共2个节点，采用1主1从",
     )
-    assert DeepSeekIntentParser._deterministic_component_audit_issues(
-        ServiceRequirement(service="rds", source_text=source), component
-    ) == []
-
-
-def test_self_hosted_service_switch_preserves_per_node_disk_and_count() -> None:
-    source = "Flink：每个节点24核CPU、64GB内存、500GB磁盘，共3个节点。"
-    parsed = ParsedIntent(
-        customer_summary="Flink",
-        services=[
-            ServiceRequirement(
-                service="flink",
-                calculator_service_name="Flink",
-                source_text=source,
-                requirements={"storage_gib": 500},
-            )
-        ],
+    assert (
+        DeepSeekIntentParser._deterministic_component_audit_issues(
+            ServiceRequirement(service="rds", source_text=source), component
+        )
+        == []
     )
 
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, source)
-    DeepSeekIntentParser._sanitize_parsed_requirements(parsed)
 
-    component = parsed.services[0]
-    assert component.service == "ec2"
-    assert component.quantity == 3
-    assert component.requirements["vcpu"] == 24
-    assert component.requirements["memory_gib"] == 64
-    assert component.requirements["system_disk_gib"] == 500
-    assert "storage_gib" not in component.requirements
 
 
 def test_redis_keeps_cpu_node_count_and_source_storage_separate_from_memory() -> None:
@@ -8805,6 +9520,377 @@ def test_same_service_numbered_blocks_remain_independent_by_source() -> None:
     assert all(item.service == "data_transfer" for item in parsed.services)
 
 
+def test_ecs_on_fargate_numbered_rows_remain_independent_ecs_components() -> None:
+    first = "Amazon ECS Fargate ARM服务：常驻40个Task，每个2 vCPU、4GB内存，ARM64，月运行730小时。"
+    second = "ECS on Fargate x86服务：常驻25项任务，每Task 4核8GB，x86_64，每月730小时。"
+    text = f"1、{first}\n2、{second}"
+    parsed = ParsedIntent(
+        customer_summary="双架构 Fargate",
+        services=[
+            ServiceRequirement(service="ecs", source_text=first),
+            ServiceRequirement(
+                service="ec2",
+                calculator_service_name="Amazon EC2（自建 ECS on Fargate x86服务）",
+                source_text=second,
+                requirements={"vcpu": 4, "memory_gib": 8},
+            ),
+        ],
+    )
+
+    DeepSeekIntentParser._reconcile_explicit_component_inventory(text, parsed)
+
+    assert [item.service for item in parsed.services] == ["ecs", "ecs"]
+    assert [item.original_source_text for item in parsed.services] == [first, second]
+    assert all(item.parent_component_key is None for item in parsed.services)
+    assert all(item.derived_from_service is None for item in parsed.services)
+
+
+def test_cloud_map_discovery_queries_use_api_call_field() -> None:
+    source = "AWS Cloud Map：200个服务实例，每月执行2亿次服务发现查询。"
+    component = ServiceRequirement(
+        service="cloud_map",
+        source_text=source,
+        original_source_text=source,
+    )
+
+    DeepSeekIntentParser._overlay_literal_component_facts(
+        source,
+        component,
+        extra_fields=SERVICE_TEMPLATE_FIELDS["cloud_map"],
+    )
+
+    assert component.requirements["service_instances"] == 200
+    assert component.requirements["api_calls"] == 200_000_000
+    assert "dns_queries" not in component.requirements
+    assert component.field_evidence["requirements.api_calls"] == "2亿次服务发现查询"
+
+
+def test_explicit_api_call_wording_uses_product_api_call_contract() -> None:
+    source = "Secrets Manager：保存3000个Secret，每月调用API 1亿次。"
+    component = ServiceRequirement(
+        service="secrets_manager",
+        source_text=source,
+        original_source_text=source,
+        requirements={"requests": 100_000_000},
+        field_sources={"requirements.requests": "customer_text"},
+        field_evidence={"requirements.requests": "每月调用API 1亿次"},
+        locked_fields=["requirements.requests"],
+    )
+
+    DeepSeekIntentParser._overlay_literal_component_facts(
+        source,
+        component,
+        extra_fields=SERVICE_TEMPLATE_FIELDS["secrets_manager"],
+    )
+    DeepSeekIntentParser._sanitize_parsed_requirements(
+        ParsedIntent(customer_summary=source, services=[component])
+    )
+
+    assert component.requirements["secret_count"] == 3000
+    assert component.requirements["api_calls"] == 100_000_000
+    assert "requests" not in component.requirements
+    assert component.field_sources["requirements.api_calls"] == "customer_text"
+    assert "requirements.requests" not in component.field_sources
+    assert "requirements.api_calls" in component.locked_fields
+
+
+def test_fifo_topic_and_scheduler_trigger_wording_use_stable_fields() -> None:
+    sns_source = "Amazon SNS FIFO：每月Publish 250,000,000次，并向订阅端投递4亿次。"
+    sns = ServiceRequirement(
+        service="sns",
+        source_text=sns_source,
+        original_source_text=sns_source,
+    )
+    scheduler_source = "EventBridge Scheduler：维护250个schedule，每月触发50,000,000次。"
+    scheduler = ServiceRequirement(
+        service="scheduler",
+        source_text=scheduler_source,
+        original_source_text=scheduler_source,
+    )
+
+    DeepSeekIntentParser._overlay_literal_component_facts(
+        sns_source,
+        sns,
+        extra_fields=SERVICE_TEMPLATE_FIELDS["sns"],
+    )
+    DeepSeekIntentParser._overlay_literal_component_facts(
+        scheduler_source,
+        scheduler,
+        extra_fields=SERVICE_TEMPLATE_FIELDS["scheduler"],
+    )
+
+    assert sns.requirements["topic_type"] == "fifo"
+    assert sns.requirements["requests"] == 250_000_000
+    assert sns.requirements["deliveries"] == 400_000_000
+    assert scheduler.requirements["schedules"] == 250
+    assert scheduler.requirements["scheduled_invocations"] == 50_000_000
+
+
+def test_devsecops_literal_phrasings_bind_to_product_contract_fields() -> None:
+    cases = [
+        (
+            "code_build",
+            "CodeBuild：Linux x86_64 / amd64，general1.medium，每月跑900,000 build minutes。",
+            {
+                "build_minutes": 900_000,
+                "architecture": "x86_64",
+                "operating_system": "linux",
+                "compute_type": "g1.medium",
+            },
+        ),
+        (
+            "code_build",
+            "CodeBuild Graviton runner：ARM64架构，arm1.medium，月度构建时长600,000分钟。",
+            {
+                "build_minutes": 600_000,
+                "architecture": "arm64",
+                "compute_type": "g1.medium",
+            },
+        ),
+        (
+            "code_pipeline",
+            "AWS CodePipeline流水线：V2类型，每月累计1,200,000个action execution minutes。",
+            {"pipeline_type": "v2", "action_execution_minutes": 1_200_000},
+        ),
+        (
+            "cloud_formation",
+            "CloudFormation IaC：每月调用5,000,000次第三方资源handler operation。",
+            {"resource_handler_operations": 5_000_000},
+        ),
+        (
+            "inspector_v2",
+            "Inspector v2漏洞检查：覆盖2000台EC2、5000份ECR image以及300个Lambda函数。",
+            {"ec2_instances": 2_000, "ecr_images": 5_000, "lambda_functions": 300},
+        ),
+        (
+            "security_hub",
+            "Security Hub CSPM：纳管4000个资源，每月完成30,000,000次security check。",
+            {"resource_count": 4_000, "security_checks": 30_000_000},
+        ),
+        (
+            "auditmanager",
+            "AWS Audit Manager：每月评估15,000个资源并收集8,000,000条证据。",
+            {"resource_assessments": 15_000, "evidence_items": 8_000_000},
+        ),
+        (
+            "code_deploy",
+            "CodeDeploy发布：面向EC2实例，每月更新80,000台次。",
+            {"deployment_updates": 80_000, "deployment_target": "ec2"},
+        ),
+        (
+            "code_artifact",
+            "CodeArtifact制品仓：包存储10TiB，每月2亿次request，并向互联网下载15TiB。",
+            {"data_transfer_out_gib": 15 * 1024},
+        ),
+    ]
+
+    for service, source, expected in cases:
+        component = ServiceRequirement(
+            service=service,
+            source_text=source,
+            original_source_text=source,
+        )
+        DeepSeekIntentParser._overlay_literal_component_facts(
+            source,
+            component,
+            extra_fields=SERVICE_TEMPLATE_FIELDS[service],
+        )
+        for field, value in expected.items():
+            assert component.requirements[field] == value, (service, field)
+
+
+def test_iot_and_media_literal_phrasings_bind_to_product_contract_fields() -> None:
+    """Uncommon products must keep their own meters under mixed wording."""
+
+    cases = [
+        (
+            "io_t",
+            "AWS IoT Core MQTT：50万台设备，每月累计360,000,000连接分钟并交换20亿条5KB消息。",
+            {
+                "device_count": 500_000,
+                "connection_minutes": 360_000_000,
+                "messages": 2_000_000_000,
+                "message_size_kib": 5,
+            },
+        ),
+        (
+            "io_t_device_management",
+            "IoT Device Management：登记500,000个Thing，每月下发10,000,000次remote action。",
+            {"things_registered": 500_000, "remote_actions": 10_000_000},
+        ),
+        (
+            "io_t_device_defender",
+            "AWS IoT Device Defender：保护500,000台设备，每月分析1,500,000,000个metric datapoint。",
+            {"device_count": 500_000, "metric_datapoints": 1_500_000_000},
+        ),
+        (
+            "kinesis_video",
+            "Kinesis Video Streams：月度ingest 100TiB、consumer读取300TiB，并保持50TiB视频存储。",
+            {
+                "data_in_gib": 100 * 1024,
+                "data_out_gib": 300 * 1024,
+                "storage_gib": 50 * 1024,
+            },
+        ),
+        (
+            "ivs",
+            "Amazon IVS Low-Latency Streaming：每月输入20,000 channel-hours，观众输出4,000,000 viewer-hours。",
+            {"input_channel_hours": 20_000, "viewer_hours": 4_000_000},
+        ),
+        (
+            "elemental_media_convert",
+            "AWS Elemental MediaConvert：每月转码8,000,000分钟HD视频。",
+            {"transcode_minutes": 8_000_000, "resolution": "hd"},
+        ),
+        (
+            "elemental_media_live",
+            "MediaLive标准频道：30个Standard channel，全天运行730小时。",
+            {"channel_count": 30, "channel_class": "standard", "channel_hours": 730},
+        ),
+        (
+            "elemental_media_package",
+            "AWS Elemental MediaPackage：每月摄取100TiB，并从origin向外传送300TiB。",
+            {"data_in_gib": 100 * 1024, "data_out_gib": 300 * 1024},
+        ),
+        (
+            "media_connect",
+            "AWS Elemental MediaConnect：20个output整月运行，每月传送80TiB。",
+            {"output_count": 20, "output_hours": 730, "data_transfer_out_gib": 80 * 1024},
+        ),
+        (
+            "cloudfront",
+            "CloudFront CDN：亚洲流量，每月下行500TiB，HTTPS请求量50亿次。",
+            {
+                "data_transfer_out_gib": 500 * 1024,
+                "https_requests": 5_000_000_000,
+                "traffic_geography": "Asia Pacific",
+            },
+        ),
+    ]
+
+    for service, source, expected in cases:
+        component = ServiceRequirement(
+            service=service,
+            source_text=source,
+            original_source_text=source,
+        )
+        DeepSeekIntentParser._overlay_literal_component_facts(
+            source,
+            component,
+            extra_fields=(
+                *SERVICE_TEMPLATE_FIELDS[service],
+                *(
+                    ("processing_hours", "audio_minutes")
+                    if service == "elemental_media_convert"
+                    else ()
+                ),
+            ),
+        )
+        DeepSeekIntentParser._sanitize_parsed_requirements(
+            ParsedIntent(customer_summary=source, services=[component])
+        )
+
+        for field, value in expected.items():
+            assert component.requirements[field] == value, (service, field)
+        assert (
+            not {
+                "audio_minutes",
+                "processing_hours",
+            }.intersection(component.requirements)
+            if service == "elemental_media_convert"
+            else True
+        )
+
+
+def test_whole_month_output_runtime_replaces_nonliteral_ai_hour_guess() -> None:
+    source = "AWS Elemental MediaConnect：20个output整月运行，每月传送80TiB。"
+    component = ServiceRequirement(
+        service="media_connect",
+        source_text=source,
+        original_source_text=source,
+        requirements={"output_hours": 744},
+        field_sources={"requirements.output_hours": "customer_text"},
+        field_evidence={"requirements.output_hours": "整月运行"},
+        locked_fields=["requirements.output_hours"],
+    )
+
+    DeepSeekIntentParser._overlay_literal_component_facts(
+        source,
+        component,
+        extra_fields=SERVICE_TEMPLATE_FIELDS["media_connect"],
+    )
+
+    assert component.requirements["output_hours"] == 730
+    assert component.field_sources["requirements.output_hours"] == "system_default"
+    assert "requirements.output_hours" not in component.locked_fields
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_quantity"),
+    [
+        ("EC2 Graviton fleet：3 x c7g.large instances，ARM64。", 3),
+        ("Elastic Compute Cloud pool：2 pcs m7i.large，x86-64。", 2),
+    ],
+)
+def test_english_ec2_quantity_notation_is_bound_to_top_level_quantity(
+    source: str,
+    expected_quantity: int,
+) -> None:
+    component = ServiceRequirement(service="ec2", source_text=source)
+
+    DeepSeekIntentParser._overlay_literal_component_facts(
+        source,
+        component,
+        extra_fields=SERVICE_TEMPLATE_FIELDS["ec2"],
+    )
+
+    assert component.quantity == expected_quantity
+    assert component.field_sources["quantity"] == "customer_text"
+
+
+def test_pib_storage_is_normalized_to_gib_without_losing_the_literal() -> None:
+    source = "Simple Storage Service S3：Standard tier capacity 1.2 PiB。"
+    component = ServiceRequirement(service="s3", source_text=source)
+
+    DeepSeekIntentParser._overlay_literal_component_facts(
+        source,
+        component,
+        extra_fields=SERVICE_TEMPLATE_FIELDS["s3"],
+    )
+
+    assert component.requirements["storage_gib"] == pytest.approx(1.2 * 1024 * 1024)
+    assert component.field_evidence["requirements.storage_gib"].endswith("1.2 PiB")
+
+
+def test_english_sqs_requests_and_payload_are_preserved_by_shared_contract() -> None:
+    source = "Simple Queue Service SQS：2.4 billion requests per month，average payload 64 KiB。"
+    component = ServiceRequirement(service="sqs", source_text=source)
+
+    DeepSeekIntentParser._overlay_literal_component_facts(
+        source,
+        component,
+        extra_fields=SERVICE_TEMPLATE_FIELDS["sqs"],
+    )
+
+    assert component.requirements["requests"] == 2_400_000_000
+    assert component.requirements["payload_size_kib"] == 64
+
+
+def test_cloudfront_english_egress_and_us_geography_are_preserved() -> None:
+    source = "CDN CloudFront：US viewers，256 TiB monthly egress，3.2 billion HTTPS requests。"
+    component = ServiceRequirement(service="cloudfront", source_text=source)
+
+    DeepSeekIntentParser._overlay_literal_component_facts(
+        source,
+        component,
+        extra_fields=SERVICE_TEMPLATE_FIELDS["cloudfront"],
+    )
+
+    assert component.requirements["data_transfer_out_gib"] == 256 * 1024
+    assert component.requirements["https_requests"] == 3_200_000_000
+    assert component.requirements["traffic_geography"] == "United States"
+
+
 def test_space_numbered_components_do_not_split_numbered_service_fields() -> None:
     text = """1 Amazon EC2
 区域：新加坡
@@ -8901,7 +9987,6 @@ def test_identical_numbered_vm_rows_are_never_deduplicated() -> None:
 
     DeepSeekIntentParser._reconcile_explicit_component_inventory(text, parsed)
     DeepSeekIntentParser._reconcile_explicit_regions(text, parsed)
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, text)
     DeepSeekIntentParser._merge_duplicate_service_fragments(parsed)
 
     assert len(parsed.services) == 9
@@ -8909,25 +9994,6 @@ def test_identical_numbered_vm_rows_are_never_deduplicated() -> None:
     assert all(item.region == "ap-southeast-1" for item in parsed.services)
 
 
-def test_plain_vm_shape_does_not_enter_third_party_architecture_flow() -> None:
-    source = "8 vCPU｜32 GiB｜c7n.2xl...｜Debian 12.0.0 64bit"
-    parsed = ParsedIntent(
-        customer_summary="服务器",
-        services=[
-            ServiceRequirement(
-                service="8_vcpu_32_gib_c7n_2xl",
-                calculator_service_name="8 vCPU | 32 GiB | c7n.2xl",
-                source_text=source,
-                requirements={"vcpu": 8, "memory_gib": 32},
-            )
-        ],
-    )
-
-    DeepSeekIntentParser._append_third_party_managed_decisions(parsed, source)
-
-    assert parsed.services[0].service == "ec2"
-    assert parsed.services[0].calculator_service_name == "Amazon EC2 云服务器"
-    assert parsed.ambiguities == []
 
 
 def test_legacy_deduplicated_vm_draft_restores_every_numbered_owner() -> None:
@@ -9014,9 +10080,7 @@ def test_customer_replacement_model_prevents_old_shape_from_being_restored() -> 
 
     DeepSeekIntentParser.reconcile_customer_pricing_facts(parsed)
 
-    assert parsed.services[0].requirements == {
-        "requested_model": "db.r6g.xlarge"
-    }
+    assert parsed.services[0].requirements == {"requested_model": "db.r6g.xlarge"}
 
 
 def test_text_glued_before_first_number_cannot_hide_first_component() -> None:
@@ -9397,21 +10461,19 @@ def test_component_fact_table_normalizes_task_log_and_ingestion_language(
         ],
     )
 
+    intent.services[0] = _validated_template_component(service, source, expected)
     DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
 
     component = intent.services[0]
     assert component.requirements == expected
     assert customer_fact_ledger_is_current(component)
-    assert DeepSeekIntentParser._uncovered_quantitative_claim_issues(
-        source, component
-    ) == []
-    assert {
-        fact.path for fact in component.customer_pricing_facts
-    } == {
+    assert DeepSeekIntentParser._uncovered_quantitative_claim_issues(source, component) == []
+    assert {fact.path for fact in component.customer_pricing_facts} == {
         f"requirements.{field}"
         for field, value in expected.items()
         if isinstance(value, (int, float)) and not isinstance(value, bool)
     }
+
 
 
 @pytest.mark.parametrize(
@@ -9442,13 +10504,13 @@ def test_component_fact_table_normalizes_task_log_and_ingestion_language(
         ),
     ],
 )
-def test_component_fact_table_fallback_recovers_template_driven_performance_facts(
+def test_component_fact_table_preserves_validated_performance_template(
     service: str,
     source: str,
     expected_requirements: dict[str, object],
     expected_hours: float,
 ) -> None:
-    """A component AI timeout must still leave a complete customer fact table."""
+    """Validated performance fields must survive typed fact finalization."""
 
     intent = ParsedIntent(
         customer_summary=source,
@@ -9462,6 +10524,8 @@ def test_component_fact_table_fallback_recovers_template_driven_performance_fact
         ],
     )
 
+    intent.services[0] = _validated_template_component(service, source, expected_requirements,
+        hours_evidence="每月运行730小时" if service == "dms" else None)
     DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
 
     component = intent.services[0]
@@ -9469,6 +10533,108 @@ def test_component_fact_table_fallback_recovers_template_driven_performance_fact
         assert component.requirements[field] == value
     assert component.hours_per_month == expected_hours
     assert customer_fact_ledger_is_current(component)
-    assert DeepSeekIntentParser._uncovered_quantitative_claim_issues(
-        source, component
-    ) == []
+    assert DeepSeekIntentParser._uncovered_quantitative_claim_issues(source, component) == []
+
+
+
+@pytest.mark.parametrize(
+    ("service", "source", "expected_model"),
+    [
+        ("app_stream", "AppStream：stream.standard.large实例", "stream.standard.large"),
+        ("future_service", "新服务型号：family.standard.large", "family.standard.large"),
+    ],
+)
+def test_generic_labelled_model_literal_accepts_suffix_and_prefix_labels(
+    service: str,
+    source: str,
+    expected_model: str,
+) -> None:
+    """Catalog-only products must not lose models because the label moved."""
+
+    intent = ParsedIntent(
+        customer_summary=source,
+        services=[
+            ServiceRequirement(
+                service=service,
+                calculator_service_name=service,
+                source_text=source,
+                original_source_text=source,
+            )
+        ],
+    )
+
+    intent.services[0] = _validated_template_component(service, source, {"requested_model": expected_model})
+    DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
+
+    component = intent.services[0]
+    assert component.requirements["requested_model"] == expected_model
+    assert component.field_sources["requirements.requested_model"] == "customer_text"
+    assert component.field_evidence["requirements.requested_model"] in source
+
+
+
+def test_appstream_monthly_per_user_usage_has_one_customer_owned_fact_per_number() -> None:
+    source = "Amazon AppStream 2.0：200名并发用户，stream.standard.large实例，每月每人使用120小时。"
+    intent = ParsedIntent(
+        customer_summary=source,
+        services=[
+            ServiceRequirement(
+                service="app_stream",
+                calculator_service_name="Amazon AppStream 2.0",
+                source_text=source,
+                original_source_text=source,
+            )
+        ],
+    )
+
+    intent.services[0] = _validated_template_component("app_stream", source, {
+        "requested_model": "stream.standard.large", "user_count": 200, "hours_per_user_per_month": 120})
+    DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
+
+    component = intent.services[0]
+    assert component.requirements == {
+        "requested_model": "stream.standard.large",
+        "user_count": 200,
+        "hours_per_user_per_month": 120,
+    }
+    assert {
+        path: source_name
+        for path, source_name in component.field_sources.items()
+        if path.startswith("requirements.")
+    } == {
+        "requirements.requested_model": "customer_text",
+        "requirements.user_count": "customer_text",
+        "requirements.hours_per_user_per_month": "customer_text",
+    }
+    assert DeepSeekIntentParser._uncovered_quantitative_claim_issues(source, component) == []
+
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "Amazon WorkMail：1000个邮箱账户。",
+        "Amazon WorkMail needs 1,000 mailboxes.",
+        "WorkMail 邮箱账号数：1000。",
+    ],
+)
+def test_workmail_mailbox_wording_maps_to_user_count(source: str) -> None:
+    intent = ParsedIntent(
+        customer_summary=source,
+        services=[
+            ServiceRequirement(
+                service="work_mail",
+                calculator_service_name="Amazon WorkMail",
+                source_text=source,
+                original_source_text=source,
+            )
+        ],
+    )
+
+    intent.services[0] = _validated_template_component("work_mail", source, {"user_count": 1000})
+    DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
+
+    component = intent.services[0]
+    assert component.requirements == {"user_count": 1000}
+    assert component.field_sources["requirements.user_count"] == "customer_text"
+    assert DeepSeekIntentParser._uncovered_quantitative_claim_issues(source, component) == []

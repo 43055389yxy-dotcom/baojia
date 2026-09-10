@@ -61,6 +61,19 @@ class RegionNotEnabledClients(FakeClients):
         return RegionNotEnabledClient()
 
 
+class PermissionDeniedClient(FakeClient):
+    def describe_instance_types(self, **parameters: object) -> dict[str, object]:
+        raise ClientError(
+            {"Error": {"Code": "UnauthorizedOperation", "Message": "SCP deny"}},
+            "DescribeInstanceTypes",
+        )
+
+
+class PermissionDeniedClients(FakeClients):
+    def regional(self, service: str, region: str) -> FakeClient:
+        return PermissionDeniedClient()
+
+
 class TemporarilyUnavailableClient(FakeClient):
     def __init__(self) -> None:
         self.calls = 0
@@ -132,6 +145,20 @@ def test_executor_reports_region_opt_in_separately_from_credentials() -> None:
 
     assert error.value.code == "aws_region_not_enabled"
     assert error.value.details["region"] == "ap-southeast-3"
+
+
+def test_executor_reports_pricing_permission_denied_without_guessing() -> None:
+    executor = ReadOnlyAwsQueryExecutor(PermissionDeniedClients())  # type: ignore[arg-type]
+    with pytest.raises(ManualConfirmationRequired) as error:
+        executor.execute(
+            service="ec2",
+            operation="describe_instance_types",
+            region="ap-southeast-1",
+            parameters={"InstanceTypes": [f"permission-test-{uuid.uuid4().hex}"]},
+        )
+
+    assert error.value.code == "aws_pricing_permission_denied"
+    assert error.value.details["aws_error_code"] == "UnauthorizedOperation"
 
 
 def test_executor_retries_temporary_official_api_failure() -> None:

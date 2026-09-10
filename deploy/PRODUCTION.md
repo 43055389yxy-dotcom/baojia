@@ -1,11 +1,66 @@
-# AstraQuote production deployment
+# AstraQuote 生产部署
 
-- Public address: `https://baojia.tontiancloud.com`
-- Container: `astraquote`
-- Runtime data: `/home/ec2-user/astraquote/data`
-- Local secrets: `/home/ec2-user/astraquote/config/backend.env`
-- Caddy route: `/home/ec2-user/caddy-gateway/managed/astraquote.caddy`
+生产版本使用一个 MCP 汇聚四个云厂商的官方价目接口：
 
-The repository does not contain credentials, customer confirmation sessions, or historical quotes.
-The Docker image contains only a compressed AWS public catalog seed. Runtime cache and sessions
-are stored in the host data directory so a rebuild does not erase active work.
+- AWS Price List API
+- Microsoft Azure Retail Prices API
+- Oracle Cloud Infrastructure Price List API
+- Google Cloud Billing Catalog API
+
+销售在报价页选择云厂商。GPT 负责理解需求、组织官网查询参数、选择官方价格项、换算用量和计算报价；MCP 只负责执行官方查询、保存原始证据、做 schema / 事实归属 / 金额加总一致性等机械校验，并交付页面结果或 Excel。
+
+生产运行路径不包含 AWS Pricing Calculator、Calculator 浏览器、模板映射或创建后回读流程。
+
+## 配置文件
+
+服务器使用以下三个环境文件：
+
+```text
+/home/ec2-user/astraquote/config/backend.env
+/home/ec2-user/astraquote/config/mcp.env
+/home/ec2-user/astraquote/config/oauth.env
+```
+
+AWS 查询使用服务器已有的 AWS 凭证链。Azure Retail Prices API 和 OCI Price List API 是公开价目接口，不要求把账号密钥写进 MCP。Google Cloud Billing Catalog API 需要在 `backend.env` 配置：
+
+```text
+GCP_BILLING_API_KEY=...
+```
+
+API Key 只用于访问官方目录，MCP 不接收也不向 GPT 返回密钥。
+
+Excel 交付仍需要配置私有 S3、稳定下载入口和企业微信 WebHook：
+
+```text
+ASTRAQUOTE_XLSX_BUCKET=...
+ASTRAQUOTE_XLSX_REGION=...
+ASTRAQUOTE_PUBLIC_BASE_URL=https://baojia.tontiancloud.com
+ASTRAQUOTE_WEBHOOK_URL=...
+```
+
+## MCP 工具
+
+生产 MCP 只公开四个工具：
+
+1. `describe_service`：查询 AWS Price List 服务元数据。
+2. `get_attribute_values`：查询 AWS 官方属性值。
+3. `get_prices`：按 GPT 提供的参数查询 AWS、Azure、OCI 或 GCP 官方价目。
+4. `build_estimate`：验证 GPT 选中的官方证据与计算结果，然后交付。
+
+## 部署与检查
+
+Jenkins 使用 [`deploy/jenkins-shell.sh`](./jenkins-shell.sh) 构建并启动容器。上线前至少运行：
+
+```bash
+cd deploy/astraquote-mcp && npm test
+cd frontend && npm test && npm run build
+cd backend && pytest
+```
+
+部署完成后检查：
+
+```bash
+docker exec astraquote curl -fsS http://127.0.0.1:3000/api/backend/api/health
+docker exec astraquote curl -fsS http://127.0.0.1:8200/readyz
+docker exec astraquote curl -fsS http://127.0.0.1:8001/readyz
+```

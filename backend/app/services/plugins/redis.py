@@ -16,6 +16,7 @@ from app.domain.requirement_fields import canonicalize_requirement_fields
 from app.integrations.aws import PricingCatalog, parse_number
 from app.services.aws_query_executor import ReadOnlyAwsQueryExecutor
 from app.services.plugins.base import ServicePlugin, required_float, required_int
+from app.services.plugins.template_billing import template_usage
 
 
 class RedisPlugin(ServicePlugin):
@@ -71,10 +72,7 @@ class RedisPlugin(ServicePlugin):
         # smallest official node that satisfies it; never ask the customer to
         # choose between a cheaper under-sized node and a valid node.
         requires_confirmation = bool(
-            not requested_model
-            and min_memory is None
-            and min_vcpu is None
-            and len(options) > 1
+            not requested_model and min_memory is None and min_vcpu is None and len(options) > 1
         )
         if requires_confirmation:
             for option in options:
@@ -113,7 +111,10 @@ class RedisPlugin(ServicePlugin):
                 "请从当前区域支持的配置中选择。"
             )
         requested = f"{requested_memory:g}G" if requested_memory is not None else "所需"
-        return f"客户需要 Redis 每节点约 {requested}；没有完全一致的官方规格，请从当前区域支持的配置中选择。"
+        return (
+            f"客户需要 Redis 每节点约 {requested}；没有完全一致的官方规格，"
+            "请从当前区域支持的配置中选择。"
+        )
 
     def nearby_candidates(
         self,
@@ -279,7 +280,8 @@ class RedisPlugin(ServicePlugin):
             raise ManualConfirmationRequired(
                 "Redis 节点数量必须至少为 1", code="invalid_redis_topology"
             )
-        amount = total_nodes * requirement.hours_per_month
+        node_usage = template_usage("elasticache", "cache_node_hours", requirement, requested)
+        amount = float(node_usage.amount)
         monthly_commitment_cost = 0.0
         upfront_commitment_cost = 0.0
         usage_lines: list[UsageLine] = []
@@ -291,6 +293,7 @@ class RedisPlugin(ServicePlugin):
                     usage_type=usage_type,
                     operation=operation,
                     amount=amount,
+                    calculation=node_usage.audit(),
                     group="redis",
                     source_fields=[
                         "quantity",
@@ -426,11 +429,7 @@ class RedisPlugin(ServicePlugin):
             for version in page.get("CacheEngineVersions", [])
         ]
         available_versions = list(
-            dict.fromkeys(
-                value
-                for item in versions
-                if (value := _text(item.get("EngineVersion")))
-            )
+            dict.fromkeys(value for item in versions if (value := _text(item.get("EngineVersion"))))
         )
         matches = [
             candidate

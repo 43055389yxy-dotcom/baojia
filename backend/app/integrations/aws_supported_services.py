@@ -7,13 +7,20 @@
 CURATED_SERVICE_OFFER_CODES: dict[str, str] = {
     "amp": "AmazonPrometheus",
     "apigateway": "AmazonApiGateway",
+    "app_stream": "AmazonAppStream",
     "appconfig": "AWSSystemsManager",
     "athena": "AmazonAthena",
     "backup": "AWSBackup",
     "bedrock": "AmazonBedrock",
     "cloud_map": "AWSCloudMap",
+    "cloud_formation": "AWSCloudFormation",
     "cloudfront": "AmazonCloudFront",
     "cloudwatch": "AmazonCloudWatch",
+    "config": "AWSConfig",
+    "code_build": "CodeBuild",
+    "code_pipeline": "AWSCodePipeline",
+    "code_artifact": "AWSCodeArtifact",
+    "code_deploy": "AWSCodeDeploy",
     "cognito": "AmazonCognito",
     "data_transfer": "AWSDataTransfer",
     "dms": "AWSDatabaseMigrationSvc",
@@ -34,9 +41,12 @@ CURATED_SERVICE_OFFER_CODES: dict[str, str] = {
     "global_accelerator": "AWSGlobalAccelerator",
     "glue": "AWSGlue",
     "kinesis": "AmazonKinesis",
+    "kinesis_firehose": "AmazonKinesisFirehose",
     "kms": "awskms",
     "lambda": "AWSLambda",
     "memorydb": "AmazonMemoryDB",
+    "inspector_v2": "AmazonInspectorV2",
+    "macie": "AmazonMacie",
     "mq": "AmazonMQ",
     "msk": "AmazonMSK",
     "nat_gateway": "AmazonEC2",
@@ -47,17 +57,70 @@ CURATED_SERVICE_OFFER_CODES: dict[str, str] = {
     "redshift": "AmazonRedshift",
     "route53": "AmazonRoute53",
     "s3": "AmazonS3",
+    "s3_glacier_deep_archive": "AmazonS3GlacierDeepArchive",
     "sagemaker": "AmazonSageMaker",
+    "textract": "AmazonTextract",
+    "comprehend": "comprehend",
+    "rekognition": "AmazonRekognition",
+    "transcribe": "transcribe",
+    "translate": "translate",
+    "polly": "AmazonPolly",
     "scheduler": "AWSEvents",
+    "security_hub": "AWSSecurityHub",
     "secrets_manager": "AWSSecretsManager",
     "ses": "AmazonSES",
     "sns": "AmazonSNS",
     "sqs": "AWSQueueService",
     "step_functions": "AmazonStates",
+    "storage_gateway": "AWSStorageGateway",
+    "data_sync": "AWSDataSync",
+    "transfer": "AWSTransfer",
     "vpc": "AmazonVPC",
+    "transit_gateway": "AmazonVPC",
+    "direct_connect": "AWSDirectConnect",
+    "site_to_site_vpn": "AmazonVPC",
+    "vpc_endpoint": "AmazonVPC",
     "waf": "awswaf",
+    "work_mail": "AmazonWorkMail",
     "xray": "AWSXRay",
+    "auditmanager": "auditmanager",
+    "io_t": "AWSIoT",
+    "io_t_device_management": "IoTDeviceManagement",
+    "io_t_device_defender": "IoTDeviceDefender",
+    "kinesis_video": "AmazonKinesisVideo",
+    "ivs": "AmazonIVS",
+    "elemental_media_convert": "AWSElementalMediaConvert",
+    "elemental_media_live": "AWSElementalMediaLive",
+    "elemental_media_package": "AWSElementalMediaPackage",
+    "media_connect": "AWSMediaConnect",
 }
+
+
+def curated_service_keys_for_offer_code(offer_code: str) -> tuple[str, ...]:
+    """Return every stable runtime service backed by one AWS offer code.
+
+    AWS Price List identities are billing containers, not quote-component
+    identities.  Most offers map to one curated component (for example
+    ``AWSELB`` -> ``elb``), while broad offers such as ``AmazonEC2`` back EC2,
+    EBS and NAT Gateway.  Callers can therefore retain an already-known
+    component key for broad offers and only auto-route genuinely unique ones.
+    Keeping this reverse lookup beside the forward contract prevents official
+    offer codes from leaking into the runtime template namespace.
+    """
+
+    normalized = "".join(character for character in offer_code.casefold() if character.isalnum())
+    if not normalized:
+        return ()
+    return tuple(
+        service_key
+        for service_key, configured_offer in CURATED_SERVICE_OFFER_CODES.items()
+        if "".join(
+            character
+            for character in configured_offer.casefold()
+            if character.isalnum()
+        )
+        == normalized
+    )
 
 
 # Botocore's signed endpoint catalogue is the local official source for region
@@ -71,6 +134,7 @@ CURATED_ENDPOINT_SERVICE_IDS: dict[str, tuple[str, ...]] = {
     "keyspacesforapachecassandra": ("keyspaces",),
     "appstream": ("appstream",),
     "appstream20": ("appstream",),
+    "workmail": ("workmail",),
     "workspaces": ("workspaces",),
     "managedgrafana": ("grafana",),
     "grafana": ("grafana",),

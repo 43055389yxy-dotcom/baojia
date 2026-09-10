@@ -9,6 +9,7 @@ from app.domain.component_integrity import (
 )
 from app.domain.customer_facts import explicit_requested_model, record_customer_fact_metadata
 from app.domain.models import ParsedIntent, ServiceRequirement
+from app.integrations.aws_supported_services import curated_service_keys_for_offer_code
 from app.integrations.service_templates import requirement_fields
 
 CUSTOMER_AUTHORITATIVE_SOURCES = {
@@ -74,6 +75,139 @@ _FSX_TYPE_NAMES = {
     "openzfs": ("amazon_fsx_openzfs", "Amazon FSx for OpenZFS"),
 }
 
+# Product identity is the stable output of the identity-resolution layer;
+# ``service`` is only the adapter routing key.  Model output can occasionally
+# preserve the correct identity while emitting a stale generic route such as
+# ``ec2``.  Keep the relationship in one schema-level registry so every later
+# parser, cache restore and customer edit reaches the same product adapter.
+_PRODUCT_IDENTITY_SERVICE_ROUTES = {
+    # ``elasticache`` is the canonical requirement/template identity.  The
+    # quote router already maps it to ``ServiceKind.REDIS`` when the dedicated
+    # adapter is selected.  Persisting ``redis`` here created two names for
+    # the same component: product preservation changed ``elasticache`` to
+    # ``redis``, invalidated the immutable fact fingerprint, and a later draft
+    # migration could then discard an already reviewed CPU/memory shape.
+    **{identity: "elasticache" for identity, _ in _CACHE_ENGINE_NAMES.values()},
+    **{identity: "elb" for identity, _ in _LOAD_BALANCER_NAMES.values()},
+    **{identity: "mq" for identity, _ in _MQ_ENGINE_NAMES.values()},
+    **{identity: "apigateway" for identity, _ in _API_GATEWAY_NAMES.values()},
+    **{identity: "msk" for identity, _ in _MSK_CLUSTER_NAMES.values()},
+    **{identity: "fsx" for identity, _ in _FSX_TYPE_NAMES.values()},
+    "amazon_memorydb_redis": "memorydb",
+    "aurora_mysql": "aurora",
+    "aurora_postgresql": "aurora",
+}
+
+
+def _remove_requirement_field(requirement: ServiceRequirement, field: str) -> None:
+    """Remove one requirement value together with all of its audit metadata."""
+
+    path = f"requirements.{field}"
+    requirement.requirements.pop(field, None)
+    requirement.field_sources.pop(path, None)
+    requirement.field_evidence.pop(path, None)
+    requirement.field_match_policies.pop(field, None)
+    requirement.field_scopes.pop(field, None)
+    requirement.locked_fields = [
+        locked for locked in requirement.locked_fields if locked != path
+    ]
+
+
+def _normalized_fact_evidence(requirement: ServiceRequirement, field: str) -> str:
+    evidence = requirement.field_evidence.get(f"requirements.{field}", "")
+    return "".join(
+        character.casefold() for character in str(evidence) if character.isalnum()
+    ).removeprefix("每月")
+
+
+def _same_source_fact(
+    requirement: ServiceRequirement,
+    left_field: str,
+    right_field: str,
+) -> bool:
+    """Return whether two schema fields represent one customer-owned fact."""
+
+    left = requirement.requirements.get(left_field)
+    right = requirement.requirements.get(right_field)
+    if isinstance(left, (int, float)) and not isinstance(left, bool):
+        if not isinstance(right, (int, float)) or isinstance(right, bool):
+            return False
+        if abs(float(left) - float(right)) > 1e-9:
+            return False
+    elif left != right:
+        return False
+
+    left_evidence = _normalized_fact_evidence(requirement, left_field)
+    right_evidence = _normalized_fact_evidence(requirement, right_field)
+    return bool(
+        left_evidence
+        and right_evidence
+        and (
+            left_evidence == right_evidence
+            or left_evidence in right_evidence
+            or right_evidence in left_evidence
+        )
+    )
+
+
+def enforce_reclassified_product_schema(
+    requirement: ServiceRequirement,
+    *,
+    discard_derived_results: bool = False,
+) -> bool:
+    """Make a product-identity change an atomic schema migration.
+
+    A component can first be interpreted as self-hosted compute and later be
+    resolved to a native AWS service. The target product's deterministic
+    extraction then owns the canonical field. If the old and new fields have
+    the same value and customer evidence, keeping both would make one literal
+    fact appear unconsumed or chargeable twice. Collapse only that provable
+    duplicate; unmatched customer facts remain intact for explicit mapping.
+
+    Derived review/catalog fields belong to the old product identity and may
+    be discarded by callers that are performing the identity transition.
+    """
+
+    allowed_fields = set(requirement_fields(requirement.service))
+    changed = False
+    target_fields = tuple(
+        field
+        for field in requirement.requirements
+        if not field.startswith("_") and field in allowed_fields
+    )
+    customer_sources = {*CUSTOMER_AUTHORITATIVE_SOURCES, "customer_text"}
+
+    for field in tuple(requirement.requirements):
+        if field.startswith("_"):
+            if discard_derived_results and (
+                field.startswith("_review_") or field.startswith("_quote_skip_")
+            ):
+                _remove_requirement_field(requirement, field)
+                changed = True
+            continue
+        if field in allowed_fields:
+            continue
+
+        path = f"requirements.{field}"
+        source = requirement.field_sources.get(path, "")
+        duplicate_target = next(
+            (
+                target
+                for target in target_fields
+                if _same_source_fact(requirement, field, target)
+            ),
+            None,
+        )
+        if duplicate_target is not None:
+            _remove_requirement_field(requirement, field)
+            changed = True
+            continue
+        if discard_derived_results and source not in customer_sources:
+            _remove_requirement_field(requirement, field)
+            changed = True
+
+    return changed
+
 
 def aurora_cluster_member_count(source: str) -> tuple[int, str] | None:
     """Read an Aurora member count without mistaking per-node CPU for topology.
@@ -96,12 +230,12 @@ def aurora_cluster_member_count(source: str) -> tuple[int, str] | None:
             return max(int(match.group(1)), 1), match.group(0)
 
     primary = re.search(
-        r"(?<![\w.])(\d+)\s*(?:个|台)?\s*(?:主|写|writer)(?:节点|实例|库|node)?",
+        r"(?<![A-Za-z0-9.])(\d+)\s*(?:个|台)?\s*(?:主|写|writer)(?:节点|实例|库|node)?",
         text,
         re.I,
     )
     readers = re.search(
-        r"(?<![\w.])(\d+)\s*(?:个|台)?\s*(?:只读|读|从|reader)(?:节点|实例|副本|库|node)?",
+        r"(?<![A-Za-z0-9.])(\d+)\s*(?:个|台)?\s*(?:只读|读|从|reader)(?:节点|实例|副本|库|node)?",
         text,
         re.I,
     )
@@ -110,6 +244,28 @@ def aurora_cluster_member_count(source: str) -> tuple[int, str] | None:
         end = max(primary.end(), readers.end())
         return max(int(primary.group(1)) + int(readers.group(1)), 1), text[start:end]
     return None
+
+
+def read_replica_count(source: str) -> tuple[int, str] | None:
+    """Return an explicitly written reader/replica role count.
+
+    A topology total and its composition are different facts.  For example,
+    ``1 writer + 2 readers`` implies three billable members but also carries
+    the independent customer requirement ``read_replica_count=2``.  Keeping
+    both prevents a later conservation check from asking the total-member
+    field to prove the reader literal.  This parser is role-based and reusable
+    across database products; it does not depend on a service display name.
+    """
+
+    match = re.search(
+        r"(?<![A-Za-z0-9.])(\d+)\s*(?:个|台)?\s*"
+        r"(?:只读|读|从|read(?:er)?)(?:节点|实例|副本|库|node)?s?",
+        str(source or ""),
+        re.I,
+    )
+    if not match:
+        return None
+    return max(int(match.group(1)), 0), match.group(0)
 
 
 def _normalized(value: object) -> str:
@@ -248,6 +404,14 @@ def preserve_customer_configuration(intent: ParsedIntent) -> None:
         for item in intent.services
     }
     for item in intent.services:
+        explicit_identity = str(item.product_identity or "").strip().casefold()
+        canonical_service = _PRODUCT_IDENTITY_SERVICE_ROUTES.get(explicit_identity)
+        if canonical_service is None and explicit_identity.startswith("rds_"):
+            canonical_service = "rds"
+        if canonical_service and _normalized(item.service) != _normalized(
+            canonical_service
+        ):
+            item.service = canonical_service
         service_key = _normalized(item.service)
         source = item.source_text or ""
         folded = source.casefold()
@@ -289,11 +453,18 @@ def preserve_customer_configuration(intent: ParsedIntent) -> None:
                     item.requirements.pop(field, None)
             _set_customer_product_field(item, "web_acls", item.quantity, "WAF 数量")
 
-        # ``数量`` is the customer's component count. It is independent from
-        # product-specific dimensions such as RDS cluster members and must not
-        # fall back to one merely because a parser/plugin uses its own count
-        # field internally.
-        quantity_match = re.search(r"(?:^|[：:，,；;\s])数量\s*[:：]?\s*(\d+)", source, re.I)
+        # A bare ``数量 N`` clause is the customer's component count.  A
+        # product role immediately following the number changes its meaning:
+        # ``数量 1 个 Hosted Zone`` owns ``hosted_zones`` and ``数量 3
+        # 节点`` owns a topology field; neither is a top-level deployment
+        # quantity.  Require the generic unit to end the clause so this rule is
+        # semantic-role neutral and works for current and future products.
+        quantity_match = re.search(
+            r"(?:^|[：:，,；;\s])数量\s*[:：]?\s*(\d+)\s*"
+            r"(?:台|套|个|份|组)?(?=\s*(?:[｜|，,。；;\n]|$))",
+            source,
+            re.I,
+        )
         if quantity_match:
             explicit_quantity = max(int(quantity_match.group(1)), 1)
             _set_customer_scalar_field(
@@ -309,6 +480,42 @@ def preserve_customer_configuration(intent: ParsedIntent) -> None:
             elif service_key in {"waf", "awswaf"}:
                 _set_customer_product_field(
                     item, "web_acls", explicit_quantity, quantity_match.group(0).strip()
+                )
+
+        # Product-role counts are owned by their schema field, independently
+        # of the adapter/service label chosen upstream.  This contract is
+        # intentionally keyed by canonical fields instead of product names so
+        # aliases such as Route53/DNS and WAF/Web ACL all reach the same fact
+        # owner without also claiming top-level ``quantity``.
+        role_count_contracts: tuple[tuple[str, tuple[str, ...]], ...] = (
+            (
+                "hosted_zones",
+                (
+                    r"(?<![a-z0-9])(\d+)\s*(?:个|套)?\s*hosted\s*zones?\b",
+                    r"(?<!\d)(\d+)\s*(?:个|套)?\s*(?:托管区域|托管区)(?![\u4e00-\u9fff])",
+                ),
+            ),
+            (
+                "web_acls",
+                (
+                    r"(?<![a-z0-9])(\d+)\s*(?:个|套)?\s*web\s*acls?\b",
+                ),
+            ),
+        )
+        allowed_product_fields = set(requirement_fields(item.service))
+        for field, patterns in role_count_contracts:
+            if field not in allowed_product_fields:
+                continue
+            role_match = next(
+                (match for pattern in patterns if (match := re.search(pattern, source, re.I))),
+                None,
+            )
+            if role_match is not None:
+                _set_customer_product_field(
+                    item,
+                    field,
+                    max(int(role_match.group(1)), 1),
+                    role_match.group(0).strip(),
                 )
 
         if service_key in {"waf", "awswaf"}:
@@ -553,8 +760,10 @@ def preserve_customer_configuration(intent: ParsedIntent) -> None:
             _set_product_identity(item, identity, display)
             continue
 
+        offer_services = curated_service_keys_for_offer_code(item.service)
         if (
             service_key in {"elb", "elbv2", "alb", "nlb", "gwlb", "elasticloadbalancing"}
+            or offer_services == ("elb",)
             or "loadbalanc" in service_key
         ):
             confirmed = _normalized(_confirmed_value(item, "load_balancer_type"))
@@ -697,7 +906,8 @@ def preserve_customer_configuration(intent: ParsedIntent) -> None:
                 version_match = re.search(
                     r"(?:mysql|postgres(?:ql)?|mariadb)(?:\s*兼容)?(?:\s*数据库)?"
                     r"(?:\s*版本)?\s*[:：]?\s*"
-                    r"(\d+(?:\.\d+|\.x){0,3}(?:[-.][a-z0-9.]+)?)",
+                    r"(\d+(?:\.\d+|\.x){0,3}(?:[-.][a-z0-9.]+)?)"
+                    r"(?!\s*(?:主|写|只读|读|从|writer|reader))",
                     source,
                     re.I,
                 )
@@ -759,7 +969,8 @@ def preserve_customer_configuration(intent: ParsedIntent) -> None:
         source = item.source_text or ""
         version_match = re.search(
             r"(?:mysql|postgres(?:ql)?)(?:\s*兼容)?(?:\s*数据库)?(?:\s*版本)?\s*"
-            r"[:：]?\s*(\d+(?:\.\d+|\.x){0,3})",
+            r"[:：]?\s*(\d+(?:\.\d+|\.x){0,3})"
+            r"(?!\s*(?:主|写|只读|读|从|writer|reader))",
             source,
             re.I,
         )
@@ -794,6 +1005,16 @@ def preserve_customer_configuration(intent: ParsedIntent) -> None:
             item.field_evidence["requirements.cluster_members"] = "system_minimum"
             item.field_sources["requirements.cluster_members"] = "system_minimum"
 
+        replica_fact = read_replica_count(source)
+        if replica_fact:
+            replicas, replica_evidence = replica_fact
+            _set_customer_product_field(
+                item,
+                "read_replica_count",
+                replicas,
+                replica_evidence,
+            )
+
     # Product identity is the hard cache boundary. If deterministic recovery
     # changes it, every old review/catalog result belongs to another product
     # and must be discarded before the component can be displayed or priced.
@@ -819,22 +1040,7 @@ def preserve_customer_configuration(intent: ParsedIntent) -> None:
         )
         if not boundary_changed and not review_boundary_mismatch:
             continue
-        allowed_fields = set(requirement_fields(item.service))
-        for field in tuple(item.requirements):
-            path = f"requirements.{field}"
-            source = item.field_sources.get(path, "")
-            is_internal_result = field.startswith("_review_") or field.startswith("_quote_skip_")
-            is_foreign_system_field = (
-                not field.startswith("_")
-                and field not in allowed_fields
-                and source not in {*CUSTOMER_AUTHORITATIVE_SOURCES, "customer_text"}
-            )
-            if not (is_internal_result or is_foreign_system_field):
-                continue
-            item.requirements.pop(field, None)
-            item.field_sources.pop(path, None)
-            item.field_evidence.pop(path, None)
-            item.locked_fields = [entry for entry in item.locked_fields if entry != path]
+        enforce_reclassified_product_schema(item, discard_derived_results=True)
 
     # A named VPC block may mention EC2/API workloads as resources it carries.
     # Those relationship words do not declare new products. Remove only the

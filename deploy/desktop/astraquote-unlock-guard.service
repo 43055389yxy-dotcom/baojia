@@ -1,0 +1,12 @@
+[Unit]
+Description=Keep the dedicated AstraQuote VNC desktop unlocked
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/astraquote-unlock-guard
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

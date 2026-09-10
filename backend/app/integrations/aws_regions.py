@@ -2,6 +2,17 @@ from __future__ import annotations
 
 from botocore.loaders import create_loader
 
+
+def official_catalog_region_scope(region: str | None) -> str:
+    """Canonical Price List discovery scope, NOT a customer deployment default.
+
+    Discovery historically uses an unfiltered catalog for both missing region
+    and ``global``. Cache keys, profile payloads and contract fingerprints must
+    share that identity. Regional workload validation still requires its own
+    explicit region; this function must never fill a customer requirement.
+    """
+    return (region or "").strip().casefold() or "global"
+
 # Customer-facing Chinese names for every commercial AWS region bundled with
 # the application's botocore directory.  The official directory remains the
 # allowlist; this table only localizes regions that AWS says are available.

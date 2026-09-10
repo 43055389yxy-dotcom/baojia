@@ -244,4 +244,5 @@ def test_customer_deleted_field_cannot_be_restored_by_original_text_or_ai() -> N
     assert restored.field_sources["requirements.system_disk_gib"] == (
         "customer_confirmation_removed"
     )
-    assert "system_disk_gib" in restored.source_text
+    # Structured corrections no longer rewrite evidence back into prose.
+    assert restored.source_text == "EC2：系统盘 40GB"

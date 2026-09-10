@@ -1,0 +1,515 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from concurrent.futures import ThreadPoolExecutor
+from typing import Annotated, Any, Literal
+from urllib.parse import quote, urlparse
+
+import httpx
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from app.services.aws_query_executor import ReadOnlyAwsQueryExecutor
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class OfficialCatalogQueryError(RuntimeError):
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class DescribeServiceRequest(StrictModel):
+    service_code: str = Field(min_length=2, max_length=120)
+
+
+class AttributeValuesRequest(DescribeServiceRequest):
+    attribute_name: str = Field(min_length=1, max_length=160)
+    max_results: int = Field(default=1000, ge=1, le=1000)
+
+
+class ProductSearchRequest(DescribeServiceRequest):
+    region: str = Field(default="global", min_length=3, max_length=40)
+    filters: dict[str, str] = Field(default_factory=dict)
+    max_results: int = Field(default=100, ge=1, le=1000)
+
+
+class AwsPriceQuery(ProductSearchRequest):
+    provider: Literal["aws"] = "aws"
+    query_id: str = Field(min_length=1, max_length=100)
+    pricing_model: Literal["on_demand", "reserved"] = "on_demand"
+    term_years: Literal[1, 3] | None = None
+    payment_option: Literal["no_upfront", "partial_upfront", "all_upfront"] | None = None
+    offering_class: Literal["standard", "convertible"] | None = None
+
+    @model_validator(mode="after")
+    def validate_purchase_terms(self) -> AwsPriceQuery:
+        if self.pricing_model == "on_demand":
+            if any(
+                value is not None
+                for value in (self.term_years, self.payment_option, self.offering_class)
+            ):
+                raise ValueError("on_demand queries cannot include commitment terms")
+            return self
+        if self.term_years is None or self.payment_option is None:
+            raise ValueError("reserved queries require term_years and payment_option")
+        return self
+
+
+class AzurePriceQuery(StrictModel):
+    provider: Literal["azure"] = "azure"
+    query_id: str = Field(min_length=1, max_length=100)
+    filter: str | None = Field(default=None, max_length=4000)
+    currency_code: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
+    api_version: Literal["2021-10-01", "2023-01-01-preview"] = "2023-01-01-preview"
+    next_page_url: str | None = Field(default=None, max_length=8000)
+
+    @model_validator(mode="after")
+    def validate_next_page(self) -> AzurePriceQuery:
+        if self.next_page_url:
+            parsed = urlparse(self.next_page_url)
+            if parsed.scheme != "https" or parsed.hostname != "prices.azure.com":
+                raise ValueError("next_page_url must use https://prices.azure.com")
+        return self
+
+
+class OciPriceQuery(StrictModel):
+    provider: Literal["oci"] = "oci"
+    query_id: str = Field(min_length=1, max_length=100)
+    part_number: str | None = Field(default=None, min_length=1, max_length=120)
+    currency_code: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
+
+
+class GcpPriceQuery(StrictModel):
+    provider: Literal["gcp"] = "gcp"
+    query_id: str = Field(min_length=1, max_length=100)
+    operation: Literal["list_services", "list_skus"]
+    service_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=240,
+        pattern=r"^[A-Za-z0-9._-]+$",
+    )
+    page_size: int = Field(default=5000, ge=1, le=5000)
+    page_token: str | None = Field(default=None, max_length=4000)
+    currency_code: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
+
+    @model_validator(mode="after")
+    def validate_operation(self) -> GcpPriceQuery:
+        if self.operation == "list_skus" and not self.service_id:
+            raise ValueError("list_skus requires service_id")
+        if self.operation == "list_services" and self.service_id:
+            raise ValueError("list_services does not accept service_id")
+        return self
+
+
+PriceQueryInput = Annotated[
+    AwsPriceQuery | AzurePriceQuery | OciPriceQuery | GcpPriceQuery,
+    Field(discriminator="provider"),
+]
+# Backward-compatible class name for callers that construct an AWS query
+# directly. The batch schema itself is provider-discriminated.
+PriceQuery = AwsPriceQuery
+
+
+class GetPricesRequest(StrictModel):
+    queries: list[PriceQueryInput] = Field(min_length=1, max_length=50)
+
+    @model_validator(mode="after")
+    def unique_query_ids(self) -> GetPricesRequest:
+        query_ids = [query.query_id for query in self.queries]
+        if len(set(query_ids)) != len(query_ids):
+            raise ValueError("query_id must be unique within one batch")
+        return self
+
+
+class OfficialPricingService:
+    """Thin dispatcher for official cloud price catalogs.
+
+    Caller-supplied query parameters are sent to the selected provider and the
+    official response is preserved. This layer never chooses a SKU, converts
+    usage or calculates a quote.
+    """
+
+    AZURE_URL = "https://prices.azure.com/api/retail/prices"
+    OCI_URL = "https://apexapps.oracle.com/pls/apex/cetools/api/v1/products/"
+    GCP_BASE_URL = "https://cloudbilling.googleapis.com/v1"
+
+    def __init__(
+        self,
+        executor: ReadOnlyAwsQueryExecutor,
+        *,
+        http_get: Any = httpx.get,
+        gcp_api_key: str | None = None,
+    ) -> None:
+        self._executor = executor
+        self._http_get = http_get
+        self._gcp_api_key = gcp_api_key or os.getenv("GCP_BILLING_API_KEY", "")
+
+    def describe_service(self, request: DescribeServiceRequest) -> dict[str, Any]:
+        payload = self._executor.execute(
+            service="pricing",
+            operation="describe_services",
+            region="us-east-1",
+            parameters={"ServiceCode": request.service_code},
+            max_items=100,
+        )
+        services = _collect(payload, "Services")
+        return {
+            "status": _identity_status(len(services)),
+            "provider": "aws",
+            "service_code": request.service_code,
+            "services": services,
+            "source": "AWS Price List API",
+        }
+
+    def get_attribute_values(self, request: AttributeValuesRequest) -> dict[str, Any]:
+        payload = self._executor.execute(
+            service="pricing",
+            operation="get_attribute_values",
+            region="us-east-1",
+            parameters={
+                "ServiceCode": request.service_code,
+                "AttributeName": request.attribute_name,
+            },
+            max_items=request.max_results,
+        )
+        values = _collect(payload, "AttributeValues")
+        return {
+            "status": "found" if values else "not_found",
+            "provider": "aws",
+            "service_code": request.service_code,
+            "attribute_name": request.attribute_name,
+            "values": values,
+            "source": "AWS Price List API",
+        }
+
+    def search_products(self, request: ProductSearchRequest) -> dict[str, Any]:
+        products = self._price_list_products(request)
+        return {
+            "status": _identity_status(len(products)),
+            "provider": "aws",
+            "service_code": request.service_code,
+            "region": request.region,
+            "product_count": len(products),
+            "products": [_product_identity(product) for product in products],
+            "source": "AWS Price List API",
+        }
+
+    def get_prices(self, request: GetPricesRequest) -> dict[str, Any]:
+        with ThreadPoolExecutor(max_workers=min(8, len(request.queries))) as pool:
+            results = list(pool.map(self._safe_price_result, request.queries))
+        return {"status": "completed", "result_count": len(results), "results": results}
+
+    def _safe_price_result(self, query: PriceQueryInput) -> dict[str, Any]:
+        try:
+            return self._get_price_result(query)
+        except Exception as exc:
+            return {
+                "query_id": query.query_id,
+                "provider": query.provider,
+                "status": "query_failed",
+                "code": getattr(exc, "code", None) or "official_catalog_query_failed",
+                "message": str(exc),
+                "official_item_ids": [],
+            }
+
+    def _get_price_result(self, query: PriceQueryInput) -> dict[str, Any]:
+        if isinstance(query, AwsPriceQuery):
+            result = (
+                self._get_aws_on_demand(query)
+                if query.pricing_model == "on_demand"
+                else self._get_aws_reserved(query)
+            )
+        elif isinstance(query, AzurePriceQuery):
+            result = self._get_azure_prices(query)
+        elif isinstance(query, OciPriceQuery):
+            result = self._get_oci_prices(query)
+        else:
+            result = self._get_gcp_catalog(query)
+        return {"query_id": query.query_id, "provider": query.provider, **result}
+
+    def _price_list_products(self, request: ProductSearchRequest) -> list[dict[str, Any]]:
+        filters = [
+            {"Type": "TERM_MATCH", "Field": field, "Value": str(value)}
+            for field, value in sorted(request.filters.items())
+        ]
+        if request.region.casefold() != "global" and "regionCode" not in request.filters:
+            filters.append(
+                {"Type": "TERM_MATCH", "Field": "regionCode", "Value": request.region}
+            )
+        payload = self._executor.execute(
+            service="pricing",
+            operation="get_products",
+            region="us-east-1",
+            parameters={"ServiceCode": request.service_code, "Filters": filters},
+            max_items=request.max_results,
+        )
+        products: list[dict[str, Any]] = []
+        for item in _collect(payload, "PriceList"):
+            if isinstance(item, str):
+                try:
+                    item = json.loads(item)
+                except json.JSONDecodeError:
+                    continue
+            if isinstance(item, dict):
+                products.append(item)
+        return products
+
+    def _get_aws_on_demand(self, query: AwsPriceQuery) -> dict[str, Any]:
+        normalized = [
+            _priced_product(product, term_key="OnDemand")
+            for product in self._price_list_products(query)
+        ]
+        return {
+            "status": _identity_status(len(normalized)),
+            "pricing_model": "on_demand",
+            "service_code": query.service_code,
+            "region": query.region,
+            "product_count": len(normalized),
+            "price_dimension_count": sum(
+                len(product["price_dimensions"]) for product in normalized
+            ),
+            "official_item_ids": [str(item["sku"]) for item in normalized if item.get("sku")],
+            "products": normalized,
+            "source": "AWS Price List API",
+        }
+
+    def _get_aws_reserved(self, query: AwsPriceQuery) -> dict[str, Any]:
+        normalized: list[dict[str, Any]] = []
+        for product in self._price_list_products(query):
+            priced = _priced_product(product, term_key="Reserved")
+            matching_terms = [
+                term for term in priced["terms"] if _reserved_term_matches(term, query)
+            ]
+            if not matching_terms:
+                continue
+            priced["terms"] = matching_terms
+            priced["price_dimensions"] = [
+                dimension for term in matching_terms for dimension in term["price_dimensions"]
+            ]
+            normalized.append(priced)
+        term_count = sum(len(product["terms"]) for product in normalized)
+        status = "not_found" if not normalized else (
+            "exact" if len(normalized) == 1 and term_count == 1 else "ambiguous"
+        )
+        return {
+            "status": status,
+            "pricing_model": "reserved",
+            "term_years": query.term_years,
+            "payment_option": query.payment_option,
+            "offering_class": query.offering_class,
+            "service_code": query.service_code,
+            "region": query.region,
+            "product_count": len(normalized),
+            "term_count": term_count,
+            "price_dimension_count": sum(
+                len(product["price_dimensions"]) for product in normalized
+            ),
+            "official_item_ids": [str(item["sku"]) for item in normalized if item.get("sku")],
+            "products": normalized,
+            "source": "AWS Price List API",
+        }
+
+    def _get_azure_prices(self, query: AzurePriceQuery) -> dict[str, Any]:
+        url = query.next_page_url or self.AZURE_URL
+        params: dict[str, Any] = {} if query.next_page_url else {
+            "api-version": query.api_version,
+            "currencyCode": query.currency_code,
+        }
+        if query.filter and not query.next_page_url:
+            params["$filter"] = query.filter
+        payload = self._official_json(url, params=params)
+        items = payload.get("Items") if isinstance(payload.get("Items"), list) else []
+        item_ids = [_azure_item_id(item) for item in items if isinstance(item, dict)]
+        return {
+            "status": _identity_status(len(item_ids)),
+            "official_item_ids": item_ids,
+            "items": items,
+            "next_page_url": payload.get("NextPageLink"),
+            "currency": query.currency_code,
+            "source": "Azure Retail Prices API",
+        }
+
+    def _get_oci_prices(self, query: OciPriceQuery) -> dict[str, Any]:
+        params: dict[str, Any] = {"currencyCode": query.currency_code}
+        if query.part_number:
+            params["partNumber"] = query.part_number
+        payload = self._official_json(self.OCI_URL, params=params)
+        items = payload.get("items") if isinstance(payload.get("items"), list) else []
+        item_ids = [
+            str(item.get("partNumber"))
+            for item in items
+            if isinstance(item, dict) and item.get("partNumber")
+        ]
+        return {
+            "status": _identity_status(len(item_ids)),
+            "official_item_ids": item_ids,
+            "items": items,
+            "currency": query.currency_code,
+            "source": "Oracle Cloud Price List API",
+        }
+
+    def _get_gcp_catalog(self, query: GcpPriceQuery) -> dict[str, Any]:
+        if not self._gcp_api_key:
+            raise OfficialCatalogQueryError(
+                "GCP_BILLING_API_KEY is not configured",
+                code="gcp_api_key_not_configured",
+            )
+        if query.operation == "list_services":
+            url = f"{self.GCP_BASE_URL}/services"
+            response_key = "services"
+        else:
+            url = f"{self.GCP_BASE_URL}/services/{quote(query.service_id or '', safe='')}/skus"
+            response_key = "skus"
+        params: dict[str, Any] = {
+            "key": self._gcp_api_key,
+            "pageSize": query.page_size,
+        }
+        if query.operation == "list_skus":
+            params["currencyCode"] = query.currency_code
+        if query.page_token:
+            params["pageToken"] = query.page_token
+        payload = self._official_json(url, params=params)
+        items = payload.get(response_key) if isinstance(payload.get(response_key), list) else []
+        item_ids = [
+            str(item.get("skuId") or item.get("serviceId") or item.get("name"))
+            for item in items
+            if isinstance(item, dict)
+            and (item.get("skuId") or item.get("serviceId") or item.get("name"))
+        ]
+        return {
+            "status": _identity_status(len(item_ids)),
+            "operation": query.operation,
+            "official_item_ids": item_ids,
+            response_key: items,
+            "next_page_token": payload.get("nextPageToken"),
+            "currency": query.currency_code,
+            "source": "Google Cloud Billing Catalog API",
+        }
+
+    def _official_json(self, url: str, *, params: dict[str, Any]) -> dict[str, Any]:
+        response = self._http_get(url, params=params, timeout=30.0)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Official catalog returned a non-object JSON payload")
+        return payload
+
+
+def _collect(payload: dict[str, Any], key: str) -> list[Any]:
+    values: list[Any] = []
+    pages = payload.get("pages")
+    if isinstance(pages, list):
+        for page in pages:
+            if isinstance(page, dict) and isinstance(page.get(key), list):
+                values.extend(page[key])
+    elif isinstance(payload.get(key), list):
+        values.extend(payload[key])
+    return values
+
+
+def _identity_status(count: int) -> str:
+    if count == 0:
+        return "not_found"
+    if count == 1:
+        return "exact"
+    return "ambiguous"
+
+
+def _azure_item_id(item: dict[str, Any]) -> str:
+    identity = {
+        key: item.get(key)
+        for key in (
+            "meterId",
+            "type",
+            "armSkuName",
+            "skuName",
+            "meterName",
+            "productName",
+            "unitOfMeasure",
+            "tierMinimumUnits",
+            "retailPrice",
+            "reservationTerm",
+            "effectiveStartDate",
+            "currencyCode",
+        )
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    ).hexdigest()[:20]
+    return f"azure:{item.get('meterId') or 'item'}:{digest}"
+
+
+def _product_identity(payload: dict[str, Any]) -> dict[str, Any]:
+    product = payload.get("product", {})
+    return {
+        "sku": product.get("sku"),
+        "product_family": product.get("productFamily"),
+        "attributes": product.get("attributes", {}),
+        "service_code": payload.get("serviceCode"),
+    }
+
+
+def _priced_product(payload: dict[str, Any], *, term_key: str) -> dict[str, Any]:
+    identity = _product_identity(payload)
+    terms: list[dict[str, Any]] = []
+    dimensions: list[dict[str, Any]] = []
+    term_map = payload.get("terms", {}).get(term_key, {})
+    if isinstance(term_map, dict):
+        for term_code, term in term_map.items():
+            if not isinstance(term, dict):
+                continue
+            term_dimensions: list[dict[str, Any]] = []
+            price_dimensions = term.get("priceDimensions", {})
+            if isinstance(price_dimensions, dict):
+                for dimension_code, dimension in price_dimensions.items():
+                    if not isinstance(dimension, dict):
+                        continue
+                    normalized = {
+                        "dimension_code": dimension_code,
+                        "rate_code": dimension.get("rateCode"),
+                        "description": dimension.get("description"),
+                        "begin_range": dimension.get("beginRange"),
+                        "end_range": dimension.get("endRange"),
+                        "unit": dimension.get("unit"),
+                        "price_per_unit": dimension.get("pricePerUnit", {}),
+                        "applies_to": dimension.get("appliesTo", []),
+                    }
+                    term_dimensions.append(normalized)
+                    dimensions.append(normalized)
+            terms.append(
+                {
+                    "term_code": term_code,
+                    "offer_term_code": term.get("offerTermCode"),
+                    "effective_date": term.get("effectiveDate"),
+                    "term_attributes": term.get("termAttributes", {}),
+                    "price_dimensions": term_dimensions,
+                }
+            )
+    return {**identity, "terms": terms, "price_dimensions": dimensions}
+
+
+def _reserved_term_matches(term: dict[str, Any], query: AwsPriceQuery) -> bool:
+    attributes = term.get("term_attributes") or {}
+    if attributes.get("LeaseContractLength") != f"{query.term_years}yr":
+        return False
+    if attributes.get("PurchaseOption") != _payment_label(query.payment_option):
+        return False
+    if query.offering_class is None:
+        return True
+    return str(attributes.get("OfferingClass") or "standard").casefold() == (
+        query.offering_class.casefold()
+    )
+
+
+def _payment_label(payment_option: str | None) -> str:
+    return {
+        "no_upfront": "No Upfront",
+        "partial_upfront": "Partial Upfront",
+        "all_upfront": "All Upfront",
+    }[payment_option or "no_upfront"]

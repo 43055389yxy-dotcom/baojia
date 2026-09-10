@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.core.errors import ManualConfirmationRequired
@@ -61,7 +62,11 @@ class _NoConfirmationPlugin(ServicePlugin):
     def preview(self, requirement: ServiceRequirement, default_region: str) -> PreviewSelection:
         preview = super().preview(requirement, default_region)
         return preview.model_copy(
-            update={"requires_confirmation": False, "confirmation_reason": None}
+            update={
+                "requires_confirmation": False,
+                "confirmation_reason": None,
+                "next_action": "none",
+            }
         )
 
 
@@ -69,11 +74,238 @@ class EbsPlugin(_NoConfirmationPlugin):
     kind = ServiceKind.EBS
     display_name = "Amazon EBS"
 
+    _SNAPSHOT_VARIANTS = frozenset({"snapshot", "snapshot_archive"})
+    _VARIANT_ALIASES = {
+        "volume": "volume",
+        "ebs_volume": "volume",
+        "snapshot": "snapshot",
+        "standard_snapshot": "snapshot",
+        "snapshot_standard": "snapshot",
+        "ebs_snapshot": "snapshot",
+        "snapshot_archive": "snapshot_archive",
+        "archive_snapshot": "snapshot_archive",
+        "ebs_snapshot_archive": "snapshot_archive",
+    }
+
+    @classmethod
+    def _product_variant(cls, requested: dict[str, Any]) -> str:
+        """Resolve the closed EBS product schema without reading prose.
+
+        Component cleaning owns language interpretation.  The adapter accepts
+        its closed variant enum and may infer ``snapshot`` only from already
+        structured snapshot fields, which also protects older cleaned drafts
+        that predate the explicit variant field.
+        """
+
+        raw = str(requested.get("product_variant") or "").strip().casefold()
+        normalized = re.sub(r"[\s-]+", "_", raw)
+        if normalized:
+            variant = cls._VARIANT_ALIASES.get(normalized)
+            if variant is None:
+                raise ManualConfirmationRequired(
+                    "EBS 产品类型必须是云盘、标准快照或归档快照",
+                    code="invalid_ebs_product_variant",
+                    product_variant=raw,
+                )
+            return variant
+        if any(
+            requested.get(field) not in (None, "", [], {})
+            for field in (
+                "backup_storage_gib",
+                "snapshot_changed_gib",
+                "snapshot_frequency",
+                "snapshot_retention_days",
+            )
+        ):
+            return "snapshot"
+        return "volume"
+
+    def _snapshot_product(
+        self,
+        *,
+        region: str,
+        archive: bool,
+    ) -> dict[str, Any]:
+        """Return one exact official EBS snapshot GB-month product.
+
+        ``productFamily`` is an optional catalog label, so it is only the
+        narrow first query.  The semantic UsageType predicate remains the
+        authority on the region-only fallback, following the shared catalog
+        compatibility rule.
+        """
+
+        expected = (
+            r"(?:^|-)EBS:SnapshotArchiveStorage$"
+            if archive
+            else r"(?:^|-)EBS:SnapshotUsage$"
+        )
+
+        def is_requested_snapshot(attributes: dict[str, str]) -> bool:
+            usage_type = str(
+                attributes.get("usagetype") or attributes.get("usageType") or ""
+            )
+            return bool(re.search(expected, usage_type, re.IGNORECASE))
+
+        products = self.catalog.matching_products(
+            "AmazonEC2",
+            {"regionCode": region, "productFamily": "Storage Snapshot"},
+            is_requested_snapshot,
+            max_pages=10,
+            fallback_filters={"regionCode": region},
+            fallback_predicate=is_requested_snapshot,
+        )
+        label = "EBS 归档快照" if archive else "EBS 标准快照"
+        return PricingCatalog.require_unique(products, context=f"{label}存储 ({region})")
+
+    def _select_snapshot(
+        self,
+        requirement: ServiceRequirement,
+        requested: dict[str, Any],
+        *,
+        region: str,
+        variant: str,
+        is_global: bool,
+    ) -> SelectedResource:
+        conflicting_volume_fields = [
+            field
+            for field in (
+                "storage_gib",
+                "total_storage_gib",
+                "volume_type",
+                "iops",
+                "throughput_mbps",
+            )
+            if requested.get(field) not in (None, "", [], {})
+        ]
+        if conflicting_volume_fields:
+            raise ManualConfirmationRequired(
+                "EBS 快照组件同时包含云盘字段，系统已停止混合两种计费口径",
+                code="ebs_product_variant_field_conflict",
+                product_variant=variant,
+                fields=conflicting_volume_fields,
+            )
+
+        storage_gib = required_float(requested, "backup_storage_gib")
+        product = self._snapshot_product(
+            region=region,
+            archive=variant == "snapshot_archive",
+        )
+        label = "EBS 归档快照" if variant == "snapshot_archive" else "EBS 标准快照"
+        lines = (
+            [
+                _usage(
+                    product,
+                    "ebssnap",
+                    storage_gib,
+                    "ebs_snapshot",
+                    source_fields=("backup_storage_gib",),
+                )
+            ]
+            if storage_gib is not None
+            else []
+        )
+        references = (
+            []
+            if storage_gib is not None
+            else [_reference(product, f"{label}存储单价")]
+        )
+        frequency = requested.get("snapshot_frequency")
+        retention_days = requested.get("snapshot_retention_days")
+        changed_gib = requested.get("snapshot_changed_gib")
+        applied_fields = [
+            field
+            for field in (
+                "product_variant",
+                "backup_storage_gib",
+                "snapshot_frequency",
+                "snapshot_retention_days",
+                "snapshot_changed_gib",
+                "quantity",
+            )
+            if field == "quantity" or requested.get(field) not in (None, "", [], {})
+        ]
+        notices: list[str] = []
+        if is_global:
+            notices.append(f"EBS 快照必须属于具体区域；本次按 {region} 查询官方计费项。")
+        if storage_gib is None:
+            notices.append(
+                "客户已提供快照频率或保留策略，但未提供可计费的快照存储量；"
+                "本项仅展示 1 GiB-month 官方单位价，不根据频率、保留天数或源云盘容量猜测月费。"
+            )
+        return SelectedResource(
+            service=self.kind,
+            display_name="Amazon EBS Snapshot",
+            region=region,
+            model=label,
+            architecture=(
+                f"{label} · {storage_gib:g} GiB-month"
+                if storage_gib is not None
+                else f"{label} · 官方单位参考价"
+            ),
+            specifications={
+                "productVariant": variant,
+                **({"backupStorageGiB": storage_gib} if storage_gib is not None else {}),
+                **(
+                    {"snapshotChangedGiB": changed_gib}
+                    if changed_gib is not None
+                    else {}
+                ),
+                **(
+                    {"snapshotFrequency": frequency}
+                    if frequency not in (None, "")
+                    else {}
+                ),
+                **(
+                    {"snapshotRetentionDays": retention_days}
+                    if retention_days is not None
+                    else {}
+                ),
+            },
+            official_product={"source": "AWS Price List", "regionCode": region},
+            rationale=f"使用 {label} 官方 GB-Month 计费维度。",
+            substitution_notice=" ".join(notices) or None,
+            pricing_status="priced" if storage_gib is not None else "reference_only",
+            pricing_issue_code=(
+                None if storage_gib is not None else "snapshot_storage_usage_missing"
+            ),
+            pricing_notice=" ".join(notices) or None,
+            usage_lines=lines,
+            reference_rates=references,
+            applied_requirement_fields=applied_fields,
+        )
+
     def select(self, requirement: ServiceRequirement, default_region: str) -> SelectedResource:
         requested_region = requirement.region or default_region
         is_global = requested_region.casefold() in {"global", "aws-global", "全球"}
         region = default_region if is_global else requested_region
         requested = canonicalize_requirement_fields(requirement.requirements, service="ebs")
+        variant = self._product_variant(requested)
+        if variant in self._SNAPSHOT_VARIANTS:
+            return self._select_snapshot(
+                requirement,
+                requested,
+                region=region,
+                variant=variant,
+                is_global=is_global,
+            )
+
+        conflicting_snapshot_fields = [
+            field
+            for field in (
+                "backup_storage_gib",
+                "snapshot_changed_gib",
+                "snapshot_frequency",
+                "snapshot_retention_days",
+            )
+            if requested.get(field) not in (None, "", [], {})
+        ]
+        if conflicting_snapshot_fields:
+            raise ManualConfirmationRequired(
+                "EBS 云盘组件同时包含快照字段，系统已停止混合两种计费口径",
+                code="ebs_product_variant_field_conflict",
+                product_variant=variant,
+                fields=conflicting_snapshot_fields,
+            )
         volume_type = str(requested.get("volume_type") or "gp3").casefold()
         storage_gib = required_float(requested, "storage_gib")
         volume_count = max(int(requirement.quantity or 1), 1)
@@ -113,6 +345,64 @@ class EbsPlugin(_NoConfirmationPlugin):
             if storage_gib is None
             else []
         )
+        provisioned_iops = required_float(requested, "iops")
+        provisioned_throughput = required_float(requested, "throughput_mbps")
+        applied_fields: list[str] = []
+
+        def provisioned_product(metric: str) -> dict[str, Any]:
+            usage_suffix = f"ebs:volumep-{metric}.{volume_type}".casefold()
+            matches = self.catalog.matching_products(
+                "AmazonEC2",
+                {
+                    "regionCode": region,
+                    "volumeApiName": volume_type,
+                },
+                lambda attrs: str(attrs.get("usagetype") or "")
+                .casefold()
+                .endswith(usage_suffix),
+                max_pages=20,
+            )
+            return PricingCatalog.require_unique(
+                matches,
+                context=f"EBS {volume_type} {metric} ({region})",
+            )
+
+        additional_iops: float | None = None
+        additional_throughput: float | None = None
+        if volume_type == "gp3" and provisioned_iops is not None:
+            additional_iops = max(provisioned_iops - 3_000, 0) * volume_count
+            if additional_iops > 0:
+                lines.append(
+                    _usage(
+                        provisioned_product("iops"),
+                        "ebsiops",
+                        additional_iops,
+                        "ebs",
+                        source_fields=("iops", "quantity", "volume_type"),
+                    )
+                )
+            else:
+                applied_fields.append("iops")
+        if volume_type == "gp3" and provisioned_throughput is not None:
+            additional_throughput = (
+                max(provisioned_throughput - 125, 0) * volume_count
+            )
+            if additional_throughput > 0:
+                lines.append(
+                    _usage(
+                        provisioned_product("throughput"),
+                        "ebsthru",
+                        additional_throughput,
+                        "ebs",
+                        source_fields=(
+                            "throughput_mbps",
+                            "quantity",
+                            "volume_type",
+                        ),
+                    )
+                )
+            else:
+                applied_fields.append("throughput_mbps")
         notice = None
         if is_global:
             notice = f"EBS 必须属于具体区域；客户未指定归属，本次按 {region} 的最低基础存储项估算。"
@@ -137,12 +427,34 @@ class EbsPlugin(_NoConfirmationPlugin):
                     if total_storage_gib is not None
                     else {}
                 ),
+                **(
+                    {
+                        "provisionedIops": provisioned_iops,
+                        "billedAdditionalIops": additional_iops,
+                    }
+                    if provisioned_iops is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "provisionedThroughputMbps": provisioned_throughput,
+                        "billedAdditionalThroughputMbps": additional_throughput,
+                    }
+                    if provisioned_throughput is not None
+                    else {}
+                ),
             },
             official_product={"source": "AWS Price List", "regionCode": region},
             rationale="使用 Amazon EBS 官方 GB-Month 计费维度。",
             substitution_notice=notice,
+            pricing_status="priced" if storage_gib is not None else "reference_only",
+            pricing_issue_code=(
+                None if storage_gib is not None else "ebs_storage_usage_missing"
+            ),
+            pricing_notice=notice,
             usage_lines=lines,
             reference_rates=references,
+            applied_requirement_fields=applied_fields,
         )
 
 
@@ -233,10 +545,6 @@ class DataTransferPlugin(_NoConfirmationPlugin):
     ) -> list[str]:
         raw = requirement.requirements.get("source_regions")
         regions = [str(item) for item in raw] if isinstance(raw, list) else []
-        source = (requirement.source_text or "").casefold()
-        for marker, region in cls._REGION_MARKERS.items():
-            if marker in source and region not in regions:
-                regions.append(region)
         if requirement.region and requirement.region.casefold() not in {"global", "全球"}:
             regions.append(requirement.region)
         return list(dict.fromkeys(regions)) or [default_region]

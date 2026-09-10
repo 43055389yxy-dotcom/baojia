@@ -1,0 +1,182 @@
+[
+  {
+    "id": 1,
+    "name": "新加坡",
+    "expected_region": "ap-southeast-1",
+    "lines": [
+      "## 方案1｜新加坡",
+      "1、Amazon EC2：新加坡 ap-southeast-1，3台，m6a.2xlarge，8核32G，磁盘500G。",
+      "2、Amazon RDS for MySQL：1套主备，db.m6i.2xlarge，8核32G，存储1TB。",
+      "3、Amazon ElastiCache for Redis：3节点，1主2从，单节点4核16G。",
+      "4、Amazon MSK：3个Broker，m7g.xlarge，4核16G，单节点1TB。",
+      "5、Amazon OpenSearch Service：3节点，4核16G，单节点500G。",
+      "6、Amazon S3：Standard存储10TB。",
+      "7、Application Load Balancer：2个。",
+      "8、Amazon CloudFront：每月下行5TB，HTTPS请求5000万次。",
+      "9、AWS NAT Gateway：2个。",
+      "10、Amazon CloudWatch Logs：每月500GB日志，保留30天。"
+    ]
+  },
+  {
+    "id": 2,
+    "name": "东京",
+    "expected_region": "ap-northeast-1",
+    "lines": [
+      "## 方案2｜东京",
+      "1、Amazon EC2：东京 ap-northeast-1，4台，m6i.xlarge，4核16G，磁盘300G。",
+      "2、Amazon RDS for MySQL：1套主备，db.m6i.xlarge，4核16G，存储500G。",
+      "3、Amazon ElastiCache for Redis：2节点，1主1从，单节点2核8G。",
+      "4、Amazon MSK：3个Broker，m7g.large，2核8G，单节点500G。",
+      "5、Amazon OpenSearch Service：3节点，2核8G，单节点300G。",
+      "6、Amazon S3：存储5TB。",
+      "7、Application Load Balancer：1个。",
+      "8、Amazon CloudFront：每月下行3TB。",
+      "9、AWS NAT Gateway：2个。",
+      "10、Amazon CloudWatch Logs：每月300GB。"
+    ]
+  },
+  {
+    "id": 3,
+    "name": "孟买",
+    "expected_region": "ap-south-1",
+    "lines": [
+      "## 方案3｜孟买",
+      "1、Amazon EC2：孟买 ap-south-1，5台，m6a.2xlarge，8核32G，磁盘1TB。",
+      "2、Amazon RDS for MySQL：1套主备，db.r6i.2xlarge，8核64G，存储2TB。",
+      "3、Amazon ElastiCache for Redis：3节点，1主2从，单节点8核32G。",
+      "4、Amazon MSK：3个Broker，m7g.2xlarge，8核32G，单节点2TB。",
+      "5、Amazon OpenSearch Service：3节点，8核32G，单节点1TB。",
+      "6、Amazon S3：存储20TB。",
+      "7、Application Load Balancer：2个。",
+      "8、Amazon CloudFront：每月下行10TB。",
+      "9、AWS NAT Gateway：2个。",
+      "10、AWS WAF：1个Web ACL。"
+    ]
+  },
+  {
+    "id": 4,
+    "name": "香港",
+    "expected_region": "ap-east-1",
+    "lines": [
+      "## 方案4｜香港",
+      "1、Amazon EC2：香港 ap-east-1，3台，m6i.xlarge，4核16G，磁盘500G。",
+      "2、Amazon RDS for MySQL：1套主备，db.m6i.xlarge，4核16G，存储1TB。",
+      "3、Amazon ElastiCache for Redis：2节点，1主1从，单节点4核16G。",
+      "4、Amazon OpenSearch Service：3节点，4核16G，单节点500G。",
+      "5、Amazon S3：存储8TB。",
+      "6、Application Load Balancer：2个。",
+      "7、Amazon CloudFront：每月下行5TB。",
+      "8、AWS NAT Gateway：2个。",
+      "9、Amazon CloudWatch Logs：每月500GB。",
+      "10、AWS WAF：1个Web ACL，10条规则。"
+    ]
+  },
+  {
+    "id": 5,
+    "name": "首尔",
+    "expected_region": "ap-northeast-2",
+    "lines": [
+      "## 方案5｜首尔",
+      "1、Amazon EC2：首尔 ap-northeast-2，6台，m6a.xlarge，4核16G，磁盘300G。",
+      "2、Amazon Aurora MySQL：1主2只读，单节点8核32G，存储1TB。",
+      "3、Amazon ElastiCache for Redis：3节点，1主2从，单节点4核16G。",
+      "4、Amazon MSK：3个Broker，4核16G，单节点1TB。",
+      "5、Amazon OpenSearch Service：3节点，4核16G，单节点500G。",
+      "6、Amazon S3：存储15TB。",
+      "7、Application Load Balancer：2个。",
+      "8、Amazon CloudFront：每月下行8TB。",
+      "9、AWS NAT Gateway：2个。",
+      "10、Amazon CloudWatch Logs：每月800GB。"
+    ]
+  },
+  {
+    "id": 6,
+    "name": "悉尼",
+    "expected_region": "ap-southeast-2",
+    "lines": [
+      "## 方案6｜悉尼",
+      "1、Amazon EC2：悉尼 ap-southeast-2，4台，m6i.2xlarge，8核32G，磁盘500G。",
+      "2、Amazon RDS for PostgreSQL：1套主备，db.m6i.2xlarge，8核32G，存储1TB。",
+      "3、Amazon ElastiCache for Redis：3节点，1主2从，单节点4核16G。",
+      "4、Amazon MSK：3个Broker，4核16G，单节点1TB。",
+      "5、Amazon OpenSearch Service：3节点，4核16G，单节点500G。",
+      "6、Amazon S3：存储10TB。",
+      "7、Application Load Balancer：2个。",
+      "8、Amazon CloudFront：每月下行5TB。",
+      "9、AWS NAT Gateway：2个。",
+      "10、AWS Backup：每日备份，保留7天。"
+    ]
+  },
+  {
+    "id": 7,
+    "name": "美国弗吉尼亚",
+    "expected_region": "us-east-1",
+    "lines": [
+      "## 方案7｜美国弗吉尼亚",
+      "1、Amazon EC2：美国弗吉尼亚 us-east-1，8台，m6a.2xlarge，8核32G，磁盘1TB。",
+      "2、Amazon Aurora MySQL：1主2只读，单节点8核32G，存储2TB。",
+      "3、Amazon ElastiCache for Redis：3节点，1主2从，单节点8核32G。",
+      "4、Amazon MSK：6个Broker，8核32G，单节点2TB。",
+      "5、Amazon OpenSearch Service：6节点，8核32G，单节点1TB。",
+      "6、Amazon S3：存储50TB。",
+      "7、Application Load Balancer：3个。",
+      "8、Amazon CloudFront：每月下行20TB。",
+      "9、AWS NAT Gateway：3个。",
+      "10、AWS WAF：1个Web ACL。"
+    ]
+  },
+  {
+    "id": 8,
+    "name": "美国俄勒冈",
+    "expected_region": "us-west-2",
+    "lines": [
+      "## 方案8｜美国俄勒冈",
+      "1、Amazon EC2：美国俄勒冈 us-west-2，3台，m7g.xlarge，4核16G，磁盘300G。",
+      "2、Amazon RDS for PostgreSQL：1套主备，db.m6g.xlarge，4核16G，存储500G。",
+      "3、Amazon ElastiCache for Redis：2节点，1主1从，单节点2核8G。",
+      "4、Amazon S3：存储5TB。",
+      "5、Application Load Balancer：1个。",
+      "6、Amazon CloudFront：每月下行2TB。",
+      "7、AWS NAT Gateway：2个。",
+      "8、Amazon CloudWatch Logs：每月200GB。",
+      "9、AWS WAF：1个Web ACL。",
+      "10、Amazon Route 53：1个Hosted Zone。"
+    ]
+  },
+  {
+    "id": 9,
+    "name": "法兰克福",
+    "expected_region": "eu-central-1",
+    "lines": [
+      "## 方案9｜法兰克福",
+      "1、Amazon EC2：法兰克福 eu-central-1，5台，m6i.2xlarge，8核32G，磁盘500G。",
+      "2、Amazon RDS for MySQL：1套主备，db.r6i.2xlarge，8核64G，存储2TB。",
+      "3、Amazon ElastiCache for Redis：3节点，1主2从，单节点8核32G。",
+      "4、Amazon MSK：3个Broker，8核32G，单节点1TB。",
+      "5、Amazon OpenSearch Service：3节点，8核32G，单节点1TB。",
+      "6、Amazon S3：存储20TB。",
+      "7、Application Load Balancer：2个。",
+      "8、Amazon CloudFront：每月下行10TB。",
+      "9、AWS NAT Gateway：2个。",
+      "10、Amazon CloudWatch Logs：每月1TB。"
+    ]
+  },
+  {
+    "id": 10,
+    "name": "新加坡大型业务",
+    "expected_region": "ap-southeast-1",
+    "lines": [
+      "## 方案10｜新加坡大型业务",
+      "1、Amazon EC2：新加坡 ap-southeast-1，10台，m6a.2xlarge，8核32G，磁盘1TB。",
+      "2、Amazon Aurora MySQL：1主2只读，单节点16核64G，存储3TB。",
+      "3、Amazon ElastiCache for Redis：6节点，2分片，每分片1主2从，单节点8核32G。",
+      "4、Amazon MSK：6个Broker，8核32G，单节点2TB。",
+      "5、Amazon OpenSearch Service：6节点，8核32G，单节点2TB。",
+      "6、Amazon S3：存储50TB。",
+      "7、Application Load Balancer：3个。",
+      "8、Amazon CloudFront：每月下行20TB，HTTPS请求2亿次。",
+      "9、AWS NAT Gateway：3个。",
+      "10、AWS WAF：1个Web ACL，20条规则。"
+    ]
+  }
+]

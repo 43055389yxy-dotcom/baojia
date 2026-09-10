@@ -13,12 +13,13 @@ from app.core.data_paths import AWS_DATA_ROOT
 from app.core.errors import ManualConfirmationRequired
 from app.integrations.aws import PricingCatalog
 from app.integrations.aws_product_registry import AwsProductRegistry
+from app.integrations.aws_regions import official_catalog_region_scope
 from app.integrations.aws_supported_services import CURATED_SERVICE_OFFER_CODES
 from app.integrations.service_templates import DYNAMIC_SEMANTIC_TEMPLATE_FIELDS
 
 PROFILE_TTL_SECONDS = 10 * 24 * 60 * 60
 FAILED_RETRY_SECONDS = 6 * 60 * 60
-PROFILE_SCHEMA_VERSION = 14
+PROFILE_SCHEMA_VERSION = 22
 
 
 def canonical_service_name(value: str) -> str:
@@ -68,6 +69,13 @@ def _dimension_field(dimension: dict[str, Any]) -> tuple[str | None, str | None]
         if "input" in text:
             return "input_tokens", "输入 Token 数量"
         return None, None
+
+    if "page" in unit:
+        return "document_pages", "文档页数"
+    if "character" in unit:
+        return "characters", "字符数量"
+    if "image" in unit and any(token in text for token in ("image", "photo")):
+        return "images", "图片数量"
 
     # Preserve the customer-facing quantity behind uncommon AWS units.  These
     # rules are based on official units/operations, not service names, so a
@@ -154,6 +162,12 @@ def _dimension_field(dimension: dict[str, Any]) -> tuple[str | None, str | None]
     if any(token in unit for token in ("gb-month", "gb-mo", "gib-month")):
         if "magnetic" in text and "store" in text:
             return "magnetic_store_gib_months", "磁性存储（GiB 月）"
+        if "restore" in text:
+            return "restore_gib", "恢复数据量（GiB）"
+        if "cold" in text and any(token in text for token in ("backup", "storage")):
+            return "cold_storage_gib", "冷备份存储（GiB/月）"
+        if "warm" in text and any(token in text for token in ("backup", "storage")):
+            return "warm_storage_gib", "热备份存储（GiB/月）"
         if any(token in text for token in ("backup", "snapshot")):
             return "backup_storage_gib", "备份或快照存储（GiB/月）"
         if "managed" in text:
@@ -163,6 +177,8 @@ def _dimension_field(dimension: dict[str, Any]) -> tuple[str | None, str | None]
     if unit in {"gb", "gbyte", "gigabyte", "gigabytes", "gib"} or (
         "byte" in unit and any(token in text for token in ("process", "processed", "ingest"))
     ):
+        if "restore" in text:
+            return "restore_gib", "恢复数据量（GiB）"
         if "attachment" in text:
             return "attachments_gib", "附件数据量（GiB）"
         if any(token in text for token in ("upload", "download", "uploaded", "downloaded")):
@@ -457,7 +473,7 @@ class AutoServiceDiscovery:
         # name resolution, but using it here made distinct offers such as
         # AmazonBedrock and AmazonBedrockService share one profile.  Resolution
         # may be tolerant; persisted fields and prices must never be.
-        return f"{canonical_service_name(service_key)}:{(region or 'global').casefold()}"
+        return f"{canonical_service_name(service_key)}:{official_catalog_region_scope(region)}"
 
     def get_profile(self, service_key: str, region: str | None = None) -> dict[str, Any] | None:
         key = self._profile_key(service_key, region)
@@ -473,6 +489,16 @@ class AutoServiceDiscovery:
             payload = json.loads(str(row["payload_json"]))
         except json.JSONDecodeError:
             return None
+        # Old payloads may preserve None/Global despite sharing the same key.
+        # Normalize equivalent spellings only; reject a corrupted cross-region
+        # or cross-product row instead of relabelling its official meters.
+        if not isinstance(payload, dict) or "region" not in payload:
+            return None
+        if (official_catalog_region_scope(payload["region"]) != official_catalog_region_scope(region)
+                or canonical_service_name(str(payload.get("service_key") or ""))
+                != canonical_service_name(service_key)):
+            return None
+        payload["region"] = official_catalog_region_scope(payload["region"])
         payload["status"] = str(row["status"])
         payload["error_code"] = row["error_code"]
         payload["updated_at"] = float(row["updated_at"])
@@ -486,6 +512,7 @@ class AutoServiceDiscovery:
         region: str | None,
         force_refresh: bool = False,
     ) -> dict[str, Any] | None:
+        region = official_catalog_region_scope(region)
         profile_key = self._profile_key(service_key, region)
         with self._lock:
             profile_lock = self._profile_locks.setdefault(profile_key, threading.Lock())
@@ -621,6 +648,7 @@ class AutoServiceDiscovery:
         refresh: bool = False,
     ) -> dict[str, Any]:
         assert self.catalog is not None
+        region = official_catalog_region_scope(region)
         filters = {"regionCode": region} if region and region != "global" else {}
         products = self._catalog_products(service_code, filters, max_pages=10, refresh=refresh)
         if filters:
@@ -846,6 +874,7 @@ class AutoServiceDiscovery:
 
     def _save(self, profile: dict[str, Any], *, status: str, error_code: str | None) -> None:
         now = time.time()
+        profile = dict(profile, region=official_catalog_region_scope(profile.get("region")))
         payload = dict(profile)
         payload["status"] = status
         payload["updated_at"] = now

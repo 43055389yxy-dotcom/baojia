@@ -166,7 +166,9 @@ class DiagnosticLog:
                 "traceback": raw_traceback,
             }
         )
-        cause = error.__cause__ or error.__context__
+        cause = error.__cause__
+        if cause is None and not error.__suppress_context__:
+            cause = error.__context__
         if cause is not None:
             error_context["cause"] = {
                 "error_type": type(cause).__name__,

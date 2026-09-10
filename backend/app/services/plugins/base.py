@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 
@@ -80,7 +81,9 @@ class PluginRegistry:
         ]
 
 
-def required_float(requirements: dict[str, object], key: str) -> float | None:
+def required_float(
+    requirements: dict[str, object], key: str, *, allow_zero: bool = False
+) -> float | None:
     value = requirements.get(key)
     if value is None:
         return None
@@ -94,9 +97,11 @@ def required_float(requirements: dict[str, object], key: str) -> float | None:
         raise ManualConfirmationRequired(
             f"需求字段 {key} 必须是数值", code="invalid_requirement", field=key
         ) from exc
-    if number <= 0:
+    if not math.isfinite(number) or number < 0 or (number == 0 and not allow_zero):
         raise ManualConfirmationRequired(
-            f"需求字段 {key} 必须大于 0", code="invalid_requirement", field=key
+            f"需求字段 {key} 必须是有限{'非负数' if allow_zero else '正数'}",
+            code="invalid_requirement",
+            field=key,
         )
     return number
 

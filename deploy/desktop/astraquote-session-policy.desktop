@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=AstraQuote Desktop Session Policy
+Comment=Keep the dedicated quotation desktop awake and unlocked
+Exec=/home/ec2-user/.local/bin/astraquote-session-policy
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

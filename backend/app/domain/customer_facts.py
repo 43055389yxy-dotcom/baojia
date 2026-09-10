@@ -92,18 +92,28 @@ def explicit_requested_model(service: str, source: str) -> tuple[str, str] | Non
     text = str(source or "")
     if pattern is None:
         # Automatically discovered official services do not have a handwritten
-        # model prefix table.  A labelled literal such as
-        # ``实例规格 db.r6g.large`` is nevertheless unambiguous customer data
-        # and must survive the generic extraction path.
-        pattern = re.compile(
-            r"(?:实例(?:类型|规格)|型号|机型|sku)\s*[:：]?\s*"
-            + ASCII_MODEL_START
+        # model prefix table.  A labelled literal is nevertheless unambiguous
+        # customer data and must survive the generic extraction path. Chinese
+        # sales prose naturally places the label on either side of the value:
+        # ``实例规格 family.large`` and ``family.large 实例`` are equivalent.
+        model_token = (
+            ASCII_MODEL_START
             + r"([a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+)"
-            + ASCII_MODEL_END,
+            + ASCII_MODEL_END
+        )
+        prefix_label = re.compile(
+            r"(?:实例(?:类型|规格)|型号|机型|sku)\s*[:：]?\s*"
+            + model_token,
             re.IGNORECASE,
         )
-    match = pattern.search(text)
-    if not match:
+        suffix_label = re.compile(
+            model_token + r"\s*(?:实例(?:类型|规格)?|型号|机型|sku)",
+            re.IGNORECASE,
+        )
+        match = prefix_label.search(text) or suffix_label.search(text)
+    else:
+        match = pattern.search(text)
+    if match is None:
         return None
     return match.group(1).lower().rstrip("。；;,.，"), match.group(0)
 
@@ -236,6 +246,27 @@ def customer_match_policy(
     if source in {"customer_confirmation", "customer_correction", "sales_confirmation"}:
         return "exact"
     return infer_match_policy(requirement.field_evidence.get(path, ""))
+
+
+def customer_field_is_explicit(
+    requirement: ServiceRequirement,
+    field: str,
+) -> bool:
+    """Return whether the cleaned customer table owns this field.
+
+    Downstream product and pricing adapters must not reopen ``source_text`` to
+    decide whether a value was written by the customer.  Provenance captured
+    during the one authorized cleaning pass is the sole authority.
+    """
+
+    path = field if field in {"quantity", "hours_per_month", "region"} else (
+        field if field.startswith("requirements.") else f"requirements.{field}"
+    )
+    return (
+        requirement.field_sources.get(path) in CUSTOMER_FACT_SOURCES
+        or path in requirement.locked_fields
+        or bool(requirement.field_evidence.get(path))
+    )
 
 
 def field_scope(requirement: ServiceRequirement, field: str) -> FieldScope:

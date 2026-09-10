@@ -69,6 +69,17 @@ def component_hierarchy(
         # component is never accidentally made a child.
         if item.service.casefold() != "ec2":
             continue
+        source_block_key = item.field_sources.get("_source_block_key")
+        if source_block_key and not any(
+            candidate.field_sources.get("_source_block_key") == source_block_key
+            for candidate_index, candidate in enumerate(services)
+            if candidate_index != index
+        ):
+            # A sales-numbered source owner is an explicit root boundary.
+            # Legacy adjacency inference may only group rows that share that
+            # immutable owner; a nearby independently numbered ECS/EKS/VPC
+            # component is never its parent.
+            continue
         relation_only = bool(source and _RELATION_ONLY.match(source))
         likely_worker = any(
             marker in f"{display} {source.casefold()}"

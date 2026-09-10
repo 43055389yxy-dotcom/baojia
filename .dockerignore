@@ -8,7 +8,8 @@ backend/.pytest_cache
 backend/.ruff_cache
 backend/.cache
 backend/artifacts
-frontend/node_modules
+outputs
+**/node_modules
 frontend/.next
 frontend/dist
 frontend/.wrangler
@@ -17,3 +18,7 @@ frontend/coverage
 **/*.pyc
 deploy/astraquote-codex-agent
 deploy/runtime
+# Historical Calculator contract experiments are retained only in source
+# history/backups. The production image is official-catalog API only.
+backend/app/integrations/*calculator*.py
+backend/app/integrations/aws_component_templates

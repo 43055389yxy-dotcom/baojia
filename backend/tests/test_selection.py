@@ -80,6 +80,70 @@ def test_ec2_exact_model_query_falls_back_to_reviewed_shape_catalog(
     assert candidates[0]["memory_gib"] == 96
 
 
+def test_ec2_endpoint_timeout_falls_back_to_exact_official_price_list_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingExecutor:
+        def __init__(self, _clients: object) -> None:
+            pass
+
+        def execute(self, **_arguments: object) -> dict[str, object]:
+            raise ManualConfirmationRequired(
+                "temporary endpoint failure", code="aws_query_execution_failed"
+            )
+
+    class Catalog:
+        def products(
+            self,
+            service_code: str,
+            filters: dict[str, str],
+            *,
+            max_pages: int = 20,
+        ) -> list[dict[str, object]]:
+            assert service_code == "AmazonEC2"
+            assert filters == {
+                "regionCode": "me-south-1",
+                "productFamily": "Compute Instance",
+                "instanceType": "m6i.2xlarge",
+            }
+            return [
+                {
+                    "serviceCode": "AmazonEC2",
+                    "product": {
+                        "sku": "exact-x86",
+                        "attributes": {
+                            "regionCode": "me-south-1",
+                            "productFamily": "Compute Instance",
+                            "instanceType": "m6i.2xlarge",
+                            "vcpu": "8",
+                            "memory": "32 GiB",
+                            "processorArchitecture": "64-bit",
+                            "currentGeneration": "Yes",
+                            "usagetype": "MES1-BoxUsage:m6i.2xlarge",
+                            "operation": "RunInstances:0002",
+                        },
+                    },
+                }
+            ]
+
+    monkeypatch.setattr(ec2_module, "ReadOnlyAwsQueryExecutor", FailingExecutor)
+    Ec2Plugin._candidate_cache.clear()
+    plugin = Ec2Plugin(None, Catalog())  # type: ignore[arg-type]
+
+    candidates = plugin._official_candidates("me-south-1", "m6i.2xlarge")
+
+    assert candidates == [
+        {
+            "model": "m6i.2xlarge",
+            "vcpu": 8.0,
+            "memory_gib": 32.0,
+            "current_generation": True,
+            "family": "general_purpose",
+            "architectures": ["x86_64"],
+        }
+    ]
+
+
 def test_ec2_configuration_picker_uses_complete_regional_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -227,6 +291,79 @@ def test_rds_unavailable_legacy_model_falls_back_to_orderable_engine_catalog(
         {"Engine": "mysql", "DBInstanceClass": "db.m4.xlarge"},
         {"Engine": "mysql"},
     ]
+
+
+def test_rds_endpoint_timeout_falls_back_to_exact_priced_official_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingExecutor:
+        def __init__(self, _clients: object) -> None:
+            pass
+
+        def execute(self, **_arguments: object) -> dict[str, object]:
+            raise ManualConfirmationRequired(
+                "temporary endpoint failure", code="aws_query_execution_failed"
+            )
+
+    class Catalog:
+        def products(
+            self,
+            service_code: str,
+            filters: dict[str, str],
+            *,
+            max_pages: int = 20,
+        ) -> list[dict[str, object]]:
+            assert service_code == "AmazonRDS"
+            assert filters == {
+                "regionCode": "me-south-1",
+                "productFamily": "Database Instance",
+                "databaseEngine": "SQL Server",
+                "databaseEdition": "Standard",
+                "instanceType": "db.r6i.2xlarge",
+            }
+            return [
+                {
+                    "serviceCode": "AmazonRDS",
+                    "product": {
+                        "sku": "exact-rds",
+                        "attributes": {
+                            "regionCode": "me-south-1",
+                            "productFamily": "Database Instance",
+                            "databaseEngine": "SQL Server",
+                            "databaseEdition": "Standard",
+                            "deploymentOption": "Multi-AZ",
+                            "instanceType": "db.r6i.2xlarge",
+                            "usagetype": "MES1-MirrorUsage:db.r6i.2xl",
+                            "operation": "CreateDBInstance:0012",
+                        },
+                    },
+                    "terms": {
+                        "OnDemand": {
+                            "term": {
+                                "priceDimensions": {
+                                    "dimension": {
+                                        "beginRange": "0",
+                                        "unit": "Hrs",
+                                        "pricePerUnit": {"USD": "6.754"},
+                                    }
+                                }
+                            }
+                        }
+                    },
+                }
+            ]
+
+    monkeypatch.setattr(rds_module, "ReadOnlyAwsQueryExecutor", FailingExecutor)
+    plugin = RdsPlugin(None, Catalog())  # type: ignore[arg-type]
+
+    classes = plugin._orderable_classes(
+        "me-south-1",
+        "sql_server_standard",
+        None,
+        requested_model="db.r6i.2xlarge",
+    )
+
+    assert classes == {"db.r6i.2xlarge"}
 
 
 def test_rds_configuration_picker_uses_complete_orderable_catalog(
@@ -404,7 +541,63 @@ def test_rds_quote_keeps_priced_storage_capacity_in_display_specifications(
 
     assert selection.specifications["storageType"] == "General Purpose-GP3"
     assert selection.specifications["storageGiB"] == 300
-    assert selection.usage_lines[-1].amount == 300
+
+
+def test_rds_storage_matches_multi_az_semantics_when_optional_label_differs() -> None:
+    mirror_storage = {
+        "serviceCode": "AmazonRDS",
+        "product": {
+            "sku": "sqlserver-mirror-gp3",
+            "productFamily": "Database Storage",
+            "attributes": {
+                "regionCode": "me-south-1",
+                "databaseEngine": "SQL Server",
+                "databaseEdition": "Standard",
+                "deploymentOption": "Multi-AZ (SQL Server Mirror)",
+                "volumeType": "General Purpose-GP3",
+                "usagetype": "MES1-RDS:Mirror-GP3-Storage",
+                "operation": "CreateDBInstance:0012",
+            },
+        },
+    }
+
+    class Catalog:
+        @staticmethod
+        def attribute_values(*_args: object, **_kwargs: object) -> list[str]:
+            return ["General Purpose-GP3"]
+
+        @staticmethod
+        def products(
+            _service_code: str,
+            filters: dict[str, str],
+            **_kwargs: object,
+        ) -> list[dict[str, object]]:
+            if filters.get("deploymentOption") == "Multi-AZ":
+                return []
+            return [mirror_storage]
+
+    plugin = RdsPlugin(None, Catalog())  # type: ignore[arg-type]
+    requirement = ServiceRequirement(
+        service="rds",
+        region="me-south-1",
+        quantity=1,
+        requirements={
+            "engine": "sql_server_standard",
+            "deployment": "multi_az",
+            "storage_type": "gp3",
+        },
+    )
+
+    line, storage_type = plugin._storage_usage(
+        "me-south-1",
+        requirement.requirements,
+        1,
+        3072,
+    )
+
+    assert storage_type == "General Purpose-GP3"
+    assert line.usage_type == "MES1-RDS:Mirror-GP3-Storage"
+    assert line.amount == 3072
 
 
 def test_ec2_user_os_maps_to_price_list_family() -> None:

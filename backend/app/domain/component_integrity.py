@@ -5,10 +5,12 @@ import re
 from dataclasses import dataclass
 
 from app.domain.fact_ledger import (
+    customer_owned_source,
     merge_unmapped_pricing_facts,
     remove_facts_mapped_to_fields,
 )
 from app.domain.models import ParsedIntent, ServiceRequirement
+from app.domain.cleaned_input import CLEANED_INPUT_POLICY_VERSION
 
 CUSTOMER_FIELD_SOURCES = {
     "customer_text",
@@ -68,7 +70,11 @@ def ensure_component_keys(intent: ParsedIntent) -> None:
     used: set[str] = set()
     collisions: dict[str, int] = {}
     for item in intent.services:
-        if not item.original_source_text:
+        if (
+            not item.original_source_text
+            and item.field_sources.get("_source_retention_policy")
+            != CLEANED_INPUT_POLICY_VERSION
+        ):
             item.original_source_text = original_component_source(item.source_text)
         if item.component_key and item.component_key not in used:
             used.add(item.component_key)
@@ -131,15 +137,111 @@ def customer_source_priority(source: str | None) -> int:
     return 0
 
 
+def _enforce_owned_source_boundary(item: ServiceRequirement) -> None:
+    """Discard customer-text facts that belong to another split component.
+
+    Once a compound customer row has been split, ``customer_owned_source`` is
+    the only prose slice from which this component may own facts.  This check
+    applies to the component currently returned by the cleaner as well as to
+    restored ledgers.  Explicit later customer/sales confirmations are not
+    prose extraction and therefore remain valid overrides.
+    """
+
+    if item.field_sources.get("_owned_source_slice") != "system_policy":
+        return
+    compact_owned_source = re.sub(
+        r"\s+", "", customer_owned_source(item)
+    ).casefold()
+    if not compact_owned_source:
+        return
+
+    rejected_paths: set[str] = set()
+    for path, source_kind in tuple(item.field_sources.items()):
+        if source_kind != "customer_text":
+            continue
+        if path not in {"region", "quantity", "hours_per_month"} and not path.startswith(
+            "requirements."
+        ):
+            continue
+        evidence = re.sub(
+            r"\s+", "", str(item.field_evidence.get(path) or "")
+        ).casefold()
+        # Older drafts can contain typed values without snippet metadata.  Do
+        # not invent ownership from that absence here; the ledger validator
+        # handles missing evidence separately.  This boundary only rejects a
+        # value when its existing evidence positively proves it came from a
+        # sibling slice.
+        if not evidence or evidence in compact_owned_source:
+            continue
+        rejected_paths.add(path)
+
+    for path in rejected_paths:
+        if path.startswith("requirements."):
+            item.requirements.pop(path.split(".", 1)[1], None)
+        elif path == "region":
+            item.region = None
+        elif path == "quantity":
+            item.quantity = 1
+        elif path == "hours_per_month":
+            item.hours_per_month = 730
+        item.field_sources.pop(path, None)
+        item.field_evidence.pop(path, None)
+        item.field_match_policies.pop(path, None)
+        item.field_scopes.pop(path, None)
+
+    if rejected_paths:
+        item.locked_fields = [
+            path for path in item.locked_fields if path not in rejected_paths
+        ]
+        item.customer_pricing_facts = [
+            fact
+            for fact in item.customer_pricing_facts
+            if fact.path not in rejected_paths
+        ]
+
+    item.unmapped_pricing_facts = [
+        fact
+        for fact in item.unmapped_pricing_facts
+        if (
+            (compact_evidence := re.sub(r"\s+", "", fact.evidence).casefold())
+            and compact_evidence in compact_owned_source
+        )
+    ]
+
+
 def overlay_customer_fields(
     target: ServiceRequirement,
     source: ServiceRequirement,
 ) -> None:
     """Merge one component without allowing weaker data to erase customer facts."""
 
+    # A compound sales row can produce a free/control-plane parent plus one or
+    # more billable children.  After that split, the component-owned source
+    # slice is a hard ownership boundary.  Restoring a ledger captured before
+    # the split must not copy Worker CPU/counts back onto the EKS/ECS parent,
+    # or copy a cluster count onto its EC2 child.  This rule uses only literal
+    # evidence containment, so it applies to every present and future
+    # parent/child product without naming either side.
+    has_owned_slice = (
+        target.field_sources.get("_owned_source_slice") == "system_policy"
+    )
+    compact_owned_source = re.sub(
+        r"\s+", "", customer_owned_source(target)
+    ).casefold()
+
+    def belongs_to_target(path: str, source_kind: str | None) -> bool:
+        if not has_owned_slice or source_kind != "customer_text":
+            return True
+        evidence = re.sub(
+            r"\s+", "", str(source.field_evidence.get(path) or "")
+        ).casefold()
+        return bool(evidence and evidence in compact_owned_source)
+
     for field in ("region", "quantity", "hours_per_month"):
         incoming_source = source.field_sources.get(field)
         if incoming_source not in CUSTOMER_FIELD_SOURCES:
+            continue
+        if not belongs_to_target(field, incoming_source):
             continue
         current_source = target.field_sources.get(field)
         if customer_source_priority(incoming_source) < customer_source_priority(current_source):
@@ -151,6 +253,8 @@ def overlay_customer_fields(
 
     for path, incoming_source in source.field_sources.items():
         if not path.startswith("requirements.") or incoming_source not in CUSTOMER_FIELD_SOURCES:
+            continue
+        if not belongs_to_target(path, incoming_source):
             continue
         current_source = target.field_sources.get(path)
         if customer_source_priority(incoming_source) < customer_source_priority(current_source):
@@ -180,7 +284,18 @@ def overlay_customer_fields(
     # automated cleanup pass may map one of these facts to a normal field, but
     # it may never erase a still-unmapped value merely by returning a shorter
     # component object.
-    merge_unmapped_pricing_facts(target, source)
+    overflow_source = source
+    if has_owned_slice:
+        overflow_source = source.model_copy(deep=True)
+        overflow_source.unmapped_pricing_facts = [
+            fact
+            for fact in source.unmapped_pricing_facts
+            if (
+                (compact_evidence := re.sub(r"\s+", "", fact.evidence).casefold())
+                and compact_evidence in compact_owned_source
+            )
+        ]
+    merge_unmapped_pricing_facts(target, overflow_source)
     remove_facts_mapped_to_fields(target)
 
 
@@ -284,6 +399,7 @@ def enforce_component_integrity(intent: ParsedIntent) -> None:
     deduplicate_derived_components(intent)
     ensure_component_keys(intent)
     for item in intent.services:
+        _enforce_owned_source_boundary(item)
         remove_facts_mapped_to_fields(item)
         locked = set(item.locked_fields)
         for path, source in tuple(item.field_sources.items()):

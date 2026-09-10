@@ -13,9 +13,10 @@ from app.domain.models import (
     UsageLine,
 )
 from app.domain.requirement_fields import canonicalize_requirement_fields
-from app.integrations.aws import PricingCatalog
+from app.integrations.aws import PricingCatalog, parse_number
 from app.services.aws_query_executor import ReadOnlyAwsQueryExecutor
 from app.services.plugins.base import ServicePlugin, required_float
+from app.services.plugins.template_billing import template_usage
 
 
 class Ec2Plugin(ServicePlugin):
@@ -39,9 +40,7 @@ class Ec2Plugin(ServicePlugin):
         confirmation page unnecessarily slow.
         """
 
-        requested = canonicalize_requirement_fields(
-            requirement.requirements, service="ec2"
-        )
+        requested = canonicalize_requirement_fields(requirement.requirements, service="ec2")
         operating_system = _pricing_operating_system(
             _optional_string(requested.get("operating_system"))
         )
@@ -489,40 +488,44 @@ class Ec2Plugin(ServicePlugin):
         monthly_commitment_cost = 0.0
         upfront_commitment_cost = 0.0
         usage_lines: list[UsageLine] = []
+        zero_usage_fields: list[str] = []
         if purchase_option == "on_demand":
-            utilization_percent = required_float(requested, "utilization_percent") or 100.0
-            if utilization_percent > 100:
-                raise ManualConfirmationRequired(
-                    "EC2 使用率不能超过 100%",
-                    code="invalid_requirement",
-                    field="utilization_percent",
-                )
-            usage_lines.append(
-                UsageLine(
-                    key="ec2",
-                    service_code=service_code,
-                    usage_type=usage_type,
-                    operation=operation,
-                    amount=(
-                        requirement.quantity
-                        * requirement.hours_per_month
-                        * utilization_percent
-                        / 100.0
-                    ),
-                    group="ec2",
-                    source_fields=[
-                        "quantity",
-                        "hours_per_month",
+            compute_usage = template_usage("ec2", "instance_hours", requirement, requested)
+            if compute_usage.amount == 0:
+                zero_usage_fields.extend(compute_usage.inputs)
+                zero_usage_fields.extend(
+                    [
                         "requested_model",
                         "vcpu",
                         "memory_gib",
                         "operating_system",
                         "tenancy",
                         "purchase_option",
-                        "utilization_percent",
-                    ],
+                    ]
                 )
-            )
+            else:
+                usage_lines.append(
+                    UsageLine(
+                        key="ec2",
+                        service_code=service_code,
+                        usage_type=usage_type,
+                        operation=operation,
+                        amount=float(compute_usage.amount),
+                        calculation=compute_usage.audit(),
+                        group="ec2",
+                        source_fields=[
+                            "quantity",
+                            "hours_per_month",
+                            "requested_model",
+                            "vcpu",
+                            "memory_gib",
+                            "operating_system",
+                            "tenancy",
+                            "purchase_option",
+                            "utilization_percent",
+                        ],
+                    )
+                )
         elif purchase_option in {"standard_reserved", "convertible_reserved"}:
             reserved = PricingCatalog.reserved_price(
                 compute_product,
@@ -541,13 +544,16 @@ class Ec2Plugin(ServicePlugin):
                 code="unsupported_purchase_option",
             )
         disk_gib = required_float(requested, "system_disk_gib")
-        if disk_gib is not None:
+        total_system_disk_gib = required_float(requested, "total_system_disk_gib")
+        if disk_gib is not None or total_system_disk_gib is not None:
+            storage_usage = template_usage("ec2", "system_ebs_gib_month", requirement, requested)
             volume_api_name = _optional_string(requested.get("volume_type")) or "gp3"
             usage_lines.append(
                 self._ebs_storage_usage(
                     region=region,
                     volume_type=volume_api_name,
-                    amount=requirement.quantity * disk_gib,
+                    amount=float(storage_usage.amount),
+                    calculation=storage_usage.audit(),
                     key="ebs",
                     source_fields=(
                         "quantity",
@@ -558,26 +564,31 @@ class Ec2Plugin(ServicePlugin):
                 )
             )
         additional_volumes = requested.get("additional_ebs_volumes")
+        # Validate the entire array before querying or emitting any disk row.
+        template_usage("ec2", "additional_ebs_gib_month", requirement, requested)
         if isinstance(additional_volumes, list):
             for index, volume in enumerate(additional_volumes, start=1):
-                if not isinstance(volume, dict):
-                    continue
-                size_gib = required_float(volume, "size_gib")
-                if size_gib is None:
-                    continue
-                count = required_float(volume, "count_per_instance") or 1
+                volume_usage = template_usage(
+                    "ec2", "additional_ebs_gib_month", requirement, requested, item_index=index - 1
+                )
                 volume_type = _optional_string(volume.get("volume_type")) or "gp3"
                 usage_lines.append(
                     self._ebs_storage_usage(
                         region=region,
                         volume_type=volume_type,
-                        amount=requirement.quantity * count * size_gib,
+                        amount=float(volume_usage.amount),
+                        calculation=volume_usage.audit(),
                         key=f"ebs{index + 1}",
                         source_fields=("quantity", "additional_ebs_volumes"),
                     )
                 )
-        transfer_out_gib = required_float(requested, "data_transfer_out_gib")
-        if transfer_out_gib is not None:
+        transfer_out_gib = None
+        transfer_usage = template_usage("ec2", "internet_data_transfer_out", requirement, requested)
+        if transfer_usage.amount is not None:
+            transfer_out_gib = float(transfer_usage.amount)
+        if transfer_out_gib == 0:
+            zero_usage_fields.extend(transfer_usage.inputs)
+        if transfer_out_gib is not None and transfer_out_gib > 0:
             transfer_products = self.catalog.products(
                 "AWSDataTransfer",
                 {
@@ -590,16 +601,17 @@ class Ec2Plugin(ServicePlugin):
             transfer_product = PricingCatalog.require_unique(
                 transfer_products, context=f"公网出站流量 ({region})"
             )
-            transfer_service, transfer_usage, transfer_operation = PricingCatalog.billing_identity(
-                transfer_product
+            transfer_service, transfer_usage_type, transfer_operation = (
+                PricingCatalog.billing_identity(transfer_product)
             )
             usage_lines.append(
                 UsageLine(
                     key="ec2out",
                     service_code=transfer_service,
-                    usage_type=transfer_usage,
+                    usage_type=transfer_usage_type,
                     operation=transfer_operation,
                     amount=transfer_out_gib,
+                    calculation=transfer_usage.audit(),
                     group="ec2-transfer",
                     source_fields=[
                         "data_transfer_out_gib",
@@ -637,13 +649,12 @@ class Ec2Plugin(ServicePlugin):
             if descriptions:
                 storage_description = "每台额外数据盘：" + "；".join(descriptions)
         if not storage_description and disk_gib is not None:
-            source_text = requirement.source_text or ""
-            storage_label = (
-                "系统盘"
-                if re.search(r"系统盘|启动盘|根卷", source_text, re.I)
-                else "EBS 存储"
-            )
-            storage_description = f"每台 {disk_gib:g} GiB {storage_label}"
+            # ``disk_gib`` is sourced exclusively from the typed
+            # ``system_disk_gib`` requirement above.  Re-reading prose here
+            # used to let presentation logic reinterpret a cleaned field.
+            storage_description = f"每台 {disk_gib:g} GiB 系统盘"
+        elif not storage_description and total_system_disk_gib is not None:
+            storage_description = f"合计 {total_system_disk_gib:g} GiB 系统盘"
 
         return SelectedResource(
             service=self.kind,
@@ -688,7 +699,7 @@ class Ec2Plugin(ServicePlugin):
                     "payment_option",
                 ]
                 if purchase_option in {"standard_reserved", "convertible_reserved"}
-                else []
+                else zero_usage_fields
             ),
             monthly_commitment_cost=monthly_commitment_cost,
             upfront_commitment_cost=upfront_commitment_cost,
@@ -702,6 +713,7 @@ class Ec2Plugin(ServicePlugin):
         amount: float,
         key: str,
         source_fields: tuple[str, ...],
+        calculation: dict[str, Any] | None = None,
     ) -> UsageLine:
         storage_products = self.catalog.products(
             "AmazonEC2",
@@ -724,6 +736,7 @@ class Ec2Plugin(ServicePlugin):
             amount=amount,
             group="ec2-storage",
             source_fields=list(source_fields),
+            calculation=calculation,
         )
 
     def _compute_product(
@@ -848,6 +861,75 @@ class Ec2Plugin(ServicePlugin):
                     )
             return candidates
 
+        def price_list_fallback() -> list[dict[str, Any]]:
+            """Recover exact official shapes when the regional EC2 API is down.
+
+            AWS Price List independently publishes the region, instance type,
+            CPU, memory, generation and processor architecture for purchasable
+            compute products.  It is safe as an availability fallback only for
+            a narrow exact model or exact shape query; an outage must not turn
+            into a broad cheapest-model guess.
+            """
+
+            if self.catalog is None:
+                return []
+            filters = {
+                "regionCode": region,
+                "productFamily": "Compute Instance",
+            }
+            if requested_model:
+                filters["instanceType"] = requested_model
+            elif requested_vcpu is not None and requested_memory is not None:
+                filters["vcpu"] = f"{requested_vcpu:g}"
+                filters["memory"] = f"{requested_memory:g} GiB"
+            else:
+                return []
+            try:
+                products = self.catalog.products(
+                    "AmazonEC2",
+                    filters,
+                    max_pages=5,
+                )
+            except (ManualConfirmationRequired, KeyError, TypeError, ValueError):
+                return []
+
+            by_model: dict[str, dict[str, Any]] = {}
+            conflicting_models: set[str] = set()
+            for product in products:
+                attrs = PricingCatalog.attributes(product)
+                model = str(attrs.get("instanceType") or "").strip()
+                if not model or (requested_model and model != requested_model):
+                    continue
+                try:
+                    vcpu = parse_number(attrs.get("vcpu"), field="vcpu")
+                    memory_gib = parse_number(attrs.get("memory"), field="memory")
+                except ManualConfirmationRequired:
+                    continue
+                architecture_text = str(attrs.get("processorArchitecture") or "").casefold()
+                if "arm" in architecture_text:
+                    architectures = ["arm64"]
+                elif "x86" in architecture_text or "64-bit" in architecture_text:
+                    architectures = ["x86_64"]
+                else:
+                    architectures = []
+                candidate = {
+                    "model": model,
+                    "vcpu": vcpu,
+                    "memory_gib": memory_gib,
+                    "current_generation": str(attrs.get("currentGeneration") or "").casefold()
+                    in {"yes", "true", "current"},
+                    "family": _instance_family(model),
+                    "architectures": architectures,
+                }
+                previous = by_model.get(model)
+                if previous is not None and previous != candidate:
+                    conflicting_models.add(model)
+                    continue
+                by_model[model] = candidate
+            return [
+                by_model[model] for model in sorted(by_model) if model not in conflicting_models
+            ]
+
         discovery_errors: list[Exception] = []
         successful_query = False
 
@@ -916,12 +998,18 @@ class Ec2Plugin(ServicePlugin):
                 "aws_region_not_enabled",
             }:
                 raise
+            fallback = price_list_fallback()
+            if fallback:
+                return remember(fallback)
             raise ManualConfirmationRequired(
                 f"EC2 官方 API 无法确认 {region} 的实例规格或区域支持",
                 code="ec2_discovery_failed",
                 region=region,
             ) from exc
         if not successful_query and discovery_errors:
+            fallback = price_list_fallback()
+            if fallback:
+                return remember(fallback)
             raise ManualConfirmationRequired(
                 f"EC2 官方 API 无法确认 {region} 的实例规格或区域支持",
                 code="ec2_discovery_failed",

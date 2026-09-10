@@ -17,7 +17,7 @@ from app.domain.models import (
 
 _UNIT_PATTERN = re.compile(
     r"(?<![a-z])(?:tib|tb|gib|gb|mib|mb|kib|kb|kpu|dpu|vcpu|核|"
-    r"毫秒|ms|秒|分钟|小时|天|次|条|个|台|节点|broker|端点)(?![a-z])",
+    r"lcu|毫秒|ms|秒|分钟|小时|天|次|条|个|台|节点|broker|端点)(?![a-z])",
     re.IGNORECASE,
 )
 
@@ -32,8 +32,9 @@ _QUANTITATIVE_ATOM_PATTERN = re.compile(
     r"(?P<magnitude>万|亿)?\s*"
     r"(?P<unit>"
     r"(?:mi?b|mb)\s*/\s*s(?:\s*/\s*tib)?|"
-    r"tib|tb|gib|gb|mib|mb|kib|kb|毫秒|ms|t|g|m|"
-    r"v\s*cpu|vcpu|核|iops|rps|qps|%|％|"
+    r"tib|tb|gib|gb|mib|mb|kib|kb|毫秒|ms|"
+    r"t(?![A-Za-z])|g(?![A-Za-z])|m(?![A-Za-z])|"
+    r"v\s*cpu|vcpu|lcu|核|iops|rps|qps|%|％|"
     r"秒|分钟|小时|天|年|"
     r"requests?|请求|调用|次|条|封|"
     r"nodes?|节点|shards?|tasks?|brokers?|"
@@ -51,7 +52,7 @@ OWNED_SOURCE_SLICE_EVIDENCE_FIELD = "_owned_source_slice_text"
 # reopened once, otherwise an internally self-consistent but incomplete table
 # can survive forever (for example ``OpenSearch，5台`` captured before the
 # component had been mapped to the OpenSearch template).
-FACT_LEDGER_SCHEMA_VERSION = 7
+FACT_LEDGER_SCHEMA_VERSION = 10
 
 
 def customer_owned_source(requirement: ServiceRequirement) -> str:
@@ -188,6 +189,15 @@ def infer_field_fact_unit(path: str, evidence: str) -> str | None:
     """Infer the unit for one semantic field, not merely the first token."""
 
     field = path.removeprefix("requirements.").casefold()
+    # Typed requirement values have already crossed the unit-normalization
+    # boundary.  Their fact-table unit must describe the stored value, not the
+    # spelling copied in the evidence (for example 5 TB becomes 5120 GiB).
+    if field.endswith("_gib"):
+        return "GiB"
+    if field.endswith("_mib"):
+        return "MiB"
+    if field.endswith("_kib"):
+        return "KiB"
     if field in {"vcpu", "cpu", "cores"} or field.endswith("_vcpu"):
         return "vCPU"
     if any(marker in field for marker in ("memory", "storage", "disk", "capacity")):
@@ -415,7 +425,14 @@ def customer_fact_ledger_fingerprint(requirement: ServiceRequirement) -> str:
         "component_key": requirement.component_key,
         "parent_component_key": requirement.parent_component_key,
         "derived_from_service": requirement.derived_from_service,
-        "service": requirement.service,
+        # Product names and adapter routes are classification metadata, not
+        # customer pricing facts. One product may legitimately appear as a
+        # customer nickname, an AI-normalized label, an AWS display name and
+        # an internal adapter key during the same workflow. Including that
+        # mutable spelling in the fact fingerprint made a harmless rename
+        # invalidate an otherwise identical ledger. Product reclassification
+        # still changes the ledger whenever it changes a fact path/value; a
+        # name-only change must not.
         "owned_source": customer_owned_source(requirement),
         "facts": [
             {
@@ -610,6 +627,19 @@ def fact_consumptions(
                 if path not in usage_paths
                 else "用于 AWS 官方产品、型号或配置匹配"
             ),
+        )
+    # A literal quantity of one is mathematically neutral. It still belongs
+    # in the fact ledger as the identity of one logical component, but no
+    # adapter should need to invent a multiplication line merely to prove
+    # ``数量1`` was retained. Quantities above one remain fail-closed until a
+    # real selection or usage line consumes them, so missed fleet/broker/node
+    # multiplication is still detected for every product.
+    if requirement.quantity == 1:
+        add(
+            "quantity",
+            "non_billable_context",
+            selection.model or selection.service,
+            "显式单个资源作为组件身份保留，不改变计费金额",
         )
     for line in selection.usage_lines:
         for field in line.source_fields:

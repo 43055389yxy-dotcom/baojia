@@ -16,7 +16,32 @@ from app.core.data_paths import AWS_DATA_ROOT
 from app.integrations.aws_public_catalog import PublicAwsPriceCatalog
 from app.integrations.service_templates import DYNAMIC_SEMANTIC_TEMPLATE_FIELDS
 
-PRODUCT_REGISTRY_SCHEMA_VERSION = 3
+PRODUCT_REGISTRY_SCHEMA_VERSION = 8
+
+
+# AWS occasionally retains a historical offer code after changing the public
+# product name.  These aliases are provider-owned identity facts, not learned
+# customer wording.  Keep the list intentionally small and tied to one exact
+# official offer so a stale learned alias cannot redirect a product.
+_OFFICIAL_MARKETING_ALIASES: dict[str, tuple[str, ...]] = {
+    "AmazonVPC": (
+        "AWS Transit Gateway",
+        "Amazon Transit Gateway",
+        "Transit Gateway",
+        "AWS Site-to-Site VPN",
+        "Site-to-Site VPN",
+        "Site to Site VPN",
+        "Interface VPC Endpoint",
+    ),
+    "AmazonGlacier": (
+        "Amazon S3 Glacier Flexible Retrieval",
+        "S3 Glacier Flexible Retrieval",
+    ),
+    "AmazonS3GlacierDeepArchive": (
+        "Amazon S3 Glacier Deep Archive",
+        "S3 Glacier Deep Archive",
+    ),
+}
 
 
 def _service_key(service_code: str) -> str:
@@ -45,6 +70,21 @@ def _aliases(service_code: str) -> list[str]:
         _service_key(service_code).replace("_", " "),
     }
     return sorted(value for value in values if value)
+
+
+def _provider_aliases(service_code: str) -> list[str]:
+    return sorted(
+        set(_aliases(service_code))
+        | set(_OFFICIAL_MARKETING_ALIASES.get(service_code, ()))
+    )
+
+
+def _official_marketing_alias_owners() -> dict[str, str]:
+    return {
+        _canonical(alias): service_code
+        for service_code, aliases in _OFFICIAL_MARKETING_ALIASES.items()
+        for alias in aliases
+    }
 
 
 def _canonical(value: str) -> str:
@@ -81,10 +121,17 @@ def _identity_words(value: str) -> set[str]:
 
     split = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(value or ""))
     split = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", split)
+    # ``resolve_product`` also evaluates compact canonical identities such as
+    # ``inspectorv2``. Recover a terminal version token before word matching.
+    split = re.sub(r"(?<=[a-z0-9])(?=v\d+\b)", " ", split, flags=re.I)
     return {
         word
         for word in re.findall(r"[a-z0-9]+", split.casefold())
-        if len(word) >= 3 and word not in _IDENTITY_STOP_WORDS
+        # Short version qualifiers (V2/V3...) are product identity, not noise.
+        # Dropping them makes a current offer indistinguishable from its
+        # legacy predecessor when a customer appends a Chinese role suffix.
+        if (len(word) >= 3 or re.fullmatch(r"v\d+", word))
+        and word not in _IDENTITY_STOP_WORDS
     }
 
 
@@ -182,6 +229,7 @@ class AwsProductRegistry:
                 "SELECT service_code, aliases_json, field_template_json "
                 "FROM aws_product_registry"
             ).fetchall()
+            marketing_alias_owners = _official_marketing_alias_owners()
             for row in rows:
                 service_code = str(row["service_code"])
                 try:
@@ -192,7 +240,13 @@ class AwsProductRegistry:
                     }
                 except (TypeError, json.JSONDecodeError):
                     aliases = set()
-                aliases.update(_aliases(service_code))
+                aliases = {
+                    alias
+                    for alias in aliases
+                    if marketing_alias_owners.get(_canonical(alias), service_code)
+                    == service_code
+                }
+                aliases.update(_provider_aliases(service_code))
                 try:
                     field_template = json.loads(str(row["field_template_json"]))
                 except (TypeError, json.JSONDecodeError):
@@ -277,13 +331,22 @@ class AwsProductRegistry:
                 policy = self._base_policy(offer.service_code)
                 if previous and isinstance(previous.get("policy"), dict):
                     policy.update(previous["policy"])
-                aliases = set(_aliases(offer.service_code))
+                aliases = set(_provider_aliases(offer.service_code))
                 if previous and isinstance(previous.get("aliases"), list):
                     aliases.update(
                         str(alias).strip()
                         for alias in previous["aliases"]
                         if str(alias).strip()
                     )
+                marketing_alias_owners = _official_marketing_alias_owners()
+                aliases = {
+                    alias
+                    for alias in aliases
+                    if marketing_alias_owners.get(
+                        _canonical(alias), offer.service_code
+                    )
+                    == offer.service_code
+                }
                 connection.execute(
                     """
                     INSERT OR REPLACE INTO aws_product_registry (
@@ -338,6 +401,33 @@ class AwsProductRegistry:
         if not clean_alias:
             return
         with self._lock, self._connect() as connection:
+            canonical_alias = _canonical(clean_alias)
+            provider_owner = _official_marketing_alias_owners().get(canonical_alias)
+            if provider_owner is not None and provider_owner != service_code:
+                return
+            # A classifier may propose a new wording, but it cannot overwrite
+            # another official product's provider identity or an alias already
+            # learned for that product.  Ambiguous wording stays unpersisted and
+            # will be validated again on the next request.
+            for existing in connection.execute(
+                "SELECT service_code, aliases_json FROM aws_product_registry "
+                "WHERE identity_status = 'official' AND service_code != ?",
+                (service_code,),
+            ).fetchall():
+                existing_code = str(existing["service_code"])
+                provider_identities = {
+                    _canonical(value) for value in _provider_aliases(existing_code)
+                }
+                try:
+                    learned_identities = {
+                        _canonical(str(value))
+                        for value in json.loads(str(existing["aliases_json"]))
+                        if str(value).strip()
+                    }
+                except (TypeError, json.JSONDecodeError):
+                    learned_identities = set()
+                if canonical_alias in provider_identities | learned_identities:
+                    return
             row = connection.execute(
                 "SELECT aliases_json, identity_status FROM aws_product_registry "
                 "WHERE service_code = ?",
@@ -566,7 +656,7 @@ class AwsProductRegistry:
         for product in self.list_products():
             if str(product.get("identity_status") or "") != "official":
                 continue
-            provider_aliases = set(_aliases(str(product["service_code"])))
+            provider_aliases = set(_provider_aliases(str(product["service_code"])))
             provider_identities = {
                 _canonical(str(product["service_code"])),
                 _canonical(str(product["service_key"])),

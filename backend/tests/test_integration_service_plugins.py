@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import pytest
 
 from app.core.errors import ManualConfirmationRequired
+from app.domain.fact_ledger import (
+    finalize_customer_fact_ledger,
+    unconsumed_customer_pricing_facts,
+)
 from app.domain.models import ServiceRequirement
 from app.services.plugins import integration_services
 from app.services.plugins.auxiliary_services import EbsPlugin, GlobalAcceleratorPlugin
@@ -105,6 +110,34 @@ class FakeCatalog:
                 result.append(item)
         return result
 
+    def matching_products(
+        self,
+        service_code: str,
+        filters: dict[str, str],
+        predicate: Callable[[dict[str, str]], bool],
+        *,
+        max_pages: int = 20,
+        fallback_filters: dict[str, str] | None = None,
+        fallback_predicate: Callable[[dict[str, str]], bool] | None = None,
+    ) -> list[dict[str, Any]]:
+        matches = [
+            item
+            for item in self.products(service_code, filters, max_pages=max_pages)
+            if predicate(item["product"]["attributes"])
+        ]
+        if matches or fallback_filters is None:
+            return matches
+        fallback_selector = fallback_predicate or predicate
+        return [
+            item
+            for item in self.products(
+                service_code,
+                fallback_filters,
+                max_pages=max_pages,
+            )
+            if fallback_selector(item["product"]["attributes"])
+        ]
+
 
 def test_ebs_prices_per_volume_capacity_times_volume_count() -> None:
     storage = product(
@@ -137,6 +170,290 @@ def test_ebs_prices_per_volume_capacity_times_volume_count() -> None:
     assert selected.specifications["volumeCount"] == 2
     assert selected.specifications["totalStorageGiB"] == 1000
     assert selected.usage_lines[0].amount == 1000
+
+
+def test_ebs_gp3_prices_explicit_iops_and_throughput_without_unconsumed_facts() -> None:
+    storage = product(
+        "AmazonEC2",
+        "APS1-EBS:VolumeUsage.gp3",
+        "",
+        0.08,
+        "GB-Mo",
+        productFamily="Storage",
+        volumeApiName="gp3",
+    )
+    iops = product(
+        "AmazonEC2",
+        "APS1-EBS:VolumeP-IOPS.gp3",
+        "",
+        0.005,
+        "IOPS-Mo",
+        volumeApiName="gp3",
+        group="EBS IOPS",
+        groupDescription="IOPS",
+    )
+    throughput = product(
+        "AmazonEC2",
+        "APS1-EBS:VolumeP-Throughput.gp3",
+        "",
+        0.04,
+        "GiBps-mo",
+        volumeApiName="gp3",
+        group="EBS Throughput",
+        groupDescription="Charge per Provisioned mbps",
+    )
+    plugin = EbsPlugin(  # type: ignore[arg-type]
+        None,
+        FakeCatalog({"AmazonEC2": [storage, iops, throughput]}),
+    )
+    requirement = ServiceRequirement(
+        service="ebs",
+        component_key="cmp_ebs_gp3_test",
+        region="ap-southeast-1",
+        quantity=2,
+        requirements={
+            "product_variant": "volume",
+            "volume_type": "gp3",
+            "storage_gib": 500,
+            "iops": 40_000,
+            "throughput_mbps": 1_500,
+        },
+        field_sources={
+            "quantity": "customer_text",
+            "requirements.storage_gib": "customer_text",
+            "requirements.iops": "customer_text",
+            "requirements.throughput_mbps": "customer_text",
+        },
+        field_evidence={
+            "quantity": "2 volumes",
+            "requirements.storage_gib": "500 GiB each",
+            "requirements.iops": "40,000 IOPS",
+            "requirements.throughput_mbps": "1,500 MiB/s throughput",
+        },
+    )
+    finalize_customer_fact_ledger(requirement)
+
+    selected = plugin.select(requirement, "ap-southeast-1")
+
+    by_usage = {line.usage_type: line for line in selected.usage_lines}
+    assert by_usage["APS1-EBS:VolumeUsage.gp3"].amount == 1_000
+    assert by_usage["APS1-EBS:VolumeP-IOPS.gp3"].amount == 74_000
+    assert by_usage["APS1-EBS:VolumeP-Throughput.gp3"].amount == 2_750
+    assert unconsumed_customer_pricing_facts(requirement, selected) == []
+
+
+def test_ebs_snapshot_policy_without_capacity_uses_snapshot_reference_not_gp3() -> None:
+    snapshot = product(
+        "AmazonEC2",
+        "APS1-EBS:SnapshotUsage",
+        "",
+        0.05,
+        "GB-Mo",
+        productFamily="Storage Snapshot",
+    )
+    plugin = EbsPlugin(None, FakeCatalog({"AmazonEC2": [snapshot]}))  # type: ignore[arg-type]
+
+    requirement = ServiceRequirement(
+        service="ebs",
+        region="ap-southeast-1",
+        requirements={
+            "product_variant": "snapshot",
+            "snapshot_frequency": "daily",
+            "snapshot_retention_days": 7,
+        },
+    )
+    selected = plugin.select(requirement, "ap-southeast-1")
+
+    assert selected.display_name == "Amazon EBS Snapshot"
+    assert selected.model == "EBS 标准快照"
+    assert selected.pricing_status == "reference_only"
+    assert selected.usage_lines == []
+    assert [rate.usage_type for rate in selected.reference_rates] == [
+        "APS1-EBS:SnapshotUsage"
+    ]
+    assert "gp3" not in selected.architecture.casefold()
+    assert "不根据频率、保留天数或源云盘容量猜测月费" in (
+        selected.pricing_notice or ""
+    )
+    assert set(selected.applied_requirement_fields) >= {
+        "product_variant",
+        "snapshot_frequency",
+        "snapshot_retention_days",
+    }
+    preview = plugin.preview(requirement, "ap-southeast-1")
+    assert preview.requires_confirmation is False
+    assert preview.confirmation_reason is None
+    assert preview.next_action == "none"
+
+
+def test_ebs_standard_snapshot_excludes_outposts_snapshot_dimension() -> None:
+    standard = product(
+        "AmazonEC2",
+        "APS1-EBS:SnapshotUsage",
+        "",
+        0.05,
+        "GB-Mo",
+        productFamily="Storage Snapshot",
+        locationType="AWS Region",
+    )
+    outposts = product(
+        "AmazonEC2",
+        "APS1-EBS:SnapshotUsage.outposts",
+        "",
+        0.027,
+        "GB-Mo",
+        productFamily="Storage Snapshot",
+        locationType="AWS Outposts",
+    )
+    plugin = EbsPlugin(  # type: ignore[arg-type]
+        None,
+        FakeCatalog({"AmazonEC2": [outposts, standard]}),
+    )
+
+    selected = plugin.select(
+        ServiceRequirement(
+            service="ebs",
+            region="ap-southeast-1",
+            requirements={
+                "product_variant": "snapshot",
+                "snapshot_frequency": "daily",
+                "snapshot_retention_days": 7,
+            },
+        ),
+        "ap-southeast-1",
+    )
+
+    assert selected.reference_rates[0].usage_type == "APS1-EBS:SnapshotUsage"
+
+
+def test_ebs_snapshot_explicit_storage_uses_snapshot_usage_line() -> None:
+    snapshot = product(
+        "AmazonEC2",
+        "APS1-EBS:SnapshotUsage",
+        "",
+        0.05,
+        "GB-Mo",
+        productFamily="Storage Snapshot",
+    )
+    gp3 = product(
+        "AmazonEC2",
+        "APS1-EBS:VolumeUsage.gp3",
+        "",
+        0.08,
+        "GB-Mo",
+        productFamily="Storage",
+        volumeApiName="gp3",
+    )
+    plugin = EbsPlugin(  # type: ignore[arg-type]
+        None,
+        FakeCatalog({"AmazonEC2": [gp3, snapshot]}),
+    )
+
+    requirement = ServiceRequirement(
+        service="ebs",
+        component_key="cmp_ebs_snapshot_1",
+        region="ap-southeast-1",
+        source_text=(
+            "Amazon EBS Snapshot：新加坡 ap-southeast-1，"
+            "快照存储500 GiB，每日快照，保留7天。"
+        ),
+        requirements={
+            "product_variant": "ebs_snapshot",
+            "backup_storage_gib": 500,
+            "snapshot_frequency": "daily",
+            "snapshot_retention_days": 7,
+        },
+        field_sources={
+            "requirements.product_variant": "customer_text",
+            "requirements.backup_storage_gib": "customer_text",
+            "requirements.snapshot_frequency": "customer_text",
+            "requirements.snapshot_retention_days": "customer_text",
+        },
+        field_evidence={
+            "requirements.product_variant": "Amazon EBS Snapshot",
+            "requirements.backup_storage_gib": "快照存储500 GiB",
+            "requirements.snapshot_frequency": "每日快照",
+            "requirements.snapshot_retention_days": "保留7天",
+        },
+    )
+    finalize_customer_fact_ledger(requirement)
+
+    selected = plugin.select(requirement, "ap-southeast-1")
+
+    assert selected.pricing_status == "priced"
+    assert selected.reference_rates == []
+    assert len(selected.usage_lines) == 1
+    assert selected.usage_lines[0].usage_type == "APS1-EBS:SnapshotUsage"
+    assert selected.usage_lines[0].amount == 500
+    assert selected.usage_lines[0].source_fields == ["backup_storage_gib"]
+    assert selected.specifications["snapshotRetentionDays"] == 7
+    assert "backup_storage_gib" in selected.applied_requirement_fields
+    assert unconsumed_customer_pricing_facts(requirement, selected) == []
+
+
+def test_ebs_snapshot_archive_requires_explicit_archive_variant() -> None:
+    standard = product(
+        "AmazonEC2",
+        "APS1-EBS:SnapshotUsage",
+        "",
+        0.05,
+        "GB-Mo",
+        productFamily="Storage Snapshot",
+    )
+    archive = product(
+        "AmazonEC2",
+        "APS1-EBS:SnapshotArchiveStorage",
+        "",
+        0.0125,
+        "GB-Mo",
+        productFamily="Storage Snapshot",
+    )
+    plugin = EbsPlugin(  # type: ignore[arg-type]
+        None,
+        FakeCatalog({"AmazonEC2": [standard, archive]}),
+    )
+
+    selected = plugin.select(
+        ServiceRequirement(
+            service="ebs",
+            region="ap-southeast-1",
+            requirements={
+                "product_variant": "snapshot_archive",
+                "backup_storage_gib": 100,
+            },
+        ),
+        "ap-southeast-1",
+    )
+
+    assert selected.model == "EBS 归档快照"
+    assert selected.usage_lines[0].usage_type == "APS1-EBS:SnapshotArchiveStorage"
+
+
+def test_ebs_snapshot_fields_infer_snapshot_for_pre_variant_cleaned_draft() -> None:
+    snapshot = product(
+        "AmazonEC2",
+        "APS1-EBS:SnapshotUsage",
+        "",
+        0.05,
+        "GB-Mo",
+        productFamily="Storage Snapshot",
+    )
+    plugin = EbsPlugin(None, FakeCatalog({"AmazonEC2": [snapshot]}))  # type: ignore[arg-type]
+
+    selected = plugin.select(
+        ServiceRequirement(
+            service="ebs",
+            region="ap-southeast-1",
+            requirements={
+                "snapshot_frequency": "daily",
+                "snapshot_retention_days": 7,
+            },
+        ),
+        "ap-southeast-1",
+    )
+
+    assert selected.model == "EBS 标准快照"
+    assert selected.reference_rates[0].usage_type == "APS1-EBS:SnapshotUsage"
 
 
 @pytest.mark.parametrize(
@@ -252,7 +569,8 @@ def test_msk_quotes_broker_hours_and_per_broker_storage(
         0.12,
         "GB-Mo",
         location="Asia Pacific (Singapore)",
-        group="Storage",
+        # AWS currently omits the optional ``group`` label on this dimension
+        # in some regions. The stable UsageType/Operation must still resolve.
     )
 
     class FakeExecutor:
@@ -292,6 +610,91 @@ def test_msk_quotes_broker_hours_and_per_broker_storage(
         ("mskbroker", 2190),
         ("mskstore", 1530),
     ]
+
+
+def test_msk_serverless_quotes_throughput_without_broker_shape() -> None:
+    dimensions = [
+        product(
+            "AmazonMSK",
+            "APS1-KafkaServerless-ClusterHours",
+            "Serverless",
+            0.9,
+            "hours",
+            group="Serverless",
+        ),
+        product(
+            "AmazonMSK",
+            "APS1-KafkaServerless-In-Bytes",
+            "Serverless",
+            0.12,
+            "GB",
+            group="Serverless",
+        ),
+        product(
+            "AmazonMSK",
+            "APS1-KafkaServerless-Out-Bytes",
+            "Serverless",
+            0.06,
+            "GB",
+            group="Serverless",
+        ),
+        product(
+            "AmazonMSK",
+            "APS1-KafkaServerless-PartitionHours",
+            "Serverless",
+            0.0018,
+            "hours",
+            group="Serverless",
+        ),
+        product(
+            "AmazonMSK",
+            "APS1-KafkaServerless-StorageHours",
+            "Serverless",
+            0.119,
+            "GB-Mo",
+            group="Serverless",
+        ),
+    ]
+    plugin = MskPlugin(  # type: ignore[arg-type]
+        None,
+        FakeCatalog({"AmazonMSK": dimensions}),
+    )
+    requirement = ServiceRequirement(
+        service="msk",
+        component_key="component-msk-serverless",
+        region="ap-southeast-1",
+        requirements={
+            "cluster_type": "serverless",
+            "data_in_gib": 20 * 1024,
+            "data_out_gib": 40 * 1024,
+        },
+        field_sources={
+            "requirements.cluster_type": "customer_text",
+            "requirements.data_in_gib": "customer_text",
+            "requirements.data_out_gib": "customer_text",
+        },
+        field_evidence={
+            "requirements.cluster_type": "MSK Serverless",
+            "requirements.data_in_gib": "每月写入20TiB",
+            "requirements.data_out_gib": "读取40TiB",
+        },
+    )
+    finalize_customer_fact_ledger(requirement)
+
+    selected = plugin.select(requirement, "ap-southeast-1")
+
+    assert selected.model == "serverless"
+    assert [(line.key, line.amount, line.usage_type) for line in selected.usage_lines] == [
+        ("mskclshr", 730, "APS1-KafkaServerless-ClusterHours"),
+        ("mskin", 20 * 1024, "APS1-KafkaServerless-In-Bytes"),
+        ("mskout", 40 * 1024, "APS1-KafkaServerless-Out-Bytes"),
+    ]
+    assert {rate.usage_type for rate in selected.reference_rates} == {
+        "APS1-KafkaServerless-PartitionHours",
+        "APS1-KafkaServerless-StorageHours",
+    }
+    assert unconsumed_customer_pricing_facts(requirement, selected) == []
+    assert plugin.configuration_candidates(requirement, "ap-southeast-1") == []
 
 
 def test_msk_configuration_candidates_include_all_regional_broker_shapes() -> None:
@@ -538,6 +941,81 @@ def test_api_gateway_uses_official_request_dimension(api_type: str, operation: s
     assert selected.usage_lines[0].operation == operation
 
 
+@pytest.mark.parametrize(
+    ("request_size_mb", "units_per_request"),
+    [(0.5, 1), (0.5001, 2), (1.25, 3)],
+)
+def test_api_gateway_http_requests_round_payloads_up_to_512_kb_units(
+    request_size_mb: float,
+    units_per_request: int,
+) -> None:
+    api = product(
+        "AmazonApiGateway",
+        "APS1-ApiGatewayHttpApi",
+        "ApiGatewayHttpApi",
+        0.000001,
+        "Requests",
+        location="Asia Pacific (Singapore)",
+    )
+    plugin = ApiGatewayPlugin(  # type: ignore[arg-type]
+        None, FakeCatalog({"AmazonApiGateway": [api]})
+    )
+
+    selected = plugin.select(
+        ServiceRequirement(
+            service="apigateway",
+            region="ap-southeast-1",
+            requirements={
+                "api_type": "http",
+                "requests": 2_000,
+                "request_size_mb": request_size_mb,
+            },
+        ),
+        "ap-southeast-1",
+    )
+
+    assert selected.usage_lines[0].amount == 2_000 * units_per_request
+    assert set(selected.usage_lines[0].source_fields) == {
+        "requests",
+        "request_count",
+        "monthly_requests",
+        "api_type",
+        "request_size_mb",
+    }
+    assert selected.specifications["billedUnitsPerRequest"] == units_per_request
+
+
+def test_api_gateway_rest_payload_size_is_consumed_as_non_billing_context() -> None:
+    api = product(
+        "AmazonApiGateway",
+        "APS1-ApiGatewayRequest",
+        "ApiGatewayRequest",
+        0.000001,
+        "Requests",
+        location="Asia Pacific (Singapore)",
+    )
+    plugin = ApiGatewayPlugin(  # type: ignore[arg-type]
+        None, FakeCatalog({"AmazonApiGateway": [api]})
+    )
+
+    selected = plugin.select(
+        ServiceRequirement(
+            service="apigateway",
+            region="ap-southeast-1",
+            requirements={
+                "api_type": "rest",
+                "requests": 2_000,
+                "request_size_mb": 2,
+            },
+        ),
+        "ap-southeast-1",
+    )
+
+    assert selected.usage_lines[0].amount == 2_000
+    assert "request_size_mb" not in selected.usage_lines[0].source_fields
+    assert "request_size_mb" in selected.applied_requirement_fields
+
+
 def test_api_gateway_websocket_quotes_messages_and_connection_minutes() -> None:
     message = product(
         "AmazonApiGateway",
@@ -605,6 +1083,43 @@ def test_scheduler_without_usage_returns_reference_rate_not_customer_question() 
     assert selected.reference_rates[0].unit_price == 0
 
 
+def test_scheduler_consumes_invocations_and_keeps_schedule_count_as_context() -> None:
+    scheduler = product(
+        "AWSEvents",
+        "APS1-ScheduledInvocation",
+        "Invocation",
+        0.000001,
+        "Invocations",
+        location="Asia Pacific (Singapore)",
+    )
+    plugin = EventBridgeSchedulerPlugin(  # type: ignore[arg-type]
+        None, FakeCatalog({"AWSEvents": [scheduler]})
+    )
+
+    requirement = ServiceRequirement(
+        service="scheduler",
+        component_key="component-scheduler-context",
+        region="ap-southeast-1",
+        requirements={"scheduled_invocations": 50_000_000, "schedules": 250},
+        field_sources={
+            "requirements.scheduled_invocations": "customer_text",
+            "requirements.schedules": "customer_text",
+        },
+        field_evidence={
+            "requirements.scheduled_invocations": "每月触发5000万次",
+            "requirements.schedules": "维护250个schedule",
+        },
+    )
+    finalize_customer_fact_ledger(requirement)
+    selected = plugin.select(requirement, "ap-southeast-1")
+
+    assert selected.usage_lines[0].amount == 50_000_000
+    assert selected.usage_lines[0].source_fields == ["scheduled_invocations"]
+    assert selected.specifications["schedules"] == 250
+    assert "schedules" in selected.applied_requirement_fields
+    assert unconsumed_customer_pricing_facts(requirement, selected) == []
+
+
 def test_opensearch_quotes_nodes_and_storage_per_node() -> None:
     unrelated_charge = product(
         "AmazonES", "APS1-DirectQueryOCU", "DirectQueryOCU", 0.10, "OCU-Hrs",
@@ -628,7 +1143,12 @@ def test_opensearch_quotes_nodes_and_storage_per_node() -> None:
     selected = plugin.select(
         ServiceRequirement(
             service="opensearch", region="ap-southeast-1", hours_per_month=730,
-            requirements={"vcpu": 4, "memory_gib": 16, "data_nodes": 3, "storage_gib_per_node": 500},
+            requirements={
+                "vcpu": 4,
+                "memory_gib": 16,
+                "data_nodes": 3,
+                "storage_gib_per_node": 500,
+            },
         ),
         "ap-southeast-1",
     )
@@ -640,7 +1160,12 @@ def test_opensearch_quotes_nodes_and_storage_per_node() -> None:
     preview = plugin.preview(
         ServiceRequirement(
             service="opensearch", region="ap-southeast-1", hours_per_month=730,
-            requirements={"vcpu": 4, "memory_gib": 16, "data_nodes": 3, "storage_gib_per_node": 500},
+            requirements={
+                "vcpu": 4,
+                "memory_gib": 16,
+                "data_nodes": 3,
+                "storage_gib_per_node": 500,
+            },
         ),
         "ap-southeast-1",
     )
@@ -909,3 +1434,31 @@ def test_nat_gateway_legacy_gateway_count_cannot_be_underpriced() -> None:
     assert selected.quantity == 2
     assert selected.usage_lines[0].amount == 1460
     assert selected.usage_lines[1].amount == 2048
+
+
+def test_nat_gateway_recovers_standard_usage_types_when_product_family_is_missing() -> None:
+    hourly = product(
+        "AmazonEC2", "NatGateway-Hours", "NatGateway", 0.045, "Hrs",
+        regionCode="us-east-1", group="NGW:NatGateway",
+    )
+    processed = product(
+        "AmazonEC2", "NatGateway-Bytes", "NatGateway", 0.045, "GB",
+        regionCode="us-east-1", group="NGW:NatGateway",
+    )
+    plugin = NatGatewayPlugin(None, FakeCatalog({"AmazonEC2": [hourly, processed]}))  # type: ignore[arg-type]
+
+    selected = plugin.select(
+        ServiceRequirement(
+            service="nat_gateway",
+            region="us-east-1",
+            quantity=8,
+            hours_per_month=730,
+            requirements={"data_processed_gib": 50 * 1024},
+        ),
+        "us-east-1",
+    )
+
+    assert [(line.usage_type, line.amount) for line in selected.usage_lines] == [
+        ("NatGateway-Hours", 8 * 730),
+        ("NatGateway-Bytes", 50 * 1024),
+    ]

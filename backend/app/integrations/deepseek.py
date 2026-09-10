@@ -6,10 +6,13 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
+from itertools import combinations
 
+import httpx
 from pydantic import ValidationError
 
 from app.core.config import Settings
+from app.core.diagnostics import diagnostic_log
 from app.core.errors import ConfigurationError, ManualConfirmationRequired
 from app.domain.component_integrity import (
     CUSTOMER_OVERRIDE_SOURCES,
@@ -22,7 +25,13 @@ from app.domain.component_integrity import (
 )
 from app.domain.customer_configuration import (
     aurora_cluster_member_count,
+    enforce_reclassified_product_schema,
     preserve_customer_configuration,
+)
+from app.domain.cleaned_input import (
+    CLEANED_INPUT_POLICY_VERSION,
+    discard_original_input,
+    intent_is_cleaned_only,
 )
 from app.domain.customer_facts import (
     EC2_MODEL_PATTERN,
@@ -31,6 +40,8 @@ from app.domain.customer_facts import (
 )
 from app.domain.fact_ledger import (
     FACT_LEDGER_FINGERPRINT_FIELD,
+    OWNED_SOURCE_SLICE_FIELD,
+    OWNED_SOURCE_SLICE_EVIDENCE_FIELD,
     customer_fact_ledger_is_current,
     customer_owned_source,
     customer_quantitative_atoms,
@@ -47,7 +58,31 @@ from app.domain.requirement_fields import (
 )
 from app.integrations.ai_gateway import AiGateway
 from app.integrations.auto_service_discovery import AutoServiceDiscovery
-from app.integrations.aws_regions import official_aws_region_labels
+from app.integrations.official_price_list_intake import (
+    PRICE_LIST_CONTRACT, PRICE_LIST_READY, verified_price_list_contract, revalidated_price_list_contract,
+)
+from app.integrations.aws_calculator_contracts import (
+    AwsCalculatorContractCatalog,
+    CalculatorConfigurationValidation,
+    CalculatorContractNotFound,
+    CalculatorContractUnavailable,
+    CalculatorServiceContract,
+    CalculatorTemplateContract,
+)
+from app.integrations.aws_calculator_intake import (
+    CalculatorContractReader,
+    OfficialCalculatorIntakeResolver,
+    OfficialCalculatorFormAbsent,
+    OfficialCalculatorTemplateSelectionError,
+    official_child_identity_field,
+)
+from app.integrations.aws_component_templates.registry import (
+    component_template_spec,
+    component_template_variant,
+    validate_component_template_values,
+)
+from app.integrations.aws_regions import official_aws_region_labels, official_catalog_region_scope
+from app.integrations.aws_supported_services import curated_service_keys_for_offer_code
 from app.integrations.component_result_cache import ValidatedComponentResultCache
 from app.integrations.prompt_library import (
     build_component_audit_prompt,
@@ -69,6 +104,16 @@ from app.integrations.service_templates import (
 
 logger = logging.getLogger(__name__)
 AiTranscriptReporter = Callable[[str, str], Awaitable[None]]
+
+OFFICIAL_CALCULATOR_STATUS = "_official_calculator_status"
+OFFICIAL_CALCULATOR_PARENT_CODE = "_official_calculator_parent_service_code"
+OFFICIAL_CALCULATOR_SELECTED_CODE = "_official_calculator_selected_service_code"
+OFFICIAL_CALCULATOR_SELECTION_SOURCE = "_official_calculator_selection_source"
+OFFICIAL_CALCULATOR_OPTIONS = "_official_calculator_options"
+OFFICIAL_CALCULATOR_PROMPT_CONTRACT = "_official_calculator_prompt_contract"
+OFFICIAL_CALCULATOR_MISSING_FIELDS = "_official_calculator_missing_fields"
+OFFICIAL_CALCULATOR_SELECTION_REQUIRED = "selection_required"
+OFFICIAL_CALCULATOR_READY = "ready"
 
 
 def _official_profile_cache_model(model_name: str, profile: dict[str, object] | None) -> str | None:
@@ -112,9 +157,7 @@ def _official_extraction_contract(
 
     if not profile or profile.get("status") != "verified":
         return (), ""
-    bindings = [
-        item for item in profile.get("field_bindings", []) if isinstance(item, dict)
-    ]
+    bindings = [item for item in profile.get("field_bindings", []) if isinstance(item, dict)]
     source_folded = source_text.casefold()
     source_ascii = set(re.findall(r"[a-z][a-z0-9_-]{2,}", source_folded))
     fields: list[str] = []
@@ -169,8 +212,7 @@ def _official_extraction_contract(
     ]
     prompt = (
         f"【AWS 官方计费字段补充：{profile.get('display_name') or profile.get('service_key')}】\n"
-        "以下字段来自当前 AWS 官方价格目录，只在客户原话明确对应时填写：\n"
-        + "\n".join(mappings)
+        "以下字段来自当前 AWS 官方价格目录，只在客户原话明确对应时填写：\n" + "\n".join(mappings)
     )
     return tuple(fields), prompt
 
@@ -180,6 +222,8 @@ def _component_prompt_cache_model(
     service_key: str,
     source_text: str,
     generated_prompt: str = "",
+    *,
+    official_calculator_schema_hash: str | None = None,
 ) -> str | None:
     """Keep cached AI output bound to this component's active prompt only."""
 
@@ -187,7 +231,10 @@ def _component_prompt_cache_model(
         return None
     active_prompt = build_component_extraction_prompt(service_key, source_text)
     fingerprint = hashlib.sha256(
-        f"{active_prompt}\n{generated_prompt}".encode("utf-8")
+        (
+            f"{active_prompt}\n{generated_prompt}\n"
+            f"official-calculator-schema:{official_calculator_schema_hash or 'none'}"
+        ).encode("utf-8")
     ).hexdigest()[:16]
     return f"{model_name}|component-prompt:{fingerprint}"
 
@@ -320,11 +367,18 @@ class DeepSeekIntentParser:
         settings: Settings,
         auto_discovery: AutoServiceDiscovery | None = None,
         component_result_cache: ValidatedComponentResultCache | None = None,
+        calculator_contract_catalog: CalculatorContractReader | None = None,
     ):
         self._settings = settings
         self._gateway = AiGateway(settings)
         self._auto_discovery = auto_discovery
         self._component_result_cache = component_result_cache
+        self._calculator_contract_catalog = calculator_contract_catalog
+        self._calculator_intake = (
+            OfficialCalculatorIntakeResolver(calculator_contract_catalog)
+            if calculator_contract_catalog is not None
+            else None
+        )
 
     def _recovery_gateway(self) -> AiGateway:
         if type(self._gateway) is not AiGateway:
@@ -383,11 +437,7 @@ class DeepSeekIntentParser:
                 )
             )
         if self._settings.deepseek_api_key:
-            append(
-                AiGateway(
-                    self._settings.model_copy(update={"ai_provider": "deepseek"})
-                )
-            )
+            append(AiGateway(self._settings.model_copy(update={"ai_provider": "deepseek"})))
         return gateways or [self._gateway]
 
     async def _complete_intake_json(
@@ -462,9 +512,7 @@ class DeepSeekIntentParser:
                     )
 
             while active:
-                done, pending = await asyncio.wait(
-                    active, return_when=asyncio.FIRST_COMPLETED
-                )
+                done, pending = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
                 active = set(pending)
                 for task in done:
                     try:
@@ -476,6 +524,39 @@ class DeepSeekIntentParser:
                         pending_task.cancel()
                     return result
 
+            if errors and any(self._is_transient_ai_error(error) for error in errors):
+                if reporter:
+                    await reporter(
+                        "intake_retry",
+                        "AI 清洗线路暂时超时，正在进行一次并行重试",
+                    )
+                retry_delay = max(self._settings.intake_ai_retry_delay_seconds, 0.0)
+                if retry_delay:
+                    await asyncio.sleep(retry_delay)
+                retry_timeout = max(
+                    self._settings.intake_ai_retry_timeout_seconds,
+                    recovery_timeout,
+                )
+                active = {
+                    asyncio.create_task(invoke(gateway, retry_timeout))
+                    for gateway in gateways
+                }
+                while active:
+                    done, pending = await asyncio.wait(
+                        active,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    active = set(pending)
+                    for task in done:
+                        try:
+                            result = task.result()
+                        except Exception as exc:
+                            errors.append(exc)
+                            continue
+                        for pending_task in active:
+                            pending_task.cancel()
+                        return result
+
             if errors:
                 raise errors[-1]
             raise RuntimeError("No configured intake AI route returned a result")
@@ -484,6 +565,14 @@ class DeepSeekIntentParser:
                 task.cancel()
             if active:
                 await asyncio.gather(*active, return_exceptions=True)
+
+    @staticmethod
+    def _is_transient_ai_error(error: BaseException) -> bool:
+        if isinstance(error, httpx.RequestError):
+            return True
+        if isinstance(error, httpx.HTTPStatusError):
+            return error.response.status_code in {408, 429, 500, 502, 503, 504}
+        return False
 
     def _service_identity_gateways(self) -> list[AiGateway]:
         """Return independent configured routes for one unresolved product name.
@@ -511,11 +600,7 @@ class DeepSeekIntentParser:
 
         append(self._recovery_gateway())
         if self._settings.deepseek_api_key:
-            append(
-                AiGateway(
-                    self._settings.model_copy(update={"ai_provider": "deepseek"})
-                )
-            )
+            append(AiGateway(self._settings.model_copy(update={"ai_provider": "deepseek"})))
         if self._settings.bedrock_api_key:
             append(
                 AiGateway(
@@ -565,12 +650,19 @@ class DeepSeekIntentParser:
             )
             append(AiGateway(stable_settings))
         append(self._recovery_gateway())
-        if self._settings.deepseek_api_key:
+        if self._settings.bedrock_api_key:
             append(
                 AiGateway(
-                    self._settings.model_copy(update={"ai_provider": "deepseek"})
+                    self._settings.model_copy(
+                        update={
+                            "ai_provider": "bedrock",
+                            "bedrock_model": "zai.glm-4.7-flash",
+                        }
+                    )
                 )
             )
+        if self._settings.deepseek_api_key:
+            append(AiGateway(self._settings.model_copy(update={"ai_provider": "deepseek"})))
         append(self._gateway)
         return gateways
 
@@ -618,6 +710,24 @@ class DeepSeekIntentParser:
                 "reason": "客户填写的区域代码不在当前 AWS 官方区域目录中，必须由销售重新选择。",
             }
 
+        # Keep sales preflight consistent with the parser's quote-region
+        # inheritance rule. A region may be written in a proposal heading, in
+        # the first numbered component, or after the component list. When the
+        # complete request contains exactly one verified AWS region, there is
+        # no competing component-region evidence and that region is the
+        # deterministic quote default. Requiring every numbered row to repeat
+        # it made an explicit ``EC2: ap-southeast-1`` quote ask for the same
+        # region again before component cleaning could even start.
+        source_regions = [
+            region for region in self._regions_in_text(text) if region in official_regions
+        ]
+        if len(source_regions) == 1:
+            return {
+                "regions": source_regions,
+                "requires_confirmation": False,
+                "reason": "客户原文中只有一个明确的 AWS 地区，已作为整单默认地区。",
+            }
+
         # A numbered quote may intentionally place every component in a
         # different region.  That is not a missing quote-wide region: each row
         # is its own pricing boundary.  Let component parsing preserve those
@@ -632,9 +742,7 @@ class DeepSeekIntentParser:
             every_component_has_one_region = True
             for block in numbered_blocks:
                 regions = [
-                    region
-                    for region in self._regions_in_text(block)
-                    if region in official_regions
+                    region for region in self._regions_in_text(block) if region in official_regions
                 ]
                 if len(regions) != 1:
                     every_component_has_one_region = False
@@ -859,8 +967,7 @@ configuration_only（只影响配置说明）、duplicate（与已有事实重�
         meaning_content = (
             f"组件：{component.calculator_service_name or component.service}\n"
             f"客户原话：{component.source_text}\n"
-            "尚未进入报价的锁定事实：\n"
-            + json.dumps(locked_facts, ensure_ascii=False, default=str)
+            "尚未进入报价的锁定事实：\n" + json.dumps(locked_facts, ensure_ascii=False, default=str)
         )
         if reporter:
             await reporter(
@@ -1008,11 +1115,7 @@ operation、单位换算或新字段。
                 confidence = float(item.get("confidence") or 0)
             except (TypeError, ValueError):
                 confidence = 0
-            if (
-                path in meanings
-                and target in allowed_targets
-                and confidence >= 0.8
-            ):
+            if path in meanings and target in allowed_targets and confidence >= 0.8:
                 resolved[path] = target
         return resolved
 
@@ -1163,9 +1266,7 @@ operation、单位换算或新字段。
                 for component in added.services
             ]
             revised.services.extend(appended)
-            revised.ambiguities = list(
-                dict.fromkeys([*revised.ambiguities, *added.ambiguities])
-            )
+            revised.ambiguities = list(dict.fromkeys([*revised.ambiguities, *added.ambiguities]))
             ensure_component_keys(revised)
             if reporter:
                 await reporter(
@@ -1263,6 +1364,11 @@ operation、单位换算或新字段。
         editing_component = component.model_copy(
             deep=True, update={"source_text": corrected_source}
         )
+        # Explicit, component-bound corrections create a new evidence scope.
+        # Never let the original draft's owned slice hide the latest answer.
+        editing_component.original_source_text = corrected_source
+        editing_component.field_sources[OWNED_SOURCE_SLICE_FIELD] = "system_policy"
+        editing_component.field_evidence[OWNED_SOURCE_SLICE_EVIDENCE_FIELD] = corrected_source
         previous_review_model = str(
             component.requirements.get("_review_selected_model")
             or (
@@ -1930,79 +2036,36 @@ operation、单位换算或新字段。
                     int(target.requirements.get("replicas_per_shard") or 0), 1
                 )
 
-    async def parse(self, text: str, reporter: AiTranscriptReporter | None = None) -> ParsedIntent:
+    async def parse(
+        self,
+        text: str,
+        reporter: AiTranscriptReporter | None = None,
+        default_region: str | None = None,
+    ) -> ParsedIntent:
         if not self._settings.ai_api_key:
             raise ConfigurationError("后端未配置解析服务，不能处理客户需求")
         ai_text = self._text_for_ai(text)
-        # A sales-numbered inventory already supplies the only fact a global AI
-        # pass can establish safely: the immutable component boundaries. Split
-        # those boundaries locally, then let the existing service-scoped AI
-        # tasks clean and standardize each component against its own complete
-        # field template. This removes one slow, cross-component model call and
-        # prevents a whole-workload response from merging or contaminating rows.
-        # Unnumbered prose keeps the original global inventory pass as a safety
-        # fallback because its component boundaries are not deterministic.
+        # Numbering is an ownership check, never a substitute for AI cleaning.
+        # Every full request reaches the same cleaner before official templates.
         numbered_fallback = self._intent_from_lossless_sales_numbering(ai_text)
         system_prompt = build_inventory_prompt()
         if reporter:
-            if numbered_fallback is not None:
-                await reporter("intake_start", "正在按销售序号拆分客户需求")
-            else:
-                await reporter("intake_start", "正在清洗、标准化并拆分客户需求")
-                await reporter(
-                    "ai_prompt",
-                    _redact_transcript(
-                        f"【第一遍数据清洗·系统提示】\n{system_prompt}\n\n【客户原文】\n{ai_text}"
-                    ),
-                )
+            await reporter("intake_start", "正在由 AI 清洗完整需求、合并重复表达并区分配置归属")
         try:
             ai_calls = 1
-            raw: dict[str, object] | None = None
-            used_numbered_fallback = False
-            if numbered_fallback is not None:
-                parsed = numbered_fallback
-                used_numbered_fallback = True
-                if reporter:
-                    await reporter(
-                        "intake_done",
-                        f"已按序号无损拆分 {len(parsed.services)} 项配置，"
-                        "正在逐项独立清洗和标准化",
-                    )
-            else:
-                prompt_modules = prompt_keys_for_request(ai_text)
-                logger.info(
-                    "AI requirement prompt modules=%s chars=%d",
-                    ",".join(prompt_modules) or "generic",
-                    len(system_prompt),
-                )
-                raw = await self._complete_intake_json(
-                    system_prompt=system_prompt,
-                    user_content=ai_text,
-                    reporter=reporter,
-                    lossless_fallback_available=False,
-                )
+            raw = await self._complete_intake_json(
+                system_prompt=system_prompt,
+                user_content=ai_text,
+                reporter=reporter,
+                lossless_fallback_available=False,
+            )
 
             if raw is not None:
-                if reporter:
-                    await reporter(
-                        "ai_response",
-                        _redact_transcript(
-                            "【第一遍数据清洗·系统原始输出】\n"
-                            + json.dumps(raw, ensure_ascii=False, indent=2)
-                        ),
-                    )
                 try:
                     raw = self._normalize(raw, fallback_summary=ai_text)
                     try:
                         parsed = ParsedIntent.model_validate(raw)
                     except ValidationError as validation_error:
-                        # A sales-numbered request already has a lossless owner
-                        # ledger and every component will immediately receive
-                        # its own template pass. Spending another long network
-                        # turn repairing only the large envelope adds latency
-                        # without protecting any fact; fall back at once.
-                        if numbered_fallback is not None:
-                            raise
                         if ai_calls >= 2:
                             raise
                         repair_prompt = (
@@ -2017,32 +2080,15 @@ operation、单位换算或新字段。
                         )
                         if reporter:
                             await reporter(
-                                "ai_prompt",
-                                _redact_transcript(
-                                    f"【JSON 修复·系统提示】\n{repair_prompt}"
-                                    f"\n\n【发送给解析引擎的内容】\n{repair_input}"
-                                ),
+                                "intake_schema_repair",
+                                "第一步清洗结果格式不完整，正在通过容错线路修复结构",
                             )
-                        repair_gateways = self._intake_ai_gateways()
-                        repair_gateway = (
-                            repair_gateways[1]
-                            if len(repair_gateways) > 1
-                            else repair_gateways[0]
-                        )
-                        repaired = await repair_gateway.complete_json(
+                        repaired = await self._complete_intake_json(
                             system_prompt=repair_prompt,
                             user_content=repair_input,
-                            timeout_seconds=self._settings.intake_ai_recovery_timeout_seconds,
-                            max_attempts=1,
+                            reporter=reporter,
+                            lossless_fallback_available=False,
                         )
-                        if reporter:
-                            await reporter(
-                                "ai_response",
-                                _redact_transcript(
-                                    "【JSON 修复·系统原始输出】\n"
-                                    + json.dumps(repaired, ensure_ascii=False, indent=2)
-                                ),
-                            )
                         ai_calls += 1
                         parsed = ParsedIntent.model_validate(
                             self._normalize(repaired, fallback_summary=ai_text)
@@ -2053,35 +2099,40 @@ operation、单位换算或新字段。
                     ):
                         raise ValueError("intake component inventory is incomplete")
                 except Exception:
-                    if numbered_fallback is None:
-                        raise
-                    logger.warning(
-                        "Intake JSON was unusable; using numbered ownership fallback"
-                    )
-                    parsed = numbered_fallback
-                    used_numbered_fallback = True
-                    if reporter:
-                        await reporter(
-                            "intake_fallback",
-                            "第一步整理结果不完整，已保留全部编号组件并转入逐组件清洗",
-                        )
+                    # A failed cleaner cannot silently become a successful
+                    # numbered/local inventory, even if the JSON is recoverable.
+                    raise
 
-                if not used_numbered_fallback:
-                    for component in parsed.services:
-                        # Later inventory guards may restore a missing row or raw
-                        # ownership, but they must not replace this successful AI
-                        # interpretation with a keyword-table guess.
-                        component.field_sources.setdefault(
-                            "_intake_ai_identity", "ai_cleaning"
-                        )
-                    if reporter:
-                        await reporter("intake_done", "第一步数据清洗和格式统一完成")
+                for component in parsed.services:
+                    component.field_sources.setdefault("_intake_ai_identity", "ai_cleaning")
+                if reporter:
+                    await reporter("intake_done", "第一步 AI 数据清洗完成，正在核对原文归属")
 
             self._bind_numbered_cleaned_sources(
                 ai_text,
                 parsed,
                 numbered_fallback=numbered_fallback,
             )
+            self._validate_cleaned_source_bindings(ai_text, parsed)
+
+            invalid_steps = [item.service for item in parsed.services if item.query_action]
+            if invalid_steps:
+                raise ManualConfirmationRequired(
+                    "系统需求清单包含不允许执行的外部操作",
+                    code="unsafe_or_invalid_query_plan",
+                    services=invalid_steps,
+                )
+
+            # The raw request is permitted only up to this losslessness check.
+            # From this point every component AI, official form, draft, cache,
+            # retry and quote sees only the normalized configuration text.
+            cleaned_request = discard_original_input(parsed)
+            ai_text = cleaned_request
+            text = cleaned_request
+            numbered_fallback = None
+            raw = None
+            if reporter:
+                await reporter("input_cleaned", cleaned_request)
 
             if not parsed.services:
                 raise ManualConfirmationRequired(
@@ -2089,122 +2140,128 @@ operation、单位换算或新字段。
                     code="intent_services_empty",
                 )
 
-            # Make the component inventory lossless before the per-service
-            # pass, otherwise an item omitted by intake would never receive its
-            # own professional prompt.
-            self._restore_literal_official_headings(ai_text, parsed)
-            self._reconcile_explicit_component_inventory(ai_text, parsed)
-            self._append_explicit_minimum_services(ai_text, parsed)
+            # AI has already cleaned and grouped the complete request.
+            # Coverage/ownership above may reject omissions, but another local
+            # inventory must not merge its role groups or recreate raw rows.
             # One numbered block can still name several products. Narrow the
             # source before any component AI call so every field has exactly
             # one component owner and cannot bleed into its neighbour.
             self._isolate_shared_component_sources(parsed)
+            # Region is an input to official field discovery and to the
+            # validated component-result cache. Apply the already-verified
+            # quote default before either boundary runs, while retaining every
+            # component-local region or explicit conflict. Previously the
+            # sales region was added only after parse(), so components without
+            # a repeated region queried the official catalogue as ``global``.
+            self._reconcile_explicit_regions(ai_text, parsed)
+            self._apply_structured_quote_region(
+                parsed,
+                default_region,
+                source_kind="sales_confirmation",
+            )
+            # Materialize compound control-plane/worker topologies before the
+            # isolated component pass. Waiting until after cleanup asks the
+            # parent template (ECS/EKS) to absorb EC2-owned CPU, memory and
+            # disk facts that it is explicitly forbidden to contain. The AI
+            # can identify those child facts but cannot create a sibling from
+            # inside one fixed template, so that repair loop is unsatisfiable.
+            self._split_eks_worker_nodes(parsed)
+            self._link_ecs_worker_nodes(parsed)
+            # Parent/child source isolation can move a region-bearing clause
+            # to only one owner. Reapply the already verified structured sales
+            # region before every resulting component reads its AWS contract.
+            self._reconcile_explicit_regions(ai_text, parsed)
+            self._apply_structured_quote_region(
+                parsed,
+                default_region,
+                source_kind="sales_confirmation",
+            )
+            # The official Calculator form is the first field authority.  A
+            # parent selector such as AWS Backup/S3/ELB has no usable fields;
+            # ask for its exact official child while independent siblings keep
+            # running against their already resolved official contracts.
+            has_pending_official_child = await self._prepare_official_calculator_intake(
+                parsed,
+                reporter=reporter,
+            )
             if reporter:
+                ready_count = sum(
+                    component.field_sources.get(OFFICIAL_CALCULATOR_STATUS)
+                    != OFFICIAL_CALCULATOR_SELECTION_REQUIRED
+                    for component in parsed.services
+                )
                 await reporter(
                     "component_plan",
-                    f"已建立 {len(parsed.services)} 项独立配置任务｜启动 {len(parsed.services)} 路并行参数解析",
+                    f"已建立 {len(parsed.services)} 项独立配置任务｜"
+                    f"启动 {ready_count} 路并行参数解析",
                 )
+            # A customer choice for one official child form must not freeze
+            # every unrelated component as a rough, unverified draft. Clean
+            # all components whose official field authority is already known;
+            # the pending component stays untouched until its bound answer is
+            # submitted. This keeps parallel components independent without
+            # ever falling back to a local template for the pending product.
+            parsed = await self._cleanup_unsealed_components(
+                parsed,
+                reporter=reporter,
+            )
+            if has_pending_official_child:
+                self._replace_untrusted_customer_summary(parsed)
+                return parsed
 
             # Pass two cleans every component in isolation with that service's
             # professional prompt. Calls are independent (and concurrency is
             # bounded) so one difficult component cannot contaminate or block
             # the rest of the workload.
-            parsed = await self._cleanup_components(
-                ai_text,
-                parsed,
-                reporter=reporter,
-            )
-            # The isolated extractor has just completed its AI repair and
-            # evidence audit. Capture that accepted customer-owned result
-            # before later identity/topology normalizers run. Those passes may
-            # canonicalize aliases and derive totals, but they must never
-            # delete a field that the repaired component bound to literal
-            # customer evidence.
-            extracted_customer_ledger = capture_customer_ledger(parsed)
-            # Re-apply the authoritative customer component inventory after
-            # the isolated model calls.  A component model is allowed to fill
-            # fields, but it is never allowed to change which numbered/source
-            # block owns the component or create a second component from a
-            # neighbouring block.  This single ownership pass prevents the
-            # same class of duplicate/cross-service bug for every service.
-            # Component extractors may only fill the fixed field template; a
-            # smaller model can still return the text after the product-name
-            # colon. Restore the immutable provider heading again before the
-            # ownership pass so no managed AWS product can fall back to EC2
-            # merely because its payload contains CPU/RAM or a ``db.*`` model.
-            self._restore_literal_official_headings(ai_text, parsed)
-            self._reconcile_explicit_component_inventory(ai_text, parsed)
-            self._isolate_shared_component_sources(parsed)
-            # The AI owns interpretation. These guards only preserve literal,
-            # customer-written facts that must never disappear between passes.
-            # Region names are normalization, not product selection. Guard the
-            # cleaned JSON against an otherwise-valid model response mapping a
-            # named city to the wrong AWS region code (for example London to
-            # Ireland). This never invents a region when the customer omitted it.
-            self._reconcile_explicit_regions(ai_text, parsed)
-            # These are lossless guards, not business rules: an explicitly
-            # written model, engine or capacity must survive both AI cleanup passes
-            # unchanged.  In particular, memory written as ``1G`` is 1 GiB;
-            # only a TB/TiB unit is multiplied by 1024.
-            self._reconcile_explicit_models(ai_text, parsed)
-            self._drop_unwritten_requested_models(ai_text, parsed)
-            self._reconcile_explicit_engines(ai_text, parsed)
-            self._reconcile_explicit_service_architecture(ai_text, parsed)
-            preserve_customer_configuration(parsed)
-            self._reconcile_explicit_capacities(ai_text, parsed)
-            self._reconcile_repeated_unit_storage(parsed)
-            self._normalize_database_group_quantity(parsed)
-            self._normalize_cluster_group_quantities(parsed)
-            self._normalize_prometheus_managed_service(parsed)
-            await self._resolve_pending_ec2_workload_identities(
-                parsed,
-                reporter=reporter,
-            )
-            self._append_third_party_managed_decisions(parsed, ai_text)
-            self._drop_unrequested_section_services(ai_text, parsed)
-            self._merge_duplicate_service_fragments(parsed)
+            # This is the one-way semantic hand-off. Every component extractor
+            # has filled a fixed schema and passed literal evidence validation.
+            # From this line onward no inventory, alias, capacity, topology or
+            # region rule is allowed to reinterpret ``ai_text``/source prose.
+            # The previous implementation replayed more than twenty legacy
+            # scanners here; those scanners caused correct AI results to be
+            # renamed, duplicated or overwritten when wording changed.
             self._sanitize_parsed_requirements(parsed)
             self._append_vague_value_questions(parsed)
             self._append_missing_required_choice_questions(parsed)
-            self._split_eks_worker_nodes(parsed)
-            self._link_ecs_worker_nodes(parsed)
             enforce_component_integrity(parsed)
-            # Derived child resources (for example EKS worker EC2) are created
-            # after the first merge pass. Run the same identity-safe merge once
-            # more so an AI-extracted child and a deterministic child can never
-            # survive as two quote rows. Legitimate same-service components with
-            # different source ownership remain separate.
-            self._merge_duplicate_service_fragments(parsed)
-            self._drop_embedded_ebs_duplicates(parsed)
-            restore_customer_ledger(
-                parsed,
-                extracted_customer_ledger,
-                restore_missing_components=False,
-            )
-            customer_ledger = capture_customer_ledger(parsed)
-            self._normalize_cluster_group_quantities(parsed)
-            self._drop_specs_inferred_from_models(ai_text, parsed)
             self._normalize_invalid_global_regions(parsed)
-            self._inherit_single_workload_region(parsed, ai_text)
             self._ensure_missing_region_ambiguity(parsed)
-            # Every operation above is automated cleanup. Restore all fields
-            # tied to customer evidence by stable component identity before
-            # the draft leaves the parser; a reorder can no longer move a
-            # value to another row and a sanitizer can no longer erase it.
-            restore_customer_ledger(parsed, customer_ledger)
-            self._order_services_by_source(ai_text, parsed)
             self._replace_untrusted_customer_summary(parsed)
-            # Freeze the component-owned fact table only after product identity
-            # has reached its final canonical template.  The inventory pass can
-            # initially know a row as ``ElasticSearch`` and map it to
-            # ``opensearch`` later; finalizing before that transition made a
-            # literal ``5台`` look like a complete quantity-less ledger.  This
-            # is the same single, component-scoped conservation pass used when
-            # upgrading persisted drafts, so later stages still never reparse
-            # prose once the ledger is current.
             self.reconcile_customer_pricing_facts(parsed)
             incomplete = self._incomplete_fact_ledger_components(parsed)
             if incomplete:
+                failed_ids = {str(item.get("component_id") or "") for item in incomplete}
+                diagnostic_log.record(
+                    "customer_fact_ledger_state",
+                    message="统一事实表封存失败时的组件原始状态",
+                    context={
+                        "components": [
+                            {
+                                "component_id": str(index),
+                                "component_key": component.component_key,
+                                "parent_component_key": component.parent_component_key,
+                                "derived_from_service": component.derived_from_service,
+                                "service": component.service,
+                                "owned_source": customer_owned_source(component),
+                                "requirements": component.requirements,
+                                "field_sources": component.field_sources,
+                                "field_evidence": component.field_evidence,
+                                "locked_fields": component.locked_fields,
+                                "unmapped_pricing_facts": [
+                                    fact.model_dump(mode="json")
+                                    for fact in component.unmapped_pricing_facts
+                                ],
+                                "customer_pricing_facts": [
+                                    fact.model_dump(mode="json")
+                                    for fact in component.customer_pricing_facts
+                                ],
+                            }
+                            for index, component in enumerate(parsed.services, start=1)
+                            if str(index) in failed_ids
+                        ]
+                    },
+                    level="error",
+                )
                 raise ManualConfirmationRequired(
                     "部分组件的客户数字尚未完整进入统一事实表",
                     code="customer_fact_ledger_incomplete",
@@ -2218,26 +2275,603 @@ operation、单位换算或新字段。
         except ManualConfirmationRequired:
             raise
         except Exception as exc:
-            logger.exception("AI intent parsing failed: %s", type(exc).__name__)
+            logger.warning("AI intent parsing failed: %s", type(exc).__name__)
+            if self._is_transient_ai_error(exc):
+                raise ManualConfirmationRequired(
+                    "AI 清洗服务连接超时，请稍后重试；本次没有生成价格",
+                    code="ai_cleaning_temporarily_unavailable",
+                    error_type=type(exc).__name__,
+                ) from None
             raise ManualConfirmationRequired(
                 "系统无法可靠地结构化此需求，请确认需求内容后重试",
                 code="intent_parse_failed",
                 error_type=type(exc).__name__,
-            ) from exc
+            ) from None
 
-        invalid_steps = [item.service for item in parsed.services if item.query_action]
-        if invalid_steps:
-            raise ManualConfirmationRequired(
-                "系统需求清单包含不允许执行的外部操作",
-                code="unsafe_or_invalid_query_plan",
-                services=invalid_steps,
-            )
         if reporter:
             await reporter(
                 "ai_result",
                 "【最终采用的结构化报价清单】\n" + parsed.model_dump_json(indent=2),
             )
         return parsed
+
+    async def resume_official_calculator_intake(
+        self,
+        intent: ParsedIntent,
+        *,
+        reporter: AiTranscriptReporter | None = None,
+    ) -> ParsedIntent:
+        """Continue a saved draft after official child-form confirmation."""
+
+        has_pending_official_child = await self._prepare_official_calculator_intake(
+            intent,
+            reporter=reporter,
+        )
+        cleaned = await self._cleanup_unsealed_components(
+            intent,
+            reporter=reporter,
+        )
+        if has_pending_official_child:
+            return intent
+        self._sanitize_parsed_requirements(cleaned)
+        self._append_vague_value_questions(cleaned)
+        self._append_missing_required_choice_questions(cleaned)
+        enforce_component_integrity(cleaned)
+        self._normalize_invalid_global_regions(cleaned)
+        self._ensure_missing_region_ambiguity(cleaned)
+        self._replace_untrusted_customer_summary(cleaned)
+        self.reconcile_customer_pricing_facts(cleaned)
+        incomplete = self._incomplete_fact_ledger_components(cleaned)
+        if incomplete:
+            raise ManualConfirmationRequired(
+                "部分组件的客户数字尚未完整进入统一事实表",
+                code="customer_fact_ledger_incomplete",
+                components=incomplete,
+            )
+        return cleaned
+
+    async def revalidate_saved_intent(
+        self,
+        intent: ParsedIntent,
+        *,
+        reporter: AiTranscriptReporter | None = None,
+    ) -> ParsedIntent:
+        """Upgrade saved extractions through the current official intake only.
+
+        Customer edits and owned clauses survive. Previous derived reviews,
+        rule-produced values and the old semantic seal cannot authorize pricing.
+        Work on a copy so a failed upgrade leaves the stored draft recoverable.
+        """
+        if not intent_is_cleaned_only(intent):
+            raise ManualConfirmationRequired(
+                "该草稿来自旧版原文流程，请返回首页重新识别；系统不会把旧原文送入新报价链路",
+                code="cleaned_input_upgrade_required",
+            )
+        stale = [i for i, item in enumerate(intent.services)
+                 if item.field_sources.get("_intake_pipeline_version") != "official-only-v4"
+                 or item.field_sources.get("_source_retention_policy")
+                 != CLEANED_INPUT_POLICY_VERSION
+                 or item.original_source_text]
+        if not stale:
+            return intent
+        refreshed = intent.model_copy(deep=True)
+        for index in stale:
+            item = refreshed.services[index]
+            item.field_sources.pop("_semantic_fact_mapping", None)
+            item.field_sources.pop("_intake_pipeline_version", None)
+            item.field_sources.pop(FACT_LEDGER_FINGERPRINT_FIELD, None)
+            item.customer_pricing_facts = []
+            for field in list(item.requirements):
+                if field.startswith(("_review_", "_quote_skip_")):
+                    item.requirements.pop(field)
+            # Preserve explicit customer answers, not old AI-filled form data.
+            item.official_calculator_configuration = {
+                field: value for field, value in item.official_calculator_configuration.items()
+                if item.field_sources.get(f"official_calculator_configuration.{field}")
+                in CUSTOMER_OVERRIDE_SOURCES
+            }
+        if reporter:
+            await reporter("intake_upgrade", "正在按当前 AWS 官方模板重新核验旧草稿")
+        return await self.resume_official_calculator_intake(refreshed, reporter=reporter)
+
+    async def _cleanup_unsealed_components(
+        self,
+        intent: ParsedIntent,
+        *,
+        reporter: AiTranscriptReporter | None = None,
+    ) -> ParsedIntent:
+        """Clean only components whose official field contract is resolved.
+
+        Official child selection is component-local. A pending Backup/VPC/FSx
+        form cannot authorize the parser to skip semantic extraction for an
+        already resolved ALB, ECR, EC2, or any other sibling. Conversely,
+        sealed siblings are not sent back through AI when the customer resumes
+        the one pending component.
+        """
+
+        ready_indexes = [
+            index
+            for index, component in enumerate(intent.services)
+            if component.field_sources.get(OFFICIAL_CALCULATOR_STATUS)
+            != OFFICIAL_CALCULATOR_SELECTION_REQUIRED
+            and component.field_sources.get("_semantic_fact_mapping")
+            != "ai_cleaning"
+        ]
+        if not ready_indexes:
+            return intent
+        partial = intent.model_copy(
+            update={
+                "services": [intent.services[index] for index in ready_indexes],
+                "ambiguities": [],
+            }
+        )
+        cleaned = await self._cleanup_components(
+            "",
+            partial,
+            reporter=reporter,
+        )
+        for index, component in zip(ready_indexes, cleaned.services, strict=True):
+            intent.services[index] = component
+        intent.ambiguities = list(
+            dict.fromkeys([*intent.ambiguities, *cleaned.ambiguities])
+        )
+        return intent
+
+    def validate_official_calculator_configurations(
+        self,
+        intent: ParsedIntent,
+    ) -> None:
+        """Block final pricing unless every selected official form is valid."""
+
+        if self._calculator_contract_catalog is None:
+            return
+        failures: list[dict[str, object]] = []
+        for index, component in enumerate(intent.services):
+            if component.field_sources.get(OFFICIAL_CALCULATOR_STATUS) == PRICE_LIST_READY:
+                try:
+                    if self._auto_discovery is None:
+                        raise ValueError("官方计费目录未连接")
+                    stored = json.loads(component.field_sources.get(PRICE_LIST_CONTRACT, "{}"))
+                    current = revalidated_price_list_contract(component, self._auto_discovery.ensure_profile(
+                        service_key=component.service,
+                        display_name=component.calculator_service_name or component.service,
+                        region=component.region,
+                    ), stored)
+                    component.field_sources[PRICE_LIST_CONTRACT] = json.dumps(current, ensure_ascii=False)
+                except Exception as exc:
+                    failures.append({"component_id": str(index), "service": component.service,
+                                     "errors": [str(exc)[:300]]})
+                continue
+            code = component.official_calculator_service_code
+            if not code:
+                failures.append(
+                    {
+                        "component_id": str(index),
+                        "service": component.calculator_service_name or component.service,
+                        "errors": ["尚未绑定 AWS 官方报价模板"],
+                    }
+                )
+                continue
+            try:
+                validation = self._validate_component_official_configuration(
+                    component
+                )
+            except Exception as exc:
+                failures.append(
+                    {
+                        "component_id": str(index),
+                        "service": component.calculator_service_name or component.service,
+                        "errors": [str(exc)[:300]],
+                    }
+                )
+                continue
+            if not validation.valid:
+                failures.append(
+                    {
+                        "component_id": str(index),
+                        "service": component.calculator_service_name or component.service,
+                        "errors": list(validation.errors),
+                    }
+                )
+        if failures:
+            raise ManualConfirmationRequired(
+                "AWS 官方配置或计费目录校验未通过，已停止报价",
+                code="official_calculator_configuration_invalid",
+                components=failures,
+            )
+
+    def _validate_component_official_configuration(
+        self,
+        component: ServiceRequirement,
+    ) -> CalculatorConfigurationValidation:
+        """Validate one AI-filled form immediately against its live AWS schema.
+
+        This runs at the component-cleaning boundary as well as before pricing.
+        A malformed widget therefore goes back to the same component AI retry
+        with the exact official validation error instead of surviving until the
+        customer presses the final quote button.
+        """
+
+        if self._calculator_contract_catalog is None:
+            raise ValueError("AWS 官方模板目录尚未加载")
+        code = component.official_calculator_service_code
+        if not code:
+            raise ValueError("尚未绑定 AWS 官方报价模板")
+        contract = self._calculator_contract_catalog.get_contract(code)
+        configuration = dict(component.official_calculator_configuration)
+        selected_template = next(
+            (
+                template
+                for template in contract.templates
+                if template.template_id
+                == component.official_calculator_template_id
+            ),
+            contract.templates[0] if len(contract.templates) == 1 else None,
+        )
+        if selected_template is not None:
+            for field in selected_template.fields:
+                if (
+                    field.default_value is not None
+                    and configuration.get(field.field_id) == field.default_value
+                ):
+                    # The Calculator owns its defaults. In particular,
+                    # duration/frequency widgets publish scalar defaults but
+                    # accept explicit values only as {value, unit}.
+                    configuration.pop(field.field_id, None)
+        validation = AwsCalculatorContractCatalog.validate_configuration(
+            contract,
+            configuration=configuration,
+            template_id=component.official_calculator_template_id,
+        )
+        if not validation.valid:
+            raise ValueError(
+                "AWS 官方模板字段格式不正确：" + "; ".join(validation.errors)
+            )
+        if selected_template is not None:
+            self._validate_official_period_against_customer_evidence(
+                component,
+                selected_template,
+                validation.normalized_configuration,
+            )
+        component.official_calculator_configuration = dict(
+            validation.normalized_configuration
+        )
+        return validation
+
+    @staticmethod
+    def _validate_official_period_against_customer_evidence(
+        component: ServiceRequirement,
+        template: CalculatorTemplateContract,
+        configuration: dict[str, object],
+    ) -> None:
+        """Normalize hour/month when the customer supplied the exact period.
+
+        Calculator size widgets often default to ``gb|hour``. That default is
+        only a UI convenience: applying it to a customer fact explicitly stated
+        as a monthly total multiplies usage by roughly 730. This check stays at
+        the authorized parsing boundary and relies on accepted field evidence,
+        never on downstream pricing code reading the original prose.
+        """
+
+        fields = {field.field_id: field for field in template.fields}
+        monthly_pattern = re.compile(
+            r"(?:每\s*(?:月|个月)|月度|按月|monthly|per\s+month)", re.I
+        )
+        hourly_pattern = re.compile(
+            r"(?:每\s*(?:小时|时)|按小时|小时(?:流量|用量)|hourly|per\s+hour)", re.I
+        )
+        size_factors = {
+            "mib": 1 / 1024,
+            "mb": 1 / 1024,
+            "gib": 1,
+            "gb": 1,
+            "tib": 1024,
+            "tb": 1024,
+        }
+        for field_id, raw_value in configuration.items():
+            field = fields.get(field_id)
+            if (
+                field is None
+                or not field.valid_frequency_units
+                or not isinstance(raw_value, dict)
+            ):
+                continue
+            unit = str(raw_value.get("unit") or "").casefold()
+            size_unit, separator, frequency = unit.partition("|")
+            if not separator or frequency not in {"hour", "month"}:
+                continue
+            factor = size_factors.get(size_unit)
+            if factor is None:
+                continue
+            try:
+                actual_gib = float(raw_value.get("value")) * factor
+            except (TypeError, ValueError):
+                continue
+            matching_evidence = [
+                str(component.field_evidence.get(f"requirements.{key}") or "")
+                for key, value in component.requirements.items()
+                if key.casefold().endswith("_gib")
+                and isinstance(value, (int, float))
+                and abs(float(value) - actual_gib) <= max(1e-9, abs(actual_gib) * 1e-9)
+            ]
+            periods = {
+                "month"
+                for evidence in matching_evidence
+                if monthly_pattern.search(evidence)
+            } | {
+                "hour"
+                for evidence in matching_evidence
+                if hourly_pattern.search(evidence)
+            }
+            if len(periods) == 1 and frequency not in periods:
+                expected_period = next(iter(periods))
+                raw_value["unit"] = f"{size_unit}|{expected_period}"
+
+    async def _prepare_official_calculator_intake(
+        self,
+        intent: ParsedIntent,
+        *,
+        reporter: AiTranscriptReporter | None,
+    ) -> bool:
+        """Read AWS Calculator contracts before component value extraction."""
+
+        if self._calculator_intake is None:
+            return False
+        ensure_component_keys(intent)
+        semaphore = asyncio.Semaphore(max(1, len(intent.services)))
+        await asyncio.gather(
+            *(
+                self._resolve_unknown_component_service(
+                    component,
+                    semaphore=semaphore,
+                    reporter=reporter,
+                    component_number=index + 1,
+                )
+                for index, component in enumerate(intent.services)
+            )
+        )
+        pending = False
+        for index, component in enumerate(intent.services):
+            selected_code = component.field_sources.get(
+                OFFICIAL_CALCULATOR_SELECTED_CODE
+            )
+            try:
+                resolution = await asyncio.to_thread(
+                    self._calculator_intake.resolve,
+                    component,
+                    selected_service_code=selected_code,
+                )
+            except OfficialCalculatorTemplateSelectionError as exc:
+                raise ManualConfirmationRequired(
+                    "客户选择的 AWS 官方子模板不属于当前组件，请重新选择",
+                    code="official_calculator_subservice_invalid",
+                    component_id=str(index),
+                    service=component.calculator_service_name or component.service,
+                ) from exc
+            except OfficialCalculatorFormAbsent as exc:
+                # Only a missing form can enter this path. Network errors and
+                # invalid child selections retain their separate stop signals.
+                profile = await self._auto_discover_component(
+                    component, semaphore=semaphore, reporter=reporter,
+                    component_number=index + 1,
+                )
+                try:
+                    price_contract = verified_price_list_contract(component, profile)
+                except ValueError as profile_error:
+                    raise ManualConfirmationRequired(
+                        f"{component.calculator_service_name or component.service} 的官方计费目录校验未通过：{profile_error}",
+                        code="official_pricing_contract_unavailable",
+                        component_id=str(index),
+                        service=component.calculator_service_name or component.service,
+                        reason=str(profile_error),
+                    ) from exc
+                component.official_calculator_service_code = None
+                component.official_calculator_template_id = None
+                component.official_calculator_schema_hash = None
+                component.official_calculator_configuration = {}
+                for key in (OFFICIAL_CALCULATOR_PROMPT_CONTRACT, OFFICIAL_CALCULATOR_MISSING_FIELDS,
+                            OFFICIAL_CALCULATOR_OPTIONS, OFFICIAL_CALCULATOR_PARENT_CODE,
+                            OFFICIAL_CALCULATOR_SELECTED_CODE, OFFICIAL_CALCULATOR_SELECTION_SOURCE):
+                    component.field_sources.pop(key, None)
+                component.field_sources[OFFICIAL_CALCULATOR_STATUS] = PRICE_LIST_READY
+                component.field_sources[PRICE_LIST_CONTRACT] = json.dumps(price_contract, ensure_ascii=False)
+                if reporter:
+                    await reporter("catalog", f"组件 {index + 1}｜已读取 AWS 官方计费目录字段")
+                continue
+            except (CalculatorContractUnavailable, CalculatorContractNotFound) as exc:
+                raise ManualConfirmationRequired(
+                    "AWS 官方报价模板暂时读取失败，请稍后重试",
+                    code="official_calculator_contract_unavailable",
+                    component_id=str(index),
+                    service=component.calculator_service_name or component.service,
+                ) from exc
+
+            if resolution.status == "selection_required":
+                selected_code = await self._select_official_calculator_child(
+                    component,
+                    resolution.options,
+                    semaphore=semaphore,
+                    reporter=reporter,
+                    component_number=index + 1,
+                )
+                if selected_code:
+                    component.field_sources[OFFICIAL_CALCULATOR_SELECTED_CODE] = (
+                        selected_code
+                    )
+                    resolution = await asyncio.to_thread(
+                        self._calculator_intake.resolve,
+                        component,
+                        selected_service_code=selected_code,
+                    )
+                else:
+                    component.field_sources[OFFICIAL_CALCULATOR_STATUS] = (
+                        OFFICIAL_CALCULATOR_SELECTION_REQUIRED
+                    )
+                    component.field_sources[OFFICIAL_CALCULATOR_PARENT_CODE] = (
+                        resolution.parent_service_code or ""
+                    )
+                    component.field_sources[OFFICIAL_CALCULATOR_OPTIONS] = json.dumps(
+                        [option.model_dump(mode="json") for option in resolution.options],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    pending = True
+                    continue
+
+            contract = resolution.contract
+            if contract is None:
+                raise ManualConfirmationRequired(
+                    "AWS 官方报价模板没有返回可填写字段，已停止报价",
+                    code="official_calculator_contract_empty",
+                    component_id=str(index),
+                )
+            self._bind_official_calculator_contract(
+                component,
+                contract,
+                parent_service_code=resolution.parent_service_code,
+            )
+            if reporter:
+                await reporter(
+                    "catalog",
+                    f"组件 {index + 1}｜已读取 AWS 官方模板：{contract.name}",
+                )
+        return pending
+
+    async def _select_official_calculator_child(
+        self,
+        component: ServiceRequirement,
+        options: tuple[object, ...],
+        *,
+        semaphore: asyncio.Semaphore,
+        reporter: AiTranscriptReporter | None,
+        component_number: int,
+    ) -> str | None:
+        """Let AI choose only when the component wording proves one child."""
+
+        if len(options) == 1:
+            return str(getattr(options[0], "service_code"))
+        option_rows = [
+            {
+                "service_code": str(getattr(option, "service_code")),
+                "name": str(getattr(option, "name")),
+            }
+            for option in options
+        ]
+        prompt = (
+            "你只负责从 AWS 官方子模板列表中选择一个。只有客户原文明确说明了具体对象时才选择；"
+            "信息不足必须返回 null。不得补充常识、不得创造代码。evidence 必须逐字复制客户原文。"
+            '返回严格 JSON：{"service_code":null,"evidence":null}'
+        )
+        content = (
+            f"当前组件客户原文：\n{customer_owned_source(component)}\n\n"
+            "AWS 官方子模板：\n"
+            + json.dumps(option_rows, ensure_ascii=False)
+        )
+        try:
+            async with semaphore:
+                raw = await self._complete_component_json(
+                    system_prompt=prompt,
+                    user_content=content,
+                    timeout_seconds=20,
+                    reporter=reporter,
+                    component_number=component_number,
+                )
+        except Exception:
+            logger.exception(
+                "Official Calculator child selection failed for %s",
+                component.calculator_service_name or component.service,
+            )
+            return None
+        code = str(raw.get("service_code") or "").strip()
+        evidence = str(raw.get("evidence") or "").strip()
+        if not code or not evidence:
+            return None
+        allowed = {
+            row["service_code"].casefold(): row["service_code"] for row in option_rows
+        }
+        selected = allowed.get(code.casefold())
+        normalized_source = re.sub(r"\s+", "", customer_owned_source(component)).casefold()
+        normalized_evidence = re.sub(r"\s+", "", evidence).casefold()
+        if selected is None or not normalized_evidence or normalized_evidence not in normalized_source:
+            return None
+        component.field_sources[OFFICIAL_CALCULATOR_SELECTED_CODE] = selected
+        component.field_sources[OFFICIAL_CALCULATOR_SELECTION_SOURCE] = "customer_text"
+        component.field_evidence[OFFICIAL_CALCULATOR_SELECTED_CODE] = evidence
+        component.locked_fields = sorted(
+            set(component.locked_fields) | {OFFICIAL_CALCULATOR_SELECTED_CODE}
+        )
+        return selected
+
+    def _bind_official_calculator_contract(
+        self,
+        component: ServiceRequirement,
+        contract: CalculatorServiceContract,
+        *,
+        parent_service_code: str | None,
+    ) -> None:
+        templates = list(contract.templates)
+        template = next(
+            (
+                item
+                for item in templates
+                if component.official_calculator_template_id == item.template_id
+            ),
+            None,
+        )
+        if template is None and len(templates) == 1:
+            template = templates[0]
+        if template is None and component.region:
+            regional = [
+                item
+                for item in templates
+                if "aws region" in str(item.title or "").casefold()
+            ]
+            if len(regional) == 1:
+                template = regional[0]
+        if template is None and templates:
+            # AWS Calculator presents templates in its own default order.  A
+            # later explicit customer choice can replace this id, but local
+            # code never invents a template outside the official contract.
+            template = templates[0]
+
+        component.official_calculator_service_code = contract.service_code
+        component.field_sources.pop(PRICE_LIST_CONTRACT, None)
+        component.official_calculator_template_id = (
+            template.template_id if template is not None else None
+        )
+        component.official_calculator_schema_hash = contract.schema_hash
+        component.official_calculator_configuration = {
+            **component.official_calculator_configuration,
+        }
+        component.field_sources[OFFICIAL_CALCULATOR_STATUS] = OFFICIAL_CALCULATOR_READY
+        if parent_service_code:
+            component.field_sources[OFFICIAL_CALCULATOR_PARENT_CODE] = parent_service_code
+        component.field_sources[OFFICIAL_CALCULATOR_PROMPT_CONTRACT] = json.dumps(
+            self._calculator_intake.prompt_payload(contract),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        selected_code = component.field_sources.get(OFFICIAL_CALCULATOR_SELECTED_CODE)
+        if selected_code:
+            identity = official_child_identity_field(
+                component.service,
+                selected_code,
+                contract.name,
+            )
+            if identity is not None:
+                field, value = identity
+                component.requirements[field] = value
+                path = f"requirements.{field}"
+                source_kind = component.field_sources.get(
+                    OFFICIAL_CALCULATOR_SELECTION_SOURCE,
+                    "customer_confirmation",
+                )
+                component.field_sources[path] = source_kind
+                component.field_evidence[path] = (
+                    component.field_evidence.get(OFFICIAL_CALCULATOR_SELECTED_CODE)
+                    or f"客户选择 AWS 官方子模板 {contract.name}"
+                )
+                component.locked_fields = sorted(set(component.locked_fields) | {path})
 
     @classmethod
     def _incomplete_fact_ledger_components(
@@ -2255,9 +2889,7 @@ operation、单位换算或新字段。
             failures.append(
                 {
                     "component_id": str(index),
-                    "display_name": (
-                        component.calculator_service_name or component.service
-                    ),
+                    "display_name": (component.calculator_service_name or component.service),
                     "source_text": source,
                     "reason": (
                         "；".join(issues)
@@ -2313,6 +2945,21 @@ operation、单位换算或新字段。
                 self._restore_authoritative_component_fields(component, filled)
                 return filled
 
+            def seal_component_semantics(
+                filled: ServiceRequirement,
+                *,
+                runtime_defaults: dict[str, object],
+            ) -> None:
+                """Seal validated AI fields without another semantic writer."""
+
+                self._canonicalize_component_requirement_contract(filled)
+                enforce_reclassified_product_schema(filled)
+                self._mark_component_field_sources(
+                    component,
+                    filled,
+                    runtime_defaults=runtime_defaults,
+                )
+
             if reporter:
                 await reporter(
                     "component_start",
@@ -2342,6 +2989,11 @@ operation、单位换算或新字段。
                 component.service,
                 component.source_text,
                 generated_prompt,
+                official_calculator_schema_hash=(
+                    component.official_calculator_schema_hash
+                    or (hashlib.sha256(component.field_sources[PRICE_LIST_CONTRACT].encode()).hexdigest()
+                        if PRICE_LIST_CONTRACT in component.field_sources else None)
+                ),
             )
             if self._component_result_cache is not None and cache_model_name:
                 cached = await asyncio.to_thread(
@@ -2351,28 +3003,78 @@ operation、单位换算或新字段。
                 )
                 if cached is not None:
                     bind_immutable_component_identity(cached)
+                    self._restore_authoritative_component_fields(component, cached)
                     # Cached JSON is only an optimization, never an authority.
-                    # Re-run the current literal-fact contract before reuse so
-                    # an older successful extraction cannot keep omitting a
-                    # pricing field that a newer conservation guard knows how
-                    # to recover. If any quantitative claim is still unbound,
-                    # bypass the cache and run the isolated extractor again.
-                    self._overlay_literal_component_facts(
-                        component.original_source_text or component.source_text,
+                    # Validate it against the current source contract, but do
+                    # not reinterpret prose and overwrite an already cleaned
+                    # field. If any quantitative claim is still unbound, the
+                    # audit below bypasses the cache and runs the isolated AI
+                    # extractor again.
+                    # A cache entry can come from an older extractor version
+                    # that persisted values/evidence before ``field_sources``
+                    # became mandatory.  Reuse must pass through the same
+                    # fact-registration boundary as a fresh model response;
+                    # otherwise a correct cached value exists in JSON but is
+                    # invisible to the immutable customer fact ledger.
+                    cached_runtime_defaults = {
+                        field: value
+                        for field, value in cached.requirements.items()
+                        if cached.field_evidence.get(f"requirements.{field}")
+                        in {"system_minimum", "system_default"}
+                        or cached.field_sources.get(f"requirements.{field}")
+                        in {"system_minimum", "system_default"}
+                    }
+                    seal_component_semantics(
                         cached,
-                        extra_fields=extra_fields,
+                        runtime_defaults=cached_runtime_defaults,
                     )
                     cached_issues = self._deterministic_component_audit_issues(
                         component,
                         cached,
                     )
+                    try:
+                        validate_component_template_values(cached.service, cached.requirements)
+                        self._validate_component_evidence(
+                            cached,
+                            provided_payload=cached.model_dump(),
+                            source_text=customer_owned_source(component),
+                            original=component,
+                        )
+                        self._validate_unmapped_pricing_facts(
+                            cached, source_text=customer_owned_source(component)
+                        )
+                        self._validate_repeated_storage_template(
+                            cached, provided_payload=cached.model_dump()
+                        )
+                    except (ValueError, ValidationError) as exc:
+                        cached_issues.append(str(exc))
+                    if (
+                        self._calculator_contract_catalog is not None
+                        and cached.official_calculator_service_code
+                    ):
+                        try:
+                            self._validate_component_official_configuration(cached)
+                        except (
+                            ValueError,
+                            CalculatorContractNotFound,
+                            CalculatorContractUnavailable,
+                        ) as exc:
+                            # The AWS schema hash protects against an updated
+                            # contract, but it cannot identify malformed data
+                            # written by an older extractor against the same
+                            # schema. Revalidate every cached official form and
+                            # bypass only this component's cache when invalid.
+                            cached_issues.append(str(exc))
                     if not cached_issues:
+                        official_questions = (
+                            self._record_missing_official_calculator_fields(cached)
+                        )
                         if reporter:
                             await reporter(
                                 "component_done",
                                 f"组件 {index + 1}｜{display_name}｜已复用历史验证结果",
                             )
-                        return index, cached, []
+                        return index, cached, official_questions
                     if reporter:
                         await reporter(
                             "component_cache_recheck",
@@ -2387,20 +3089,94 @@ operation、单位换算或新字段。
             prompt = build_component_extraction_prompt(component.service, component.source_text)
             if generated_prompt:
                 prompt = f"{prompt}\n\n{generated_prompt}"
+            if component.field_sources.get(OFFICIAL_CALCULATOR_STATUS) == PRICE_LIST_READY:
+                # No invented Calculator form: use the provider profile already
+                # loaded above and retain its exact meter identities for audit.
+                verified_price_list_contract(component, profile)
+                prompt = (
+                    "【AWS 官方计费目录】该产品没有 Calculator 表单，字段依据为 AWS Price List。"
+                    "下面的单位和字段映射来自官方目录；本地字段只是结构化翻译。"
+                    "必须保留所有客户数字及作用域，无法映射的值放入 unmapped_pricing_facts，"
+                    "缺失的关键计费条件必须提出，不得补造收费规则或价格。\n"
+                    + prompt
+                )
             template = component_template(component, extra_fields=extra_fields)
+            official_contract_payload: dict[str, object] = {}
+            raw_official_contract = component.field_sources.get(
+                OFFICIAL_CALCULATOR_PROMPT_CONTRACT
+            )
+            if raw_official_contract:
+                try:
+                    decoded_contract = json.loads(raw_official_contract)
+                    if isinstance(decoded_contract, dict):
+                        official_contract_payload = decoded_contract
+                except json.JSONDecodeError:
+                    official_contract_payload = {}
+            official_fields: list[dict[str, object]] = []
+            for official_template in official_contract_payload.get("templates", []):
+                if not isinstance(official_template, dict):
+                    continue
+                if (
+                    component.official_calculator_template_id
+                    and official_template.get("template_id")
+                    != component.official_calculator_template_id
+                ):
+                    continue
+                official_fields.extend(
+                    field
+                    for field in official_template.get("fields", [])
+                    if isinstance(field, dict) and field.get("field_id")
+                )
+            template.update(
+                {
+                    "official_calculator_service_code": (
+                        component.official_calculator_service_code
+                    ),
+                    "official_calculator_template_id": (
+                        component.official_calculator_template_id
+                    ),
+                    "official_calculator_schema_hash": (
+                        component.official_calculator_schema_hash
+                    ),
+                    "official_calculator_configuration": {
+                        str(field["field_id"]): component.official_calculator_configuration.get(
+                            str(field["field_id"])
+                        )
+                        for field in official_fields
+                    },
+                }
+            )
+            if official_contract_payload:
+                prompt = (
+                    "【最高优先级：AWS 官方报价器模板】\n"
+                    "下面的 AWS Calculator runtime 合同是当前组件唯一的字段权威。"
+                    "只填写客户明确提供的官方字段；官方默认值保持不变；缺失值保持 null，"
+                    "不得用本地字段猜测。requirements 只是程序内部的单位与选型翻译，"
+                    "不能增加官方合同不存在的收费含义。fileSize、frequency、durationInput "
+                    "等结构化控件必须严格使用官方合同规定的 {value, unit} JSON 格式，"
+                    "并从 valid_size_units、valid_frequency_units 中选择清洗后配置对应单位。\n"
+                    + json.dumps(official_contract_payload, ensure_ascii=False)
+                    + "\n\n"
+                    + prompt
+                )
             numbered_fields = [
                 "region",
                 "quantity",
                 "hours_per_month",
+                *(
+                    f"official_calculator_configuration.{field['field_id']}"
+                    for field in official_fields
+                ),
                 *(f"requirements.{field}" for field in template.get("requirements", {})),
             ]
             content = (
-                f"程序已按销售序号拆出的当前组件原文：\n{component.source_text}\n\n"
-                "拆分阶段已绑定的结构化事实（必须逐项复核；不能覆盖上面的明确文字）：\n"
+                f"第一遍 AI 清洗后的权威配置（field_evidence 只能逐字引用这里）：\n{component.source_text}\n\n"
+                "原始输入已在上一步完成完整性核对并删除，本步骤不得恢复或推测原始说法。\n\n"
+                "清洗阶段已绑定的结构化候选（必须逐项复核；不能覆盖上面的明确配置）：\n"
                 f"{json.dumps(component.requirements, ensure_ascii=False)}\n\n"
-                "系统最低运行建议（不是客户原话；没有建议时为空）：\n"
+                "系统最低运行建议（不是清洗后的客户配置；没有建议时为空）：\n"
                 f"{json.dumps(runtime_defaults, ensure_ascii=False)}\n\n"
-                "按编号逐项检查以下字段；原文没有就保持 null：\n"
+                "按编号逐项检查以下字段；清洗后配置没有就保持 null：\n"
                 + "\n".join(
                     f"{number}. {field}" for number, field in enumerate(numbered_fields, start=1)
                 )
@@ -2421,11 +3197,6 @@ operation、单位换算或新字段。
                     ),
                 )
                 bind_immutable_component_identity(cleaned)
-                self._overlay_literal_component_facts(
-                    component.source_text,
-                    cleaned,
-                    extra_fields=extra_fields,
-                )
                 # Do not reserve semantic verification for a small list of
                 # topology-heavy products. Every current and future component
                 # is compared with its own source fragment after extraction.
@@ -2440,7 +3211,8 @@ operation、单位换算或新字段。
                     reporter=reporter,
                 )
                 if audit_issues:
-                    cleaned = await self._fill_component_template_with_retries(
+                    baseline = cleaned.model_copy(deep=True)
+                    repair_candidate = await self._fill_component_template_with_retries(
                         index=index,
                         component=component,
                         prompt=prompt,
@@ -2455,12 +3227,13 @@ operation、单位换算或新字段。
                             component.service, extra_fields=extra_fields
                         ),
                     )
-                    bind_immutable_component_identity(cleaned)
-                    self._overlay_literal_component_facts(
-                        component.source_text,
-                        cleaned,
-                        extra_fields=extra_fields,
+                    bind_immutable_component_identity(repair_candidate)
+                    cleaned = self._merge_monotonic_component_repair(
+                        component,
+                        baseline,
+                        repair_candidate,
                     )
+                    bind_immutable_component_identity(cleaned)
                     remaining_issues = await self._component_audit_issues(
                         index=index,
                         original_component=component,
@@ -2482,21 +3255,11 @@ operation、单位换算或新字段。
                         )
                     ]
                     if remaining_issues:
-                        return (
-                            index,
-                            cleaned,
-                            (
-                                [
-                                    f"{display_name} 中“{fact.evidence}”还不能确定对应哪项价格，"
-                                    "请说明这个数值代表什么。"
-                                    for fact in cleaned.unmapped_pricing_facts
-                                ]
-                                or [
-                                    f"{display_name} 的识别结果与客户原话仍不一致，"
-                                    "请核对这一项配置。"
-                                ]
-                            ),
-                        )
+                        # A review error is not a completed extraction. The
+                        # old branch sealed incomplete data and hoped a later
+                        # question would stop it; question deduplication could
+                        # then hide that error and publish a false free item.
+                        raise ValueError("官方模板事实校验未通过：" + "；".join(remaining_issues))
 
                 extracted_requirements = {
                     key: value
@@ -2533,10 +3296,12 @@ operation、单位换算或新字段。
                 # returned to the same isolated component conversation by
                 # _fill_component_template_with_retries; valid output proceeds
                 # directly to the literal-source reconciliation guards.
-                self._mark_component_field_sources(
-                    component,
+                seal_component_semantics(
                     cleaned,
                     runtime_defaults=runtime_defaults,
+                )
+                official_questions = self._record_missing_official_calculator_fields(
+                    cleaned
                 )
                 if self._component_result_cache is not None and cache_model_name:
                     await asyncio.to_thread(
@@ -2548,37 +3313,26 @@ operation、单位换算或新字段。
                 if reporter:
                     await reporter(
                         "component_done",
-                        f"组件 {index + 1}｜{display_name}｜参数完整性与原文一致性核验通过",
+                    f"组件 {index + 1}｜{display_name}｜参数完整性与清洗配置一致性核验通过",
                     )
-                return index, cleaned, []
-            except Exception:
-                logger.exception(
-                    "Component template extraction failed for %s; preserving inventory result",
-                    component.service,
-                )
-                # A transient model/schema failure must not turn this component
-                # into an empty requirements object or normalize an already
-                # preserved customer value. Runtime-discovered AWS fields are
-                # available only inside this isolated component pass, so replay
-                # the literal ledger here instead of relying only on the later
-                # global cleanup.
-                recovered = component.model_copy(deep=True)
-                self._overlay_literal_component_facts(
-                    component.source_text,
-                    recovered,
-                    extra_fields=extra_fields,
-                )
-                self._mark_component_field_sources(
-                    component,
-                    recovered,
-                    runtime_defaults=runtime_defaults,
-                )
-                if reporter:
-                    await reporter(
-                        "component_done",
-                        f"组件 {index + 1}｜{display_name}｜已转入规则引擎复核",
+                return index, cleaned, official_questions
+            except Exception as exc:
+                if component.field_sources.get(OFFICIAL_CALCULATOR_STATUS) == PRICE_LIST_READY:
+                    raise ManualConfirmationRequired(
+                        f"{display_name} 的官方计费字段解析未通过，请重试该组件",
+                        code="official_price_list_extraction_failed",
+                        component_id=str(index),
                     )
-                return index, recovered, []
+                logger.exception("Official template extraction failed for %s", component.service)
+                raise ManualConfirmationRequired(
+                    f"{display_name} 的官方模板填写未通过校验，请重试该组件",
+                    code="official_template_extraction_failed",
+                    component_id=str(index),
+                    component_key=component.component_key,
+                    service=component.service,
+                    display_name=display_name,
+                    validation_error=str(exc)[:1600] if isinstance(exc, ValueError) else None,
+                ) from exc
 
         results = await asyncio.gather(
             *(clean_one(index, component) for index, component in enumerate(intent.services))
@@ -2604,12 +3358,141 @@ operation、单位换算或新字段。
                 seen_ambiguities.add(key)
                 merged_ambiguities.append(compact)
 
-        return intent.model_copy(
+        cleaned_intent = intent.model_copy(
             update={
                 "services": [component for _, component, _ in results],
                 "ambiguities": merged_ambiguities,
             }
         )
+        await self._rebind_price_list_intake_regions(cleaned_intent)
+        return cleaned_intent
+
+    async def _rebind_price_list_intake_regions(self, intent: ParsedIntent) -> None:
+        """Bind a cleaning-time region change only to identical provider meters.
+
+        This is an intake boundary, never a pricing-time relaxation. A changed
+        product, field binding or meter requires a new extraction/confirmation.
+        No customer text or customer facts are read or altered here.
+        """
+        for index, component in enumerate(intent.services):
+            if component.field_sources.get(OFFICIAL_CALCULATOR_STATUS) != PRICE_LIST_READY:
+                continue
+            try:
+                stored = json.loads(component.field_sources.get(PRICE_LIST_CONTRACT, "{}"))
+                if ("region" in stored and stored.get("region")
+                        == official_catalog_region_scope(component.region)):
+                    continue
+                if self._auto_discovery is None:
+                    raise ValueError("官方计费目录未连接")
+                profile = await asyncio.to_thread(
+                    self._auto_discovery.ensure_profile,
+                    service_key=component.service,
+                    display_name=component.calculator_service_name or component.service,
+                    region=component.region,
+                )
+                current = verified_price_list_contract(component, profile)
+                if current["billing_schema_hash"] != stored.get("billing_schema_hash"):
+                    raise ValueError("区域调整后官方计费字段发生变化，请重新解析该组件")
+                component.field_sources[PRICE_LIST_CONTRACT] = json.dumps(current, ensure_ascii=False)
+            except (ValueError, TypeError) as exc:
+                raise ManualConfirmationRequired(
+                    "组件区域调整后需要重新核验官方计费字段",
+                    code="official_price_list_region_revalidation_required",
+                    component_id=str(index),
+                    reason=str(exc),
+                ) from exc
+
+    @staticmethod
+    def _record_missing_official_calculator_fields(
+        component: ServiceRequirement,
+    ) -> list[str]:
+        """Turn missing required AWS form controls into customer questions."""
+
+        raw_contract = component.field_sources.get(
+            OFFICIAL_CALCULATOR_PROMPT_CONTRACT
+        )
+        if not raw_contract:
+            component.field_sources.pop(OFFICIAL_CALCULATOR_MISSING_FIELDS, None)
+            return []
+        try:
+            contract = json.loads(raw_contract)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(contract, dict):
+            return []
+        missing: list[dict[str, object]] = []
+        service_name = str(contract.get("service_name") or component.calculator_service_name)
+        for template in contract.get("templates", []):
+            if not isinstance(template, dict):
+                continue
+            if (
+                component.official_calculator_template_id
+                and template.get("template_id") != component.official_calculator_template_id
+            ):
+                continue
+            fields = [
+                field
+                for field in template.get("fields", [])
+                if isinstance(field, dict)
+            ]
+            section_ids = {
+                str(field.get("section_id"))
+                for field in fields
+                if field.get("section_id")
+            }
+            active_sections = {
+                str(field.get("section_id"))
+                for field in fields
+                if field.get("section_id")
+                and str(field.get("field_id") or "")
+                in component.official_calculator_configuration
+                and component.official_calculator_configuration.get(
+                    str(field.get("field_id") or "")
+                )
+                not in (None, "")
+            }
+            if len(section_ids) <= 1 or not active_sections:
+                active_sections = section_ids
+            for field in fields:
+                if not field.get("required"):
+                    continue
+                section_id = str(field.get("section_id") or "")
+                if section_id and section_id not in active_sections:
+                    continue
+                if field.get("default_value") is not None:
+                    continue
+                field_id = str(field.get("field_id") or "").strip()
+                if not field_id:
+                    continue
+                value = component.official_calculator_configuration.get(field_id)
+                inner = value.get("value") if isinstance(value, dict) else value
+                if inner not in (None, ""):
+                    continue
+                label = str(field.get("label") or field_id).strip()
+                question = f"{service_name} 还缺少“{label}”，请补充后再报价。"
+                missing.append(
+                    {
+                        "field_id": field_id,
+                        "label": label,
+                        "field_type": str(field.get("field_type") or "input"),
+                        "options": field.get("options") or [],
+                        "valid_size_units": field.get("valid_size_units") or [],
+                        "valid_frequency_units": field.get(
+                            "valid_frequency_units"
+                        )
+                        or [],
+                        "question": question,
+                    }
+                )
+        if not missing:
+            component.field_sources.pop(OFFICIAL_CALCULATOR_MISSING_FIELDS, None)
+            return []
+        component.field_sources[OFFICIAL_CALCULATOR_MISSING_FIELDS] = json.dumps(
+            missing,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return [str(item["question"]) for item in missing]
 
     @classmethod
     def _overlay_literal_component_facts(
@@ -2621,22 +3504,42 @@ operation、单位换算或新字段。
     ) -> None:
         """Overlay only provable fields from one component's customer text."""
 
-        isolated = ParsedIntent(
-            customer_summary=source,
-            services=[component],
-            ambiguities=[],
-        )
-        cls._reconcile_explicit_models(source, isolated)
-        cls._reconcile_explicit_engines(source, isolated)
-        cls._reconcile_explicit_service_architecture(source, isolated)
-        cls._reconcile_explicit_capacities(
-            source,
-            isolated,
-            extra_fields=extra_fields,
-        )
-        cls._reconcile_plain_resource_counts(isolated, extra_fields=extra_fields)
-        cls._normalize_database_group_quantity(isolated)
-        cls._normalize_cluster_group_quantities(isolated)
+        # Several shared literal helpers intentionally read the component's
+        # own ``source_text``.  A parent/child component can retain the full
+        # customer row for display while owning only one clause for facts.
+        # Temporarily expose only that owned clause so no helper can read a
+        # sibling's count/CPU/storage and bind it to this component.
+        original_source = component.source_text
+        original_full_source = component.original_source_text
+        component.source_text = source
+        component.original_source_text = source
+        try:
+            isolated = ParsedIntent(
+                customer_summary=source,
+                services=[component],
+                ambiguities=[],
+            )
+            cls._reconcile_explicit_models(source, isolated)
+            cls._reconcile_explicit_engines(source, isolated)
+            cls._reconcile_explicit_service_architecture(source, isolated)
+            cls._reconcile_explicit_capacities(
+                source,
+                isolated,
+                extra_fields=extra_fields,
+            )
+            # Per-resource storage has its own cross-product contract (EC2
+            # disks, EKS workers, MSK brokers, OpenSearch nodes, MQ brokers).
+            # The fresh intake path already runs it; replaying an old draft
+            # without this step could create the target value but omit its
+            # evidence metadata, leaving the old product field as a second
+            # customer fact after reclassification.
+            cls._reconcile_repeated_unit_storage(isolated)
+            cls._reconcile_plain_resource_counts(isolated, extra_fields=extra_fields)
+            cls._normalize_database_group_quantity(isolated)
+            cls._normalize_cluster_group_quantities(isolated)
+        finally:
+            component.source_text = original_source
+            component.original_source_text = original_full_source
 
     @classmethod
     def _reconcile_plain_resource_counts(
@@ -2669,6 +3572,8 @@ operation、单位换算或新字段。
         count_pattern = re.compile(
             r"(?<![a-z0-9])(?P<count>\d+)\s*(?:台|个?\s*(?:数据)?节点|"
             r"个?\s*实例|"
+            r"(?:pcs?|pieces?)\s*[a-z0-9][a-z0-9._-]*|"
+            r"[x×*]\s*[a-z0-9][a-z0-9._-]*\s*(?:instances?|vms?)|"
             r"(?:套|个)\s*集群|"
             r"个?\s*(?:event\s*bus(?:es)?|事件总线)|"
             r"个?\s*(?:resources?|资源)|"
@@ -2700,8 +3605,7 @@ operation、单位换算或新字段。
                         (
                             field
                             for field in member_count_fields
-                            if field in allowed
-                            and field not in {"cluster_count", "instance_count"}
+                            if field in allowed and field not in {"cluster_count", "instance_count"}
                         ),
                         None,
                     )
@@ -2714,13 +3618,9 @@ operation、单位换算或新字段。
                     r"(?<![a-z0-9])event\s*bus(?:es)?(?![a-z])|事件总线",
                     folded_evidence,
                 ):
-                    member_field = (
-                        "event_buses" if "event_buses" in allowed else None
-                    )
+                    member_field = "event_buses" if "event_buses" in allowed else None
                 elif re.search(r"\bresources?\b|资源", folded_evidence):
-                    member_field = (
-                        "resource_count" if "resource_count" in allowed else None
-                    )
+                    member_field = "resource_count" if "resource_count" in allowed else None
                 else:
                     member_field = next(
                         (field for field in member_count_fields if field in allowed),
@@ -2738,160 +3638,16 @@ operation、单位换算或新字段。
 
     @classmethod
     def reconcile_customer_pricing_facts(cls, intent: ParsedIntent) -> None:
-        """Rebuild the source-owned pricing ledger at every draft boundary.
+        """Finalize typed facts; old prose must return through official intake.
 
-        Initial AI extraction, cached extraction, customer confirmation and
-        final pricing all reuse the same persisted component JSON. Replaying
-        this one component-scoped contract at every boundary prevents a field
-        omitted in an earlier version from remaining omitted forever. Derived
-        official-review data is discarded only when source-owned pricing facts
-        changed, so it can never price a stale subset of the component.
+        This boundary never fills missing fields, restores topology or runs
+        source scanners. Product schema aliases can move existing structured
+        facts with their provenance; they cannot invent customer values.
         """
-
         ensure_component_keys(intent)
-        # ECS on EC2 has a free cluster control plane plus separately billed
-        # EC2 workers.  Restore that lineage before the immutable fact table is
-        # finalized so saved drafts and fresh parses use the same ownership
-        # contract.
-        cls._link_ecs_worker_nodes(intent)
-        incomplete_component_keys: set[str] = set()
         for component in intent.services:
-            # Persisted drafts and the intake model may use a generic alias
-            # such as ``node_count``. Route it to the product's one canonical
-            # field before deciding that an old fact ledger is current. The
-            # metadata must move with the value; otherwise evidence still
-            # points at the discarded alias and the conservation audit reports
-            # a false loss later in the workflow.
             cls._canonicalize_component_requirement_contract(component)
-            if customer_fact_ledger_is_current(component):
-                continue
-            # Derived children are rebuilt from their parent contract by the
-            # lineage reconciler immediately after this pass. Re-parsing the
-            # shared parent sentence as if it were standalone EC2 can mistake
-            # the parent cluster count for the child fleet quantity.
-            if component.derived_from_service:
-                continue
-            canonical_service = cls._service_key(component.service)
-            if canonical_service in SERVICE_TEMPLATE_FIELDS:
-                # Known products use one identity at every boundary.  Keeping
-                # punctuation variants such as ``dynamo_db`` after official
-                # discovery bypassed the curated template and price adapter.
-                component.service = canonical_service
-            source = customer_owned_source(component)
-
-            if canonical_service == "rds" and str(
-                component.requirements.get("engine") or ""
-            ).casefold().startswith("aurora"):
-                storage_path = "requirements.storage_type"
-                if (
-                    component.requirements.get("storage_type") == "gp3"
-                    and component.field_sources.get(storage_path)
-                    in {None, "system_minimum", "system_default"}
-                ):
-                    component.requirements.pop("storage_type", None)
-                    component.field_sources.pop(storage_path, None)
-                    component.field_evidence.pop(storage_path, None)
-                    component.locked_fields = [
-                        path for path in component.locked_fields if path != storage_path
-                    ]
-
-            # Legacy CloudFront drafts could ask for a billing geography even
-            # when the source already stated one, then persist the UI default
-            # as a customer confirmation. Such a question was invalid: restore
-            # the explicit source value. A later direct table edit uses
-            # ``customer_correction`` and remains authoritative.
-            if cls._service_key(component.service) == "cloudfront" and re.search(
-                r"亚太(?:地区|区域)?|asia\s*pacific|apac|"
-                r"美国(?:地区|区域)?|united\s*states|\busa?\b|"
-                r"欧洲(?:地区|区域)?|\beurope\b|日本|\bjapan\b|"
-                r"澳大利亚|\baustralia\b|加拿大|\bcanada\b",
-                source,
-                re.I,
-            ):
-                path = "requirements.traffic_geography"
-                if (
-                    component.field_sources.get(path) == "customer_confirmation"
-                    and component.field_evidence.get(path)
-                    == "客户从 CloudFront 官方流量地区中选择"
-                ):
-                    component.field_sources.pop(path, None)
-                    component.field_evidence.pop(path, None)
-                    component.field_match_policies.pop("traffic_geography", None)
-                    component.field_scopes.pop("traffic_geography", None)
-                    component.locked_fields = [
-                        field for field in component.locked_fields if field != path
-                    ]
-
-            before = {
-                field: value
-                for field, value in component.requirements.items()
-                if not field.startswith("_")
-            }
-            cls._overlay_literal_component_facts(source, component)
-            # This boundary upgrades persisted drafts; it is not a fresh
-            # hallucination-cleaning pass. Keep previously accepted fields
-            # that the literal parser cannot prove either way, while adding or
-            # correcting only facts explicitly recoverable from the source.
-            for field, value in before.items():
-                component.requirements.setdefault(field, value)
-            if canonical_service == "elb" and component.requirements.get(
-                "processed_bytes_gib"
-            ) is not None:
-                component.requirements.pop("data_processed_gib", None)
-                component.requirements.pop("reference_lcu_unit_only", None)
-                assumption = str(
-                    component.requirements.get("system_default_assumption") or ""
-                )
-                if "未提供 ALB LCU" in assumption:
-                    component.requirements.pop("system_default_assumption", None)
-                for field in (
-                    "data_processed_gib",
-                    "reference_lcu_unit_only",
-                    "system_default_assumption",
-                ):
-                    path = f"requirements.{field}"
-                    component.field_sources.pop(path, None)
-                    component.field_evidence.pop(path, None)
-                    component.locked_fields = [
-                        locked for locked in component.locked_fields if locked != path
-                    ]
-            if canonical_service == "dynamodb" and any(
-                component.requirements.get(field) is not None
-                for field in ("read_request_units", "write_request_units")
-            ):
-                for field in ("requests", "request_count"):
-                    component.requirements.pop(field, None)
-                    path = f"requirements.{field}"
-                    component.field_sources.pop(path, None)
-                    component.field_evidence.pop(path, None)
-                    component.locked_fields = [
-                        locked for locked in component.locked_fields if locked != path
-                    ]
-            # This is the only legacy-upgrade boundary allowed to inspect
-            # prose.  If the source still contains an uncovered quantitative
-            # claim, leave the ledger explicitly open so the caller can stop
-            # with the exact component instead of freezing an incomplete fact
-            # table and rediscovering prose on every later page.
-            if cls._uncovered_quantitative_claim_issues(source, component):
-                if component.component_key:
-                    incomplete_component_keys.add(component.component_key)
-                component.customer_pricing_facts = []
-                component.field_sources.pop(FACT_LEDGER_FINGERPRINT_FIELD, None)
-            after = {
-                field: value
-                for field, value in component.requirements.items()
-                if not field.startswith("_")
-            }
-            if before == after:
-                continue
-            for internal_field in tuple(component.requirements):
-                if internal_field.startswith("_review_") or internal_field.startswith(
-                    "_quote_skip_"
-                ):
-                    component.requirements.pop(internal_field, None)
-        for component in intent.services:
-            if component.component_key in incomplete_component_keys:
-                continue
+            enforce_reclassified_product_schema(component)
             finalize_customer_fact_ledger(component)
 
     @classmethod
@@ -2996,8 +3752,8 @@ operation、单位换算或新字段。
 
         prompt = build_component_audit_prompt(filled.service)
         content = (
-            f"客户原话：\n{original_component.source_text}\n\n"
-            "系统最低运行建议（不是客户原话）：\n"
+            f"清洗后配置：\n{customer_owned_source(original_component)}\n\n"
+            "系统最低运行建议（不是客户配置）：\n"
             f"{json.dumps(runtime_defaults, ensure_ascii=False)}\n\n"
             f"待复核结构化结果：\n{filled.model_dump_json()}"
         )
@@ -3053,9 +3809,7 @@ operation、单位换算或新字段。
             return any(token and token.casefold() in source_folded for token in evidence_tokens)
 
         ai_issues = [
-            str(issue).strip()[:300]
-            for issue in issues
-            if supported_by_customer_text(issue)
+            str(issue).strip()[:300] for issue in issues if supported_by_customer_text(issue)
         ]
         return list(dict.fromkeys([*deterministic_issues, *ai_issues]))[:8]
 
@@ -3106,8 +3860,7 @@ operation、单位换算或新字段。
         )
         if any(marker in folded for marker in missing_markers):
             if mentioned_fields and all(
-                component.requirements.get(field) not in (None, "")
-                for field in mentioned_fields
+                component.requirements.get(field) not in (None, "") for field in mentioned_fields
             ):
                 return True
             mentioned_numbers = {
@@ -3123,8 +3876,7 @@ operation、单位换算或新字段。
                 return True
         if any(marker in folded for marker in unwanted_markers) and mentioned_fields:
             return all(
-                component.requirements.get(field) in (None, "")
-                for field in mentioned_fields
+                component.requirements.get(field) in (None, "") for field in mentioned_fields
             )
         return False
 
@@ -3136,51 +3888,10 @@ operation、单位换算或新字段。
     ) -> list[str]:
         """Compare literal customer facts with one isolated AI result."""
 
-        expected = original_component.model_copy(deep=True)
-        expected.requirements = {}
-        expected.field_sources = {}
-        expected.field_evidence = {}
-        expected.locked_fields = []
-        isolated = ParsedIntent(
-            customer_summary=original_component.source_text,
-            services=[expected],
-            ambiguities=[],
-        )
-        source = original_component.source_text or ""
-        cls._reconcile_explicit_models(source, isolated)
-        cls._reconcile_explicit_engines(source, isolated)
-        cls._reconcile_explicit_service_architecture(source, isolated)
-        cls._reconcile_explicit_capacities(source, isolated)
-        cls._normalize_database_group_quantity(isolated)
-        cls._normalize_cluster_group_quantities(isolated)
-        expected = isolated.services[0]
-
-        def value_at(component: ServiceRequirement, path: str) -> object:
-            if path.startswith("requirements."):
-                return component.requirements.get(path.split(".", 1)[1])
-            return getattr(component, path, None)
-
-        def same_value(left: object, right: object) -> bool:
-            if isinstance(left, (int, float)) and isinstance(right, (int, float)):
-                return abs(float(left) - float(right)) < 1e-9
-            if isinstance(left, str) and isinstance(right, str):
-                return left.strip().casefold() == right.strip().casefold()
-            return left == right
-
+        # Check conservation against the accepted evidence only. A second
+        # keyword extractor cannot dictate a different field owner to the AI.
+        source = customer_owned_source(original_component)
         issues: list[str] = []
-        for path in expected.locked_fields:
-            if expected.field_sources.get(path) != "customer_text":
-                continue
-            wanted = value_at(expected, path)
-            actual = value_at(filled, path)
-            if wanted in (None, "") or same_value(wanted, actual):
-                continue
-            evidence = expected.field_evidence.get(path) or source
-            field_name = path.removeprefix("requirements.")
-            issues.append(
-                f"客户原话“{evidence}”明确要求 {field_name}={wanted}，"
-                f"当前结果为 {actual if actual not in (None, '') else '缺失'}"
-            )
         # ``unmapped_pricing_facts`` is the lossless overflow column of the
         # component fact table, not an extraction failure.  The final pricing
         # boundary still refuses to omit an overflow fact, but rejecting it
@@ -3190,6 +3901,236 @@ operation、单位换算或新字段。
         # internal mapping issue) without throwing away the other components.
         issues.extend(cls._uncovered_quantitative_claim_issues(source, filled))
         return list(dict.fromkeys(issues))[:8]
+
+    @classmethod
+    def _merge_monotonic_component_repair(
+        cls,
+        original_component: ServiceRequirement,
+        baseline: ServiceRequirement,
+        candidate: ServiceRequirement,
+    ) -> ServiceRequirement:
+        """Merge a second AI pass without deleting already proved facts.
+
+        The component extractor sometimes needs a second pass to add one
+        missing field.  That pass is not a new interpretation authority: a
+        full-template response may omit a field which the first pass already
+        proved from literal customer evidence.  Treat repair as a monotonic
+        patch, retain those proved paths, and resolve any duplicate ownership
+        by the deterministic audit rather than response recency.
+
+        This boundary is product-neutral.  It compares structured paths,
+        literal evidence and number/unit atoms; it never branches on an AWS
+        service name or a customer phrase.
+        """
+
+        merged = candidate.model_copy(deep=True)
+        owned_source = customer_owned_source(original_component)
+        normalized_source = re.sub(r"\s+", "", owned_source).casefold()
+
+        def value_at(component: ServiceRequirement, path: str) -> object:
+            if path == "region":
+                return component.region
+            if path == "quantity":
+                return component.quantity
+            if path == "hours_per_month":
+                return component.hours_per_month
+            if path.startswith("requirements."):
+                return component.requirements.get(path.split(".", 1)[1])
+            return None
+
+        def has_submitted_path(component: ServiceRequirement, path: str) -> bool:
+            if path.startswith("requirements."):
+                return path.split(".", 1)[1] in component.requirements
+            return path in component.field_evidence
+
+        def evidence_is_literal(component: ServiceRequirement, path: str) -> bool:
+            evidence = str(component.field_evidence.get(path) or "").strip()
+            if not evidence or evidence in {
+                "system_default",
+                "system_minimum",
+                "system_derived",
+            }:
+                return False
+            return re.sub(r"\s+", "", evidence).casefold() in normalized_source
+
+        def copy_path(
+            target: ServiceRequirement,
+            source: ServiceRequirement,
+            path: str,
+        ) -> None:
+            if path == "region":
+                target.region = source.region
+            elif path == "quantity":
+                target.quantity = source.quantity
+            elif path == "hours_per_month":
+                target.hours_per_month = source.hours_per_month
+            elif path.startswith("requirements."):
+                field = path.split(".", 1)[1]
+                if field in source.requirements:
+                    target.requirements[field] = source.requirements[field]
+                    if field in source.field_scopes:
+                        target.field_scopes[field] = source.field_scopes[field]
+                    if field in source.field_match_policies:
+                        target.field_match_policies[field] = source.field_match_policies[field]
+            if path in source.field_evidence:
+                target.field_evidence[path] = source.field_evidence[path]
+            if path in source.field_sources:
+                target.field_sources[path] = source.field_sources[path]
+            if path in source.locked_fields and path not in target.locked_fields:
+                target.locked_fields.append(path)
+
+        def remove_path(target: ServiceRequirement, path: str) -> None:
+            if path == "region":
+                target.region = None
+            elif path == "quantity":
+                target.quantity = 1
+            elif path == "hours_per_month":
+                target.hours_per_month = 730
+            elif path.startswith("requirements."):
+                field = path.split(".", 1)[1]
+                target.requirements.pop(field, None)
+                target.field_scopes.pop(field, None)
+                target.field_match_policies.pop(field, None)
+            target.field_evidence.pop(path, None)
+            target.field_sources.pop(path, None)
+            target.locked_fields = [item for item in target.locked_fields if item != path]
+
+        def issue_score(component: ServiceRequirement) -> int:
+            return len(
+                cls._deterministic_component_audit_issues(
+                    original_component,
+                    component,
+                )
+            )
+
+        protected_paths = {
+            path
+            for path in baseline.field_evidence
+            if evidence_is_literal(baseline, path) and has_submitted_path(baseline, path)
+        }
+
+        # Missing proved paths are always restored.  For a direct conflict on
+        # the same path, the candidate must strictly reduce deterministic
+        # issues; ties retain the already validated baseline value.
+        for path in sorted(protected_paths):
+            if not has_submitted_path(merged, path) or not evidence_is_literal(merged, path):
+                copy_path(merged, baseline, path)
+                continue
+            if value_at(merged, path) == value_at(baseline, path):
+                # Both model passes bound the same value to the same field.
+                # Retain both literal citations instead of oscillating between
+                # two repeated mentions. Never infer another value from prose.
+                field = path.removeprefix("requirements.")
+                if (value_at(merged, path) is not None
+                    and original_component.field_sources.get(path) not in CUSTOMER_OVERRIDE_SOURCES
+                    and baseline.field_scopes.get(field) == merged.field_scopes.get(field)):
+                    joined = cls._cover_proved_evidence(
+                        owned_source,
+                        [baseline.field_evidence[path], merged.field_evidence[path]],
+                        [str(item) for component in (baseline, merged)
+                         for evidence_path, item in component.field_evidence.items()
+                         if evidence_is_literal(component, evidence_path)
+                         and has_submitted_path(component, evidence_path)],
+                    )
+                    if joined:
+                        merged.field_evidence[path] = joined
+                continue
+            baseline_trial = merged.model_copy(deep=True)
+            copy_path(baseline_trial, baseline, path)
+            if issue_score(baseline_trial) <= issue_score(merged):
+                copy_path(merged, baseline, path)
+
+        # Preserve overflow rows discovered by either pass.  They remain
+        # non-priceable until the shared mapper gives them one formal owner.
+        merge_unmapped_pricing_facts(merged, baseline)
+
+        # One literal atom may not own two structured fields.  Group equal
+        # evidence/value owners, count how many matching atoms actually occur
+        # in the evidence, then keep the subset with the best deterministic
+        # audit score.  This catches e.g. ``1个 Hosted Zone`` being written to
+        # both hosted_zones and quantity while allowing ``1主1从`` to own two
+        # separate occurrences of the value 1.
+        numeric_owners: dict[tuple[str, float], list[str]] = {}
+        all_paths = {
+            *merged.field_evidence,
+            *(f"requirements.{field}" for field in merged.requirements),
+        }
+        for path in all_paths:
+            if not has_submitted_path(merged, path) or not evidence_is_literal(merged, path):
+                continue
+            value = value_at(merged, path)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            evidence = str(merged.field_evidence.get(path) or "").strip()
+            key = (re.sub(r"\s+", "", evidence).casefold(), float(value))
+            numeric_owners.setdefault(key, []).append(path)
+
+        for (normalized_evidence, numeric_value), owners in numeric_owners.items():
+            if len(owners) < 2:
+                continue
+            evidence = next(
+                (
+                    str(merged.field_evidence.get(path) or "")
+                    for path in owners
+                    if str(merged.field_evidence.get(path) or "").strip()
+                ),
+                "",
+            )
+            matching_atom_count = sum(
+                1
+                for atom in customer_quantitative_atoms(evidence)
+                if abs(atom.value - numeric_value) < 1e-6
+            )
+            owner_limit = max(matching_atom_count, 1)
+            if len(owners) <= owner_limit:
+                continue
+
+            best_trial: ServiceRequirement | None = None
+            best_key: tuple[int, int, tuple[str, ...]] | None = None
+            for kept in combinations(sorted(owners), owner_limit):
+                trial = merged.model_copy(deep=True)
+                kept_set = set(kept)
+                for path in owners:
+                    if path not in kept_set:
+                        remove_path(trial, path)
+                # On an equal audit score retain more paths already proved by
+                # the first pass.  The final tuple makes selection stable.
+                key = (
+                    issue_score(trial),
+                    -len(kept_set & protected_paths),
+                    tuple(kept),
+                )
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_trial = trial
+            if best_trial is not None:
+                merged = best_trial
+
+        remove_facts_mapped_to_fields(merged)
+        merged.locked_fields = sorted(set(merged.locked_fields))
+        return merged
+
+    @staticmethod
+    def _cover_proved_evidence(source: str, snippets: list[str], proved: list[str]) -> str | None:
+        """Return one literal span, without absorbing unexplained intervening digits."""
+        def span(snippet: str) -> tuple[int, int] | None:
+            compact = re.sub(r"\s+", "", snippet)
+            if not compact:
+                return None
+            match = re.search(r"\s*".join(re.escape(char) for char in compact), source, re.I)
+            return match.span() if match else None
+
+        spans = [span(snippet) for snippet in snippets]
+        if not spans or any(item is None for item in spans):
+            return None
+        start = min(item[0] for item in spans if item is not None)
+        end = max(item[1] for item in spans if item is not None)
+        covered = [item for snippet in proved if (item := span(snippet)) is not None]
+        for number in re.finditer(r"\d+(?:\.\d+)?", source[start:end]):
+            left, right = start + number.start(), start + number.end()
+            if not any(a <= left and right <= b for a, b in covered):
+                return None
+        return source[start:end]
 
     @staticmethod
     def _uncovered_quantitative_claim_issues(
@@ -3218,12 +4159,31 @@ operation、单位换算或新字段。
         }
         evidence_by_path.update(
             {
-                f"unmapped.{index}.{fact.field_hint}": re.sub(
-                    r"\s+", "", fact.evidence
-                ).casefold()
+                f"unmapped.{index}.{fact.field_hint}": re.sub(r"\s+", "", fact.evidence).casefold()
                 for index, fact in enumerate(filled.unmapped_pricing_facts)
             }
         )
+        # A customer may explicitly replace an approximate/requested
+        # CPU-memory shape by selecting one official AWS model.  The mutable
+        # requirement fields then hold the official choice (or tombstones),
+        # while the immutable ledger deliberately retains the original shape
+        # as the evidence that led to that choice.  If an unrelated draft
+        # migration invalidates the fingerprint, the literal audit must read
+        # those preserved facts rather than declaring the original numbers
+        # lost.  This is a generic model-selection boundary shared by EC2,
+        # RDS, caches, brokers, search and future instance-sized services.
+        preserved_replaced_values: dict[str, object] = {}
+        if filled.field_sources.get(
+            "_customer_shape_replaced_by_model"
+        ) == "customer_confirmation" and filled.requirements.get("requested_model"):
+            for fact in filled.customer_pricing_facts:
+                if (
+                    fact.path in {"requirements.vcpu", "requirements.memory_gib"}
+                    and fact.source_kind == "customer_text"
+                    and fact.evidence
+                ):
+                    evidence_by_path[fact.path] = re.sub(r"\s+", "", fact.evidence).casefold()
+                    preserved_replaced_values[fact.path] = fact.value
         # An empty fact table is not evidence that the source contained no
         # pricing facts.  It is the most dangerous omission case: older code
         # returned early here, allowing a new service such as MediaConvert to
@@ -3232,6 +4192,8 @@ operation、单位换算或新字段。
         # returned no structured fields at all.
 
         def value_for(path: str) -> object:
+            if path in preserved_replaced_values:
+                return preserved_replaced_values[path]
             if path.startswith("unmapped."):
                 try:
                     return filled.unmapped_pricing_facts[int(path.split(".", 2)[1])].value
@@ -3254,7 +4216,50 @@ operation、单位换算或新字段。
                 return [number for item in value.values() for number in numeric_values(item)]
             return []
 
+        def comparable_atom_values(path: str, atom_unit: str) -> list[float]:
+            """Return field values in the lexical atom's comparison scale.
+
+            The intake ledger normalizes broad capacities to GiB, while a few
+            official schemas deliberately use MB or milliseconds.  Comparing
+            the raw digits (64 KB versus 0.0625 MB, 2 seconds versus 2000 ms)
+            made correctly parsed facts look lost.  Keep this conversion at
+            the schema boundary so product adapters never need phrase- or
+            service-specific exceptions.
+            """
+
+            values = numeric_values(value_for(path))
+            field = path.removeprefix("requirements.").casefold()
+            unit = atom_unit.casefold()
+            if path.startswith("unmapped."):
+                try:
+                    fact = filled.unmapped_pricing_facts[int(path.split(".", 2)[1])]
+                except (IndexError, TypeError, ValueError):
+                    return values
+                declared = re.sub(r"\s+", "", str(fact.unit or "")).casefold()
+                if declared in {"t", "tb", "tib"}:
+                    return [value * 1024 for value in values]
+                if declared in {"m", "mb", "mib"}:
+                    return [value / 1024 for value in values]
+                return values
+            if field.endswith("_mb") or "memory_mb" in field:
+                if unit in {"kb", "kib"}:
+                    return [value * 1024 for value in values]
+                if unit in {"g", "gb", "gib"}:
+                    return [value / 1024 for value in values]
+                return values
+            if field.endswith("_ms") or field == "duration_ms":
+                if unit == "秒":
+                    return [value / 1000 for value in values]
+            return values
+
         def compatible(path: str, category: str) -> bool:
+            # The lossless overflow table is intentionally schema-neutral. Its
+            # exact evidence, declared unit and numeric value are the contract;
+            # a free-form field hint must not be forced through English schema
+            # name heuristics before the official catalogue has supplied a
+            # destination field.
+            if path.startswith("unmapped."):
+                return True
             field = path.removeprefix("requirements.").split(".", 2)[-1].casefold()
             if category == "cpu":
                 return "vcpu" in field or field in {"cpu", "cores"}
@@ -3262,8 +4267,16 @@ operation、单位换算或新字段。
                 return any(
                     marker in field
                     for marker in (
-                        "gib", "gb", "storage", "disk", "memory", "transfer",
-                        "processed_bytes", "data_", "size", "volume",
+                        "gib",
+                        "gb",
+                        "storage",
+                        "disk",
+                        "memory",
+                        "transfer",
+                        "processed_bytes",
+                        "data_",
+                        "size",
+                        "volume",
                     )
                 )
             if category == "messages":
@@ -3289,8 +4302,17 @@ operation、单位换算或新字段。
                 return path == "quantity" or any(
                     marker in field
                     for marker in (
-                        "count", "node", "shard", "replica", "rule", "user",
-                        "instance", "broker", "task", "cluster", "deployment",
+                        "count",
+                        "node",
+                        "shard",
+                        "replica",
+                        "rule",
+                        "user",
+                        "instance",
+                        "broker",
+                        "task",
+                        "cluster",
+                        "deployment",
                     )
                 )
             if category == "endpoint_count":
@@ -3318,11 +4340,16 @@ operation、单位换算或新字段。
                 "quantity",
                 re.compile(
                     r"(?<![A-Za-z0-9_\u4e00-\u9fff])"
-                    r"数量\s*[:：]?\s*(\d[\d,]*(?:\.\d+)?)",
+                    r"数量\s*[:：]?\s*(\d[\d,]*(?:\.\d+)?)"
+                    r"\s*(?:台|套|个|块|卷)?"
+                    r"(?=\s*(?:[|｜,，。；;\n]|$))",
                     re.I,
                 ),
             ),
-            ("cpu", re.compile(r"(?<![a-z0-9.])(\d+(?:\.\d+)?)\s*(?:核|v\s*cpu|vcpu|c(?![a-z]))", re.I)),
+            (
+                "cpu",
+                re.compile(r"(?<![a-z0-9.])(\d+(?:\.\d+)?)\s*(?:核|v\s*cpu|vcpu|c(?![a-z]))", re.I),
+            ),
             (
                 "throughput_per_tib",
                 re.compile(
@@ -3373,11 +4400,18 @@ operation、单位换算或新字段。
                 re.compile(
                     r"(?:(?:https|put|copy|post|list|get|select|api)\s*)?"
                     r"(?:请求|调用)(?:量|数|次数)?\s*[:：]?\s*(?:约|大约|预计)?\s*"
-                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次|个)?",
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?"
+                    r"(?!\s*(?:k|m|g|t)i?b)\s*(?:次|个)?",
                     re.I,
                 ),
             ),
-            ("requests", re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次)?\s*(?:(?:api\s*)?请求|调用(?:量|次数)?)", re.I)),
+            (
+                "requests",
+                re.compile(
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次)?\s*(?:(?:api\s*)?请求|调用(?:量|次数)?)",
+                    re.I,
+                ),
+            ),
             ("duration", re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(ms|毫秒|秒)", re.I)),
             (
                 "hours",
@@ -3408,7 +4442,7 @@ operation、单位换算或新字段。
                 re.compile(
                     r"(?<!单)(?<!每)(\d+)\s*(?:台|个)\s*"
                     r"(?=(?:实例|机器|服务器|主机|writer|reader|broker|函数|集群|"
-                    r"[,，。；;]|$))",
+                    r"节点|分片|副本|规则|用户))",
                     re.I,
                 ),
             ),
@@ -3454,27 +4488,31 @@ operation、单位换算或新字段。
             ),
         )
         issues: list[str] = []
+        semantically_covered_ranges: list[tuple[int, int]] = []
         for category, pattern in claim_patterns:
             for match in pattern.finditer(source):
                 claim = match.group(0)
-                if "美元" in source[match.end() : match.end() + 4] or "$" in source[max(0, match.start() - 2) : match.start()]:
+                if (
+                    "美元" in source[match.end() : match.end() + 4]
+                    or "$" in source[max(0, match.start() - 2) : match.start()]
+                ):
                     continue
                 raw_number = match.group(1).replace(",", "")
                 wanted = float(raw_number)
-                unit = match.group(2).casefold() if match.lastindex and match.lastindex >= 2 and match.group(2) else ""
+                unit = (
+                    match.group(2).casefold()
+                    if match.lastindex and match.lastindex >= 2 and match.group(2)
+                    else ""
+                )
                 if category == "capacity" and unit in {"tib", "tb", "t"}:
                     wanted *= 1024
-                elif category in {
-                    "messages", "requests", "connection_minutes", "write_records"
-                }:
+                elif category in {"messages", "requests", "connection_minutes", "write_records"}:
                     wanted *= {"万": 10_000, "亿": 100_000_000}.get(match.group(2), 1)
                 elif category == "duration" and match.group(2).casefold() == "秒":
                     wanted *= 1000
                 compact_claim = re.sub(r"\s+", "", claim).casefold()
                 covered = False
-                claim_context = source[
-                    max(0, match.start() - 14) : match.end()
-                ].casefold()
+                claim_context = source[max(0, match.start() - 14) : match.end()].casefold()
                 for path, evidence in evidence_by_path.items():
                     if not compatible(path, category):
                         continue
@@ -3496,7 +4534,11 @@ operation、单位换算或新字段。
                         break
                     if compact_claim not in evidence:
                         continue
-                    values = numeric_values(value_for(path))
+                    values = (
+                        comparable_atom_values(path, unit)
+                        if path.startswith("unmapped.")
+                        else numeric_values(value_for(path))
+                    )
                     # Topology fields such as deployment can encode a count
                     # semantically without storing the literal as a number.
                     if category == "role_count" and "deployment" in path.casefold():
@@ -3513,7 +4555,9 @@ operation、单位换算或新字段。
                         covered = True
                         break
                 if not covered:
-                    issues.append(f"客户原话中的“{claim}”没有进入对应的结构化字段")
+                    issues.append(f"清洗后配置中的“{claim}”没有进入对应的结构化字段")
+                else:
+                    semantically_covered_ranges.append((match.start(), match.end()))
 
         # The semantic checks above catch wrong destinations for known common
         # shapes.  This final product-neutral inventory catches everything
@@ -3523,20 +4567,20 @@ operation、单位换算或新字段。
         # services and new customer wording therefore become an explicit
         # unmapped fact/question instead of a silent omission.
         for atom in customer_quantitative_atoms(source):
+            if any(
+                atom.start < covered_end and atom.end > covered_start
+                for covered_start, covered_end in semantically_covered_ranges
+            ):
+                continue
             compact_atom = re.sub(r"\s+", "", atom.raw).casefold()
             atom_covered = False
             for path, evidence in evidence_by_path.items():
                 if compact_atom not in evidence:
                     continue
                 comparable_atom_value = atom.value
-                field = path.removeprefix("requirements.").casefold()
-                if atom.unit in {"mb", "mib", "m"} and (
-                    field.endswith("_mb") or "memory_mb" in field
-                ):
-                    comparable_atom_value *= 1024
                 if any(
                     abs(value - comparable_atom_value) < 1e-6
-                    for value in numeric_values(value_for(path))
+                    for value in comparable_atom_values(path, atom.unit)
                 ):
                     atom_covered = True
                     break
@@ -3545,33 +4589,10 @@ operation、单位换算或新字段。
             if any(compact_atom in re.sub(r"\s+", "", issue).casefold() for issue in issues):
                 continue
             issues.append(
-                f"客户原话中的“{atom.raw}”没有进入统一事实表；"
-                "请绑定正式字段或保留为待映射事实"
+                f"清洗后配置中的“{atom.raw}”没有进入统一事实表；请绑定正式字段或保留为待映射事实"
             )
         return list(dict.fromkeys(issues))
 
-    @classmethod
-    def _needs_revision_component_audit(
-        cls,
-        original_component: ServiceRequirement,
-        revised: ServiceRequirement,
-        feedback: str,
-    ) -> bool:
-        """Limit the extra network audit to genuinely related fields."""
-
-        if cls._needs_selective_component_audit(original_component, revised):
-            return True
-        service = cls._service_key(revised.service)
-        if service in {"opensearch", "msk", "eks", "elasticache", "rds", "aurora", "ebs"}:
-            return bool(
-                re.search(
-                    r"每(?:个|台|节点|块|套)?|总(?:容量|存储|数量)|"
-                    r"主从|主备|副本|replica|broker|worker|分片|集群|multi-az",
-                    feedback,
-                    re.IGNORECASE,
-                )
-            )
-        return False
 
     async def _resolve_unknown_component_service(
         self,
@@ -3590,6 +4611,20 @@ operation、单位换算或新字段。
         """
 
         current_key = self._service_key(component.service)
+        # Parent/child materialization already assigned a provider product at
+        # the irreversible ownership boundary.  The child's source can still
+        # contain the parent's heading (for example an EKS row that owns EC2
+        # Worker facts); sending that text through product classification a
+        # second time relabels the child as another parent.  Derived identity
+        # is therefore immutable for every current and future product.
+        if component.derived_from_service or component.parent_component_key:
+            if current_key in SERVICE_TEMPLATE_FIELDS:
+                return
+            component.field_sources["_identity_resolution_status"] = "failed"
+            component.field_sources["_identity_resolution_reason"] = (
+                "派生组件缺少预拆分阶段确定的正式产品身份"
+            )
+            return
         # Product identity and self-hosting evidence are different facts. A
         # normal sales row often starts ``S3，容量15T``: the comma isolates
         # the product label for the official directory, but storage capacity
@@ -3597,6 +4632,21 @@ operation、单位换算或新字段。
         # stricter self-hosted-name extractor, so the official lookup received
         # the entire sentence and missed S3.
         heading = self._component_product_heading(component)
+        heading_inventory = {
+            self._service_key(service_key)
+            for service_key, _display_name in self._inventory_keys_for_line(heading or "")
+        }
+        # A sales-numbered owner that is already a supported product and whose
+        # heading independently resolves to the same product is complete
+        # identity evidence. Do not send it through the mutable learned-alias
+        # registry again: that registry is only a discovery aid for unknown
+        # products and an older alias must never turn a managed service into a
+        # self-hosted EC2 workload.
+        if current_key in SERVICE_TEMPLATE_FIELDS and (
+            not heading or current_key in heading_inventory
+        ):
+            component.service = current_key
+            return
 
         def selected_official_product(
             raw: dict[str, object],
@@ -3629,8 +4679,7 @@ operation、单位换算或新字段。
                 if str(raw.get(field) or "").strip()
             }
             returned_targets = {
-                re.sub(r"[^a-z0-9]", "", value.casefold())
-                for value in returned_values
+                re.sub(r"[^a-z0-9]", "", value.casefold()) for value in returned_values
             }
             if not returned_targets:
                 return None
@@ -3640,22 +4689,14 @@ operation、单位换算或新字段。
                     str(product.get("service_code") or ""),
                     str(product.get("service_key") or ""),
                     str(product.get("display_name") or ""),
-                    *(
-                        str(alias)
-                        for alias in product.get("aliases", [])
-                        if str(alias).strip()
-                    ),
+                    *(str(alias) for alias in product.get("aliases", []) if str(alias).strip()),
                 }
                 identity_targets = {
-                    re.sub(r"[^a-z0-9]", "", value.casefold())
-                    for value in identities
-                    if value
+                    re.sub(r"[^a-z0-9]", "", value.casefold()) for value in identities if value
                 }
                 if returned_targets & identity_targets:
                     matches.append(product)
-            unique = {
-                str(product.get("service_code") or ""): product for product in matches
-            }
+            unique = {str(product.get("service_code") or ""): product for product in matches}
             return next(iter(unique.values())) if len(unique) == 1 else None
 
         def candidate_identity_labels(product: dict[str, object]) -> list[str]:
@@ -3669,11 +4710,7 @@ operation、单位换算或新字段。
             without turning every new phrase into another parser branch.
             """
 
-            official_identity = str(
-                product.get("service_key")
-                or product.get("service_code")
-                or ""
-            )
+            official_identity = str(product.get("service_key") or product.get("service_code") or "")
             routed_identity = self._service_key(official_identity)
             business_markers = next(
                 (
@@ -3688,10 +4725,7 @@ operation、单位换算或新字段。
                     value
                     for value in (
                         str(product.get("display_name") or ""),
-                        *(
-                            str(alias)
-                            for alias in list(product.get("aliases") or [])[:3]
-                        ),
+                        *(str(alias) for alias in list(product.get("aliases") or [])[:3]),
                         *(str(marker) for marker in business_markers[:8]),
                     )
                     if value.strip()
@@ -3700,37 +4734,39 @@ operation、单位换算或新字段。
 
         def apply_official_identity(product: dict[str, object]) -> None:
             aliases = [
-                str(value).strip()
-                for value in product.get("aliases", [])
-                if str(value).strip()
+                str(value).strip() for value in product.get("aliases", []) if str(value).strip()
             ]
             human_name = (
                 heading
                 if heading and re.match(r"^(?:Amazon|AWS)\s+", heading, re.I)
                 else next(
-                    (
-                        alias
-                        for alias in aliases
-                        if re.match(r"^(?:Amazon|AWS)\s+", alias, re.I)
-                    ),
+                    (alias for alias in aliases if re.match(r"^(?:Amazon|AWS)\s+", alias, re.I)),
                     str(product.get("display_name") or component.service),
                 )
             )
             official_identity = str(
-                product.get("service_key")
-                or product.get("service_code")
-                or component.service
+                product.get("service_key") or product.get("service_code") or component.service
             )
             # The AWS Price List frequently exposes an offer-code spelling
             # (for example ``AWSDatabaseMigrationSvc``) while the runtime
             # adapter uses a stable internal key (``dms``).  Always pass an
             # official catalog hit through the same canonical router so a
             # renamed product cannot silently fall back to the generic plugin.
-            routed_identity = self._service_key(official_identity)
+            offer_services = curated_service_keys_for_offer_code(
+                str(product.get("service_code") or "")
+            )
+            current_identity = self._service_key(component.service)
+            routed_identity = (
+                current_identity
+                if current_identity in offer_services
+                else (
+                    offer_services[0]
+                    if len(offer_services) == 1
+                    else self._service_key(official_identity)
+                )
+            )
             component.service = (
-                routed_identity
-                if routed_identity in SERVICE_TEMPLATE_FIELDS
-                else official_identity
+                routed_identity if routed_identity in SERVICE_TEMPLATE_FIELDS else official_identity
             )
             if not (heading and re.match(r"^(?:Amazon|AWS)\s+", heading, re.I)):
                 canonical_display = next(
@@ -3790,9 +4826,10 @@ operation、单位换算或新字段。
                     labels = ()
                 if labels:
                     official_product = await asyncio.to_thread(resolver, *labels)
-        if official_product is not None and str(
-            official_product.get("identity_match_source") or ""
-        ) == "learned_alias":
+        if (
+            official_product is not None
+            and str(official_product.get("identity_match_source") or "") == "learned_alias"
+        ):
             # Learned aliases accelerate candidate retrieval but are not AWS
             # facts. A previous model once learned Doris/DolphinScheduler as
             # aliases of EC2, which made that mistake permanent in local cache.
@@ -3807,22 +4844,36 @@ operation、单位换算或新字段。
             await remember_official_identity(official_product)
             return
 
+        # The standalone templates own exact provider aliases such as
+        # ``RDS MySQL`` and ``Amazon RDS for PostgreSQL``. Use that declaration
+        # only after the complete official directory misses, but before the
+        # third-party software route; a database instance shape is not evidence
+        # that RDS is self-hosted.
+        declared_template = component_template_spec(heading or "")
+        if declared_template is not None and declared_template.service_key != "ec2":
+            component.service = declared_template.service_key
+            component.calculator_service_name = declared_template.display_name
+            component.workload_identity_kind = "official_aws_service"
+            component.workload_name = None
+            component.field_sources["_template_product_identity"] = heading or component.service
+            component.field_sources.pop("_pending_architecture_decision", None)
+            component.field_sources.pop("_third_party_product", None)
+            variant = component_template_variant(heading or "")
+            if variant is not None and "engine" in declared_template.field_names:
+                component.requirements["engine"] = variant
+                component.field_sources["requirements.engine"] = "customer_text"
+                component.field_evidence["requirements.engine"] = heading or variant
+                component.locked_fields = sorted(
+                    set(component.locked_fields) | {"requirements.engine"}
+                )
+            return
+
         # At this point the provider-owned exact aliases have definitely missed.
         # A stable non-AWS software heading with explicit node shape is therefore
         # a deployment workload, not an unknown AWS product. Route it before the
         # broader AI catalog search can recommend an unrelated product by
         # capability similarity.
         if self._route_named_third_party_workload(component):
-            return
-
-        heading_inventory = {
-            self._service_key(service_key)
-            for service_key, _display_name in self._inventory_keys_for_line(heading or "")
-        }
-        if current_key in SERVICE_TEMPLATE_FIELDS and (
-            not heading or current_key in heading_inventory
-        ):
-            component.service = current_key
             return
 
         # A current marketing name may differ from the long-lived Price List
@@ -3863,10 +4914,7 @@ operation、单位换算或新字段。
         }
         if official_by_code:
             choices = "\n".join(
-                "- "
-                + code
-                + ": "
-                + ", ".join(candidate_identity_labels(product))
+                "- " + code + ": " + ", ".join(candidate_identity_labels(product))
                 for code, product in official_by_code.items()
             )
             response_field = "service_code"
@@ -3884,8 +4932,7 @@ operation、单位换算或新字段。
                             markers := next(
                                 (
                                     list(item_markers)
-                                    for item_key, _display, item_markers
-                                    in self._INVENTORY_DEFINITIONS
+                                    for item_key, _display, item_markers in self._INVENTORY_DEFINITIONS
                                     if self._service_key(item_key) == self._service_key(key)
                                 ),
                                 [],
@@ -3913,7 +4960,7 @@ operation、单位换算或新字段。
             "候选如下：\n"
             f"{choices}"
         )
-        content = f"当前临时名称：{component.service}\n客户原话：\n{component.source_text}"
+        content = f"当前临时名称：{component.service}\n清洗后配置：\n{component.source_text}"
 
         async def complete_identity_json(
             system_prompt: str,
@@ -3978,10 +5025,7 @@ operation、单位换算或新字段。
                     }
                     if set(full_by_code) - set(official_by_code):
                         full_choices = "\n".join(
-                            "- "
-                            + code
-                            + ": "
-                            + ", ".join(candidate_identity_labels(product))
+                            "- " + code + ": " + ", ".join(candidate_identity_labels(product))
                             for code, product in full_by_code.items()
                         )
                         fallback_prompt = prompt.replace(choices, full_choices)
@@ -3999,8 +5043,7 @@ operation、单位换算或新字段。
                         # only this component with the validation failure made
                         # explicit; do not rerun the other quote components.
                         retry_prompt = (
-                            prompt
-                            + "\n上一次没有返回可验证的唯一官方产品。请重新阅读客户原话，"
+                            prompt + "\n上一次没有返回可验证的唯一官方产品。请重新阅读清洗后配置，"
                             "必须返回候选行开头的 service_code；无法确定时返回 unknown。"
                         )
                         raw = await complete_identity_json(
@@ -4056,9 +5099,7 @@ operation、单位换算或新字段。
             if self._route_named_third_party_workload(component):
                 return
             component.field_sources["_identity_resolution_status"] = "failed"
-            component.field_sources["_identity_resolution_reason"] = (
-                "服务名称识别线路暂时无法连接"
-            )
+            component.field_sources["_identity_resolution_reason"] = "服务名称识别线路暂时无法连接"
             logger.exception("Unknown component classification failed for %s", component.service)
 
     async def _fill_component_template_with_retries(
@@ -4205,7 +5246,7 @@ operation、单位换算或新字段。
         if not self._needs_minimum_runtime_defaults(component):
             return safe_defaults, ""
         prompt = build_minimum_runtime_prompt()
-        content = f"软件/用途客户原话：\n{component.source_text}"
+        content = f"软件/用途清洗后配置：\n{component.source_text}"
         if reporter:
             await reporter(
                 "ai_prompt",
@@ -4290,11 +5331,32 @@ operation、单位换算或新字段。
         provided_payload = dict(compacted)
         payload["service"] = component.service
         payload["calculator_service_name"] = component.calculator_service_name
+        payload["official_calculator_service_code"] = (
+            component.official_calculator_service_code
+        )
+        payload["official_calculator_template_id"] = (
+            component.official_calculator_template_id
+        )
+        payload["official_calculator_schema_hash"] = (
+            component.official_calculator_schema_hash
+        )
+        raw_official_configuration = payload.get(
+            "official_calculator_configuration"
+        )
+        payload["official_calculator_configuration"] = {
+            **component.official_calculator_configuration,
+            **(
+                raw_official_configuration
+                if isinstance(raw_official_configuration, dict)
+                else {}
+            ),
+        }
         payload["workload_identity_kind"] = component.workload_identity_kind
         payload["workload_name"] = component.workload_name
         payload.setdefault("quantity", component.quantity)
         payload.setdefault("hours_per_month", component.hours_per_month)
         payload["source_text"] = component.source_text
+        payload["intake_source_fragments"] = list(component.intake_source_fragments)
         payload["query_action"] = None
         payload.pop("field_sources", None)
         payload.pop("locked_fields", None)
@@ -4323,9 +5385,7 @@ operation、单位换算或新字段。
                 # of them as a malformed template used to trigger three remote
                 # AI retries before the exact same value was stripped later.
                 # Unknown fields still fail closed.
-                if not strip_non_pricing_context_fields(
-                    component.service, {canonical: value}
-                ):
+                if not strip_non_pricing_context_fields(component.service, {canonical: value}):
                     continue
                 evidence = str(
                     raw_evidence.get(f"requirements.{field}")
@@ -4354,14 +5414,16 @@ operation、单位换算或新字段。
                 + "。请只使用当前组件字段："
                 + "、".join(sorted(allowed))
             )
+        normalized_requirements = validate_component_template_values(
+            component.service,
+            normalized_requirements,
+        )
         payload["requirements"] = normalized_requirements
         provided_payload["requirements"] = normalized_requirements
         payload["unmapped_pricing_facts"] = [
             item.model_dump(mode="json") for item in parsed_unmapped
         ]
-        provided_payload["unmapped_pricing_facts"] = list(
-            payload["unmapped_pricing_facts"]
-        )
+        provided_payload["unmapped_pricing_facts"] = list(payload["unmapped_pricing_facts"])
         evidence = payload.get("field_evidence")
         normalized_evidence: dict[str, object] = {}
         if isinstance(evidence, dict):
@@ -4395,14 +5457,19 @@ operation、单位换算或新字段。
         self._validate_component_evidence(
             result,
             provided_payload=provided_payload,
-            source_text=component.source_text,
+            source_text=customer_owned_source(component),
             original=component,
         )
-        self._validate_unmapped_pricing_facts(result, source_text=component.source_text)
+        self._validate_unmapped_pricing_facts(result, source_text=customer_owned_source(component))
         self._validate_repeated_storage_template(
             result,
             provided_payload=provided_payload,
         )
+        if (
+            self._calculator_contract_catalog is not None
+            and result.official_calculator_service_code
+        ):
+            self._validate_component_official_configuration(result)
         return result
 
     @staticmethod
@@ -4424,20 +5491,17 @@ operation、单位换算或新字段。
             # prose to influence later product matching. Drop reference-only
             # money globally; real billable quantities remain lossless.
             reference_text = f"{fact.field_hint} {fact.evidence}".casefold()
-            if (
-                re.search(r"(?:usd|us\$|\$|\u7f8e\u5143|\u7f8e\u91d1)", reference_text, re.I)
-                and re.search(
-                    r"(?:\u53c2\u8003|\u9884\u4f30|\u4f30\u7b97|\u9884\u7b97|\u5386\u53f2|\u539f\u62a5\u4ef7|\u5ba2\u6237.*\u8d39\u7528)",
-                    reference_text,
-                    re.I,
-                )
+            if re.search(
+                r"(?:usd|us\$|\$|\u7f8e\u5143|\u7f8e\u91d1)", reference_text, re.I
+            ) and re.search(
+                r"(?:\u53c2\u8003|\u9884\u4f30|\u4f30\u7b97|\u9884\u7b97|\u5386\u53f2|\u539f\u62a5\u4ef7|\u5ba2\u6237.*\u8d39\u7528)",
+                reference_text,
+                re.I,
             ):
                 continue
             normalized_evidence = re.sub(r"\s+", "", fact.evidence).casefold()
             if not normalized_evidence or normalized_evidence not in normalized_source:
-                raise ValueError(
-                    f"待映射事实 {fact.field_hint} 的原文证据不存在：{fact.evidence}"
-                )
+                raise ValueError(f"待映射事实 {fact.field_hint} 的原文证据不存在：{fact.evidence}")
             identity = (
                 fact.field_hint.casefold(),
                 json.dumps(fact.value, ensure_ascii=False, sort_keys=True, default=str),
@@ -4532,9 +5596,24 @@ operation、单位换算或新字段。
         for field in ("region", "quantity", "hours_per_month"):
             if provided_payload.get(field) not in (None, ""):
                 provided_paths.add(field)
-        if component.quantity == 1 and original.quantity == 1:
+        raw_evidence = provided_payload.get("field_evidence")
+        raw_evidence = raw_evidence if isinstance(raw_evidence, dict) else {}
+        # A value equal to a model default can still be explicit. The AI may
+        # normalize ``一套`` or ``1个部署`` to quantity=1. Only suppress the
+        # fallback when no literal evidence accompanied it; otherwise a
+        # correct normalized result is turned back into a missing fact.
+        if (
+            component.quantity == 1
+            and original.quantity == 1
+            and raw_evidence.get("quantity") in (None, "", "system_minimum", "system_default")
+        ):
             provided_paths.discard("quantity")
-        if component.hours_per_month == 730 and original.hours_per_month == 730:
+        if (
+            component.hours_per_month == 730
+            and original.hours_per_month == 730
+            and raw_evidence.get("hours_per_month")
+            in (None, "", "system_minimum", "system_default")
+        ):
             provided_paths.discard("hours_per_month")
 
         normalized_source = re.sub(r"\s+", "", source_text).casefold()
@@ -4558,6 +5637,26 @@ operation、单位换算或新字段。
                 "hours_per_month",
             }:
                 continue
+            if original.field_sources.get(path) in CUSTOMER_OVERRIDE_SOURCES:
+                # A later confirmation is authoritative evidence bound to this
+                # exact component; it is intentionally not expected to occur
+                # in the earlier customer sentence.
+                original_value = (
+                    original.requirements.get(path.split(".", 1)[1])
+                    if path.startswith("requirements.")
+                    else getattr(original, path, None)
+                )
+                current_value = (
+                    component.requirements.get(path.split(".", 1)[1])
+                    if path.startswith("requirements.")
+                    else getattr(component, path, None)
+                )
+                if current_value == original_value:
+                    valid_evidence[path] = str(
+                        original.field_evidence.get(path)
+                        or "customer_confirmation"
+                    )
+                    continue
             snippet = str(raw_snippet).strip()
             normalized_snippet = re.sub(r"\s+", "", snippet).casefold()
             if snippet in {"system_minimum", "system_derived"} or (
@@ -4740,6 +5839,9 @@ operation、单位换算或新字段。
                 r"(?:数量|实例数量|部署数量)\s*[:：]\s*(\d+)",
                 r"(?:数量|实例数量|部署数量)\s*(\d+)",
                 r"(\d+)\s*(?:台|套|个|块|卷)(?!\s*(?:核|gib|gb|tb))",
+                r"(\d+)\s*(?:pcs?|pieces?)\b(?:\s*[a-z0-9][a-z0-9._-]*)?",
+                r"(\d+)\s*[x×*]\s*[a-z0-9][a-z0-9._-]*\s*"
+                r"(?:instances?|vms?)\b",
             ]
         elif field in {
             "broker_count",
@@ -4783,6 +5885,11 @@ operation、单位换算或新字段。
                     r"(\d+)\s*(?:套|个)\s*(?:集群|部署)",
                     r"集群(?:数量|数|总数)\s*[:：]?\s*(\d+)",
                     r"集群\s*[:：]\s*(\d+)",
+                    # The AI already chose the semantic field. This boundary
+                    # validates the universal deployment classifier rather
+                    # than requiring one product-specific phrase. Capacity
+                    # and CPU cannot match because their units differ.
+                    r"(\d+)\s*套(?!\s*(?:核|gib|gb|tb))",
                 ],
                 "instance_count": [
                     r"(\d+)\s*(?:个|台)?\s*(?:数据库)?实例",
@@ -4811,6 +5918,14 @@ operation、单位换算或新字段。
                 # Capacity/CPU phrases cannot match because the unit must end
                 # at 台.
                 patterns.append(r"(\d+)\s*台(?!\s*(?:核|gib|gb|tb))")
+            # The field has already been selected by the structured extractor
+            # and this function validates only that field's own evidence.  A
+            # model identifier may legitimately sit between the literal count
+            # and its role (``4个ra3.4xlarge计算节点``).  Requiring the role to
+            # immediately follow the number rejected valid evidence.  The
+            # explicit count unit is sufficient here; CPU and capacities have
+            # different units and cannot match this fallback.
+            patterns.append(r"(\d+)\s*(?:个|台|套)(?!\s*(?:核|gib|gb|tb))")
         elif field.endswith("_gib") or "storage_gib" in field:
             values: list[float] = []
             for match in re.finditer(r"(\d+(?:\.\d+)?)\s*(tib|tb|t|gib|gb|g)", snippet, re.I):
@@ -4873,100 +5988,6 @@ operation、单位换算或新字段。
         if values and not any(abs(float(value) - item) < 1e-6 for item in values):
             raise ValueError(f"字段 {path}={value} 与原文证据中的数值 {snippet!r} 不一致")
 
-    async def _audit_component_template(
-        self,
-        index: int,
-        original_component: ServiceRequirement,
-        filled: ServiceRequirement,
-        *,
-        runtime_defaults: dict[str, object],
-        extra_fields: tuple[str, ...] = (),
-        semaphore: asyncio.Semaphore,
-        reporter: AiTranscriptReporter | None,
-    ) -> ServiceRequirement:
-        prompt = build_component_audit_prompt(filled.service)
-        content = (
-            f"客户原话：\n{original_component.source_text}\n\n"
-            "系统最低运行建议（不是客户原话）：\n"
-            f"{json.dumps(runtime_defaults, ensure_ascii=False)}\n\n"
-            f"已填写模板：\n{filled.model_dump_json()}"
-        )
-        if reporter:
-            await reporter(
-                "ai_prompt",
-                _redact_transcript(f"【组件 {index + 1} · 模板对照审核】\n{prompt}\n\n{content}"),
-            )
-        try:
-            async with semaphore:
-                raw = await self._recovery_gateway().complete_json(
-                    system_prompt=prompt,
-                    user_content=content,
-                    timeout_seconds=25,
-                    max_attempts=1,
-                )
-            if reporter:
-                await reporter(
-                    "ai_response",
-                    _redact_transcript(
-                        f"【组件 {index + 1} · 模板审核输出】\n"
-                        + json.dumps(raw, ensure_ascii=False, indent=2)
-                    ),
-                )
-            corrections = raw.get("corrections")
-            if isinstance(corrections, dict):
-                if (
-                    corrections.get("region") not in (None, "")
-                    and original_component.region is None
-                    and filled.field_evidence.get("region")
-                ):
-                    filled.region = str(corrections["region"])
-                quantity = corrections.get("quantity")
-                if (
-                    isinstance(quantity, int)
-                    and not isinstance(quantity, bool)
-                    and quantity > 0
-                    and original_component.quantity == 1
-                    and filled.field_evidence.get("quantity")
-                ):
-                    filled.quantity = quantity
-                hours = corrections.get("hours_per_month")
-                if (
-                    isinstance(hours, (int, float))
-                    and 0 < hours <= 744
-                    and filled.field_evidence.get("hours_per_month")
-                ):
-                    filled.hours_per_month = float(hours)
-                requirement_corrections = corrections.get("requirements")
-                if isinstance(requirement_corrections, dict):
-                    allowed = allowed_requirement_fields(filled.service, extra_fields=extra_fields)
-                    for key, value in requirement_corrections.items():
-                        path = f"requirements.{key}"
-                        if (
-                            key in allowed
-                            and value not in (None, "")
-                            and (
-                                path in filled.field_evidence
-                                or key in original_component.requirements
-                                or key in runtime_defaults
-                            )
-                        ):
-                            filled.requirements[key] = value
-            # Intake/directly guarded values have the strongest precedence.
-            filled.requirements.update(original_component.requirements)
-            questions = raw.get("customer_questions")
-            # Private transient metadata; Pydantic ignores it in serialization.
-            object.__setattr__(
-                filled,
-                "_audit_questions",
-                [str(item).strip() for item in questions if str(item).strip()]
-                if isinstance(questions, list)
-                else [],
-            )
-            return filled
-        except Exception:
-            logger.exception("Component audit failed for %s", filled.service)
-            object.__setattr__(filled, "_audit_questions", [])
-            return filled
 
     @staticmethod
     def _restore_authoritative_component_fields(
@@ -4985,13 +6006,38 @@ operation、单位换算或新字段。
         filled.component_key = original.component_key
         filled.parent_component_key = original.parent_component_key
         filled.derived_from_service = original.derived_from_service
+        filled.official_calculator_service_code = (
+            original.official_calculator_service_code
+        )
+        filled.official_calculator_template_id = (
+            original.official_calculator_template_id
+        )
+        filled.official_calculator_schema_hash = (
+            original.official_calculator_schema_hash
+        )
+        filled.official_calculator_configuration = {
+            **original.official_calculator_configuration,
+            **filled.official_calculator_configuration,
+        }
         # ``source_text`` may be rewritten into a compact AI-cleaned sentence,
         # but the raw numbered block is the immutable ownership key used by
         # the global inventory reconciler. Losing it here made the same row
         # look missing after component extraction, so reconciliation appended
         # a second copy and a 10-component quote became 20 components.
         filled.original_source_text = original.original_source_text
-        locked = set(original.locked_fields)
+        filled.intake_source_fragments = list(original.intake_source_fragments)
+        # The first inventory pass is only a draft interpretation.  Its
+        # ``customer_text`` fields must not overwrite the service-scoped AI
+        # template that has just been cleaned and evidence-checked.  Only an
+        # explicit user/sales correction made after extraction is immutable.
+        # Treating every intake ``locked_field`` as authoritative was the
+        # precise cause of a correct ECS ``cluster_count=1`` being changed
+        # back to the intake mistake ``cluster_count=5``.
+        locked = {
+            path
+            for path in original.locked_fields
+            if original.field_sources.get(path) in CUSTOMER_OVERRIDE_SOURCES
+        }
         locked.update(
             path
             for path, source in original.field_sources.items()
@@ -5010,9 +6056,21 @@ operation、单位换算或新字段。
                     filled.requirements.pop(field, None)
                 elif field in original.requirements:
                     filled.requirements[field] = original.requirements[field]
+            elif path.startswith("official_calculator_configuration."):
+                field = path.split(".", 1)[1]
+                if field in original.official_calculator_configuration:
+                    filled.official_calculator_configuration[field] = (
+                        original.official_calculator_configuration[field]
+                    )
 
         merged_sources = dict(filled.field_sources)
-        merged_sources.update(original.field_sources)
+        preserved_metadata_paths = {
+            path
+            for path, source in original.field_sources.items()
+            if path.startswith("_") or source in CUSTOMER_OVERRIDE_SOURCES
+        }
+        for path in preserved_metadata_paths:
+            merged_sources[path] = original.field_sources[path]
         if original.field_sources.get("_third_party_product"):
             # The official EC2 profile may fill compute and disk fields, but it
             # must not replace the customer's software identity with the generic
@@ -5025,7 +6083,19 @@ operation、单位换算或新字段。
             merged_sources.pop("_official_service_code", None)
         filled.field_sources = merged_sources
         merged_evidence = dict(filled.field_evidence)
-        merged_evidence.update(original.field_evidence)
+        for path in preserved_metadata_paths:
+            if path in original.field_evidence:
+                merged_evidence[path] = original.field_evidence[path]
+        # Internal boundary metadata is stored as a marker in field_sources
+        # plus a payload in field_evidence.  The payload key is intentionally
+        # different (for example ``_owned_source_slice_text``), so preserving
+        # evidence only by source-key intersection loses half of the pair and
+        # makes customer_owned_source() fall back to the whole sales row.
+        # Preserve every private evidence value as an indivisible boundary
+        # record; none of these keys is a customer pricing field.
+        for path, evidence in original.field_evidence.items():
+            if path.startswith("_"):
+                merged_evidence[path] = evidence
         filled.field_evidence = merged_evidence
         filled.locked_fields = sorted(set(filled.locked_fields) | locked)
         merge_unmapped_pricing_facts(filled, original)
@@ -5065,7 +6135,12 @@ operation、单位换算或新字段。
             locked.discard("quantity")
         for field in filled.requirements:
             path = f"requirements.{field}"
-            if field in runtime_defaults and field not in original.requirements:
+            evidence = str(filled.field_evidence.get(path) or "").strip()
+            if (
+                field in runtime_defaults
+                and field not in original.requirements
+                and evidence in {"", "system_minimum", "system_default"}
+            ):
                 sources[path] = "system_minimum"
                 continue
             if field == "system_default_assumption":
@@ -5077,13 +6152,18 @@ operation、单位换算或新字段。
                 continue
             sources.setdefault(path, "customer_text")
             locked.add(path)
-            evidence = str(filled.field_evidence.get(path) or "").strip()
             if evidence and field not in filled.field_scopes:
                 # A valid extractor may return only the numeric token as
                 # evidence.  Record the scope once at the cleaning boundary;
                 # pricing adapters must not later reinterpret customer prose.
                 record_customer_fact_metadata(filled, field, evidence)
         filled.field_sources = sources
+        # This is the hand-off boundary requested by the architecture: AI
+        # interpreted the prose exactly once; later stages consume only the
+        # typed fields, evidence and overflow facts produced here.
+        filled.field_sources["_semantic_fact_mapping"] = "ai_cleaning"
+        filled.field_sources["_intake_pipeline_version"] = "official-only-v4"
+        filled.field_sources["_source_retention_policy"] = CLEANED_INPUT_POLICY_VERSION
         filled.locked_fields = sorted(locked)
 
     @staticmethod
@@ -5135,88 +6215,6 @@ operation、单位换算或新字段。
             return f"{base}\n\n客户补充确认：\n" + "\n".join(supplements)
         return base
 
-    @staticmethod
-    def _append_explicit_design_conflicts(text: str, parsed: ParsedIntent) -> None:
-        """Preserve obvious customer contradictions that a smaller model may omit."""
-
-        request_text = text.split("【客户确认回复】", 1)[0]
-        source = request_text.casefold()
-        segments = [item.strip() for item in re.split(r"[\n。；]+", source) if item.strip()]
-
-        notices: list[str] = []
-        rds_segments = [
-            item
-            for item in segments
-            if any(marker in item for marker in ("rds", "数据库", "mysql", "postgresql"))
-        ]
-        if any(
-            re.search(r"single\s*[- ]?\s*az|单可用区", item)
-            and any(marker in item for marker in ("主备", "自动故障切换", "高可用"))
-            for item in rds_segments
-        ):
-            notices.append("RDS Single-AZ 与主备自动故障切换冲突")
-        if any(
-            ("application load balancer" in item or re.search(r"\balb\b", item))
-            and any(marker in item for marker in ("固定公网 ip", "固定一个公网 ip", "ip 永远不变"))
-            for item in segments
-        ):
-            notices.append("ALB 不支持固定公网 IP")
-        if any(
-            any(
-                marker in item
-                for marker in (
-                    "全部放在一个可用区",
-                    "都放在一个可用区",
-                    "全部放在同一个可用区",
-                    "都放在同一个可用区",
-                )
-            )
-            and "可用区故障" in item
-            for item in segments
-        ):
-            notices.append("EC2 单可用区部署与跨可用区自动切换要求冲突")
-        if any(
-            re.search(r"multi\s*[- ]?\s*az", item) and "备用库" in item and "只读" in item
-            for item in rds_segments
-        ):
-            notices.append("RDS Multi-AZ 主备模式的备用库不能用于只读查询")
-        if any(
-            "redis" in item and "同一个可用区" in item and "可用区故障" in item for item in segments
-        ):
-            notices.append("Redis 同可用区部署与单可用区故障自动切换要求冲突")
-        if any(
-            re.search(r"\bnlb\b", item)
-            and any(marker in item for marker in ("url 路径", "按 url", "/api", "/static"))
-            for item in segments
-        ):
-            notices.append("NLB 不支持按 URL 路径转发")
-        if any(
-            "s3 standard" in item
-            and "s3 express one zone" in item
-            and any(marker in item for marker in ("自动转", "转成", "生命周期"))
-            for item in segments
-        ):
-            notices.append("S3 Standard 不支持生命周期转换到 S3 Express One Zone")
-        if any(
-            "cloudfront" in item
-            and any(marker in item for marker in ("固定不变", "固定公网 ip", "固定 ip"))
-            for item in segments
-        ):
-            notices.append("CloudFront 固定公网 IP 需要启用 Anycast Static IP 并产生额外费用")
-
-        total_cache = re.search(
-            r"整套(?:缓存)?[^。；,，]{0,20}?(\d+(?:\.\d+)?)\s*(?:gib|gb|g)", source
-        )
-        per_node = re.search(
-            r"每(?:个)?节点[^。；,，]{0,20}?(\d+(?:\.\d+)?)\s*(?:gib|gb|g)", source
-        )
-        if total_cache and per_node and float(total_cache.group(1)) != float(per_node.group(1)):
-            notices.append(
-                f"Redis 整套 {total_cache.group(1)}G 与每节点 {per_node.group(1)}G 的要求冲突"
-            )
-
-        combined = list(dict.fromkeys([*parsed.ambiguities, *notices]))
-        parsed.ambiguities = DeepSeekIntentParser._apply_confirmation_replies(combined, text)
 
     @staticmethod
     def _apply_confirmation_replies(notices: list[str], text: str) -> list[str]:
@@ -5249,145 +6247,9 @@ operation、单位换算或新字段。
                 remaining.clear()
         return remaining
 
-    @staticmethod
-    def _apply_confirmed_model_choices(text: str, parsed: ParsedIntent) -> None:
-        """Apply explicit model buttons deterministically after customer confirmation."""
 
-        replies = "\n".join(
-            re.findall(r"【客户确认回复】\s*([\s\S]*?)(?=【客户确认回复】|$)", text)
-        )
-        cache_match = re.search(
-            r"(?:选择|采用|使用)\s*(cache\.[a-z0-9][a-z0-9.-]*)",
-            replies,
-            re.IGNORECASE,
-        )
-        if cache_match:
-            model = cache_match.group(1).lower().rstrip("。；;,.，")
-            for item in parsed.services:
-                name = f"{item.service} {item.calculator_service_name or ''}".casefold()
-                if any(marker in name for marker in ("elasticache", "redis", "valkey")):
-                    item.requirements["requested_model"] = model
-                    break
 
-    @staticmethod
-    def _missing_explicit_services(text: str, parsed: ParsedIntent) -> list[str]:
-        source = text.lower()
-        represented = " ".join(
-            f"{item.service} {item.calculator_service_name or ''}".lower()
-            for item in parsed.services
-        )
-        checks = (
-            (
-                "ec2",
-                (
-                    "ec2",
-                    "应用服务器",
-                    "应用主机",
-                    "linux 服务器",
-                    "windows 服务器",
-                    "linux服务器",
-                    "windows服务器",
-                    "云服务器",
-                ),
-                ("ec2", "elastic compute cloud"),
-            ),
-            (
-                "rds",
-                (
-                    "amazon rds",
-                    " rds",
-                    "数据库",
-                    "mysql",
-                    "postgresql",
-                    "mariadb",
-                    "aurora",
-                    "sql server",
-                    "sqlserver",
-                ),
-                ("rds", "mysql", "postgresql", "mariadb", "aurora", "sql server"),
-            ),
-            (
-                "elastic-load-balancing",
-                ("负载均衡", "load balancer", "application load balancer", "alb", "nlb"),
-                ("elastic load balancing", "load balancer", "elb", "alb", "nlb"),
-            ),
-            (
-                "s3",
-                ("amazon s3", "s3", "对象存储"),
-                ("amazon s3", " s3", "simple storage service"),
-            ),
-            (
-                "cloudfront",
-                ("cloudfront", "cdn", "内容分发网络"),
-                ("cloudfront",),
-            ),
-            (
-                "elasticache",
-                ("elasticache", "redis", "valkey"),
-                ("elasticache", "redis", "valkey"),
-            ),
-            ("route53", ("route 53", "route53", "域名解析"), ("route53", "route 53")),
-            ("waf", ("aws waf", "waf", "web 防火墙", "web防火墙"), ("waf",)),
-            ("sqs", ("amazon sqs", "sqs：", "sqs｜", "异步队列"), ("sqs",)),
-            ("ses", ("amazon ses", "ses", "邮件验证码", "邮件通知"), ("ses",)),
-            ("pinpoint", ("amazon pinpoint", "pinpoint"), ("pinpoint",)),
-            ("cloudwatch", ("cloudwatch", "日志和监控", "日志监控"), ("cloudwatch",)),
-            (
-                "ebs",
-                ("amazon ebs", "独立 ebs", "云硬盘"),
-                ("ebs", "elastic block store"),
-            ),
-            (
-                "data_transfer",
-                ("公网出网流量", "公网出站流量", "aws data transfer"),
-                ("data_transfer", "data transfer"),
-            ),
-            (
-                "global_accelerator",
-                ("global accelerator", "全球访问加速", "全球加速 ga"),
-                ("global_accelerator", "global accelerator"),
-            ),
-        )
-        missing: list[str] = []
-        for name, source_markers, represented_markers in checks:
-            if any(marker in source for marker in source_markers) and not any(
-                marker in represented for marker in represented_markers
-            ):
-                missing.append(name)
-        return missing
 
-    @classmethod
-    def _drop_referenced_only_ec2(cls, text: str, parsed: ParsedIntent) -> None:
-        if cls._has_explicit_ec2_workload(text):
-            return
-        parsed.services = [
-            item for item in parsed.services if cls._service_key(item.service) != "ec2"
-        ]
-
-    @classmethod
-    def _drop_unrequested_services(cls, text: str, parsed: ParsedIntent) -> None:
-        """Remove model-added services that have no evidence in customer text."""
-
-        explicit = cls._explicit_service_keys(text)
-        retained: list[ServiceRequirement] = []
-        for item in parsed.services:
-            key = cls._service_key(item.service)
-            # Some smaller models describe a bare instance line as a generic
-            # "compute" service.  The concrete model in that same source line
-            # is stronger evidence than the model's service label, so normalize
-            # it to EC2 instead of deleting a valid workload.
-            evidence = item.source_text or ""
-            if (
-                key not in explicit
-                and "ec2" in explicit
-                and BARE_EC2_MODEL_PATTERN.search(evidence)
-            ):
-                item.service = "ec2"
-                item.calculator_service_name = "Amazon Elastic Compute Cloud (EC2)"
-                key = "ec2"
-            if key in explicit:
-                retained.append(item)
-        parsed.services = retained
 
     @staticmethod
     def _explicit_service_keys(text: str) -> set[str]:
@@ -5450,7 +6312,15 @@ operation、单位换算或新字段。
             ),
             "opensearch": ("amazon opensearch", "opensearch"),
             "dms": ("aws dms", "amazon dms", "database migration service"),
-            "kinesis": ("amazon kinesis", "kinesis data streams", "kinesis"),
+            "kinesis_firehose": (
+                "amazon data firehose",
+                "amazon kinesis data firehose",
+                "kinesis data firehose",
+                "amazon kinesis firehose",
+                "kinesis firehose",
+                "kinesis-firehose",
+            ),
+            "kinesis": ("kinesis data streams",),
             "secrets_manager": ("secrets manager", "secret 管理", "密钥管理"),
         }
         explicit = {
@@ -5474,6 +6344,7 @@ operation、单位换算或新字段。
             "amazonec2",
             "amazonec2instance",
             "amazonelasticcomputecloud",
+            "elasticcomputecloud",
         }:
             return "ec2"
         if canonical in {"rds", "amazonrds", "aurora"} or "rds" in canonical:
@@ -5548,6 +6419,7 @@ operation、单位换算或新字段。
             "documentdb",
             "amazondocumentdb",
             "amazondocdb",
+            "docdb",
             "mongodb",
         }:
             return "documentdb"
@@ -5565,6 +6437,13 @@ operation、单位换算或新字段。
             return "lambda"
         if canonical in {"dynamodb", "amazondynamodb"}:
             return "dynamodb"
+        if canonical in {
+            "kinesisfirehose",
+            "amazonkinesisfirehose",
+            "kinesisdatafirehose",
+            "amazonkinesisdatafirehose",
+        }:
+            return "kinesis_firehose"
         if canonical in {"kinesis", "amazonkinesis", "kinesisdatastreams"}:
             return "kinesis"
         if canonical in {"athena", "amazonathena"}:
@@ -5591,12 +6470,152 @@ operation、单位换算或新字段。
             return "scheduler"
         if canonical in {"quicksight", "amazonquicksight"}:
             return "quicksight"
+        if canonical in {
+            "transitgateway",
+            "awstransitgateway",
+            "amazontransitgateway",
+        }:
+            return "transit_gateway"
+        if canonical in {"directconnect", "awsdirectconnect", "dx"}:
+            return "direct_connect"
+        if canonical in {
+            "sitetositevpn",
+            "awssitetositevpn",
+            "site2sitevpn",
+        }:
+            return "site_to_site_vpn"
+        if canonical in {
+            "vpcendpoint",
+            "interfacevpcendpoint",
+            "privatelink",
+            "awsprivatelink",
+        }:
+            return "vpc_endpoint"
+        if canonical in {
+            "s3glacierdeeparchive",
+            "amazons3glacierdeeparchive",
+            "glacierdeeparchive",
+        }:
+            return "s3_glacier_deep_archive"
+        if canonical in {"storagegateway", "awsstoragegateway"}:
+            return "storage_gateway"
+        if canonical in {"datasync", "awsdatasync"}:
+            return "data_sync"
+        if canonical in {
+            "transfer",
+            "transferfamily",
+            "awstransfer",
+            "awstransferfamily",
+        }:
+            return "transfer"
+        if canonical in {
+            "appstream",
+            "appstream20",
+            "amazonappstream",
+            "amazonappstream20",
+            "amazonworkspacesapplications",
+        }:
+            return "app_stream"
+        if canonical in {"workmail", "amazonworkmail"}:
+            return "work_mail"
+        if canonical in {"codebuild", "awscodebuild"}:
+            return "code_build"
+        if canonical in {"codepipeline", "awscodepipeline"}:
+            return "code_pipeline"
+        if canonical in {"codeartifact", "awscodeartifact"}:
+            return "code_artifact"
+        if canonical in {"codedeploy", "awscodedeploy"}:
+            return "code_deploy"
+        if canonical in {"cloudformation", "awscloudformation"}:
+            return "cloud_formation"
+        if canonical in {"inspectorv2", "amazoninspectorv2"}:
+            return "inspector_v2"
+        if canonical in {"securityhub", "awssecurityhub"}:
+            return "security_hub"
+        if canonical in {"auditmanager", "awsauditmanager"}:
+            return "auditmanager"
+        if canonical in {"iot", "iott", "iotcore", "awsiot", "awsiotcore"}:
+            return "io_t"
+        if canonical in {
+            "iotdevicemanagement",
+            "awsiotdevicemanagement",
+        }:
+            return "io_t_device_management"
+        if canonical in {"iotdevicedefender", "awsiotdevicedefender"}:
+            return "io_t_device_defender"
+        if canonical in {
+            "kinesisvideo",
+            "kinesisvideostreams",
+            "amazonkinesisvideo",
+        }:
+            return "kinesis_video"
+        if canonical in {
+            "ivs",
+            "amazonivs",
+            "amazonivslowlatencystreaming",
+        }:
+            return "ivs"
+        if canonical in {
+            "mediaconvert",
+            "elementalmediaconvert",
+            "awselementalmediaconvert",
+        }:
+            return "elemental_media_convert"
+        if canonical in {
+            "medialive",
+            "elementalmedialive",
+            "awselementalmedialive",
+        }:
+            return "elemental_media_live"
+        if canonical in {
+            "mediapackage",
+            "elementalmediapackage",
+            "awselementalmediapackage",
+        }:
+            return "elemental_media_package"
+        if canonical in {
+            "mediaconnect",
+            "elementalmediaconnect",
+            "awsmediaconnect",
+            "awselementalmediaconnect",
+        }:
+            return "media_connect"
+        offer_services = curated_service_keys_for_offer_code(service)
+        if len(offer_services) == 1:
+            return offer_services[0]
         return canonical
 
     _INVENTORY_DEFINITIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-        ("ecs", "Amazon ECS", ("amazon ecs", "ecs 集群", "elastic container service")),
-        ("fargate", "AWS Fargate", ("aws fargate", "amazon fargate", "fargate 任务")),
-        ("ec2", "Amazon EC2", ("amazon ec2", " ec2", "ec2 ", "ec2：", "ec2｜", "nacos", "xxl-job")),
+        (
+            "ecs",
+            "Amazon ECS",
+            (
+                "amazon ecs",
+                "ecs 集群",
+                "elastic container service",
+                "ecs on fargate",
+                "ecs fargate",
+            ),
+        ),
+        (
+            "fargate",
+            "AWS Fargate",
+            ("aws fargate", "amazon fargate", "fargate", "fargate 任务"),
+        ),
+        (
+            "ec2",
+            "Amazon EC2",
+            (
+                "amazon ec2",
+                "elastic compute cloud",
+                " ec2",
+                "ec2 ",
+                "ec2：",
+                "ec2｜",
+                "nacos",
+                "xxl-job",
+            ),
+        ),
         # RDS and Aurora share one AWS pricing family, but inventory labels are
         # customer-facing.  Aurora identity is restored from the explicit
         # engine/source by preserve_customer_configuration().
@@ -5626,7 +6645,7 @@ operation、单位换算或新字段。
         (
             "documentdb",
             "Amazon DocumentDB (with MongoDB compatibility)",
-            ("amazon documentdb", "documentdb", "mongodb", "mongo db"),
+            ("amazon documentdb", "documentdb", "docdb", "mongodb", "mongo db"),
         ),
         ("nat_gateway", "AWS NAT Gateway", ("nat gateway", "nat 网关", "公网出口")),
         (
@@ -5683,7 +6702,43 @@ operation、单位换算或新字段。
         ),
         ("glue", "AWS Glue", ("aws glue", "amazon glue")),
         ("redshift", "Amazon Redshift", ("amazon redshift", "redshift")),
+        (
+            "s3_glacier_deep_archive",
+            "Amazon S3 Glacier Deep Archive",
+            (
+                "amazon s3 glacier deep archive",
+                "s3 glacier deep archive",
+                "glacier deep archive",
+            ),
+        ),
         ("s3", "Amazon Simple Storage Service (S3)", ("amazon s3", "s3：", "s3｜", "对象存储")),
+        (
+            "storage_gateway",
+            "AWS Storage Gateway",
+            ("aws storage gateway", "storage gateway", "file gateway"),
+        ),
+        ("data_sync", "AWS DataSync", ("aws datasync", "datasync")),
+        (
+            "transfer",
+            "AWS Transfer Family",
+            ("aws transfer family", "transfer family"),
+        ),
+        (
+            "app_stream",
+            "Amazon AppStream 2.0",
+            (
+                "amazon appstream 2.0",
+                "amazon appstream",
+                "appstream 2.0",
+                "appstream",
+                "workspaces applications",
+            ),
+        ),
+        (
+            "work_mail",
+            "Amazon WorkMail",
+            ("amazon workmail", "workmail"),
+        ),
         ("efs", "Amazon Elastic File System (EFS)", ("amazon efs", "efs：", "efs｜")),
         ("apigateway", "Amazon API Gateway", ("amazon api gateway", "api gateway")),
         (
@@ -5717,7 +6772,11 @@ operation、单位换算或新字段。
         ("cloudfront", "Amazon CloudFront", ("amazon cloudfront", "cloudfront", "cdn")),
         ("route53", "Amazon Route 53", ("route 53", "route53", "域名解析")),
         ("waf", "AWS WAF", ("aws waf", "waf", "web 应用防火墙", "web 防火墙")),
-        ("cloudwatch", "Amazon CloudWatch", ("amazon cloudwatch", "cloudwatch")),
+        (
+            "cloudwatch",
+            "Amazon CloudWatch",
+            ("amazon cloudwatch", "cloudwatch", "vpc flow logs", "vpc flow log"),
+        ),
         (
             "amp",
             "Amazon Managed Service for Prometheus (AMP)",
@@ -5727,7 +6786,14 @@ operation、单位换算或新字段。
         (
             "ebs",
             "Amazon Elastic Block Store (EBS)",
-            ("amazon ebs", "ebs 云硬盘", "独立 ebs", "云硬盘"),
+            (
+                "amazon ebs",
+                "elastic block store",
+                "ebs",
+                "ebs 云硬盘",
+                "独立 ebs",
+                "云硬盘",
+            ),
         ),
         (
             "data_transfer",
@@ -5740,16 +6806,68 @@ operation、单位换算或新字段。
         ("pinpoint", "Amazon Pinpoint", ("amazon pinpoint", "pinpoint：", "pinpoint｜")),
         ("fsx", "Amazon FSx", ("amazon fsx", "fsx 文件系统")),
         ("global_accelerator", "AWS Global Accelerator", ("global accelerator", "全球访问加速")),
+        (
+            "transit_gateway",
+            "AWS Transit Gateway",
+            ("aws transit gateway", "amazon transit gateway", "transit gateway"),
+        ),
+        (
+            "direct_connect",
+            "AWS Direct Connect",
+            ("aws direct connect", "direct connect", "dx 专线", "专线连接"),
+        ),
+        (
+            "site_to_site_vpn",
+            "AWS Site-to-Site VPN",
+            (
+                "aws site-to-site vpn",
+                "site-to-site vpn",
+                "site to site vpn",
+                "站点到站点 vpn",
+            ),
+        ),
+        (
+            "vpc_endpoint",
+            "AWS PrivateLink / Interface VPC Endpoint",
+            (
+                "interface vpc endpoint",
+                "vpc interface endpoint",
+                "aws privatelink",
+                "private link",
+            ),
+        ),
         ("secrets_manager", "AWS Secrets Manager", ("secrets manager",)),
         ("lambda", "AWS Lambda", ("amazon lambda", "aws lambda", "lambda｜", "lambda：")),
         ("dynamodb", "Amazon DynamoDB", ("amazon dynamodb", "dynamodb｜", "dynamodb：")),
         (
+            "kinesis_firehose",
+            "Amazon Kinesis Firehose",
+            (
+                "amazon data firehose",
+                "amazon kinesis data firehose",
+                "kinesis data firehose",
+                "amazon kinesis firehose",
+                "kinesis firehose",
+                "kinesis-firehose",
+            ),
+        ),
+        (
             "kinesis",
             "Amazon Kinesis Data Streams",
-            ("amazon kinesis", "kinesis data streams", "kinesis"),
+            ("kinesis data streams",),
         ),
         ("athena", "Amazon Athena", ("amazon athena", "athena｜", "athena：")),
         ("sagemaker", "Amazon SageMaker", ("amazon sagemaker", "sagemaker｜", "sagemaker：")),
+        ("textract", "Amazon Textract", ("amazon textract", "textract｜", "textract：")),
+        ("comprehend", "Amazon Comprehend", ("amazon comprehend", "comprehend｜", "comprehend：")),
+        (
+            "rekognition",
+            "Amazon Rekognition",
+            ("amazon rekognition", "rekognition｜", "rekognition："),
+        ),
+        ("transcribe", "Amazon Transcribe", ("amazon transcribe", "transcribe｜", "transcribe：")),
+        ("translate", "Amazon Translate", ("amazon translate", "translate｜", "translate：")),
+        ("polly", "Amazon Polly", ("amazon polly", "polly｜", "polly：")),
         ("cognito", "Amazon Cognito", ("amazon cognito", "cognito｜", "cognito：")),
         (
             "step_functions",
@@ -5763,6 +6881,97 @@ operation、单位换算或新字段。
             "eventbridge",
             "Amazon EventBridge",
             ("eventbridge event bus", "eventbridge 事件总线", "eventbridge 事件规则"),
+        ),
+        (
+            "config",
+            "AWS Config",
+            ("aws config", "amazon config", "配置项记录", "config rule"),
+        ),
+        (
+            "code_build",
+            "AWS CodeBuild",
+            ("aws codebuild", "codebuild", "构建机"),
+        ),
+        (
+            "code_pipeline",
+            "AWS CodePipeline",
+            ("aws codepipeline", "codepipeline"),
+        ),
+        (
+            "code_artifact",
+            "AWS CodeArtifact",
+            ("aws codeartifact", "codeartifact"),
+        ),
+        (
+            "code_deploy",
+            "AWS CodeDeploy",
+            ("aws codedeploy", "codedeploy"),
+        ),
+        (
+            "cloud_formation",
+            "AWS CloudFormation",
+            ("aws cloudformation", "cloudformation"),
+        ),
+        (
+            "inspector_v2",
+            "Amazon Inspector V2",
+            ("amazon inspector v2", "inspector v2"),
+        ),
+        ("macie", "Amazon Macie", ("amazon macie", "macie")),
+        (
+            "security_hub",
+            "AWS Security Hub",
+            ("aws security hub", "security hub"),
+        ),
+        (
+            "auditmanager",
+            "AWS Audit Manager",
+            ("aws audit manager", "audit manager"),
+        ),
+        (
+            "io_t",
+            "AWS IoT Core",
+            ("aws iot core", "iot core", "iot mqtt"),
+        ),
+        (
+            "io_t_device_management",
+            "AWS IoT Device Management",
+            ("iot device management", "设备管理 thing"),
+        ),
+        (
+            "io_t_device_defender",
+            "AWS IoT Device Defender",
+            ("iot device defender", "设备防护 metric datapoint"),
+        ),
+        (
+            "kinesis_video",
+            "Amazon Kinesis Video Streams",
+            ("kinesis video streams", "amazon kinesis video", "kinesis video"),
+        ),
+        (
+            "ivs",
+            "Amazon IVS Low-Latency Streaming",
+            ("amazon ivs", "ivs low-latency", "ivs low latency"),
+        ),
+        (
+            "elemental_media_convert",
+            "AWS Elemental MediaConvert",
+            ("aws elemental mediaconvert", "elemental mediaconvert", "mediaconvert"),
+        ),
+        (
+            "elemental_media_live",
+            "AWS Elemental MediaLive",
+            ("aws elemental medialive", "elemental medialive", "medialive"),
+        ),
+        (
+            "elemental_media_package",
+            "AWS Elemental MediaPackage",
+            ("aws elemental mediapackage", "elemental mediapackage", "mediapackage"),
+        ),
+        (
+            "media_connect",
+            "AWS Elemental MediaConnect",
+            ("aws elemental mediaconnect", "elemental mediaconnect", "mediaconnect"),
         ),
         (
             "quicksight",
@@ -5805,6 +7014,24 @@ operation、单位换算或新字段。
         for key, display, markers in cls._INVENTORY_DEFINITIONS:
             if any(cls._inventory_marker_matches(line, marker) for marker in markers):
                 found.append((key, display))
+        # In an explicitly named ECS component, Fargate describes the launch
+        # type rather than a second customer component.  A standalone
+        # Fargate heading still keeps its own native billing identity.
+        if any(key == "ecs" for key, _display in found):
+            found = [item for item in found if item[0] != "fargate"]
+        # EBS mentioned inside an explicitly EC2-owned row is an attached
+        # volume attribute, not a second root component. A standalone EBS or
+        # Elastic Block Store heading remains an EBS component.
+        component_heading = re.split(
+            r"[：:]", cls._strip_numbered_requirement_prefix(line), maxsplit=1
+        )[0]
+        if {key for key, _display in found} >= {"ec2", "ebs"} and re.search(
+            r"amazon\s*ec2|(?<![a-z0-9])ec2(?![a-z0-9])|"
+            r"elastic\s*compute\s*cloud",
+            component_heading,
+            re.I,
+        ):
+            found = [item for item in found if item[0] != "ebs"]
         # MemoryDB uses Redis compatibility, but the word Redis is an engine
         # here rather than evidence for a second ElastiCache component.
         if re.search(r"(?<![a-z0-9])(?:amazon\s+)?memorydb(?![a-z0-9])", folded, re.I):
@@ -5874,13 +7101,10 @@ operation、单位换算或新字段。
         # Restrict this to the component heading so a real EC2/API Gateway row
         # elsewhere in the same request is unaffected.
         heading = re.split(r"[：:]", cls._strip_numbered_requirement_prefix(line), maxsplit=1)[0]
-        if (
-            re.search(r"(?=.*\bwaf\b)(?=.*\balb\b)", heading, re.I)
-            or re.search(
-                r"waf\s*[+＋/&和与]\s*(?:application\s+load\s+balancer|负载均衡)",
-                heading,
-                re.I,
-            )
+        if re.search(r"(?=.*\bwaf\b)(?=.*\balb\b)", heading, re.I) or re.search(
+            r"waf\s*[+＋/&和与]\s*(?:application\s+load\s+balancer|负载均衡)",
+            heading,
+            re.I,
         ):
             found = [item for item in found if item[0] != "vpc"]
             existing_keys = {key for key, _ in found}
@@ -5890,6 +7114,27 @@ operation、单位换算或新字段。
             re.I,
         ):
             found = [item for item in found if item[0] not in {"ec2", "apigateway"}]
+            existing_keys = {key for key, _ in found}
+        # Broad AmazonVPC wording is only an offer container when the heading
+        # explicitly names one of its independently billed products. Keep the
+        # narrow component and discard the free VPC shell so pricing cannot
+        # collapse an Interface Endpoint into an ordinary VPC.
+        if any(
+            key in {
+                "nat_gateway",
+                "transit_gateway",
+                "site_to_site_vpn",
+                "vpc_endpoint",
+            }
+            for key, _display in found
+        ):
+            found = [item for item in found if item[0] != "vpc"]
+            existing_keys = {key for key, _ in found}
+        # Glacier Deep Archive has its own official offer and retrieval
+        # contract. The word S3 in its marketing name must not create a
+        # second broad S3 component for the same customer-owned line.
+        if any(key == "s3_glacier_deep_archive" for key, _display in found):
+            found = [item for item in found if item[0] != "s3"]
             existing_keys = {key for key, _ in found}
         # Managed-first is a product invariant.  When EC2 is mentioned only as
         # a host for software that has an AWS managed equivalent, retain the
@@ -6046,6 +7291,13 @@ operation、单位换算或新字段。
         if not declarations:
             return
         for component in parsed.services:
+            # ``original_source_text`` is the immutable customer-owned block.
+            # This helper exists only to restore a heading that the intake
+            # model removed; it must never replace an already bound block by
+            # comparing similar remainders.  ALB and NAT rows such as
+            # ``新加坡，2个`` legitimately have identical remainders.
+            if str(component.original_source_text or "").strip():
+                continue
             source = cls._strip_numbered_requirement_prefix(
                 component.source_text or component.original_source_text or ""
             )
@@ -6062,10 +7314,8 @@ operation、单位换算或新字段。
             if len(matches) != 1:
                 continue
             _heading, complete_source = matches[0]
-            had_cleaned_binding = bool(component.original_source_text)
             component.original_source_text = complete_source
-            if not had_cleaned_binding:
-                component.source_text = complete_source
+            component.source_text = complete_source
 
     @classmethod
     def _numbered_requirement_blocks(cls, text: str) -> list[str]:
@@ -6290,13 +7540,51 @@ operation、单位换算或新字段。
             return fallback
         return [cls._unknown_numbered_component_identity(source)]
 
+    @classmethod
+    def _explicit_numbered_owner(
+        cls,
+        block: str,
+    ) -> tuple[str, str] | None:
+        """Return a customer-declared service owner only when it is explicit.
+
+        The complete block can mention dependencies, destinations and instance
+        shapes. Those words are useful for extraction but are not permission
+        to change product identity. Conversely, an unfamiliar AWS product must
+        still reach official discovery. This guard therefore accepts only one
+        known runtime service written in the heading before the first field
+        separator; it never guesses ownership from the body.
+        """
+
+        source = cls._strip_numbered_requirement_prefix(block).strip()
+        first_line = next(
+            (line.strip() for line in source.splitlines() if line.strip()),
+            "",
+        )
+        heading_match = re.match(
+            r"^([^：:,，；;|｜\n]{1,160})\s*[：:,，；;|｜]",
+            first_line,
+        )
+        if heading_match is None:
+            return None
+        heading = re.sub(r"\s+", " ", heading_match.group(1)).strip()
+        identities = list(dict.fromkeys(cls._inventory_keys_for_line(heading)))
+        if not identities:
+            identities = list(dict.fromkeys(cls._fallback_numbered_block_services(heading)))
+        canonical: dict[str, str] = {
+            cls._service_key(key): display
+            for key, display in identities
+            if cls._service_key(key) in SERVICE_TEMPLATE_FIELDS
+        }
+        if len(canonical) != 1:
+            return None
+        key, display = next(iter(canonical.items()))
+        return key, display
+
     @staticmethod
     def _has_fixed_node_contract(source: str) -> bool:
         """Whether the customer specified a concrete per-node server shape."""
 
-        has_cpu = bool(
-            re.search(r"\d+(?:\.\d+)?\s*(?:v\s*cpu|vcpu|核|c(?![a-z]))", source, re.I)
-        )
+        has_cpu = bool(re.search(r"\d+(?:\.\d+)?\s*(?:v\s*cpu|vcpu|核|c(?![a-z]))", source, re.I))
         has_memory = bool(
             re.search(
                 r"(?:内存|ram)\s*[:：]?\s*\d+(?:\.\d+)?\s*(?:gib|gb|g)?|"
@@ -6324,10 +7612,16 @@ operation、单位换算或新字段。
         if key == "ec2":
             return True
         fields = set(SERVICE_TEMPLATE_FIELDS.get(key, ()))
-        has_cpu = bool(fields & {"vcpu", "worker_vcpu", "master_vcpu", "core_vcpu"})
+        has_cpu = bool(fields & {"vcpu", "worker_vcpu", "master_vcpu", "core_vcpu", "task_vcpu"})
         has_memory = bool(
             fields
-            & {"memory_gib", "worker_memory_gib", "master_memory_gib", "core_memory_gib"}
+            & {
+                "memory_gib",
+                "worker_memory_gib",
+                "master_memory_gib",
+                "core_memory_gib",
+                "task_memory_gib",
+            }
         )
         has_topology = bool(
             fields
@@ -6339,6 +7633,7 @@ operation、单位换算或新字段。
                 "cluster_members",
                 "worker_node_count",
                 "worker_nodes_per_cluster",
+                "tasks",
                 "replication_instances",
                 "master_nodes",
                 "core_nodes",
@@ -6509,8 +7804,10 @@ operation、单位换算或新字段。
         # other named products also describe CPU/RAM per node.  Generic
         # machine nouns, an OS, or an EC2 model are the actual boundary.
         has_machine_noun = bool(re.search(r"机器|服务器|主机|云主机|虚拟机|实例", text, re.I))
-        return has_cpu and has_memory and (
-            has_operating_system or has_instance_token or has_machine_noun
+        return (
+            has_cpu
+            and has_memory
+            and (has_operating_system or has_instance_token or has_machine_noun)
         )
 
     @staticmethod
@@ -6550,7 +7847,7 @@ operation、单位换算或新字段。
 
         if not parsed.services:
             return False
-        if numbered_fallback is not None and len(parsed.services) != len(
+        if numbered_fallback is not None and len(parsed.services) < len(
             numbered_fallback.services
         ):
             return False
@@ -6568,6 +7865,54 @@ operation、单位换算或新字段。
             if service in generic_identity or display in generic_identity:
                 return False
         return True
+
+    @staticmethod
+    def _validate_cleaned_source_bindings(text: str, parsed: ParsedIntent) -> None:
+        """A rewritten sentence must never replace its original evidence."""
+        def literal_spans(haystack: str, needle: str) -> list[tuple[int, int]]:
+            compact = "".join(character for character in needle if not character.isspace())
+            if not compact:
+                return []
+            pattern = r"\s*".join(re.escape(character) for character in compact)
+            return [match.span() for match in re.finditer(pattern, haystack, re.IGNORECASE)]
+
+        covered_fragments: list[str] = []
+        seen_keys: set[str] = set()
+        for component in parsed.services:
+            if component.component_key:
+                if component.component_key in seen_keys:
+                    raise ValueError("第一步清洗产生重复组件键，不能合并独立配置组")
+                seen_keys.add(component.component_key)
+            original = str(component.original_source_text or "").strip()
+            if not original:
+                source = component.source_text.strip()
+                if source and literal_spans(text, source):
+                    original = source
+                elif len(parsed.services) == 1:
+                    original = text
+                else:
+                    raise ValueError("第一步清洗缺少组件的逐字原文归属，不能把改写文字作为证据")
+            if not literal_spans(text, original):
+                raise ValueError("第一步清洗的 original_source_text 不是客户逐字原文")
+            component.original_source_text = original
+            fragments = component.intake_source_fragments
+            if fragments:
+                for fragment in fragments:
+                    if not literal_spans(original, fragment):
+                        raise ValueError("第一步清洗的归属片段不是当前组件的逐字原文")
+                component.field_sources[OWNED_SOURCE_SLICE_FIELD] = "system_policy"
+                component.field_evidence[OWNED_SOURCE_SLICE_EVIDENCE_FIELD] = "\n".join(
+                    dict.fromkeys(fragments)
+                )
+            covered_fragments.extend(fragments or [original])
+        # All original pricing atoms must be assigned somewhere before the
+        # irreversible narrowing. This checks lexical coverage, not meaning.
+        covered: list[tuple[int, int]] = []
+        for fragment in covered_fragments:
+            covered.extend(literal_spans(text, fragment))
+        for atom in customer_quantitative_atoms(text):
+            if not any(start <= atom.start and atom.end <= end for start, end in covered):
+                raise ValueError(f"第一步清洗遗漏原文用量 {atom.raw}，必须分配到组件归属片段")
 
     @classmethod
     def _bind_numbered_cleaned_sources(
@@ -6591,15 +7936,26 @@ operation、单位换算或新字段。
             return
 
         fallback_rows = numbered_fallback.services if numbered_fallback is not None else []
-        if fallback_rows and len(parsed.services) == len(fallback_rows):
-            for cleaned, fallback in zip(parsed.services, fallback_rows, strict=True):
+        if fallback_rows:
+            # Never join component ownership by list position. A model may
+            # reorder otherwise valid rows, and one numbered block may expand
+            # into several independently priced products. Positional ``zip``
+            # silently assigns one component's source to its neighbour. Stable
+            # component keys are the only valid ownership join.
+            fallback_by_key = {
+                str(row.component_key): row for row in fallback_rows if row.component_key
+            }
+            matched = 0
+            for cleaned in parsed.services:
+                fallback = fallback_by_key.get(str(cleaned.component_key or ""))
+                if fallback is None:
+                    continue
                 cleaned.original_source_text = fallback.source_text
-                # Use the raw-block digest as the stable owner across retries;
-                # AI-authored keys remain a useful fallback for non-numbered input.
-                cleaned.component_key = fallback.component_key
                 if not cleaned.source_text.strip():
                     cleaned.source_text = fallback.source_text
-            return
+                matched += 1
+            if matched == len(parsed.services) == len(fallback_rows):
+                return
 
         # A numbered block can legitimately contain two explicit products. If
         # the model followed the requested cmp_source_000N key, retain that
@@ -6662,11 +8018,35 @@ operation、单位换算或新字段。
         if prefix:
             prefix_text = "\n".join(prefix)
             safe_region_preface = cls._explicit_global_region(prefix_text) is not None
-            safe_title_preface = all(
-                not re.search(r"\d", line)
-                and bool(re.search(r"(?:需求|清单|报价|架构|配置|方案)$", line, re.I))
-                for line in prefix
-            )
+
+            def safe_heading(line: str) -> bool:
+                """Accept presentation metadata without reading it as a component.
+
+                A Markdown heading or a conventional quote/architecture title may
+                legitimately contain an edition, project or plan number.  The old
+                ``not re.search(r"\\d", line)`` rule treated that harmless ordinal as
+                a pricing quantity and disabled the lossless 1..N owner ledger for
+                the whole request.  A heading is safe when it contains no
+                number-with-unit pricing atom and is visibly title-shaped; actual
+                component quantities such as ``3台`` therefore still force the
+                workload-wide parser.
+                """
+
+                raw = str(line or "").strip()
+                if not raw or customer_quantitative_atoms(raw):
+                    return False
+                markdown_heading = bool(re.match(r"^#{1,6}\s+\S", raw))
+                title = re.sub(r"^#{1,6}\s*", "", raw).strip()
+                conventional_title = bool(
+                    re.search(
+                        r"(?:需求|清单|报价|架构|配置|方案|项目|环境|业务)",
+                        title,
+                        re.I,
+                    )
+                )
+                return markdown_heading or conventional_title
+
+            safe_title_preface = all(safe_heading(line) for line in prefix)
             if not safe_region_preface and not safe_title_preface:
                 return None
 
@@ -6677,12 +8057,10 @@ operation、单位换算或新字段。
 
     @classmethod
     def _intent_from_numbered_blocks(cls, text: str) -> ParsedIntent | None:
-        """Build the inventory locally when sales already numbered every item.
+        """Build an ownership reference for a numbered request.
 
-        This is the normal first pass for a losslessly numbered sales request:
-        Python owns only the component boundaries and stable source ledger.
-        Every component still goes through its independent AI identity/field
-        template pass; unnumbered prose uses the workload-wide AI splitter.
+        This never replaces the first AI cleaner. It supports stable numbered
+        boundaries and existing explicit draft migration/ownership checks.
         """
 
         blocks = cls._inventory_numbered_requirement_blocks(text)
@@ -6764,9 +8142,28 @@ operation、单位换算或新字段。
         an MSK ``m7g.large`` row incorrectly returned as EC2).
         """
 
+        # Compiler-derived children deliberately share the customer's original
+        # source block with their parent (for example an EC2 Worker fleet
+        # derived from one EKS line).  The customer inventory owns only root
+        # declarations. Reclassifying a child from that shared heading creates
+        # a second parent and then a second child on the next materialization
+        # pass. Preserve child identity and remember its parent object while
+        # root component keys are rebound to stable sales-owner keys.
+        derived_components = [
+            item
+            for item in parsed.services
+            if item.derived_from_service or item.parent_component_key
+        ]
+        parent_object_by_old_key = {
+            str(item.component_key): item
+            for item in parsed.services
+            if item.component_key and item not in derived_components
+        }
+
         declarations: list[tuple[str, str, str, str | None]] = []
         source_block_key_by_owner: dict[str, str] = {}
         single_owner_blocks: list[tuple[str, str, str]] = []
+        explicit_owner_by_block: dict[str, tuple[str, str]] = {}
         numbered_blocks = cls._inventory_numbered_requirement_blocks(text)
         if numbered_blocks:
             # Sales supplied the boundaries.  Inventory every literal service
@@ -6774,18 +8171,25 @@ operation、单位换算或新字段。
             # is deliberately performed before looking at the AI output.
             for block_index, block in enumerate(numbered_blocks, start=1):
                 block_keys = cls._numbered_block_service_identities(block)
+                explicit_owner = cls._explicit_numbered_owner(block)
+                block_canonical_keys = {cls._service_key(key) for key, _display in block_keys}
+                if explicit_owner is not None and len(block_canonical_keys) == 1:
+                    explicit_owner_by_block[cls._strip_numbered_requirement_prefix(block)] = (
+                        explicit_owner
+                    )
                 for key, display in block_keys:
-                    source_block_key = "src_" + hashlib.sha256(
-                        f"{block_index}\x1f{block}".encode("utf-8")
-                    ).hexdigest()[:20]
+                    source_block_key = (
+                        "src_"
+                        + hashlib.sha256(f"{block_index}\x1f{block}".encode("utf-8")).hexdigest()[
+                            :20
+                        ]
+                    )
                     owner_digest = hashlib.sha256(
                         f"{block_index}\x1f{key}\x1f{block}".encode("utf-8")
                     ).hexdigest()[:20]
                     owner_key = f"cmp_sales_{owner_digest}"
                     source_block_key_by_owner[owner_key] = source_block_key
-                    declarations.append(
-                        (key, display, block, owner_key)
-                    )
+                    declarations.append((key, display, block, owner_key))
                 if len(block_keys) == 1:
                     key, display = block_keys[0]
                     single_owner_blocks.append((key, display, block))
@@ -6816,9 +8220,7 @@ operation、单位换算或新字段。
                 # Stop at either the next service or a category heading.
                 block = "\n".join(lines[line_index:next_heading_index]).strip()
                 for key, display in keys:
-                    declarations.append(
-                        (key, display, block or lines[line_index], None)
-                    )
+                    declarations.append((key, display, block or lines[line_index], None))
         if not declarations:
             return
 
@@ -6835,12 +8237,62 @@ operation、单位换算或新字段。
                 )
             )
 
+        def rebind_to_explicit_owner(
+            item: ServiceRequirement,
+            key: str,
+            display: str,
+        ) -> bool:
+            """Atomically discard a conflicting derived product schema.
+
+            A provider/AI identity may resolve an unfamiliar heading, but it
+            may not turn a customer-declared NAT row into ELB (or vice versa).
+            When that conflict occurs, keeping fields extracted under the
+            wrong template is equally unsafe, so reset the whole derived
+            schema and let the correct isolated component pass rebuild it.
+            Region ownership is product-neutral and is retained.
+            """
+
+            canonical_key = cls._service_key(key)
+            if cls._service_key(item.service) == canonical_key:
+                item.service = canonical_key
+                item.calculator_service_name = item.calculator_service_name or display
+                return False
+
+            preserved_sources = {
+                path: source
+                for path, source in item.field_sources.items()
+                if path in {"region", "_source_block_key"}
+            }
+            preserved_evidence = {
+                path: evidence for path, evidence in item.field_evidence.items() if path == "region"
+            }
+            item.service = canonical_key
+            item.calculator_service_name = display
+            item.product_identity = None
+            item.workload_identity_kind = None
+            item.workload_name = None
+            # Top-level quantity/hours are product-neutral execution facts.
+            # Keep them through the identity repair; the correct isolated
+            # template will revalidate them against the same source text.
+            item.requirements = {}
+            item.query_action = None
+            item.field_evidence = preserved_evidence
+            item.field_sources = preserved_sources
+            item.field_sources["_identity_conflict_repaired"] = "system_policy"
+            item.locked_fields = [path for path in item.locked_fields if path == "region"]
+            item.field_match_policies = {}
+            item.field_scopes = {}
+            item.unmapped_pricing_facts = []
+            item.customer_pricing_facts = []
+            return True
+
         interpreted_by_source: dict[str, ServiceRequirement] = {
             cls._strip_numbered_requirement_prefix(
                 item.original_source_text or item.source_text or ""
             ): item
             for item in parsed.services
-            if keeps_interpreted_identity(item)
+            if item not in derived_components
+            and keeps_interpreted_identity(item)
             and cls._strip_numbered_requirement_prefix(
                 item.original_source_text or item.source_text or ""
             )
@@ -6861,6 +8313,11 @@ operation、单位换算或新字段。
             rewritten: list[tuple[str, str, str, str | None]] = []
             for key, display, block, owner_key in declarations:
                 block_identity = cls._strip_numbered_requirement_prefix(block)
+                explicit_owner = explicit_owner_by_block.get(block_identity)
+                if explicit_owner is not None:
+                    explicit_key, explicit_display = explicit_owner
+                    rewritten.append((explicit_key, explicit_display, block, owner_key))
+                    continue
                 interpreted = interpreted_by_source.get(block_identity)
                 if interpreted is None:
                     rewritten.append((key, display, block, owner_key))
@@ -6869,9 +8326,7 @@ operation、单位换算或新字段。
                     rewritten.append((key, display, block, owner_key))
                     continue
                 interpreted_key = cls._service_key(interpreted.service)
-                interpreted_display = (
-                    interpreted.calculator_service_name or interpreted.service
-                )
+                interpreted_display = interpreted.calculator_service_name or interpreted.service
                 digest = hashlib.sha256(
                     f"interpreted\x1f{interpreted_key}\x1f{block}".encode("utf-8")
                 ).hexdigest()[:20]
@@ -6908,9 +8363,28 @@ operation、单位换算或新字段。
         # fragment belongs to exactly one single-service block, bind it back to
         # that block's canonical identity and complete original text.
         for item in parsed.services:
+            if item in derived_components:
+                continue
             raw_source = (item.original_source_text or item.source_text or "").strip()
             source = cls._strip_numbered_requirement_prefix(raw_source)
             if not source:
+                continue
+            explicit_owner = explicit_owner_by_block.get(source)
+            if explicit_owner is not None:
+                key, display = explicit_owner
+                rebind_to_explicit_owner(item, key, display)
+                complete_block = next(
+                    (
+                        block
+                        for block in numbered_blocks
+                        if cls._strip_numbered_requirement_prefix(block) == source
+                    ),
+                    raw_source,
+                )
+                had_cleaned_binding = bool(item.original_source_text)
+                item.original_source_text = complete_block
+                if not had_cleaned_binding:
+                    item.source_text = complete_block
                 continue
             owners = [
                 (key, display, block)
@@ -6949,6 +8423,9 @@ operation、单位换算或新字段。
 
         filtered: list[ServiceRequirement] = []
         for item in parsed.services:
+            if item in derived_components:
+                filtered.append(item)
+                continue
             if keeps_interpreted_identity(item):
                 filtered.append(item)
                 continue
@@ -6968,10 +8445,7 @@ operation、单位换算或新字段。
                 # a generated service label.  Rebind rather than discard so an
                 # unfamiliar alias cannot create a missing or duplicate row.
                 source_key, source_display = source_inventory[0]
-                if (
-                    item_key in SERVICE_TEMPLATE_FIELDS
-                    and item_key != cls._service_key(source_key)
-                ):
+                if item_key in SERVICE_TEMPLATE_FIELDS and item_key != cls._service_key(source_key):
                     item.quantity = 1
                     item.requirements = {}
                     item.field_evidence = {}
@@ -6988,10 +8462,7 @@ operation、单位换算或新字段。
             candidate = cls._strip_numbered_requirement_prefix(
                 item.original_source_text or item.source_text or ""
             )
-            return bool(
-                candidate
-                and (candidate == line or candidate in line or line in candidate)
-            )
+            return bool(candidate and (candidate == line or candidate in line or line in candidate))
 
         used: set[int] = set()
         inventoried: list[ServiceRequirement] = []
@@ -7010,6 +8481,7 @@ operation、单位换算或新字段。
                     index
                     for index, item in enumerate(filtered)
                     if index not in used
+                    and item not in derived_components
                     and cls._service_key(item.service) == cls._service_key(key)
                     and source_belongs_to_declaration(item, line)
                 ),
@@ -7036,6 +8508,7 @@ operation、单位换算或新字段。
                         index
                         for index, item in enumerate(filtered)
                         if index not in used
+                        and item not in derived_components
                         and keeps_interpreted_identity(item)
                         and source_belongs_to_declaration(item, line)
                     ),
@@ -7047,6 +8520,7 @@ operation、单位换算或新字段。
                         index
                         for index, item in enumerate(filtered)
                         if index not in used
+                        and item not in derived_components
                         and cls._service_key(item.service) == cls._service_key(key)
                     ),
                     None,
@@ -7063,6 +8537,7 @@ operation、单位换算或新字段。
                         index
                         for index, item in enumerate(filtered)
                         if index not in used
+                        and item not in derived_components
                         and item.field_sources.get("_official_service_code")
                         and source_belongs_to_declaration(item, line)
                     ),
@@ -7071,9 +8546,7 @@ operation、单位换算或新字段。
             if match_index is None:
                 field_sources = {}
                 if owner_key and owner_key in source_block_key_by_owner:
-                    field_sources["_source_block_key"] = source_block_key_by_owner[
-                        owner_key
-                    ]
+                    field_sources["_source_block_key"] = source_block_key_by_owner[owner_key]
                 inventoried.append(
                     ServiceRequirement(
                         service=key,
@@ -7093,9 +8566,9 @@ operation、单位换算或新字段。
             if owner_key is not None:
                 matched.component_key = owner_key
                 if owner_key in source_block_key_by_owner:
-                    matched.field_sources["_source_block_key"] = (
-                        source_block_key_by_owner[owner_key]
-                    )
+                    matched.field_sources["_source_block_key"] = source_block_key_by_owner[
+                        owner_key
+                    ]
             # The AI often returns the full multi-line component block. Keep
             # that richer source instead of replacing it with only the heading
             # line ("Amazon RDS", "EC2云服务器", etc.). Capacity reconciliation
@@ -7127,6 +8600,16 @@ operation、单位换算或新字段。
                 item.component_key = owner_matches[0]
             inventoried.append(item)
         parsed.services = inventoried[:25]
+        for child in derived_components:
+            old_parent_key = str(child.parent_component_key or "")
+            parent = parent_object_by_old_key.get(old_parent_key)
+            if parent is None:
+                continue
+            new_parent_key = str(parent.component_key or old_parent_key)
+            child.parent_component_key = new_parent_key
+            old_child_key = str(child.component_key or "")
+            if old_child_key.startswith(f"{old_parent_key}:"):
+                child.component_key = f"{new_parent_key}:{old_child_key.split(':', 1)[1]}"
         # Merge heading/detail fragments before launching isolated component
         # extraction.  This both preserves all explicit fields and prevents two
         # model calls for one customer component.
@@ -7145,11 +8628,13 @@ operation、单位换算或新字段。
 
         groups: dict[str, list[ServiceRequirement]] = {}
         for item in parsed.services:
+            if item.field_sources.get(OWNED_SOURCE_SLICE_FIELD) == "system_policy":
+                continue  # A narrowed owner must never reopen the parent row.
             # A leading sales sequence number is formatting, not ownership.
             # Normalize it so inventory-restored and AI-cleaned copies of the
             # same compound row are still isolated together.
             source = cls._strip_numbered_requirement_prefix(
-                item.source_text or ""
+                item.original_source_text or item.source_text or ""
             ).strip()
             if source:
                 groups.setdefault(source, []).append(item)
@@ -7191,6 +8676,7 @@ operation、单位换算或新字段。
                 if slice_lines:
                     item.source_text = "".join(dict.fromkeys(slice_lines))
                     item.field_sources["_owned_source_slice"] = "system_policy"
+                    item.field_evidence[OWNED_SOURCE_SLICE_EVIDENCE_FIELD] = item.source_text
 
     @staticmethod
     def _ensure_missing_region_ambiguity(parsed: ParsedIntent) -> None:
@@ -7205,622 +8691,7 @@ operation、单位换算或新字段。
             if question not in parsed.ambiguities:
                 parsed.ambiguities.append(question)
 
-    async def _resolve_pending_ec2_workload_identities(
-        self,
-        parsed: ParsedIntent,
-        *,
-        reporter: AiTranscriptReporter | None = None,
-    ) -> None:
-        """Decide EC2 role versus named software once, without word lists.
 
-        Numbered intake deliberately lets the program preserve component
-        boundaries before any model call.  Some provisional EC2 rows therefore
-        reach the component template with a display heading that has not yet
-        answered the semantic question "server role or named software?".  The
-        service-specific template model is forbidden to change identity, so a
-        separate closed-output decision is required before architecture
-        questions are built.
-
-        Only provisional third-party EC2 rows enter this pass.  The returned
-        kind is persisted on the component and is authoritative downstream;
-        no later stage may infer it again from the heading.
-        """
-
-        candidates = [
-            (index, item)
-            for index, item in enumerate(parsed.services, start=1)
-            if self._service_key(item.service) == "ec2"
-            and not item.field_sources.get("_official_service_code")
-            and not item.field_sources.get("_architecture_decision")
-            and item.workload_identity_kind is None
-            and (
-                item.field_sources.get("_identity_resolution_status") == "third_party"
-                or bool(item.field_sources.get("_third_party_product"))
-                or bool(item.field_sources.get("_pending_architecture_decision"))
-            )
-        ]
-        if not candidates:
-            return
-
-        prompt = """你只判断一个已经拆分好的计算组件的产品身份，不提取参数、不报价、不推荐AWS产品。
-请根据完整客户原话判断开头名称属于哪一类：
-- generic_compute：服务器、主机、节点、Worker或业务用途等计算角色；客户只是要计算资源，并未要求保留某个具体第三方软件产品。
-- named_third_party_software：客户明确写出了需要保留、部署或运行的具体非AWS软件、框架、中间件、数据库或平台产品名。
-- unresolved：证据不足，无法可靠区分前两类。
-
-不要用关键词表或名称后缀机械判断，必须理解整条组件语义。一个名称包含“服务器”“数据库”等用途词，
-既不能自动判为 generic_compute，也不能自动判为具体产品。只返回严格JSON：
-{"kind":"generic_compute|named_third_party_software|unresolved","workload_name":null,"evidence":"客户原话中的逐字片段","confidence":"high|low"}
-named_third_party_software 时 workload_name 必须逐字复制客户原话中的产品名；其他类型必须为 null。
-evidence 必须逐字来自客户原话。"""
-
-        for component_number, component in candidates:
-            source = component.original_source_text or component.source_text
-            content = f"当前组件完整客户原话：\n{source}"
-            resolved = False
-            for attempt in range(1, 3):
-                attempt_prompt = prompt
-                if attempt > 1:
-                    attempt_prompt += (
-                        "\n上一轮没有形成可验证的高置信度结论。请重新判断；仍不确定必须返回 unresolved。"
-                    )
-                if reporter:
-                    await reporter(
-                        "ai_prompt",
-                        _redact_transcript(
-                            f"【组件 {component_number} · 计算角色/软件身份判断"
-                            f"·第 {attempt} 次】\n{attempt_prompt}\n\n{content}"
-                        ),
-                    )
-                try:
-                    raw = await self._complete_component_json(
-                        system_prompt=attempt_prompt,
-                        user_content=content,
-                        timeout_seconds=25,
-                        reporter=reporter,
-                        component_number=component_number,
-                    )
-                except Exception:
-                    logger.exception(
-                        "EC2 workload identity AI failed for component %s",
-                        component_number,
-                    )
-                    continue
-                if reporter:
-                    await reporter(
-                        "ai_response",
-                        _redact_transcript(
-                            f"【组件 {component_number} · 计算角色/软件身份输出"
-                            f"·第 {attempt} 次】\n"
-                            + json.dumps(raw, ensure_ascii=False, indent=2)
-                        ),
-                    )
-
-                payload = raw.get("identity") if isinstance(raw.get("identity"), dict) else raw
-                kind = str(payload.get("kind") or "").strip()
-                confidence = str(payload.get("confidence") or "").strip().casefold()
-                evidence = str(payload.get("evidence") or "").strip()
-                workload_name = str(payload.get("workload_name") or "").strip()
-                evidence_is_literal = bool(evidence and evidence in source)
-                name_is_literal = bool(workload_name and workload_name in source)
-
-                if (
-                    kind == "generic_compute"
-                    and confidence == "high"
-                    and evidence_is_literal
-                    and not workload_name
-                ):
-                    component.workload_identity_kind = "generic_compute"
-                    component.workload_name = None
-                    component.field_sources["_identity_resolution_status"] = (
-                        "generic_compute"
-                    )
-                    component.field_evidence["workload_identity_kind"] = evidence
-                    resolved = True
-                    break
-                if (
-                    kind == "named_third_party_software"
-                    and confidence == "high"
-                    and evidence_is_literal
-                    and name_is_literal
-                ):
-                    component.workload_identity_kind = (
-                        "named_third_party_software"
-                    )
-                    component.workload_name = workload_name
-                    component.field_sources["_identity_resolution_status"] = (
-                        "third_party"
-                    )
-                    component.field_sources["_third_party_product"] = workload_name
-                    component.field_evidence["workload_identity_kind"] = evidence
-                    resolved = True
-                    break
-                if kind == "unresolved" and confidence == "high" and evidence_is_literal:
-                    break
-
-            if resolved:
-                continue
-            component.workload_identity_kind = "unresolved"
-            component.workload_name = None
-            component.field_sources["_identity_resolution_status"] = "failed"
-            component.field_sources["_identity_resolution_reason"] = (
-                "组件AI未能确定这是普通计算角色还是需要保留的第三方软件"
-            )
-
-    @classmethod
-    def _append_third_party_managed_decisions(
-        cls,
-        parsed: ParsedIntent,
-        original_text: str | None = None,
-    ) -> None:
-        """Preserve third-party identity when AWS only offers partial coverage.
-
-        Product identity is stronger evidence than capability prose.  A
-        compound replacement is a customer architecture decision, not an
-        inventory synonym, so keep the self-hosted component intact until the
-        customer explicitly chooses the managed combination.
-        """
-
-        # A component AI can preserve a newly encountered product under its
-        # literal service key (for example ``clickhouse``) instead of the EC2
-        # wrapper expected by the normal selector.  Do not let that unknown
-        # key fall through to the generic AWS catalog: when the customer's own
-        # component block describes a node deployment, it is a third-party
-        # workload and must enter the managed-vs-self-hosted decision first.
-        # Official future AWS services remain untouched because their headings
-        # identify them as AWS/Amazon services.
-        original_blocks = (
-            cls._inventory_numbered_requirement_blocks(original_text)
-            if original_text
-            else []
-        )
-
-        def customer_explicitly_selected_ec2(
-            item: ServiceRequirement,
-            product: str,
-            source: str,
-        ) -> bool:
-            """Accept a real customer decision, not a sales-stage plan label.
-
-            A normalized sales row such as ``Doris，Amazon EC2 自建，...``
-            describes the candidate architecture shown before the customer
-            confirmation link.  It is not proof that the customer clicked the
-            self-hosted option.  Structured confirmation metadata is always
-            authoritative; natural prose/model evidence remains compatible for
-            older drafts, while the bare comma-separated plan label must still
-            produce the managed-vs-self-hosted customer question.
-            """
-
-            if not product:
-                return False
-            if item.field_sources.get("_architecture_decision") in {
-                "customer_confirmation",
-                "customer_correction",
-                "sales_confirmation",
-            }:
-                return True
-            sales_plan_label = bool(
-                re.match(
-                    rf"^\s*{re.escape(product)}\s*[,，；;|｜]\s*"
-                    r"(?:(?:amazon|aws)\s+)?ec2(?:\s+云服务器)?\s*"
-                    r"(?:自建|自行部署|self[ -]?hosted)\s*[,，；;|｜]",
-                    source,
-                    re.I,
-                )
-            )
-            if sales_plan_label:
-                return False
-            folded = source.casefold()
-            return bool(
-                re.search(r"(?<![a-z0-9])ec2(?![a-z0-9])", folded, re.I)
-                or BARE_EC2_MODEL_PATTERN.search(source)
-                or any(
-                    marker in folded
-                    for marker in (
-                        "自建",
-                        "自行部署",
-                        "部署在 ec2",
-                        "运行在 ec2",
-                        "self-hosted",
-                        "self hosted",
-                    )
-                )
-            )
-
-        def apply_explicit_self_hosting(
-            item: ServiceRequirement, product: str, source: str
-        ) -> None:
-            item.service = "ec2"
-            item.calculator_service_name = f"Amazon EC2（自建 {product}）"
-            item.workload_identity_kind = "named_third_party_software"
-            item.workload_name = product
-            item.requirements.setdefault("operating_system", "linux")
-            apply_self_hosted_dimensions(item, source)
-            item.field_sources.pop("_pending_architecture_decision", None)
-            item.field_sources["_architecture_decision"] = "customer_text"
-            item.field_sources["_third_party_product"] = product
-            item.field_evidence["_architecture_decision"] = source[:240]
-
-        def apply_self_hosted_dimensions(
-            item: ServiceRequirement, source: str
-        ) -> None:
-            """Move literal node facts across the third-party -> EC2 boundary.
-
-            The component AI first extracts an unknown product with the generic
-            contract and this method later changes it to EC2.  Previously that
-            service switch kept CPU/RAM but silently dropped generic storage
-            and node counts.  Re-read only unambiguous literals from this
-            component so every current and future self-hosted product follows
-            the same lossless boundary.
-            """
-
-            def to_gib(value: str, unit: str) -> float:
-                number = float(value)
-                return number * 1024 if unit.casefold() in {"tb", "tib", "t"} else number
-
-            shape_match = re.search(
-                r"(\d+(?:\.\d+)?)\s*(?:核|c(?![a-z])|v\s*cpu|vcpu)"
-                r"[^。；,，\n]{0,16}?(\d+(?:\.\d+)?)\s*"
-                r"(?:gib|gi?b|gb|g)(?:\s*内存)?",
-                source,
-                re.I,
-            )
-            if shape_match:
-                for field, value in (
-                    ("vcpu", float(shape_match.group(1))),
-                    ("memory_gib", float(shape_match.group(2))),
-                ):
-                    item.requirements[field] = value
-                    path = f"requirements.{field}"
-                    item.field_sources[path] = "customer_text"
-                    item.field_evidence[path] = shape_match.group(0)
-                    item.locked_fields = sorted(set(item.locked_fields) | {path})
-
-            count_match = (
-                re.search(
-                    r"(?:共|合计|总共|需要|部署|预计|计划|准备)?\s*(\d+)\s*"
-                    r"(?:个|台)?\s*(?:节点|机器|服务器|主机)(?!\s*(?:核|vcpu))",
-                    source,
-                    re.I,
-                )
-                or re.search(
-                    r"(?:预计|计划|准备|需要|部署|共|合计|总共)\s*(\d+)\s*台"
-                    r"(?=\s*[,，。；;]|\s*(?:单台|每台))",
-                    source,
-                    re.I,
-                )
-                or re.search(
-                    r"(?:部署数量|节点数量|服务器数量|机器数量|数量)\s*[:：]?\s*"
-                    r"(\d+)\s*(?:个|台)?",
-                    source,
-                    re.I,
-                )
-                or re.search(
-                    r"[|｜]\s*(\d+)\s*(?:个\s*)?"
-                    r"(?:台|节点|机器|服务器|主机)\s*(?=[|｜])",
-                    source,
-                    re.I,
-                )
-                or re.search(
-                    r"[,，|｜]\s*(\d+)\s*(?:个|台)?\s*"
-                    r"(?:节点|机器|服务器|主机|实例|台)?"
-                    r"(?=\s*[,，。；;|｜])",
-                    source,
-                    re.I,
-                )
-            )
-            if count_match:
-                item.quantity = max(int(count_match.group(1)), 1)
-
-            storage_match = (
-                re.search(
-                    r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tib|tb|t)\s*"
-                    r"(?:/\s*(?:节点|台|机器|服务器))?\s*(?:磁盘|硬盘|存储)",
-                    source,
-                    re.I,
-                )
-                or re.search(
-                    r"(?:每(?:个)?节点[^。；,，\n]{0,18}?)?"
-                    r"(?:磁盘|硬盘|存储(?:容量)?)\s*[:：]?\s*"
-                    r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tib|tb|t)",
-                    source,
-                    re.I,
-                )
-            )
-            generic_storage = item.requirements.pop("storage_gib", None)
-            if storage_match:
-                storage = to_gib(storage_match.group(1), storage_match.group(2))
-                item.requirements["system_disk_gib"] = storage
-                evidence = storage_match.group(0)
-                item.field_sources["requirements.system_disk_gib"] = "customer_text"
-                item.field_evidence["requirements.system_disk_gib"] = evidence
-                item.locked_fields = sorted(
-                    set(item.locked_fields) | {"requirements.system_disk_gib"}
-                )
-            elif isinstance(generic_storage, (int, float)) and not isinstance(
-                generic_storage, bool
-            ):
-                item.requirements["system_disk_gib"] = generic_storage
-
-        def compatible_managed_equivalent(
-            product: str, source: str
-        ) -> tuple[str, str] | None:
-            managed = cls._fully_managed_equivalent(product)
-            if managed is None:
-                return None
-            # A similar managed product is an alternative, not an automatic
-            # replacement, when its own template cannot represent the fixed
-            # per-node CPU/RAM topology the customer supplied.  Keep the two
-            # architectures visible instead of silently discarding node facts.
-            if (
-                not re.match(r"^(?:Amazon|AWS)\b", product, re.I)
-                and cls._has_fixed_node_contract(source)
-                and not cls._managed_service_accepts_fixed_node_contract(managed[0])
-            ):
-                return None
-            return managed
-
-        def remove_architecture_question(product: str) -> None:
-            parsed.ambiguities = [
-                notice
-                for notice in parsed.ambiguities
-                if product.casefold() not in notice.casefold()
-                or not any(
-                    marker in notice.casefold() for marker in ("自建", "托管", "managed", "aws")
-                )
-            ]
-
-        for item in parsed.services:
-            # Workload identity is decided once by the isolated component AI.
-            # The architecture stage must not reinterpret a display name or
-            # customer phrase after that boundary.
-            if item.workload_identity_kind == "generic_compute":
-                stale_products = re.findall(
-                    r"自建\s*([^）)]+)", item.calculator_service_name or ""
-                )
-                if item.workload_name:
-                    stale_products.append(item.workload_name)
-                for stale_product in dict.fromkeys(stale_products):
-                    remove_architecture_question(stale_product.strip())
-                item.service = "ec2"
-                item.calculator_service_name = "Amazon EC2 云服务器"
-                item.workload_name = None
-                item.field_sources.pop("_pending_architecture_decision", None)
-                item.field_sources.pop("_third_party_product", None)
-                item.field_sources.pop("_identity_resolution_reason", None)
-                continue
-            source = item.source_text or ""
-            # A failed official-product lookup is an unresolved identity, not
-            # evidence that the customer asked for EC2 self-hosting.  Keep the
-            # original heading intact so a later component-only retry can
-            # classify it; never manufacture an architecture choice from an
-            # AI/network failure.
-            if item.field_sources.get("_identity_resolution_status") == "failed":
-                continue
-            # An exact provider-catalog identity always wins over generic VM
-            # shape prose. Managed databases also describe CPU, memory and an
-            # "instance", which must not make them look like standalone EC2.
-            if item.field_sources.get("_official_service_code"):
-                continue
-            # A plain VM shape is infrastructure, not a third-party product.
-            # This defensive boundary also repairs older/AI-created drafts
-            # whose service key was derived from the first text column.
-            named_product = cls._self_hosted_product_name(item)
-            if cls._looks_like_standalone_compute_spec(source) and not named_product:
-                contextual_products = re.findall(
-                    r"自建\s*([^）)]+)", item.calculator_service_name or ""
-                )
-                for contextual_product in contextual_products:
-                    remove_architecture_question(contextual_product.strip())
-                item.service = "ec2"
-                item.calculator_service_name = "Amazon EC2 云服务器"
-                item.field_sources.pop("_pending_architecture_decision", None)
-                item.field_sources.pop("_third_party_product", None)
-                continue
-            if cls._service_key(item.service) == "ec2":
-                continue
-            product = (
-                item.workload_name
-                if item.workload_identity_kind == "named_third_party_software"
-                else cls._self_hosted_product_name(item)
-            )
-            if not product or re.search(r"\b(?:aws|amazon)\b", product, re.I):
-                continue
-            source = item.source_text or ""
-            matching_blocks = [
-                block
-                for block in original_blocks
-                if re.search(
-                    rf"(?<![a-z0-9]){re.escape(product)}(?![a-z0-9])",
-                    block,
-                    re.I,
-                )
-            ]
-            if len(matching_blocks) == 1:
-                source = matching_blocks[0]
-                item.source_text = source
-            if customer_explicitly_selected_ec2(item, product, source):
-                apply_explicit_self_hosting(item, product, source)
-                remove_architecture_question(product)
-                continue
-            managed_equivalent = compatible_managed_equivalent(product, source)
-            if managed_equivalent is not None:
-                cls._apply_fully_managed_equivalent(item, product, source, managed_equivalent)
-                parsed.ambiguities = [
-                    notice
-                    for notice in parsed.ambiguities
-                    if product.casefold() not in notice.casefold()
-                    or not any(
-                        marker in notice.casefold() for marker in ("自建", "托管", "managed", "aws")
-                    )
-                ]
-                continue
-            has_node_deployment = bool(
-                re.search(
-                    r"(?:部署数量|节点数量|每\s*节点|\d+\s*个\s*节点|自建|自行部署)",
-                    source,
-                    re.I,
-                )
-            )
-            has_machine_shape = any(
-                key in item.requirements for key in ("vcpu", "memory_gib", "system_disk_gib")
-            )
-            if not has_node_deployment and not has_machine_shape:
-                continue
-            item.service = "ec2"
-            item.calculator_service_name = f"Amazon EC2（自建 {product}）"
-            item.requirements.setdefault("operating_system", "linux")
-            apply_self_hosted_dimensions(item, source)
-            node_match = re.search(
-                r"(?:部署数量|节点数量|数量)\s*[：:]?\s*(\d+)\s*(?:个)?\s*节点",
-                source,
-                re.I,
-            )
-            if node_match:
-                item.quantity = max(int(node_match.group(1)), 1)
-
-        for item in parsed.services:
-            if item.workload_identity_kind == "generic_compute":
-                continue
-            if item.field_sources.get("_identity_resolution_status") == "failed":
-                continue
-            source = item.source_text or ""
-            if not re.search(r"(?<![a-z0-9])nacos(?![a-z0-9])", source, re.I):
-                continue
-            if item.field_sources.get("_architecture_decision"):
-                continue
-            item.service = "ec2"
-            item.calculator_service_name = "Amazon EC2（自建 Nacos）"
-            item.requirements.setdefault("operating_system", "linux")
-            apply_self_hosted_dimensions(item, source)
-            item.field_sources["_pending_architecture_decision"] = "system_policy"
-            node_match = re.search(
-                r"(?:部署数量|节点数量|数量)\s*[：:]?\s*(\d+)\s*(?:个)?\s*节点",
-                source,
-                re.I,
-            )
-            if node_match:
-                item.quantity = max(int(node_match.group(1)), 1)
-            node_count = item.quantity
-            question = (
-                f"您需要 Nacos 的服务发现和配置中心。是继续自建 Nacos（{node_count} 个节点），"
-                "还是改用 AWS 托管的 Cloud Map + AppConfig？托管方案不再按 Nacos 节点部署。"
-            )
-            # AI may return an explanatory Nacos note instead of an actual
-            # customer question. Replace every such note with one stable,
-            # actionable choice so the UI can always render the two buttons.
-            parsed.ambiguities = [
-                notice for notice in parsed.ambiguities if "nacos" not in notice.casefold()
-            ]
-            parsed.ambiguities.append(question)
-
-        # The model can correctly preserve an unsupported named product as EC2
-        # yet omit the required architecture question.  Recover the product
-        # identity from the component's own heading instead of silently
-        # presenting it as an ordinary application server.  This is generic:
-        # ClickHouse, XXL-JOB and future named middleware follow the same path.
-        for item in parsed.services:
-            if item.workload_identity_kind == "generic_compute":
-                continue
-            if item.field_sources.get("_identity_resolution_status") == "failed":
-                continue
-            if cls._service_key(item.service) != "ec2":
-                continue
-            if item.field_sources.get("_official_service_code"):
-                continue
-            if item.field_sources.get("_architecture_decision"):
-                continue
-            product = (
-                item.workload_name
-                if item.workload_identity_kind == "named_third_party_software"
-                else cls._self_hosted_product_name(item)
-            )
-            if not product or product.casefold() == "nacos":
-                continue
-            matching_blocks = [
-                block
-                for block in original_blocks
-                if re.search(
-                    rf"(?<![a-z0-9]){re.escape(product)}(?![a-z0-9])",
-                    block,
-                    re.I,
-                )
-            ]
-            source = item.source_text or ""
-            if len(matching_blocks) == 1:
-                source = matching_blocks[0]
-                item.source_text = source
-            if customer_explicitly_selected_ec2(item, product, source):
-                apply_explicit_self_hosting(item, product, source)
-                remove_architecture_question(product)
-                continue
-            managed_equivalent = compatible_managed_equivalent(product, source)
-            if managed_equivalent is not None:
-                cls._apply_fully_managed_equivalent(item, product, source, managed_equivalent)
-                parsed.ambiguities = [
-                    notice
-                    for notice in parsed.ambiguities
-                    if product.casefold() not in notice.casefold()
-                    or not any(
-                        marker in notice.casefold() for marker in ("自建", "托管", "managed", "aws")
-                    )
-                ]
-                continue
-            item.calculator_service_name = f"Amazon EC2（自建 {product}）"
-            item.requirements.setdefault("operating_system", "linux")
-            apply_self_hosted_dimensions(item, source)
-            item.field_sources.setdefault("_pending_architecture_decision", "system_policy")
-            item.field_sources["_third_party_product"] = product
-            quantity = max(int(item.quantity or 1), 1)
-            details = [f"{quantity} 个节点"]
-            vcpu = item.requirements.get("vcpu")
-            memory = item.requirements.get("memory_gib")
-            storage = item.requirements.get("system_disk_gib")
-            if isinstance(vcpu, (int, float)) and isinstance(memory, (int, float)):
-                details.append(f"每节点 {vcpu:g} 核 {memory:g} GiB")
-            if isinstance(storage, (int, float)):
-                details.append(f"每节点 {storage:g} GiB 存储")
-            question = (
-                f"AWS 没有与 {product} 完全等价的托管服务。您要采用 AWS 托管方案"
-                f"（功能会有所不同），还是按原配置在 EC2 上自建 {product}"
-                f"（{'，'.join(details)}）？"
-            )
-            parsed.ambiguities = [
-                notice
-                for notice in parsed.ambiguities
-                if product.casefold() not in notice.casefold()
-                or not any(
-                    marker in notice.casefold() for marker in ("自建", "托管", "managed", "aws")
-                )
-            ]
-            parsed.ambiguities.append(question)
-
-        # Apply the same staged customer flow to every third-party workload
-        # that the parser preserved as a named self-hosted EC2 component and
-        # explicitly marked as only partially replaceable by AWS managed
-        # services. This keeps the workflow generic without guessing that an
-        # ordinary application EC2 server is third-party middleware.
-        architecture_notices = [
-            notice
-            for notice in parsed.ambiguities
-            if "自建" in notice
-            and any(marker in notice.casefold() for marker in ("托管", "managed", "aws"))
-        ]
-        for item in parsed.services:
-            if item.field_sources.get("_identity_resolution_status") == "failed":
-                continue
-            if cls._service_key(item.service) != "ec2":
-                continue
-            display = item.calculator_service_name or ""
-            products = re.findall(r"自建\s*([^）)]+)", display)
-            if not products or item.field_sources.get("_architecture_decision"):
-                continue
-            if any(
-                product.casefold() in notice.casefold()
-                for product in products
-                for notice in architecture_notices
-            ):
-                item.field_sources.setdefault("_pending_architecture_decision", "system_policy")
 
     @classmethod
     def _fully_managed_equivalent(cls, product: str) -> tuple[str, str] | None:
@@ -7832,6 +8703,10 @@ evidence 必须逐字来自客户原话。"""
         Products without a direct mapping intentionally return ``None`` and
         keep the managed-alternative versus EC2-self-hosted decision.
         """
+
+        declared_template = component_template_spec(product)
+        if declared_template is not None and declared_template.service_key != "ec2":
+            return declared_template.service_key, declared_template.display_name
 
         folded = re.sub(r"[^a-z0-9]+", "", product.casefold())
         mappings: tuple[tuple[tuple[str, ...], str, str], ...] = (
@@ -7948,7 +8823,7 @@ evidence 必须逐字来自客户原话。"""
             "postgres": "postgresql",
             "mariadb": "mariadb",
         }
-        engine = managed_engines.get(normalized_product)
+        engine = managed_engines.get(normalized_product) or component_template_variant(product)
         if engine is not None:
             item.requirements["engine"] = engine
             item.field_sources["requirements.engine"] = "customer_text"
@@ -7972,6 +8847,12 @@ evidence 必须逐字来自客户原话。"""
             # copies of the complete service. A separately stated cluster
             # count is restored by the shared topology normalizer later.
             item.quantity = 1
+
+        # A product switch invalidates derived review/catalog output
+        # immediately. Customer-owned foreign fields remain until the target
+        # literal overlay can either map them or report them as genuinely
+        # unresolved; they are never silently discarded.
+        enforce_reclassified_product_schema(item, discard_derived_results=True)
 
     @staticmethod
     def _component_product_heading(item: ServiceRequirement) -> str | None:
@@ -8036,8 +8917,10 @@ evidence 必须逐字来自客户原话。"""
             first_line,
             re.I,
         )
-        match = labeled_match or explicit_ec2_workload or re.match(
-            r"([^：:，,；;|｜]{1,48})\s*[：:|｜]", first_line
+        match = (
+            labeled_match
+            or explicit_ec2_workload
+            or re.match(r"([^：:，,；;|｜]{1,48})\s*[：:|｜]", first_line)
         )
         if not match:
             # Cleaned sales text does not always retain a colon.  Preserve a
@@ -8119,21 +9002,15 @@ evidence 必须逐字来自客户原话。"""
         # engines that map directly to RDS.  The old substring rule regressed
         # those managed services into EC2 self-hosting.
         generic_identities = {
-            re.sub(r"[\s\-—_（）()]+", "", marker.casefold())
-            for marker in generic_markers
+            re.sub(r"[\s\-—_（）()]+", "", marker.casefold()) for marker in generic_markers
         }
         product_identity = re.sub(r"[\s\-—_（）()]+", "", folded)
-        if (
-            not product
-            or product_identity in generic_identities
-        ):
+        if not product or product_identity in generic_identities:
             return None
         return product
 
     @classmethod
-    def _route_named_third_party_workload(
-        cls, component: ServiceRequirement
-    ) -> bool:
+    def _route_named_third_party_workload(cls, component: ServiceRequirement) -> bool:
         """Keep a literal software deployment on the architecture-choice path.
 
         The official AWS catalog can only answer whether a name is an AWS
@@ -8184,9 +9061,7 @@ evidence 必须逐字来自客户原话。"""
         component.field_sources["_identity_resolution_status"] = "third_party"
         component.field_sources.pop("_identity_resolution_reason", None)
         component.field_sources["_third_party_product"] = product
-        component.field_sources.setdefault(
-            "_pending_architecture_decision", "system_policy"
-        )
+        component.field_sources.setdefault("_pending_architecture_decision", "system_policy")
         if component.field_sources.get("requirements.operating_system") not in {
             "customer_text",
             "customer_confirmation",
@@ -8224,6 +9099,18 @@ evidence 必须逐字来自客户原话。"""
 
         represented = {cls._service_key(item.service) for item in parsed.services}
         numbered_blocks = cls._inventory_numbered_requirement_blocks(text)
+
+        def numbered_block_already_owned(source_line: str) -> bool:
+            if not numbered_blocks:
+                return False
+            source_identity = cls._strip_numbered_requirement_prefix(source_line)
+            return any(
+                cls._strip_numbered_requirement_prefix(
+                    item.original_source_text or item.source_text or ""
+                )
+                == source_identity
+                for item in parsed.services
+            )
 
         def explicitly_owned_source(markers: tuple[str, ...]) -> str:
             """Return a customer block that actually owns this service.
@@ -8362,6 +9249,16 @@ evidence 必须逐字来自客户原话。"""
             source_line = explicitly_owned_source(markers)
             if not source_line:
                 continue
+            # A numbered row is already a complete ownership boundary.  Its
+            # neutral placeholder may be waiting for official identity
+            # discovery (for example a newly named S3 storage class).  Adding
+            # a second, broader service merely because the heading contains a
+            # legacy marker creates two cards for one customer component.  All
+            # explicit multi-product headings were inventoried earlier, so the
+            # minimum-service recovery path only owns still-unrepresented
+            # source blocks.
+            if numbered_block_already_owned(source_line):
+                continue
             requirements: dict[str, object] = {}
             if key == "cloudwatch":
                 requirements = {"include_logs": True, "include_metrics": True}
@@ -8496,32 +9393,6 @@ evidence 必须逐字来自客户原话。"""
             if not written_in_request or not written_in_component:
                 item.requirements.pop("requested_model", None)
 
-    @classmethod
-    def _drop_embedded_ebs_duplicates(cls, parsed: ParsedIntent) -> None:
-        """Do not quote an EC2/worker root disk twice as a separate EBS service."""
-
-        ec2_disks = [
-            (item.source_text.strip().casefold(), item.requirements.get("system_disk_gib"))
-            for item in parsed.services
-            if cls._service_key(item.service) == "ec2"
-        ]
-        retained: list[ServiceRequirement] = []
-        for item in parsed.services:
-            if cls._service_key(item.service) != "ebs":
-                retained.append(item)
-                continue
-            source = item.source_text.strip().casefold()
-            embedded = any(
-                source
-                and ec2_source
-                and (source == ec2_source or source in ec2_source or ec2_source in source)
-                and disk is not None
-                for ec2_source, disk in ec2_disks
-            )
-            if embedded and any(marker in source for marker in ("worker node", "系统盘", "每台")):
-                continue
-            retained.append(item)
-        parsed.services = retained
 
     @classmethod
     def _reconcile_explicit_engines(cls, text: str, parsed: ParsedIntent) -> None:
@@ -8613,8 +9484,7 @@ evidence 必须逐字来自客户原话。"""
                 if any(marker in folded for marker in ("windows", "win server")):
                     requirements["operating_system"] = "windows"
                 elif any(
-                    marker in folded
-                    for marker in ("linux", "ubuntu", "debian", "amazon linux")
+                    marker in folded for marker in ("linux", "ubuntu", "debian", "amazon linux")
                 ):
                     requirements["operating_system"] = "linux"
             elif key == "rds":
@@ -8701,7 +9571,9 @@ evidence 必须逐字来自客户原话。"""
                 if writer and reader:
                     writer_count = max(int(writer.group(1)), 1)
                     reader_count = max(int(reader.group(1)), 0)
-                    evidence = source[min(writer.start(), reader.start()):max(writer.end(), reader.end())]
+                    evidence = source[
+                        min(writer.start(), reader.start()) : max(writer.end(), reader.end())
+                    ]
                     for field, value in (
                         ("writer_nodes", writer_count),
                         ("reader_nodes", reader_count),
@@ -8892,9 +9764,8 @@ evidence 必须逐字来自客户原话。"""
             # Respect that customer-owned deployment count before collapsing
             # topology fields to a single group.
             quantity_evidence = str(item.field_evidence.get("quantity") or "")
-            if (
-                item.field_sources.get("quantity") == "customer_text"
-                and re.search(r"数量\s*[:：]?\s*\d+", quantity_evidence, re.I)
+            if item.field_sources.get("quantity") == "customer_text" and re.search(
+                r"数量\s*[:：]?\s*\d+", quantity_evidence, re.I
             ):
                 continue
             has_internal_topology = any(
@@ -8925,9 +9796,7 @@ evidence 必须逐字来自客户原话。"""
             # a primary plus a readable replica.  Do not silently choose one
             # billing topology.  Keep the customer's member count and publish
             # one finite business question instead.
-            bare_primary_replica = bool(
-                re.search(r"主从|1\s*主\s*1\s*从|一主一从", source, re.I)
-            )
+            bare_primary_replica = bool(re.search(r"主从|1\s*主\s*1\s*从|一主一从", source, re.I))
             explicit_ha = bool(
                 re.search(
                     r"主备|高可用|自动故障切换|multi[ -]?az",
@@ -8947,17 +9816,19 @@ evidence 必须逐字来自客户原话。"""
                 requirements["instance_count"] = total_members
                 item.field_sources["requirements.instance_count"] = "customer_text"
                 item.field_evidence["requirements.instance_count"] = (
-                    re.search(r"(?:共|合计|总共)?\s*\d+\s*(?:个|台)?\s*(?:数据库)?节点", source, re.I).group(0)
-                    if re.search(r"(?:共|合计|总共)?\s*\d+\s*(?:个|台)?\s*(?:数据库)?节点", source, re.I)
+                    re.search(
+                        r"(?:共|合计|总共)?\s*\d+\s*(?:个|台)?\s*(?:数据库)?节点", source, re.I
+                    ).group(0)
+                    if re.search(
+                        r"(?:共|合计|总共)?\s*\d+\s*(?:个|台)?\s*(?:数据库)?节点", source, re.I
+                    )
                     else source
                 )
                 requirements.pop("deployment", None)
                 item.field_sources.pop("requirements.deployment", None)
                 item.field_evidence.pop("requirements.deployment", None)
                 item.locked_fields = [
-                    field
-                    for field in item.locked_fields
-                    if field != "requirements.deployment"
+                    field for field in item.locked_fields if field != "requirements.deployment"
                 ]
                 notice = (
                     "Amazon RDS MySQL：客户写了“主从部署”。请确认是主备高可用"
@@ -8987,9 +9858,7 @@ evidence 必须逐字来自客户原话。"""
             item.field_evidence["requirements.deployment"] = (
                 deployment_match.group(0) if deployment_match else source
             )
-            item.locked_fields = sorted(
-                set(item.locked_fields) | {"requirements.deployment"}
-            )
+            item.locked_fields = sorted(set(item.locked_fields) | {"requirements.deployment"})
             member_count_match = re.search(
                 r"(?:数据库)?(?:节点|实例)(?:数量|数|总数)\s*[:：]?\s*"
                 r"(\d+)\s*(?:个|台)?|"
@@ -9001,13 +9870,9 @@ evidence 必须逐字来自客户原话。"""
             )
             if member_count_match:
                 member_count = next(
-                    int(group)
-                    for group in member_count_match.groups()
-                    if group is not None
+                    int(group) for group in member_count_match.groups() if group is not None
                 )
-                requirements["instance_count"] = max(
-                    member_count, 2
-                )
+                requirements["instance_count"] = max(member_count, 2)
                 member_evidence = member_count_match.group(0)
             elif re.search(r"1\s*主\s*1\s*备|主备", source, re.I):
                 requirements["instance_count"] = 2
@@ -9082,8 +9947,7 @@ evidence 必须逐字来自客户原话。"""
                 ):
                     continue
                 if (
-                    existing.parent_component_key
-                    or item.parent_component_key
+                    existing.parent_component_key or item.parent_component_key
                 ) and existing.parent_component_key != item.parent_component_key:
                     continue
                 existing_source = (existing.source_text or "").strip()
@@ -9183,10 +10047,7 @@ evidence 必须逐字来自客户原话。"""
                     metadata.setdefault(new_path, value)
 
         component.locked_fields = sorted(
-            {
-                path_mapping.get(path, path)
-                for path in component.locked_fields
-            }
+            {path_mapping.get(path, path) for path in component.locked_fields}
         )
         for metadata in (component.field_match_policies, component.field_scopes):
             for old_path, new_path in path_mapping.items():
@@ -9211,9 +10072,7 @@ evidence 必须逐字来自客户原话。"""
                 item.requirements,
                 service=DeepSeekIntentParser._service_key(item.service),
             )
-            item.requirements = strip_non_pricing_context_fields(
-                item.service, item.requirements
-            )
+            item.requirements = strip_non_pricing_context_fields(item.service, item.requirements)
             retained_paths = {f"requirements.{field}" for field in item.requirements}
             item.field_sources = {
                 path: value
@@ -9252,7 +10111,7 @@ evidence 必须逐字来自客户原话。"""
         """
 
         questions: list[str] = []
-        for item in parsed.services:
+        for component_index, item in enumerate(parsed.services):
             key = DeepSeekIntentParser._service_key(item.service)
             source = item.source_text or ""
             display = item.calculator_service_name or item.service
@@ -9267,7 +10126,7 @@ evidence 必须逐字来自客户原话。"""
             )
             if vague_count and not (key == "eks" and re.search(r"几个服务", source, re.I)):
                 questions.append(
-                    f"{display}（客户原话：{source[:100]}）的数量写的是"
+                    f"{display}（清洗后配置：{source[:100]}）的数量写的是"
                     f"“{vague_count.group(0).strip()}”，请确认具体数量。"
                 )
 
@@ -9337,7 +10196,7 @@ evidence 必须逐字来自客户原话。"""
             ),
         }
         questions: list[str] = []
-        for item in parsed.services:
+        for component_index, item in enumerate(parsed.services):
             service = DeepSeekIntentParser._service_key(item.service)
             for field, question in required_choices.get(service, ()):
                 value = item.requirements.get(field)
@@ -9362,7 +10221,7 @@ evidence 必须逐字来自客户原话。"""
                         item.requirements.pop("engine", None)
                         value = None
                 if value is None or (isinstance(value, str) and not value.strip()):
-                    questions.append(question)
+                    questions.append(f"【组件 {component_index + 1}】{question}")
         parsed.ambiguities = list(dict.fromkeys([*parsed.ambiguities, *questions]))
 
     @staticmethod
@@ -9371,13 +10230,26 @@ evidence 必须逐字来自客户原话。"""
 
         source = text.casefold()
         indexed = list(enumerate(parsed.services))
-        indexed.sort(
-            key=lambda pair: (
-                source.find(pair[1].source_text.casefold())
-                if pair[1].source_text and source.find(pair[1].source_text.casefold()) >= 0
-                else len(source) + pair[0]
+
+        def source_position(pair: tuple[int, ServiceRequirement]) -> tuple[int, int]:
+            original_index, component = pair
+            # ``source_text`` may be the AI-standardized sentence and therefore
+            # no longer occur verbatim in the sales request.  The immutable
+            # owner slice is the authoritative ordering key.  Derived siblings
+            # may share one slice, so the pre-sort index remains the stable
+            # tie-breaker instead of inventing a product-specific order.
+            candidates = (
+                str(component.original_source_text or "").strip(),
+                str(component.source_text or "").strip(),
             )
-        )
+            positions = [
+                source.find(candidate.casefold())
+                for candidate in candidates
+                if candidate and source.find(candidate.casefold()) >= 0
+            ]
+            return (min(positions) if positions else len(source) + original_index, original_index)
+
+        indexed.sort(key=source_position)
         parsed.services = [item for _, item in indexed]
 
     @staticmethod
@@ -9435,12 +10307,34 @@ evidence 必须逐字来自客户原话。"""
         """
 
         def gib(value: str, unit: str) -> float:
-            number = float(value)
-            return number * 1024 if unit.lower() in {"tb", "tib", "t"} else number
+            number = float(value.replace(",", ""))
+            normalized_unit = unit.casefold()
+            if normalized_unit in {"pb", "pib", "p"}:
+                return number * 1024 * 1024
+            if normalized_unit in {"tb", "tib", "t"}:
+                return number * 1024
+            return number
 
         def first(pattern: str, source: str) -> float | None:
-            match = re.search(pattern, source, flags=re.IGNORECASE)
-            return gib(match.group(1), match.group(2)) if match else None
+            for match in re.finditer(pattern, source, flags=re.IGNORECASE):
+                # Capacity numbers must be standalone literals.  AWS model
+                # names, region codes and product identifiers contain compact
+                # number/unit-looking fragments (for example ``r6g`` in
+                # ``cache.r6g.xlarge``).  Accepting a match that starts or
+                # ends inside such an identifier can overwrite a correctly
+                # extracted customer value with the generation number of the
+                # SKU.  Keep this guard in the shared capacity reader so every
+                # current and future component gets the same protection.
+                number_start = match.start(1)
+                unit_end = match.end(2)
+                before = source[number_start - 1] if number_start > 0 else ""
+                after = source[unit_end] if unit_end < len(source) else ""
+                if before and re.match(r"[A-Za-z0-9._-]", before):
+                    continue
+                if after and re.match(r"[A-Za-z0-9._-]", after):
+                    continue
+                return gib(match.group(1), match.group(2))
+            return None
 
         chinese_digits = {
             "零": 0,
@@ -9555,13 +10449,35 @@ evidence 必须逐字来自客户原话。"""
                     multiplier = {
                         "万": 10_000,
                         "亿": 100_000_000,
-                    }.get(match.group(2), 1)
+                        "thousand": 1_000,
+                        "million": 1_000_000,
+                        "billion": 1_000_000_000,
+                    }.get((match.group(2) or "").casefold(), 1)
                     return float(match.group(1)) * multiplier, scoped_clause(match)
 
             # A bare request total is still valid when the component does not
             # describe a per-second/minute/hour rate.  This supports compact
             # forms such as ``requests: 50000000`` without turning 1000 RPS
             # into a fabricated monthly total.
+            english_monthly = re.search(
+                r"(\d[\d,]*(?:\.\d+)?)\s*"
+                r"(thousand|million|billion)?\s*"
+                r"(?:requests?|invocations?|calls?)\s*"
+                r"(?:per\s+month|monthly)",
+                source,
+                re.I,
+            )
+            if english_monthly:
+                return (
+                    float(english_monthly.group(1).replace(",", ""))
+                    * {
+                        "thousand": 1_000,
+                        "million": 1_000_000,
+                        "billion": 1_000_000_000,
+                    }.get((english_monthly.group(2) or "").casefold(), 1),
+                    scoped_clause(english_monthly),
+                )
+
             if re.search(
                 r"(?:每秒|每分钟|每分|每小时|/\s*(?:s|sec|秒|分钟|小时)|\brps\b)",
                 source,
@@ -9575,8 +10491,24 @@ evidence 必须逐字来自客户原话。"""
                 re.I,
             )
             if not match:
-                return None
-            multiplier = {"万": 10_000, "亿": 100_000_000}.get(match.group(2), 1)
+                bare_monthly = list(
+                    re.finditer(
+                        r"(?:每月|月度|月均)\s*(?:总|合计)?\s*"
+                        r"(\d+(?:\.\d+)?)\s*(万|亿)?\s*次",
+                        source,
+                        re.I,
+                    )
+                )
+                if len(bare_monthly) != 1:
+                    return None
+                match = bare_monthly[0]
+            multiplier = {
+                "万": 10_000,
+                "亿": 100_000_000,
+                "thousand": 1_000,
+                "million": 1_000_000,
+                "billion": 1_000_000_000,
+            }.get((match.group(2) or "").casefold(), 1)
             return float(match.group(1)) * multiplier, scoped_clause(match)
 
         def scaled_number(value: str, magnitude: str | None) -> float:
@@ -9585,7 +10517,10 @@ evidence 必须逐字来自客户原话。"""
             return float(value.replace(",", "")) * {
                 "万": 10_000,
                 "亿": 100_000_000,
-            }.get(magnitude or "", 1)
+                "thousand": 1_000,
+                "million": 1_000_000,
+                "billion": 1_000_000_000,
+            }.get((magnitude or "").casefold(), 1)
 
         for item in parsed.services:
             # Literal recovery repairs AI/cache omissions, but it is older than
@@ -9661,6 +10596,13 @@ evidence 必须逐字来自客户原话。"""
             # brokers and search nodes all understand the same compact sales
             # wording, including an unambiguous omitted GiB suffix.
             template_fields = set(requirement_fields(service)) | set(extra_fields)
+            # A dynamic official contract can explicitly choose the aggregate
+            # processing-hours meter even when the fixed service template
+            # normally owns transcode minutes.  When both are exposed, the
+            # fixed minute field remains the sole owner of that duration.
+            prefer_processing_hours = (
+                "processing_hours" in extra_fields and "transcode_minutes" not in extra_fields
+            )
             # Task-shaped services share one literal contract regardless of
             # whether their public name is ECS, Fargate, Batch or a future
             # product.  The component template, not a product-name branch,
@@ -9703,7 +10645,8 @@ evidence 必须逐字来自客户原话。"""
                     lock(item, "task_memory_gib", task_memory_match.group(0))
 
             task_hours_match = re.search(
-                r"(?:每月|月度|月均)\s*(?:运行|使用|执行)?\s*"
+                r"(?:每月|月度|月均|月(?=\s*(?:运行|使用|执行)))\s*"
+                r"(?:运行|使用|执行)?\s*"
                 r"(\d+(?:\.\d+)?)\s*小时",
                 source,
                 re.I,
@@ -9720,7 +10663,7 @@ evidence 必须逐字来自客户原话。"""
             # excluded so 5,000 processing hours cannot be mistaken for more
             # than the 744 wall-clock hours in a month.
             monthly_runtime_match = re.search(
-                r"(?:每月|月度|月均)\s*"
+                r"(?:每月|月度|月均|月(?=\s*(?:运行|使用|执行|持续|工作|在线)))\s*"
                 r"(?:运行|使用|执行|持续|工作|在线)(?:时间|时长)?\s*"
                 r"[:：]?\s*(\d+(?:\.\d+)?)\s*小时",
                 source,
@@ -9757,9 +10700,7 @@ evidence 必须逐字来自客户原话。"""
                     lock(item, "product_variant", variant_evidence.group(0))
                 elif re.search(r"(?:for\s*)?influx\s*db|influxdb", source, re.I):
                     requirements["product_variant"] = "influxdb"
-                    variant_evidence = re.search(
-                        r"(?:for\s*)?influx\s*db|influxdb", source, re.I
-                    )
+                    variant_evidence = re.search(r"(?:for\s*)?influx\s*db|influxdb", source, re.I)
                     assert variant_evidence is not None
                     lock(item, "product_variant", variant_evidence.group(0))
 
@@ -9784,6 +10725,79 @@ evidence 必须逐字来自客户原话。"""
                         requirements["file_system_type"] = normalized_type
                         lock(item, "file_system_type", type_match.group(0))
                         break
+
+            if "route53_type" in template_fields:
+                resolver_match = re.search(
+                    r"route\s*53\s+resolver|resolver\s+(?:endpoint|端点)|"
+                    r"(?:入站|出站|inbound|outbound)[^。；,，\n]{0,16}(?:endpoint|端点)",
+                    source,
+                    re.I,
+                )
+                if resolver_match:
+                    requirements["route53_type"] = "resolver"
+                    lock(item, "route53_type", resolver_match.group(0))
+
+            if "gateway_type" in template_fields:
+                gateway_types = (
+                    ("file_gateway", r"file\s+gateway|文件网关"),
+                    ("volume_gateway", r"volume\s+gateway|卷网关"),
+                    ("tape_gateway", r"tape\s+gateway|磁带网关"),
+                )
+                for gateway_type, pattern in gateway_types:
+                    gateway_match = re.search(pattern, source, re.I)
+                    if gateway_match:
+                        requirements["gateway_type"] = gateway_type
+                        lock(item, "gateway_type", gateway_match.group(0))
+                        break
+
+            if "protocol" in template_fields:
+                protocol_match = re.search(
+                    r"(?<![a-z0-9])(sftp|ftps|ftp|as2)(?![a-z0-9])",
+                    source,
+                    re.I,
+                )
+                if protocol_match:
+                    requirements["protocol"] = protocol_match.group(1).casefold()
+                    lock(item, "protocol", protocol_match.group(0))
+
+            if "storage_backend" in template_fields:
+                backend_match = re.search(
+                    r"(?<![a-z0-9])(s3|efs)(?![a-z0-9])",
+                    source,
+                    re.I,
+                )
+                if backend_match:
+                    requirements["storage_backend"] = backend_match.group(1).casefold()
+                    lock(item, "storage_backend", backend_match.group(0))
+
+            if "transfer_direction" in template_fields:
+                direction_match = re.search(
+                    r"上传|传入|upload|inbound|下载|传出|download|outbound",
+                    source,
+                    re.I,
+                )
+                if direction_match:
+                    requirements["transfer_direction"] = (
+                        "download"
+                        if re.search(
+                            r"下载|传出|download|outbound",
+                            direction_match.group(0),
+                            re.I,
+                        )
+                        else "upload"
+                    )
+                    lock(item, "transfer_direction", direction_match.group(0))
+
+            if "endpoint_type" in template_fields:
+                interface_endpoint_match = re.search(
+                    r"interface\s+vpc\s+endpoint|vpc\s+interface\s+endpoint|"
+                    r"(?:aws\s+)?private\s*link|接口型\s*(?:vpc\s*)?端点",
+                    source,
+                    re.I,
+                )
+                if interface_endpoint_match:
+                    requirements["endpoint_type"] = "interface"
+                    lock(item, "endpoint_type", interface_endpoint_match.group(0))
 
             deployment_match = re.search(r"multi[\s_-]*az|多可用区", source, re.I)
             single_az_match = re.search(r"single[\s_-]*az|单可用区", source, re.I)
@@ -9830,6 +10844,31 @@ evidence 必须逐字来自客户原话。"""
             # prompt or maintaining one-off regexes per adapter.
             if "requests" in template_fields:
                 explicit_requests = monthly_request_count(source)
+                if explicit_requests is None:
+                    publish_match = re.search(
+                        r"(?:每月|月度|月均)?\s*(?:publish|发布)"
+                        r"(?:\s*(?:api)?\s*(?:请求|调用|requests?))?\s*[:：]?\s*"
+                        r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次|个)?|"
+                        r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次|个)?\s*"
+                        r"(?:publish|发布)(?:\s*(?:api)?\s*(?:请求|调用|requests?))?",
+                        source,
+                        re.I,
+                    )
+                    if publish_match:
+                        if publish_match.group(1) is not None:
+                            raw_value, magnitude = (
+                                publish_match.group(1),
+                                publish_match.group(2),
+                            )
+                        else:
+                            raw_value, magnitude = (
+                                publish_match.group(3),
+                                publish_match.group(4),
+                            )
+                        explicit_requests = (
+                            scaled_number(raw_value, magnitude),
+                            publish_match.group(0),
+                        )
                 if explicit_requests is None and re.search(r"graphql|api", source, re.I):
                     operation_match = re.search(
                         r"(?:每月|月度|月均)?\s*"
@@ -9841,15 +10880,479 @@ evidence 必须逐字来自客户原话。"""
                     )
                     if operation_match:
                         explicit_requests = (
-                            scaled_number(
-                                operation_match.group(1), operation_match.group(2)
-                            ),
+                            scaled_number(operation_match.group(1), operation_match.group(2)),
                             operation_match.group(0),
                         )
                 if explicit_requests is not None:
                     request_count, evidence = explicit_requests
                     requirements["requests"] = request_count
                     lock(item, "requests", evidence)
+
+            if "topic_type" in template_fields:
+                topic_type_match = re.search(
+                    r"(?<![a-z0-9])(fifo|standard)(?:\s+(?:topic|主题))?"
+                    r"(?![a-z0-9])",
+                    source,
+                    re.I,
+                )
+                if topic_type_match:
+                    requirements["topic_type"] = topic_type_match.group(1).casefold()
+                    lock(item, "topic_type", topic_type_match.group(0))
+
+            if "deliveries" in template_fields:
+                delivery_match = re.search(
+                    r"(?:向[^。；,，\n]{0,20})?(?:投递|推送|deliver(?:y|ies|ed)?)"
+                    r"(?:量|数量|次数)?\s*[:：]?\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次|条|个)?|"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次|条|个)?\s*"
+                    r"(?:通知)?(?:投递|推送|deliver(?:y|ies|ed)?)",
+                    source,
+                    re.I,
+                )
+                if delivery_match:
+                    if delivery_match.group(1) is not None:
+                        raw_value, magnitude = (
+                            delivery_match.group(1),
+                            delivery_match.group(2),
+                        )
+                    else:
+                        raw_value, magnitude = (
+                            delivery_match.group(3),
+                            delivery_match.group(4),
+                        )
+                    requirements["deliveries"] = scaled_number(raw_value, magnitude)
+                    lock(item, "deliveries", delivery_match.group(0))
+
+            if "schedules" in template_fields:
+                schedules_match = re.search(
+                    r"(?:维护|配置|创建|包含)?\s*"
+                    r"(\d[\d,]*)\s*(?:个|项|条)?\s*(?:schedules?|计划任务)|"
+                    r"(?:schedules?|计划任务)(?:数量|数)?\s*[:：]?\s*(\d[\d,]*)",
+                    source,
+                    re.I,
+                )
+                if schedules_match:
+                    raw_count = next(
+                        group for group in schedules_match.groups() if group is not None
+                    )
+                    requirements["schedules"] = int(raw_count.replace(",", ""))
+                    lock(item, "schedules", schedules_match.group(0))
+
+            if "scheduled_invocations" in template_fields:
+                scheduled_match = re.search(
+                    r"(?:每月|月度|月均)?\s*(?:触发|调用|执行)"
+                    r"(?:量|次数)?\s*[:：]?\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次|个)?|"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次|个)?\s*"
+                    r"(?:定时)?(?:触发|调用|执行)",
+                    source,
+                    re.I,
+                )
+                if scheduled_match:
+                    if scheduled_match.group(1) is not None:
+                        raw_value, magnitude = (
+                            scheduled_match.group(1),
+                            scheduled_match.group(2),
+                        )
+                    else:
+                        raw_value, magnitude = (
+                            scheduled_match.group(3),
+                            scheduled_match.group(4),
+                        )
+                    requirements["scheduled_invocations"] = scaled_number(
+                        raw_value,
+                        magnitude,
+                    )
+                    lock(
+                        item,
+                        "scheduled_invocations",
+                        scheduled_match.group(0),
+                    )
+
+            if "build_minutes" in template_fields:
+                build_minutes_match = re.search(
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*"
+                    r"(?:个|次)?\s*(?:build|构建)\s*(?:时长|duration)?\s*"
+                    r"(?:minutes?|mins?|分钟)|"
+                    r"(?:每月|月度|月均)?[^。；,，\n]{0,12}?"
+                    r"(?:build|构建)(?:\s*(?:时长|duration))?\s*[:：]?\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*"
+                    r"(?:minutes?|mins?|分钟)",
+                    source,
+                    re.I,
+                )
+                if build_minutes_match:
+                    if build_minutes_match.group(1) is not None:
+                        raw_value, magnitude = (
+                            build_minutes_match.group(1),
+                            build_minutes_match.group(2),
+                        )
+                    else:
+                        raw_value, magnitude = (
+                            build_minutes_match.group(3),
+                            build_minutes_match.group(4),
+                        )
+                    requirements["build_minutes"] = scaled_number(raw_value, magnitude)
+                    # Generic discovery used to classify every value followed
+                    # by “分钟” as audio. The product template is authoritative.
+                    requirements.pop("audio_minutes", None)
+                    lock(item, "build_minutes", build_minutes_match.group(0))
+
+            if "compute_type" in template_fields:
+                compute_type_match = re.search(
+                    r"(?<![a-z0-9])(?:general1|arm1|g1)[._-]"
+                    r"(small|medium|large|xlarge|2xlarge)(?![a-z0-9])",
+                    source,
+                    re.I,
+                )
+                if compute_type_match:
+                    requirements["compute_type"] = f"g1.{compute_type_match.group(1).casefold()}"
+                    lock(item, "compute_type", compute_type_match.group(0))
+
+            if "pipeline_type" in template_fields:
+                pipeline_type_match = re.search(
+                    r"(?<![a-z0-9])v([12])(?:\s*(?:类型|型|pipeline))?"
+                    r"(?![a-z0-9])",
+                    source,
+                    re.I,
+                )
+                if pipeline_type_match:
+                    requirements["pipeline_type"] = f"v{pipeline_type_match.group(1)}"
+                    lock(item, "pipeline_type", pipeline_type_match.group(0))
+
+            if "action_execution_minutes" in template_fields:
+                action_minutes_match = re.search(
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:个|次)?\s*"
+                    r"action\s+executions?\s+(?:minutes?|mins?)|"
+                    r"action\s+executions?\s+(?:minutes?|mins?)\s*[:：]?\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?",
+                    source,
+                    re.I,
+                )
+                if action_minutes_match:
+                    if action_minutes_match.group(1) is not None:
+                        raw_value, magnitude = (
+                            action_minutes_match.group(1),
+                            action_minutes_match.group(2),
+                        )
+                    else:
+                        raw_value, magnitude = (
+                            action_minutes_match.group(3),
+                            action_minutes_match.group(4),
+                        )
+                    requirements["action_execution_minutes"] = scaled_number(raw_value, magnitude)
+                    requirements.pop("scheduled_invocations", None)
+                    lock(
+                        item,
+                        "action_execution_minutes",
+                        action_minutes_match.group(0),
+                    )
+
+            if "resource_handler_operations" in template_fields:
+                resource_handler_match = re.search(
+                    r"(?:每月|月度|月均)?\s*(?:调用|执行|处理)?\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次|个)?\s*"
+                    r"(?:第三方\s*)?(?:资源\s*)?handler\s+operations?|"
+                    r"(?:第三方\s*)?(?:资源\s*)?handler\s+operations?\s*"
+                    r"[:：]?\s*(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?",
+                    source,
+                    re.I,
+                )
+                if resource_handler_match:
+                    if resource_handler_match.group(1) is not None:
+                        raw_value, magnitude = (
+                            resource_handler_match.group(1),
+                            resource_handler_match.group(2),
+                        )
+                    else:
+                        raw_value, magnitude = (
+                            resource_handler_match.group(3),
+                            resource_handler_match.group(4),
+                        )
+                    requirements["resource_handler_operations"] = scaled_number(
+                        raw_value, magnitude
+                    )
+                    requirements.pop("requests", None)
+                    requirements.pop("scheduled_invocations", None)
+                    lock(
+                        item,
+                        "resource_handler_operations",
+                        resource_handler_match.group(0),
+                    )
+
+            devsecops_count_contracts = (
+                (
+                    "ec2_instances",
+                    r"(\d[\d,]*)\s*(?:台|个|份)?\s*(?:ec2|云服务器)(?:实例)?",
+                ),
+                (
+                    "ecr_images",
+                    r"(\d[\d,]*)\s*(?:份|个|张)?\s*(?:ecr\s*)?"
+                    r"(?:images?|镜像)",
+                ),
+                (
+                    "lambda_functions",
+                    r"(\d[\d,]*)\s*(?:个|项)?\s*(?:lambda\s*)?"
+                    r"(?:functions?|函数)",
+                ),
+                (
+                    "security_checks",
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次|个)?\s*"
+                    r"(?:security\s+checks?|安全检查)",
+                ),
+                (
+                    "resource_assessments",
+                    r"(?:每月|月度|月均)?\s*(?:评估|assessment)\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:个|项)?\s*"
+                    r"(?:资源|resource)?",
+                ),
+                (
+                    "evidence_items",
+                    r"(?:收集|采集|collect)\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:条|个|项)?\s*"
+                    r"(?:证据|evidence)",
+                ),
+            )
+            for count_field, pattern in devsecops_count_contracts:
+                if count_field not in template_fields:
+                    continue
+                count_match = re.search(pattern, source, re.I)
+                if count_match:
+                    magnitude = (
+                        count_match.group(2)
+                        if count_match.lastindex and count_match.lastindex >= 2
+                        else None
+                    )
+                    requirements[count_field] = scaled_number(count_match.group(1), magnitude)
+                    lock(item, count_field, count_match.group(0))
+
+            # IoT device/fleet quantities are reusable billing facts selected
+            # by the active service template.  Keep each role separate: a
+            # protected device is not a registered Thing, remote action or
+            # metric datapoint merely because all four can appear together.
+            scalar_count_contracts = (
+                (
+                    "device_count",
+                    r"(?:保护|覆盖|连接|纳管|管理)?\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:台|个)?\s*设备|"
+                    r"(?:设备(?:数量|数)?)\s*[:：]?\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?",
+                ),
+                (
+                    "things_registered",
+                    r"(?:登记|注册|register(?:ed|ing)?)\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:个|项)?\s*things?|"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:个|项)?\s*"
+                    r"(?:已登记|已注册)?\s*things?",
+                ),
+                (
+                    "remote_actions",
+                    r"(?:下发|执行|运行)?\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次|个)?\s*"
+                    r"remote\s+actions?|"
+                    r"remote\s+actions?(?:数量|次数)?\s*[:：]?\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?",
+                ),
+                (
+                    "metric_datapoints",
+                    r"(?:分析|检测|处理)?\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:个|条|次)?\s*"
+                    r"metric\s+data\s*points?|"
+                    r"metric\s+data\s*points?(?:数量|数)?\s*[:：]?\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?",
+                ),
+            )
+            for count_field, pattern in scalar_count_contracts:
+                if count_field not in template_fields:
+                    continue
+                count_match = re.search(pattern, source, re.I)
+                if not count_match:
+                    continue
+                groups = count_match.groups()
+                raw_index = 0 if groups[0] is not None else 2
+                requirements[count_field] = scaled_number(groups[raw_index], groups[raw_index + 1])
+                lock(item, count_field, count_match.group(0))
+
+            payload_size_field = next(
+                (
+                    field
+                    for field in ("message_size_kib", "payload_size_kib")
+                    if field in template_fields
+                ),
+                None,
+            )
+            if payload_size_field:
+                message_size_match = re.search(
+                    r"(\d+(?:\.\d+)?)\s*(?:ki?b|kb)\s*(?:的)?\s*"
+                    r"(?:消息|messages?|payload)|"
+                    r"(?:消息(?:大小|尺寸|payload)?|(?:average\s+)?payload(?:\s+size)?)"
+                    r"\s*[:：]?\s*"
+                    r"(\d+(?:\.\d+)?)\s*(?:ki?b|kb)",
+                    source,
+                    re.I,
+                )
+                if message_size_match:
+                    raw_size = next(
+                        group for group in message_size_match.groups() if group is not None
+                    )
+                    requirements[payload_size_field] = float(raw_size)
+                    lock(item, payload_size_field, message_size_match.group(0))
+
+            duration_contracts = (
+                (
+                    "input_channel_hours",
+                    r"(?:输入|input)?\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*channel[ -]?hours?",
+                ),
+                (
+                    "viewer_hours",
+                    r"(?:观众(?:输出|观看)?|viewer)?\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*viewer[ -]?hours?",
+                ),
+                (
+                    "channel_hours",
+                    r"(?:运行|工作)?\s*(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*小时",
+                ),
+                (
+                    "output_hours",
+                    r"(?:outputs?|输出)[^。；,，\n]{0,20}?"
+                    r"(?:运行|工作)?\s*(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*小时",
+                ),
+            )
+            for duration_field, pattern in duration_contracts:
+                if duration_field not in template_fields:
+                    continue
+                duration_match = re.search(pattern, source, re.I)
+                if duration_match:
+                    requirements[duration_field] = scaled_number(
+                        duration_match.group(1), duration_match.group(2)
+                    )
+                    lock(item, duration_field, duration_match.group(0))
+
+            if "output_hours" in template_fields and re.search(
+                r"(?:outputs?|输出)[^。；,，\n]{0,20}?整月运行|整月运行",
+                source,
+                re.I,
+            ):
+                # "整月" is a service-neutral monthly-runtime convention,
+                # not evidence for an AI-invented 744/720 literal. Customer
+                # corrections are restored at the end of this component pass.
+                requirements["output_hours"] = 730
+                output_hours_path = "requirements.output_hours"
+                item.field_sources[output_hours_path] = "system_default"
+                item.field_evidence[output_hours_path] = "整月运行按 730 小时/月"
+                item.locked_fields = [
+                    path for path in item.locked_fields if path != output_hours_path
+                ]
+
+            count_role_contracts = (
+                (
+                    "channel_count",
+                    r"(\d[\d,]*)\s*(?:个|条|路)?\s*"
+                    r"(?:(?:standard|single[ -]?pipeline)\s*)?channels?|"
+                    r"频道(?:数量|数)?\s*[:：]?\s*(\d[\d,]*)",
+                ),
+                (
+                    "output_count",
+                    r"(\d[\d,]*)\s*(?:个|条|路)?\s*(?:outputs?|输出)|"
+                    r"(?:outputs?|输出)(?:数量|数)?\s*[:：]?\s*(\d[\d,]*)",
+                ),
+            )
+            for count_field, pattern in count_role_contracts:
+                if count_field not in template_fields:
+                    continue
+                role_match = re.search(pattern, source, re.I)
+                if role_match:
+                    raw_count = next(group for group in role_match.groups() if group is not None)
+                    requirements[count_field] = int(raw_count.replace(",", ""))
+                    lock(item, count_field, role_match.group(0))
+
+            if "channel_class" in template_fields:
+                channel_class_match = re.search(
+                    r"(?<![a-z0-9])(standard|single[ -]?pipeline)\s*channel|"
+                    r"(?:标准|单管线)频道",
+                    source,
+                    re.I,
+                )
+                if channel_class_match:
+                    requirements["channel_class"] = (
+                        "single_pipeline"
+                        if re.search(r"single|单管线", channel_class_match.group(0), re.I)
+                        else "standard"
+                    )
+                    lock(item, "channel_class", channel_class_match.group(0))
+
+            if "transcode_minutes" in template_fields and not prefer_processing_hours:
+                transcode_match = re.search(
+                    r"(?:每月|月度|月均)?\s*(?:转码|视频处理|video\s+transcod(?:e|ing))"
+                    r"[^\d。；,，\n]{0,12}?(\d[\d,]*(?:\.\d+)?)\s*"
+                    r"(万|亿)?\s*(?:分钟|minutes?|mins?)|"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:分钟|minutes?|mins?)"
+                    r"[^。；,，\n]{0,16}?(?:转码|视频)",
+                    source,
+                    re.I,
+                )
+                if transcode_match:
+                    if transcode_match.group(1) is not None:
+                        raw_value, magnitude = transcode_match.group(1), transcode_match.group(2)
+                    else:
+                        raw_value, magnitude = transcode_match.group(3), transcode_match.group(4)
+                    requirements["transcode_minutes"] = scaled_number(raw_value, magnitude)
+                    requirements.pop("processing_hours", None)
+                    requirements.pop("audio_minutes", None)
+                    lock(item, "transcode_minutes", transcode_match.group(0))
+
+            if "resolution" in template_fields:
+                resolution_match = re.search(
+                    r"(?<![a-z0-9])(8k|4k|uhd|full\s*hd|fhd|hd|sd)(?![a-z0-9])",
+                    source,
+                    re.I,
+                )
+                if resolution_match:
+                    token = re.sub(r"\s+", "", resolution_match.group(1).casefold())
+                    requirements["resolution"] = {
+                        "fullhd": "full_hd",
+                        "fhd": "full_hd",
+                        "uhd": "4k",
+                    }.get(token, token)
+                    lock(item, "resolution", resolution_match.group(0))
+
+            if "operating_system" in template_fields:
+                os_match = re.search(
+                    r"(?<![a-z0-9])(linux|windows)(?![a-z0-9])",
+                    source,
+                    re.I,
+                )
+                if os_match:
+                    requirements["operating_system"] = os_match.group(1).casefold()
+                    lock(item, "operating_system", os_match.group(0))
+
+            if "architecture" in template_fields:
+                architecture_match = re.search(
+                    r"(?<![a-z0-9])"
+                    r"(arm64|aarch64|arm|graviton|x86[_-]?64|amd64|x86)"
+                    r"(?![a-z0-9])",
+                    source,
+                    re.I,
+                )
+                if architecture_match:
+                    architecture_token = architecture_match.group(1).casefold()
+                    requirements["architecture"] = (
+                        "arm64"
+                        if architecture_token in {"arm64", "aarch64", "arm", "graviton"}
+                        else "x86_64"
+                    )
+                    lock(item, "architecture", architecture_match.group(0))
+
+            if "port_speed_gbps" in template_fields:
+                port_speed_match = re.search(
+                    r"(\d+(?:\.\d+)?)\s*g(?:iga)?(?:bit)?(?:/\s*s|bps)",
+                    source,
+                    re.I,
+                )
+                if port_speed_match:
+                    requirements["port_speed_gbps"] = float(port_speed_match.group(1))
+                    lock(item, "port_speed_gbps", port_speed_match.group(0))
 
             # Unknown/new AWS services still share a small set of literal
             # pricing facts.  Recover them before any service adapter runs so
@@ -9868,9 +11371,7 @@ evidence 必须逐字来自客户原话。"""
                 re.I,
             )
             if user_count_match and "user_count" in template_fields:
-                multiplier = {"万": 10_000, "亿": 100_000_000}.get(
-                    user_count_match.group(2), 1
-                )
+                multiplier = {"万": 10_000, "亿": 100_000_000}.get(user_count_match.group(2), 1)
                 requirements["user_count"] = float(user_count_match.group(1)) * multiplier
                 lock(item, "user_count", user_count_match.group(0))
 
@@ -9882,19 +11383,57 @@ evidence 必须逐字来自客户原话。"""
                 re.I,
             )
             if per_user_hours_match and "hours_per_user_per_day" in template_fields:
-                requirements["hours_per_user_per_day"] = float(
-                    per_user_hours_match.group(1)
-                )
+                requirements["hours_per_user_per_day"] = float(per_user_hours_match.group(1))
                 lock(item, "hours_per_user_per_day", per_user_hours_match.group(0))
+
+            per_user_monthly_hours_match = re.search(
+                r"(?:每月\s*每(?:个)?(?:用户|人)|每(?:个)?(?:用户|人)\s*每月)\s*"
+                r"(?:使用|运行|在线|工作)?\s*(?:约|大约|预计)?\s*"
+                r"(\d+(?:\.\d+)?)\s*(?:个)?小时",
+                source,
+                re.I,
+            ) or re.search(
+                r"(\d+(?:\.\d+)?)\s*hours?\s*per\s*"
+                r"(?:user|person)\s*per\s*month",
+                source,
+                re.I,
+            )
+            if per_user_monthly_hours_match and "hours_per_user_per_month" in template_fields:
+                requirements["hours_per_user_per_month"] = float(
+                    per_user_monthly_hours_match.group(1)
+                )
+                lock(
+                    item,
+                    "hours_per_user_per_month",
+                    per_user_monthly_hours_match.group(0),
+                )
+
+            mailbox_count_match = re.search(
+                r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:个|名)?\s*"
+                r"(?:邮箱(?:账户|账号)|mailboxes?|mail\s+accounts?)",
+                source,
+                re.I,
+            ) or re.search(
+                r"(?:邮箱(?:账户|账号)(?:数量|数)?|mailboxes?|mail\s+accounts?)"
+                r"\s*(?:约|大约|预计|为|[:：])?\s*"
+                r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?",
+                source,
+                re.I,
+            )
+            if mailbox_count_match and "user_count" in template_fields:
+                requirements["user_count"] = scaled_number(
+                    mailbox_count_match.group(1), mailbox_count_match.group(2)
+                )
+                lock(item, "user_count", mailbox_count_match.group(0))
 
             def labelled_volume(label: str) -> tuple[float, str] | None:
                 match = re.search(
                     rf"(?:{label})\s*[:：]?\s*(?:约|大约|预计)?\s*"
-                    r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tib|tb|t)",
+                    r"(\d+(?:\.\d+)?)\s*(pib|pb|p|tib|tb|t|gib|gi?b|gb|g)",
                     source,
                     re.I,
                 ) or re.search(
-                    r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tib|tb|t)\s*"
+                    r"(\d+(?:\.\d+)?)\s*(pib|pb|p|tib|tb|t|gib|gi?b|gb|g)\s*"
                     rf"(?:的)?\s*(?:{label})",
                     source,
                     re.I,
@@ -9957,6 +11496,33 @@ evidence 必须逐字来自客户原话。"""
                     )
                     lock(item, "object_count", object_match.group(0))
 
+            if "attachments" in template_fields:
+                attachment_match = re.search(
+                    r"(\d[\d,]*)\s*(?:个|条)?\s*"
+                    r"(?:(vpc|direct\s*connect|vpn|peering|connect)\s*)?"
+                    r"attachments?",
+                    source,
+                    re.I,
+                ) or re.search(
+                    r"(?:attachments?|挂载)(?:数量|数)?\s*[:：]?\s*"
+                    r"(\d[\d,]*)",
+                    source,
+                    re.I,
+                )
+                if attachment_match:
+                    requirements["attachments"] = int(attachment_match.group(1).replace(",", ""))
+                    lock(item, "attachments", attachment_match.group(0))
+                    explicit_type = (
+                        attachment_match.group(2)
+                        if attachment_match.lastindex and attachment_match.lastindex >= 2
+                        else None
+                    )
+                    if explicit_type:
+                        requirements["attachment_type"] = re.sub(
+                            r"[^a-z0-9]", "", explicit_type.casefold()
+                        )
+                        lock(item, "attachment_type", explicit_type)
+
             if {"processed_bytes_gib", "data_processed_gib"} & template_fields:
                 processed_volume = labelled_volume(
                     r"每月(?:共|合计)?处理(?:数据|流量|容量)?|"
@@ -10006,6 +11572,48 @@ evidence 必须逐字来自客户原话。"""
                     requirements["log_ingestion_gib"] = log_ingestion[0]
                     lock(item, "log_ingestion_gib", log_ingestion[1])
 
+            if "log_delivery_to_s3_gib" in template_fields:
+                delivery_to_s3 = labelled_volume(
+                    r"(?:vpc\s*)?flow\s*logs?[^。；,，\n]{0,24}(?:投递|发送|写入|保存)?"
+                    r"(?:到|至)?\s*s3(?:的)?(?:数据|日志|流量|写入量)?|"
+                    r"(?:投递|发送|写入|保存)(?:到|至)\s*s3(?:的)?(?:数据|日志|流量|写入量)?"
+                )
+                if delivery_to_s3 is None and re.search(
+                    r"vpc\s*flow\s*logs?[^。；\n]{0,24}s3",
+                    source,
+                    re.I,
+                ):
+                    delivery_to_s3 = labelled_volume(r"vpc\s*flow\s*logs?\s*[+＋/&和与]\s*s3")
+                if delivery_to_s3 is None and re.search(
+                    r"vpc\s*flow\s*logs?\s*[+＋/&和与]\s*s3",
+                    source,
+                    re.I,
+                ):
+                    unlabeled_delivery = re.search(
+                        r"[：:]\s*(\d+(?:\.\d+)?)\s*"
+                        r"(pib|pb|p|tib|tb|t|gib|gi?b|gb|g)(?:\s*/\s*月)?",
+                        source,
+                        re.I,
+                    )
+                    if unlabeled_delivery:
+                        delivery_to_s3 = (
+                            gib(unlabeled_delivery.group(1), unlabeled_delivery.group(2)),
+                            unlabeled_delivery.group(0).lstrip("：:").strip(),
+                        )
+                if delivery_to_s3 is not None:
+                    requirements["log_delivery_to_s3_gib"] = delivery_to_s3[0]
+                    requirements["log_destination"] = "s3"
+                    requirements["include_logs"] = True
+                    lock(item, "log_delivery_to_s3_gib", delivery_to_s3[1])
+                    destination_evidence = re.search(
+                        r"vpc\s*flow\s*logs?[^。；\n]{0,24}s3",
+                        source,
+                        re.I,
+                    )
+                    if destination_evidence:
+                        lock(item, "log_destination", destination_evidence.group(0))
+                        lock(item, "include_logs", destination_evidence.group(0))
+
             if "log_storage_gib" in template_fields:
                 log_storage = labelled_volume(
                     r"日志(?:存储|留存|归档)(?:容量|量)?|"
@@ -10023,9 +11631,7 @@ evidence 必须逐字来自客户原话。"""
                     re.I,
                 )
                 if log_retention:
-                    requirements["log_retention_days"] = int(
-                        float(log_retention.group(1))
-                    )
+                    requirements["log_retention_days"] = int(float(log_retention.group(1)))
                     lock(item, "log_retention_days", log_retention.group(0))
 
             if "data_in_gib" in template_fields:
@@ -10033,6 +11639,7 @@ evidence 必须逐字来自客户原话。"""
                     r"每月(?:共|合计)?(?:写入|摄取|摄入|导入|流入)(?:数据|流量)?(?:量)?|"
                     r"(?:写入|摄取|摄入|导入|流入)(?:数据|流量)?(?:量)?|"
                     r"数据(?:写入|摄取|摄入|导入|流入)量|"
+                    r"(?:每月|月度|月均)?\s*ingest(?:ion)?|"
                     r"monthly\s+(?:data\s+)?(?:ingest|ingestion|input|written)"
                 )
                 if incoming_volume is not None:
@@ -10065,17 +11672,121 @@ evidence 必须逐字来自客户原话。"""
                     r"[:：]?\s*(\d+)\s*(?:个|台)?|"
                     r"(\d+)\s*(?:个|台)\s*(?:复制实例|replication\s+instances?)",
                 ),
+                (
+                    "connection_count",
+                    r"(?:部署|配置|包含|使用|需要)?\s*(\d+)\s*(?:个|条|路)?\s*"
+                    r"(?:\d+(?:\.\d+)?\s*g(?:iga)?(?:bit)?(?:/\s*s|bps)\s*)?"
+                    r"(?:专线|连接|connections?)|"
+                    r"(?:专线|连接|connections?)(?:数量|数)?\s*[:：]?\s*(\d+)",
+                ),
+                (
+                    "resolver_endpoints",
+                    r"(?:部署|配置|包含|使用)?\s*(\d+)\s*(?:个|条)?\s*"
+                    r"(?:(?:入站|出站|inbound|outbound)\s*[/／、和与]?\s*)*"
+                    r"(?:resolver\s*)?(?:endpoints?|端点)|"
+                    r"(?:resolver\s*)?(?:endpoints?|端点)(?:数量|数)?\s*[:：]?\s*(\d+)",
+                ),
             )
             for count_field, pattern in count_contracts:
                 if count_field not in template_fields:
                     continue
+                if (
+                    count_field == "resolver_endpoints"
+                    and requirements.get("route53_type") != "resolver"
+                ):
+                    continue
                 count_match = re.search(pattern, source, re.I)
                 if count_match:
-                    count_value = next(
-                        group for group in count_match.groups() if group is not None
-                    )
+                    count_value = next(group for group in count_match.groups() if group is not None)
                     requirements[count_field] = int(count_value)
                     lock(item, count_field, count_match.group(0))
+
+            if "service_instances" in template_fields:
+                service_instance_match = re.search(
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(?:个|项|条)?\s*"
+                    r"(?:已注册的?\s*)?(?:服务\s*)?(?:实例|resources?)|"
+                    r"(?:服务\s*)?(?:实例|resources?)(?:数量|数)?\s*[:：]?\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)",
+                    source,
+                    re.I,
+                )
+                if service_instance_match:
+                    raw_value = next(
+                        group for group in service_instance_match.groups() if group is not None
+                    )
+                    requirements["service_instances"] = float(raw_value.replace(",", ""))
+                    if requirements["service_instances"].is_integer():
+                        requirements["service_instances"] = int(requirements["service_instances"])
+                    lock(
+                        item,
+                        "service_instances",
+                        service_instance_match.group(0),
+                    )
+
+            discovery_api_match = None
+            if "api_calls" in template_fields:
+                discovery_api_match = re.search(
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次|个)?\s*"
+                    r"(?:服务\s*)?(?:发现|查找|检索|lookup|discovery)\s*"
+                    r"(?:api\s*)?(?:查询|请求|调用|queries?|requests?|calls?)",
+                    source,
+                    re.I,
+                )
+                if discovery_api_match:
+                    requirements["api_calls"] = scaled_number(
+                        discovery_api_match.group(1),
+                        discovery_api_match.group(2),
+                    )
+                    lock(item, "api_calls", discovery_api_match.group(0))
+                else:
+                    api_call_match = re.search(
+                        r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次|个)?\s*"
+                        r"api\s*(?:请求|调用|requests?|calls?)|"
+                        r"(?:每月|月度|月均)?\s*(?:调用|请求|执行|发起)?\s*"
+                        r"api\s*(?:请求|调用|requests?|calls?)?\s*[:：]?\s*"
+                        r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次|个)?",
+                        source,
+                        re.I,
+                    )
+                    if api_call_match:
+                        if api_call_match.group(1) is not None:
+                            raw_value, magnitude = (
+                                api_call_match.group(1),
+                                api_call_match.group(2),
+                            )
+                        else:
+                            raw_value, magnitude = (
+                                api_call_match.group(3),
+                                api_call_match.group(4),
+                            )
+                        requirements["api_calls"] = scaled_number(
+                            raw_value,
+                            magnitude,
+                        )
+                        lock(item, "api_calls", api_call_match.group(0))
+
+            if "dns_queries" in template_fields and discovery_api_match is None:
+                dns_query_match = re.search(
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次|个)?\s*"
+                    r"(?:dns\s*)?(?:查询|queries?)|"
+                    r"(?:dns\s*)?(?:查询|queries?)(?:量|数|次数)?\s*[:：]?\s*"
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?",
+                    source,
+                    re.I,
+                )
+                if dns_query_match:
+                    if dns_query_match.group(1) is not None:
+                        raw_value, magnitude = (
+                            dns_query_match.group(1),
+                            dns_query_match.group(2),
+                        )
+                    else:
+                        raw_value, magnitude = (
+                            dns_query_match.group(3),
+                            dns_query_match.group(4),
+                        )
+                    requirements["dns_queries"] = scaled_number(raw_value, magnitude)
+                    lock(item, "dns_queries", dns_query_match.group(0))
 
             if "write_records" in template_fields:
                 record_match = re.search(
@@ -10141,14 +11852,54 @@ evidence 必须逐字来自客户原话。"""
 
             if "data_out_gib" in template_fields:
                 outgoing_volume = labelled_volume(
-                    r"每月(?:共|合计)?(?:读取|读出|检索|消费)(?:数据|流量)?(?:量)?|"
-                    r"(?:读取|读出|检索|消费)(?:数据|流量)?(?:量)?|"
-                    r"数据(?:读取|读出|检索|消费)量|"
+                    r"每月(?:共|合计)?(?:读取|读出|检索|消费|输出|向外传送|传送)(?:数据|流量)?(?:量)?|"
+                    r"(?:读取|读出|检索|消费|输出|向外传送|传送)(?:数据|流量)?(?:量)?|"
+                    r"数据(?:读取|读出|检索|消费|输出|传送)量|"
                     r"monthly\s+(?:data\s+)?(?:read|retrieval|output|consumed)"
                 )
                 if outgoing_volume is not None:
                     requirements["data_out_gib"] = outgoing_volume[0]
                     lock(item, "data_out_gib", outgoing_volume[1])
+
+            # Managed AI services expose customer-friendly document, text,
+            # image and audio units that are neither requests nor generic
+            # resource counts. Keep the reusable unit contract here so every
+            # product profile can opt in without a service-name parser patch.
+            scalar_unit_contracts = (
+                (
+                    "document_pages",
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*页(?:文档|文件)?",
+                ),
+                (
+                    "characters",
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:个)?字符",
+                ),
+                (
+                    "images",
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:张|幅|个)?\s*"
+                    r"(?:图片|图像|照片)",
+                ),
+                (
+                    "audio_minutes",
+                    (
+                        r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*分钟\s*"
+                        + (
+                            r"(?:音频|语音|录音)"
+                            if "transcode_minutes" in template_fields
+                            else r"(?:音频|语音|录音)?"
+                        )
+                    ),
+                ),
+            )
+            for scalar_field, pattern in scalar_unit_contracts:
+                if scalar_field not in template_fields:
+                    continue
+                scalar_match = re.search(pattern, source, re.I)
+                if scalar_match:
+                    requirements[scalar_field] = scaled_number(
+                        scalar_match.group(1), scalar_match.group(2)
+                    )
+                    lock(item, scalar_field, scalar_match.group(0))
 
             if "capacity_mode" in template_fields:
                 provisioned_mode = re.search(
@@ -10186,9 +11937,7 @@ evidence 必须逐字来自客户原话。"""
                     re.I,
                 )
                 if backup_retention:
-                    requirements["backup_retention_days"] = int(
-                        float(backup_retention.group(1))
-                    )
+                    requirements["backup_retention_days"] = int(float(backup_retention.group(1)))
                     lock(item, "backup_retention_days", backup_retention.group(0))
 
             if "cross_region_copy_gib" in template_fields:
@@ -10210,9 +11959,7 @@ evidence 必须逐字来自客户原话。"""
                     re.I,
                 )
                 if throughput_match:
-                    requirements["provisioned_throughput_mibps"] = float(
-                        throughput_match.group(1)
-                    )
+                    requirements["provisioned_throughput_mibps"] = float(throughput_match.group(1))
                     requirements["throughput_mode"] = "provisioned"
                     lock(
                         item,
@@ -10220,9 +11967,7 @@ evidence 必须逐字来自客户原话。"""
                         throughput_match.group(0),
                     )
                     item.field_sources["requirements.throughput_mode"] = "system_derived"
-                    item.field_evidence["requirements.throughput_mode"] = (
-                        throughput_match.group(0)
-                    )
+                    item.field_evidence["requirements.throughput_mode"] = throughput_match.group(0)
 
             # Several managed storage products use a plain throughput_mbps
             # field rather than EFS's provisioned_throughput_mibps.  The unit
@@ -10239,9 +11984,7 @@ evidence 必须逐字来自客户原话。"""
                     re.I,
                 )
                 if throughput_match:
-                    requirements["throughput_mbps"] = float(
-                        throughput_match.group(1)
-                    )
+                    requirements["throughput_mbps"] = float(throughput_match.group(1))
                     lock(item, "throughput_mbps", throughput_match.group(0))
 
             role_values_found = False
@@ -10297,10 +12040,28 @@ evidence 必须逐字来自客户原话。"""
                     lock(item, "spice_gib", spice_volume[1])
 
             if "deployment_updates" in template_fields:
+                if "deployment_target" in template_fields:
+                    target_contracts = (
+                        ("on_premises", r"on[ -]?premises?|本地(?:服务器|实例|部署)?|自有机房"),
+                        ("lambda", r"(?<![a-z0-9])lambda(?![a-z0-9])"),
+                        ("ecs", r"(?<![a-z0-9])ecs(?![a-z0-9])"),
+                        ("ec2", r"(?<![a-z0-9])ec2(?![a-z0-9])"),
+                    )
+                    for target, pattern in target_contracts:
+                        target_match = re.search(pattern, source, re.I)
+                        if target_match:
+                            requirements["deployment_target"] = target
+                            lock(
+                                item,
+                                "deployment_target",
+                                target_match.group(0),
+                            )
+                            break
                 deployment_match = re.search(
                     r"(?:每月|月度|月均)?\s*(?:更新|部署到|部署)\s*"
-                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*台\s*"
-                    r"(?:本地|自有|on[ -]?premises?)?(?:服务器|实例|主机)",
+                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*"
+                    r"(?:台次|次|台)(?:\s*(?:本地|自有|on[ -]?premises?)?"
+                    r"(?:服务器|实例|主机))?",
                     source,
                     re.I,
                 ) or re.search(
@@ -10323,22 +12084,55 @@ evidence 必须逐字来自客户原话。"""
                     requirements["edition"] = "standard"
                     lock(item, "edition", "标准版" if "标准版" in source else "Standard")
                 if str(requirements.get("requested_model") or "").casefold() in {
-                    "企业版", "enterprise", "标准版", "standard"
+                    "企业版",
+                    "enterprise",
+                    "标准版",
+                    "standard",
                 }:
                     requirements.pop("requested_model", None)
 
             if "storage_gib" in template_fields:
                 storage_volume = labelled_volume(
                     r"文件系统容量|存储容量|对象存储容量|磁盘容量|"
-                    r"磁盘|硬盘|存储|容量"
+                    r"归档(?:存储|容量)?|视频存储|镜像存储|磁盘|硬盘|存储|容量|capacity"
                 )
                 if storage_volume is not None:
                     requirements["storage_gib"] = storage_volume[0]
                     lock(item, "storage_gib", storage_volume[1])
 
+            if "lcu_count" in template_fields:
+                lcu_match = re.search(
+                    r"(?:每(?:个|台)?\s*(?:alb|负载均衡器)?\s*)?"
+                    r"(?:平均|均值|约)?\s*(\d+(?:\.\d+)?)\s*(?:个)?\s*lcu",
+                    source,
+                    re.I,
+                )
+                if lcu_match:
+                    lcu_value = float(lcu_match.group(1))
+                    requirements["lcu_count"] = (
+                        int(lcu_value) if lcu_value.is_integer() else lcu_value
+                    )
+                    lock(item, "lcu_count", lcu_match.group(0).strip())
+
+            if "cache_storage_gib" in template_fields:
+                cache_volume = labelled_volume(r"缓存(?:存储)?容量|缓存存储|本地缓存")
+                if cache_volume is not None:
+                    requirements["cache_storage_gib"] = cache_volume[0]
+                    lock(item, "cache_storage_gib", cache_volume[1])
+
+            if "data_retrieval_gib" in template_fields:
+                retrieval_volume = labelled_volume(
+                    r"每月(?:共|合计)?(?:恢复|取回|检索)(?:数据|流量|容量)?|"
+                    r"(?:恢复|取回|检索)(?:数据|流量|容量)?"
+                )
+                if retrieval_volume is not None:
+                    requirements["data_retrieval_gib"] = retrieval_volume[0]
+                    lock(item, "data_retrieval_gib", retrieval_volume[1])
+
             if "data_transfer_out_gib" in template_fields:
                 transfer_match = re.search(
-                    r"(?:加速器)?(?:传输(?:量|数据)?|流量|出站|出网|公网下行|下行)"
+                    r"(?:加速器)?(?:传输(?:量|数据)?|传送(?:量|数据)?|流量|出站|出网|公网下行|下行|"
+                    r"(?:向)?(?:公网|互联网)(?:下载|传输)|egress|outbound)"
                     r"[^\d。；,，\n]{0,18}?(\d+(?:\.\d+)?)\s*"
                     r"(gib|gi?b|gb|g|tib|tb|t)(?:\s*/?月)?",
                     source,
@@ -10346,14 +12140,16 @@ evidence 必须逐字来自客户原话。"""
                 ) or re.search(
                     r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tib|tb|t)"
                     r"(?:\s*/?月)?[^。；,，\n]{0,18}?"
-                    r"(?:加速器)?(?:传输(?:量|数据)?|流量|出站|出网|公网下行|下行)",
+                    r"(?:加速器)?(?:传输(?:量|数据)?|传送(?:量|数据)?|流量|出站|出网|公网下行|下行|"
+                    r"(?:向)?(?:公网|互联网)(?:下载|传输)|egress|outbound)",
                     source,
                     re.I,
                 )
                 if transfer_match:
                     nearby = source[
-                        max(0, transfer_match.start() - 16) :
-                        min(len(source), transfer_match.end() + 16)
+                        max(0, transfer_match.start() - 16) : min(
+                            len(source), transfer_match.end() + 16
+                        )
                     ]
                     # Generic "流量" can describe data processed by a
                     # firewall, scanner or ingestion service. Only treat it as
@@ -10369,9 +12165,34 @@ evidence 必须逐字来自客户原话。"""
                         )
                         lock(item, "data_transfer_out_gib", transfer_match.group(0))
 
+            if "transfer_scope" in template_fields:
+                scope_match = re.search(
+                    r"同(?:一)?(?:个)?区域|同区|区域内|same[- ]?region|in[- ]?region",
+                    source,
+                    re.I,
+                )
+                transfer_scope = "same_region"
+                if scope_match is None:
+                    scope_match = re.search(
+                        r"跨(?:aws\s*)?区域|跨区|cross[- ]?region",
+                        source,
+                        re.I,
+                    )
+                    transfer_scope = "cross_region"
+                if scope_match is None:
+                    scope_match = re.search(
+                        r"公网|互联网|internet|public\s+(?:network|internet)",
+                        source,
+                        re.I,
+                    )
+                    transfer_scope = "internet"
+                if scope_match is not None:
+                    requirements["transfer_scope"] = transfer_scope
+                    lock(item, "transfer_scope", scope_match.group(0))
+
             if "data_processed_gib" in template_fields:
                 processed_transfer_match = re.search(
-                    r"(?:传输(?:量|数据)?|流量|处理(?:量|数据)?)"
+                    r"(?:传输(?:量|数据)?|流量|处理(?:量|数据)?|写入|上传)"
                     r"[^\d。；,，\n]{0,18}?(\d+(?:\.\d+)?)\s*"
                     r"(gib|gi?b|gb|g|tib|tb|t)(?:\s*/?月)?",
                     source,
@@ -10379,7 +12200,7 @@ evidence 必须逐字来自客户原话。"""
                 ) or re.search(
                     r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tib|tb|t)"
                     r"(?:\s*/?月)?[^。；,，\n]{0,18}?"
-                    r"(?:传输(?:量|数据)?|流量|处理(?:量|数据)?)",
+                    r"(?:传输(?:量|数据)?|流量|处理(?:量|数据)?|写入|上传)",
                     source,
                     re.I,
                 )
@@ -10398,7 +12219,9 @@ evidence 必须逐字来自客户原话。"""
                         processed_transfer_match.group(0),
                     )
 
-            if "processing_hours" in template_fields:
+            if "processing_hours" in template_fields and (
+                "transcode_minutes" not in template_fields or prefer_processing_hours
+            ):
                 processing_hours_match = re.search(
                     r"(?:每月|月度|月均)?[^。；,，\n]{0,18}?"
                     r"(?:处理|转码|编码|渲染|分析|作业)"
@@ -10420,6 +12243,33 @@ evidence 必须逐字来自客户原话。"""
                         "processing_hours",
                         processing_hours_match.group(0),
                     )
+                else:
+                    processing_minutes_match = re.search(
+                        r"(?:每月|月度|月均)?[^。；,，\n]{0,18}?"
+                        r"(?:处理|转码|编码|渲染|分析|作业)"
+                        r"[^\d。；,，\n]{0,18}?(\d[\d,]*(?:\.\d+)?)\s*"
+                        r"(万|亿)?\s*分钟",
+                        source,
+                        re.I,
+                    ) or re.search(
+                        r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*分钟"
+                        r"[^。；,，\n]{0,18}?(?:处理|转码|编码|渲染|分析|作业)",
+                        source,
+                        re.I,
+                    )
+                    if processing_minutes_match:
+                        requirements["processing_hours"] = (
+                            scaled_number(
+                                processing_minutes_match.group(1),
+                                processing_minutes_match.group(2),
+                            )
+                            / 60
+                        )
+                        lock(
+                            item,
+                            "processing_hours",
+                            processing_minutes_match.group(0),
+                        )
 
             if "throughput_mbps_per_tib" in template_fields:
                 throughput_tier = re.search(
@@ -10428,28 +12278,31 @@ evidence 必须逐字来自客户原话。"""
                     re.I,
                 )
                 if throughput_tier:
-                    requirements["throughput_mbps_per_tib"] = float(
-                        throughput_tier.group(1)
-                    )
+                    requirements["throughput_mbps_per_tib"] = float(throughput_tier.group(1))
                     lock(item, "throughput_mbps_per_tib", throughput_tier.group(0))
 
             if "messages" in template_fields:
-                message_match = re.search(
-                    r"(?:每月|月度|月均)?\s*消息(?:量|数|总数)?\s*"
-                    r"[:：]?\s*(?:约|大约|预计)?\s*"
-                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:条|个|次)?",
-                    source,
-                    re.I,
-                ) or re.search(
-                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:条|个|次)\s*消息",
-                    source,
-                    re.I,
-                ) or re.search(
-                    r"(?:每月|月度|月均)?\s*"
-                    r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*次?\s*"
-                    r"(?:实时更新|实时通知|实时推送|real[ -]?time updates?)",
-                    source,
-                    re.I,
+                message_match = (
+                    re.search(
+                        r"(?:每月|月度|月均)?\s*消息(?:量|数|总数)?\s*"
+                        r"[:：]?\s*(?:约|大约|预计)?\s*"
+                        r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:条|个|次)?",
+                        source,
+                        re.I,
+                    )
+                    or re.search(
+                        r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:条|个|次)\s*"
+                        r"(?:\d+(?:\.\d+)?\s*(?:ki?b|kb)\s*)?消息",
+                        source,
+                        re.I,
+                    )
+                    or re.search(
+                        r"(?:每月|月度|月均)?\s*"
+                        r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*次?\s*"
+                        r"(?:实时更新|实时通知|实时推送|real[ -]?time updates?)",
+                        source,
+                        re.I,
+                    )
                 )
                 if message_match:
                     requirements["messages"] = scaled_number(
@@ -10528,8 +12381,10 @@ evidence 必须逐字来自客户原话。"""
                     lock(item, "operating_system_version", os_version_match.group(0))
                     folded_os = os_version.casefold()
                     requirements["operating_system"] = (
-                        "windows" if folded_os.startswith("windows")
-                        else "rhel" if folded_os.startswith(("rhel", "red hat"))
+                        "windows"
+                        if folded_os.startswith("windows")
+                        else "rhel"
+                        if folded_os.startswith(("rhel", "red hat"))
                         else "linux"
                     )
                     lock(item, "operating_system", os_version_match.group(0))
@@ -10723,9 +12578,7 @@ evidence 必须逐字来自客户原话。"""
                         item.field_evidence[path] = evidence
                         item.locked_fields = sorted(set(item.locked_fields) | {path})
                 worker_disk = labelled_volume(r"系统盘|磁盘|存储")
-                if worker_disk is not None and re.search(
-                    r"worker|工作节点", source, re.I
-                ):
+                if worker_disk is not None and re.search(r"worker|工作节点", source, re.I):
                     requirements["worker_system_disk_gib"] = worker_disk[0]
                     lock(item, "worker_system_disk_gib", worker_disk[1])
             elif service == "lambda":
@@ -10759,7 +12612,11 @@ evidence 必须逐字来自客户原话。"""
                     requirements["memory_mb"] = float(match.group(1))
                     lock(item, "memory_mb", match.group(0))
                 if match := re.search(
-                    r"(?:运行|执行|持续)?(?:时间|时长)\s*(\d+(?:\.\d+)?)\s*(毫秒|ms|秒|s)",
+                    r"(?:"
+                    r"(?:运行|执行|持续)?(?:时间|时长|耗时|延迟)|"
+                    r"(?:单次|每次|平均(?:每次)?)"
+                    r"(?:运行|执行|调用)?(?:时间|时长|耗时)?"
+                    r")\s*(\d+(?:\.\d+)?)\s*(毫秒|ms|秒|s)",
                     source,
                     re.I,
                 ):
@@ -10784,9 +12641,7 @@ evidence 必须逐字来自客户原话。"""
                     )
                     if storage_match:
                         lock(item, "storage_gib", storage_match.group(0))
-                mode_match = re.search(
-                    r"按需(?:模式|容量)?|on[ -]?demand", source, re.I
-                )
+                mode_match = re.search(r"按需(?:模式|容量)?|on[ -]?demand", source, re.I)
                 if mode_match:
                     requirements["capacity_mode"] = "on_demand"
                     lock(item, "capacity_mode", mode_match.group(0))
@@ -11168,9 +13023,7 @@ evidence 必须逐字来自客户原话。"""
                         item.field_evidence.get("requirements.memory_gib") or ""
                     ).strip()
                     normalized_source = re.sub(r"\s+", "", source).casefold()
-                    normalized_evidence = re.sub(
-                        r"\s+", "", memory_evidence
-                    ).casefold()
+                    normalized_evidence = re.sub(r"\s+", "", memory_evidence).casefold()
                     has_literal_memory_evidence = bool(
                         normalized_evidence
                         and normalized_evidence
@@ -11182,19 +13035,16 @@ evidence 必须逐字来自客户原话。"""
                         lock(item, "memory_gib", memory_evidence)
                     else:
                         requirements.pop("memory_gib", None)
-                storage_match = (
-                    re.search(
-                        r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tib|tb|t)\s*"
-                        r"(?:/\s*(?:节点|台))?\s*(?:磁盘|硬盘|存储)",
-                        source,
-                        re.I,
-                    )
-                    or re.search(
-                        r"(?:磁盘|硬盘|存储(?:容量)?)\s*[:：]?\s*"
-                        r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tib|tb|t)",
-                        source,
-                        re.I,
-                    )
+                storage_match = re.search(
+                    r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tib|tb|t)\s*"
+                    r"(?:/\s*(?:节点|台))?\s*(?:磁盘|硬盘|存储)",
+                    source,
+                    re.I,
+                ) or re.search(
+                    r"(?:磁盘|硬盘|存储(?:容量)?)\s*[:：]?\s*"
+                    r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tib|tb|t)",
+                    source,
+                    re.I,
                 )
                 if storage_match:
                     requirements["source_storage_gib_per_node"] = gib(
@@ -11250,12 +13100,12 @@ evidence 必须逐字来自客户原话。"""
                     r"(?:文件存储|存储(?:容量)?|对象存储|容量)\s*[:：]?\s*"
                     r"(?:改成|改为|修改为|调整为|设为|设置为|变成|"
                     r"预计|预估|大概|约|大约|左右|为)?\s*"
-                    r"(\d+(?:\.\d+)?)\s*(gib|gi?b|g|tb|tib|t)",
+                    r"(\d+(?:\.\d+)?)\s*(pib|pb|p|tib|tb|t|gib|gi?b|gb|g)",
                     source,
                 )
                 if value is None:
                     value = first(
-                        r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tb|tib|t)"
+                        r"(\d+(?:\.\d+)?)\s*(pib|pb|p|tib|tb|t|gib|gi?b|gb|g)"
                         r"[^。；,，\n]{0,20}(?:对象存储|存储)",
                         source,
                     )
@@ -11267,7 +13117,7 @@ evidence 必须逐字来自客户原话。"""
                     # number is unambiguous storage capacity.
                     value = first(
                         r"(?:amazon\s*)?s3[^\d。；\n]{0,16}"
-                        r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tb|tib|t)",
+                        r"(\d+(?:\.\d+)?)\s*(pib|pb|p|tib|tb|t|gib|gi?b|gb|g)",
                         source,
                     )
                     if value is not None:
@@ -11277,7 +13127,7 @@ evidence 必须逐字来自客户原话。"""
                         # GB/TB capacity is storage even when the customer says
                         # “预计30TB左右，主要存图片” without repeating “容量”.
                         value = first(
-                            r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tb|tib|t)",
+                            r"(\d+(?:\.\d+)?)\s*(pib|pb|p|tib|tb|t|gib|gi?b|gb|g)",
                             source,
                         )
                         if value is not None:
@@ -11286,7 +13136,7 @@ evidence 必须逐字来自客户原话。"""
                             requirements.pop("storage_gib", None)
                 if value is not None:
                     storage_match = re.search(
-                        r"\d+(?:\.\d+)?\s*(?:gib|gi?b|gb|g|tb|tib|t)",
+                        r"\d+(?:\.\d+)?\s*(?:pib|pb|p|tib|tb|t|gib|gi?b|gb|g)",
                         source,
                         re.I,
                     )
@@ -11304,32 +13154,28 @@ evidence 必须逐字来自客户原话。"""
                     "get_select_requests": r"(?:get|select)",
                 }
                 for field, label in request_labels.items():
-                    request_match = (
-                        re.search(
-                            rf"{label}\s*(?:类)?\s*(?:请求|操作)(?:量|数|次数)?\s*"
-                            rf"[:：]?\s*(?:约|大约|预计)?\s*"
-                            rf"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次|个)?",
-                            source,
-                            re.I,
-                        )
-                        or re.search(
-                            rf"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次|个)?\s*"
-                            rf"{label}\s*(?:类)?\s*(?:请求|操作)",
-                            source,
-                            re.I,
-                        )
+                    request_match = re.search(
+                        rf"{label}\s*(?:类)?\s*(?:请求|操作)(?:量|数|次数)?\s*"
+                        rf"[:：]?\s*(?:约|大约|预计)?\s*"
+                        rf"(\d[\d,]*(?:\.\d+)?)\s*"
+                        rf"(万|亿|thousand|million|billion)?\s*(?:次|个)?",
+                        source,
+                        re.I,
+                    ) or re.search(
+                        rf"(\d[\d,]*(?:\.\d+)?)\s*"
+                        rf"(万|亿|thousand|million|billion)?\s*(?:次|个)?\s*"
+                        rf"{label}(?:s)?\s*(?:类)?\s*(?:请求|操作)?",
+                        source,
+                        re.I,
                     )
                     if request_match:
-                        multiplier = {"万": 10_000, "亿": 100_000_000}.get(
-                            request_match.group(2), 1
-                        )
-                        count = float(request_match.group(1).replace(",", "")) * multiplier
+                        count = scaled_number(request_match.group(1), request_match.group(2))
                         requirements[field] = int(count) if count.is_integer() else count
                         lock(item, field, request_match.group(0))
 
                 if storage_class_match := re.search(
                     r"\bS3\s+(Standard(?:[- ]IA)?|One\s+Zone[- ]IA|"
-                    r"Glacier(?:\s+Instant\s+Retrieval)?)\b",
+                    r"Express\s+One\s+Zone|Glacier(?:\s+Instant\s+Retrieval)?)\b",
                     source,
                     re.I,
                 ):
@@ -11406,24 +13252,23 @@ evidence 必须逐字来自客户原话。"""
                 if value is None:
                     value = first(
                         r"(\d+(?:\.\d+)?)\s*(gib|gi?b|gb|g|tb|tib|t)"
-                        r"(?:\s*/?月)?[^。；,，\n]{0,16}(?:流量|传输|出站|出网|下行)",
+                        r"(?:\s*/?月)?[^。；,，\n]{0,18}"
+                        r"(?:流量|传输|出站|出网|下行|egress|outbound)",
                         source,
                     )
                 if value is not None:
                     requirements["data_transfer_out_gib"] = value
-                    transfer_match = (
-                        re.search(
-                            r"(?:下行|传输|流量)[^。；,，]{0,24}?"
-                            r"\d+(?:\.\d+)?\s*(?:gib|gi?b|gb|g|tb|tib|t)",
-                            source,
-                            re.I,
-                        )
-                        or re.search(
-                            r"\d+(?:\.\d+)?\s*(?:gib|gi?b|gb|g|tb|tib|t)"
-                            r"(?:\s*/?月)?[^。；,，\n]{0,16}(?:流量|传输|出站|出网|下行)",
-                            source,
-                            re.I,
-                        )
+                    transfer_match = re.search(
+                        r"(?:下行|传输|流量)[^。；,，]{0,24}?"
+                        r"\d+(?:\.\d+)?\s*(?:gib|gi?b|gb|g|tb|tib|t)",
+                        source,
+                        re.I,
+                    ) or re.search(
+                        r"\d+(?:\.\d+)?\s*(?:gib|gi?b|gb|g|tb|tib|t)"
+                        r"(?:\s*/?月)?[^。；,，\n]{0,18}"
+                        r"(?:流量|传输|出站|出网|下行|egress|outbound)",
+                        source,
+                        re.I,
                     )
                     lock(
                         item,
@@ -11433,26 +13278,21 @@ evidence 必须逐字来自客户原话。"""
                 else:
                     requirements.pop("data_transfer_out_gib", None)
 
-                https_match = (
-                    re.search(
-                        r"https\s*(?:请求|访问)(?:量|数|次数)?\s*[:：]?\s*"
-                        r"(?:约|大约|预计)?\s*(\d[\d,]*(?:\.\d+)?)\s*"
-                        r"(万|亿)?\s*(?:次|个)?",
-                        source,
-                        re.I,
-                    )
-                    or re.search(
-                        r"(\d[\d,]*(?:\.\d+)?)\s*(万|亿)?\s*(?:次|个)?\s*"
-                        r"https\s*(?:请求|访问)",
-                        source,
-                        re.I,
-                    )
+                https_match = re.search(
+                    r"https\s*(?:请求|访问|requests?)(?:量|数|次数)?\s*[:：]?\s*"
+                    r"(?:约|大约|预计)?\s*(\d[\d,]*(?:\.\d+)?)\s*"
+                    r"(万|亿|thousand|million|billion)?\s*(?:次|个)?",
+                    source,
+                    re.I,
+                ) or re.search(
+                    r"(\d[\d,]*(?:\.\d+)?)\s*"
+                    r"(万|亿|thousand|million|billion)?\s*(?:次|个)?\s*"
+                    r"https\s*(?:请求|访问|requests?)",
+                    source,
+                    re.I,
                 )
                 if https_match:
-                    multiplier = {"万": 10_000, "亿": 100_000_000}.get(
-                        https_match.group(2), 1
-                    )
-                    count = float(https_match.group(1).replace(",", "")) * multiplier
+                    count = scaled_number(https_match.group(1), https_match.group(2))
                     requirements["https_requests"] = int(count) if count.is_integer() else count
                     lock(item, "https_requests", https_match.group(0))
 
@@ -11460,7 +13300,11 @@ evidence 必须逐字来自客户原话。"""
                 # region. Preserve only an explicit customer phrase and never
                 # infer it from an AWS region such as ap-east-1.
                 geography_patterns = (
-                    ("Asia Pacific", r"亚太(?:地区|区域)?|asia\s*pacific|apac"),
+                    (
+                        "Asia Pacific",
+                        r"亚太(?:地区|区域)?|亚洲(?:地区|区域)?|"
+                        r"asia(?:\s*pacific)?|apac",
+                    ),
                     ("United States", r"美国(?:地区|区域)?|united\s*states|\busa?\b"),
                     ("Europe", r"欧洲(?:地区|区域)?|\beurope\b"),
                     ("Japan", r"日本(?:地区|区域)?|\bjapan\b"),
@@ -12099,9 +13943,7 @@ evidence 必须逐字来自客户原话。"""
             )
             requirements["cluster_count"] = cluster_count
             cluster_path = "requirements.cluster_count"
-            item.field_sources[cluster_path] = item.field_sources.get(
-                "quantity", "system_derived"
-            )
+            item.field_sources[cluster_path] = item.field_sources.get("quantity", "system_derived")
             if "quantity" in item.field_evidence:
                 item.field_evidence[cluster_path] = item.field_evidence["quantity"]
             cluster_locks = set(item.locked_fields)
@@ -12130,7 +13972,12 @@ evidence 必须逐字来自客户原话。"""
                     if total_count
                     else None
                 )
-            if isinstance(per_cluster_value, (int, float)) and per_cluster_value > 0:
+            worker_total_is_derived = (
+                isinstance(per_cluster_value, (int, float))
+                and not isinstance(per_cluster_value, bool)
+                and per_cluster_value > 0
+            )
+            if worker_total_is_derived:
                 node_count_value = int(per_cluster_value) * cluster_count
 
             worker_vcpu = requirements.get("worker_vcpu")
@@ -12198,7 +14045,8 @@ evidence 必须逐字来自客户原话。"""
                             and bool(canonical_component_source(candidate.source_text))
                             and (
                                 canonical_component_source(candidate.source_text) == parent_source
-                                or canonical_component_source(candidate.source_text) in parent_source
+                                or canonical_component_source(candidate.source_text)
+                                in parent_source
                             )
                         )
                         or (
@@ -12207,7 +14055,8 @@ evidence 必须逐字来自客户原话。"""
                             and bool(canonical_component_source(candidate.source_text))
                             and (
                                 canonical_component_source(candidate.source_text) == parent_source
-                                or canonical_component_source(candidate.source_text) in parent_source
+                                or canonical_component_source(candidate.source_text)
+                                in parent_source
                             )
                         )
                     )
@@ -12266,7 +14115,11 @@ evidence 必须逐字来自客户原话。"""
                         not in CUSTOMER_OVERRIDE_SOURCES
                     ):
                         existing_worker.quantity = node_count
-                        existing_worker.field_sources["quantity"] = "customer_text"
+                        existing_worker.field_sources["quantity"] = (
+                            "system_derived" if worker_total_is_derived else "customer_text"
+                        )
+                        if worker_total_is_derived:
+                            existing_worker.field_evidence["quantity"] = "system_derived"
                     existing_worker.region = existing_worker.region or item.region
                     existing_worker.calculator_service_name = "Amazon EC2 (EKS Worker Nodes)"
                     for key, value in worker_requirements.items():
@@ -12290,78 +14143,77 @@ evidence 必须逐字来自客户原话。"""
                             existing_has_shape,
                         )
                     ):
-                        existing_worker.field_sources[
-                            "_customer_select_configuration"
-                        ] = "system_policy"
-                    else:
-                        existing_worker.field_sources.pop(
-                            "_customer_select_configuration", None
+                        existing_worker.field_sources["_customer_select_configuration"] = (
+                            "system_policy"
                         )
-                    existing_worker.locked_fields = sorted(
-                        set(existing_worker.locked_fields)
-                        | {"quantity"}
-                        | {
-                            f"requirements.{key}"
-                            for key in worker_requirements
-                            if key != "operating_system"
-                        }
-                    )
+                    else:
+                        existing_worker.field_sources.pop("_customer_select_configuration", None)
+                    worker_locks = set(existing_worker.locked_fields) | {
+                        f"requirements.{key}"
+                        for key in worker_requirements
+                        if key != "operating_system"
+                    }
+                    if worker_total_is_derived:
+                        worker_locks.discard("quantity")
+                    else:
+                        worker_locks.add("quantity")
+                    existing_worker.locked_fields = sorted(worker_locks)
                     worker_component = existing_worker
                 else:
-                    child_evidence: dict[str, str] = {}
-                    if total_count:
+                    child_evidence: dict[str, str] = {
+                        **({"quantity": "system_derived"} if worker_total_is_derived else {})
+                    }
+                    if total_count and not worker_total_is_derived:
                         child_evidence["quantity"] = total_count.group(0)
-                    elif per_cluster_count:
+                    elif per_cluster_count and not worker_total_is_derived:
                         child_evidence["quantity"] = per_cluster_count.group(0)
                     if shape:
                         child_evidence["requirements.vcpu"] = shape.group(0)
                         child_evidence["requirements.memory_gib"] = shape.group(0)
                     if worker_disk is not None:
                         disk_evidence = str(
-                            item.field_evidence.get(
-                                "requirements.worker_system_disk_gib"
-                            )
+                            item.field_evidence.get("requirements.worker_system_disk_gib")
                             or (disk_match.group(0) if disk_match else "")
                         ).strip()
                         if disk_evidence:
                             child_evidence["requirements.system_disk_gib"] = disk_evidence
                     worker_component = ServiceRequirement(
-                            service="ec2",
-                            component_key=f"{parent_key}:eks_worker",
-                            derived_from_service="eks",
-                            parent_component_key=parent_key,
-                            calculator_service_name="Amazon EC2 (EKS Worker Nodes)",
-                            region=item.region,
-                            quantity=node_count,
-                            hours_per_month=item.hours_per_month,
-                            requirements=worker_requirements,
-                            source_text=source,
-                            field_sources={
-                                "quantity": "customer_text",
-                                **{
-                                    f"requirements.{key}": "customer_text"
-                                    for key in worker_requirements
-                                    if key != "operating_system"
-                                },
-                                "requirements.operating_system": "system_minimum",
-                                **(
-                                    {
-                                        "_customer_select_configuration": "system_policy"
-                                    }
-                                    if not requested_model and not has_worker_shape
-                                    else {}
-                                ),
+                        service="ec2",
+                        component_key=f"{parent_key}:eks_worker",
+                        derived_from_service="eks",
+                        parent_component_key=parent_key,
+                        calculator_service_name="Amazon EC2 (EKS Worker Nodes)",
+                        region=item.region,
+                        quantity=node_count,
+                        hours_per_month=item.hours_per_month,
+                        requirements=worker_requirements,
+                        source_text=source,
+                        field_sources={
+                            "quantity": (
+                                "system_derived" if worker_total_is_derived else "customer_text"
+                            ),
+                            **{
+                                f"requirements.{key}": "customer_text"
+                                for key in worker_requirements
+                                if key != "operating_system"
                             },
-                            field_evidence=child_evidence,
-                            locked_fields=[
-                                "quantity",
-                                *(
-                                    f"requirements.{key}"
-                                    for key in worker_requirements
-                                    if key != "operating_system"
-                                ),
-                            ],
-                        )
+                            "requirements.operating_system": "system_minimum",
+                            **(
+                                {"_customer_select_configuration": "system_policy"}
+                                if not requested_model and not has_worker_shape
+                                else {}
+                            ),
+                        },
+                        field_evidence=child_evidence,
+                        locked_fields=[
+                            *([] if worker_total_is_derived else ["quantity"]),
+                            *(
+                                f"requirements.{key}"
+                                for key in worker_requirements
+                                if key != "operating_system"
+                            ),
+                        ],
+                    )
                     additions.append(worker_component)
 
                 count_evidence = (
@@ -12371,14 +14223,10 @@ evidence 必须逐字来自客户原话。"""
                     if per_cluster_count
                     else ""
                 )
-                if count_evidence:
-                    worker_component.field_evidence.setdefault(
-                        "quantity", count_evidence
-                    )
+                if count_evidence and not worker_total_is_derived:
+                    worker_component.field_evidence.setdefault("quantity", count_evidence)
                 if shape:
-                    worker_component.field_evidence.setdefault(
-                        "requirements.vcpu", shape.group(0)
-                    )
+                    worker_component.field_evidence.setdefault("requirements.vcpu", shape.group(0))
                     worker_component.field_evidence.setdefault(
                         "requirements.memory_gib", shape.group(0)
                     )
@@ -12397,21 +14245,15 @@ evidence 必须逐字来自客户原话。"""
                 # by product vocabulary, so future Worker fields follow the
                 # same rule without another alias table.
                 if worker_owned_source != source:
-                    worker_component.field_sources["_owned_source_slice"] = (
-                        "system_policy"
-                    )
+                    worker_component.field_sources["_owned_source_slice"] = "system_policy"
                     worker_component.field_evidence["_owned_source_slice_text"] = (
                         worker_owned_source
                     )
-                    normalized_child_source = re.sub(
-                        r"\s+", "", worker_owned_source
-                    ).casefold()
+                    normalized_child_source = re.sub(r"\s+", "", worker_owned_source).casefold()
                     child_overflow: list[UnmappedPricingFact] = []
                     parent_overflow: list[UnmappedPricingFact] = []
                     for fact in item.unmapped_pricing_facts:
-                        normalized_evidence = re.sub(
-                            r"\s+", "", fact.evidence
-                        ).casefold()
+                        normalized_evidence = re.sub(r"\s+", "", fact.evidence).casefold()
                         if normalized_evidence and normalized_evidence in normalized_child_source:
                             child_overflow.append(fact)
                         else:
@@ -12487,16 +14329,33 @@ evidence 必须逐字来自客户原话。"""
             if cls._service_key(parent.service) != "ecs":
                 continue
             source = parent.original_source_text or parent.source_text or ""
-            if not re.search(r"(?:ec2\s*)?(?:worker|工作)\s*节点", source, re.I):
+            worker_marker = re.search(r"(?:ec2\s*)?(?:worker|工作)\s*节点", source, re.I)
+            runtime_marker = worker_marker or re.search(
+                r"(?:\bon\s+|运行(?:在|于)|部署(?:在|于)|使用\s*)ec2\b",
+                source,
+                re.I,
+            )
+            if runtime_marker is None:
                 continue
+
+            # The parent owns the control-plane declaration and EC2 launch
+            # type; the child owns the fleet count and per-node shape. Keep
+            # the full immutable row in ``original_source_text`` while each
+            # component receives a numeric ownership slice before its AI
+            # template is filled. This prevents one correct extraction from
+            # being rejected merely because a sibling's numbers are visible.
+            parent_owned_source = source[: runtime_marker.end()].strip(" ,，;；")
+            worker_owned_source = source[runtime_marker.start() :].strip(" ,，;；")
 
             worker_count_match = re.search(
                 r"(?:ec2\s*)?(?:worker|工作)\s*节点(?:数量|总数)?\s*"
                 r"[:：]?\s*(\d+)\s*(?:台|个)?|"
-                r"(\d+)\s*(?:台|个)\s*(?:ec2\s*)?(?:worker|工作)\s*节点",
+                r"(\d+)\s*(?:台|个)\s*(?:ec2\s*)?(?:worker|工作)\s*节点|"
+                r"(\d+)\s*[×x*]\s*[a-z][a-z0-9-]*\.",
                 source,
                 re.I,
             )
+            worker_model_match = BARE_EC2_MODEL_PATTERN.search(source)
             worker_shape_match = re.search(
                 r"(?:单台|每台|单节点|每节点)?[^。；,，\n]{0,18}?"
                 r"(\d+(?:\.\d+)?)\s*(?:核|vcpu)"
@@ -12522,19 +14381,22 @@ evidence 必须逐字来自客户原话。"""
                     candidate.parent_component_key == parent.component_key
                     or (
                         candidate.parent_component_key is None
-                        and re.search(
-                            r"(?:ec2\s*)?(?:worker|工作)\s*节点",
-                            " ".join(
-                                filter(
-                                    None,
-                                    (
-                                        candidate.calculator_service_name,
-                                        candidate.original_source_text,
-                                        candidate.source_text,
-                                    ),
-                                )
-                            ),
-                            re.I,
+                        and (
+                            worker_marker is None
+                            or re.search(
+                                r"(?:ec2\s*)?(?:worker|工作)\s*节点",
+                                " ".join(
+                                    filter(
+                                        None,
+                                        (
+                                            candidate.calculator_service_name,
+                                            candidate.original_source_text,
+                                            candidate.source_text,
+                                        ),
+                                    )
+                                ),
+                                re.I,
+                            )
                         )
                         and (
                             (
@@ -12543,16 +14405,12 @@ evidence 必须逐字来自客户原话。"""
                                 == source_block_key
                             )
                             or canonical_component_source(
-                                candidate.original_source_text
-                                or candidate.source_text
-                                or ""
+                                candidate.original_source_text or candidate.source_text or ""
                             )
                             in parent_source
                             or parent_source
                             in canonical_component_source(
-                                candidate.original_source_text
-                                or candidate.source_text
-                                or ""
+                                candidate.original_source_text or candidate.source_text or ""
                             )
                         )
                     )
@@ -12561,9 +14419,7 @@ evidence 必须逐字来自客户原话。"""
 
             if not candidates:
                 if worker_count_match:
-                    count = int(
-                        next(group for group in worker_count_match.groups() if group)
-                    )
+                    count = int(next(group for group in worker_count_match.groups() if group))
                     requirements: dict[str, object] = {"operating_system": "Linux"}
                     field_sources: dict[str, str] = {
                         "quantity": "customer_text",
@@ -12585,14 +14441,18 @@ evidence 必须逐字来自客户原话。"""
                             field_sources[path] = "customer_text"
                             field_evidence[path] = worker_shape_match.group(0)
                             locked_fields.append(path)
+                    if worker_model_match:
+                        model_path = "requirements.requested_model"
+                        requirements["requested_model"] = worker_model_match.group(1).casefold()
+                        field_sources[model_path] = "customer_text"
+                        field_evidence[model_path] = worker_model_match.group(0)
+                        locked_fields.append(model_path)
                     if worker_disk_match:
                         disk = float(worker_disk_match.group(1))
                         if worker_disk_match.group(2).casefold() in {"tib", "tb", "t"}:
                             disk *= 1024
                         path = "requirements.system_disk_gib"
-                        requirements["system_disk_gib"] = (
-                            int(disk) if disk.is_integer() else disk
-                        )
+                        requirements["system_disk_gib"] = int(disk) if disk.is_integer() else disk
                         field_sources[path] = "customer_text"
                         field_evidence[path] = worker_disk_match.group(0)
                         locked_fields.append(path)
@@ -12619,24 +14479,23 @@ evidence 必须逐字来自客户原话。"""
             for worker in candidates:
                 worker.parent_component_key = parent.component_key
                 worker.derived_from_service = "ecs"
-                worker.component_key = (
-                    worker.component_key or f"{parent.component_key}:ecs_worker"
-                )
+                worker.component_key = worker.component_key or f"{parent.component_key}:ecs_worker"
                 worker.calculator_service_name = "Amazon EC2 (ECS Worker Nodes)"
                 worker.region = worker.region or parent.region
+                worker.original_source_text = source
+                worker.source_text = worker_owned_source
+                worker.field_sources["_owned_source_slice"] = "system_policy"
+                worker.field_evidence["_owned_source_slice_text"] = worker_owned_source
                 if (
                     worker_count_match
-                    and worker.field_sources.get("quantity")
-                    not in CUSTOMER_OVERRIDE_SOURCES
+                    and worker.field_sources.get("quantity") not in CUSTOMER_OVERRIDE_SOURCES
                 ):
                     worker.quantity = int(
                         next(group for group in worker_count_match.groups() if group)
                     )
                     worker.field_sources["quantity"] = "customer_text"
                     worker.field_evidence["quantity"] = worker_count_match.group(0)
-                    worker.locked_fields = sorted(
-                        set(worker.locked_fields) | {"quantity"}
-                    )
+                    worker.locked_fields = sorted(set(worker.locked_fields) | {"quantity"})
                 for field, match, group in (
                     ("vcpu", worker_shape_match, 1),
                     ("memory_gib", worker_shape_match, 2),
@@ -12654,23 +14513,30 @@ evidence 必须逐字来自客户原话。"""
                         "t",
                     }:
                         value *= 1024
-                    worker.requirements[field] = (
-                        int(value) if value.is_integer() else value
-                    )
+                    worker.requirements[field] = int(value) if value.is_integer() else value
                     worker.field_sources[path] = "customer_text"
                     worker.field_evidence[path] = match.group(0)
-                    worker.locked_fields = sorted(
-                        set(worker.locked_fields) | {path}
-                    )
+                    worker.locked_fields = sorted(set(worker.locked_fields) | {path})
                 worker.requirements.setdefault("operating_system", "Linux")
-                worker.field_sources.setdefault(
-                    "requirements.operating_system", "system_minimum"
-                )
+                worker.field_sources.setdefault("requirements.operating_system", "system_minimum")
+                if (
+                    worker_model_match
+                    and worker.field_sources.get("requirements.requested_model")
+                    not in CUSTOMER_OVERRIDE_SOURCES
+                ):
+                    worker.requirements["requested_model"] = (
+                        worker_model_match.group(1).casefold()
+                    )
+                    worker.field_sources["requirements.requested_model"] = "customer_text"
+                    worker.field_evidence["requirements.requested_model"] = (
+                        worker_model_match.group(0)
+                    )
+                    worker.locked_fields = sorted(
+                        set(worker.locked_fields) | {"requirements.requested_model"}
+                    )
 
             parent.requirements.setdefault("launch_type", "ec2")
-            parent.field_sources.setdefault(
-                "requirements.launch_type", "system_minimum"
-            )
+            parent.field_sources.setdefault("requirements.launch_type", "system_minimum")
             # Worker sizing is owned exclusively by the EC2 child.  Removing
             # stale copies prevents the ECS control-plane row from selecting
             # an instance model or charging storage a second time.
@@ -12690,9 +14556,63 @@ evidence 必须逐字来自客户原话。"""
                 path = f"requirements.{field}"
                 parent.field_sources.pop(path, None)
                 parent.field_evidence.pop(path, None)
-                parent.locked_fields = [
-                    entry for entry in parent.locked_fields if entry != path
-                ]
+                parent.locked_fields = [entry for entry in parent.locked_fields if entry != path]
+
+            # Enforce the ownership boundary generically as well.  A new
+            # template field must not require another hand-written removal
+            # rule: if its customer evidence belongs to the Worker clause, it
+            # cannot remain on the ECS parent.  Correct parent evidence such
+            # as ``1套`` and ``EC2工作节点`` is retained because it is a literal
+            # part of ``parent_owned_source``.
+            compact_parent_source = re.sub(r"\s+", "", parent_owned_source).casefold()
+            for path, source_kind in tuple(parent.field_sources.items()):
+                if source_kind != "customer_text":
+                    continue
+                evidence = re.sub(r"\s+", "", str(parent.field_evidence.get(path) or "")).casefold()
+                if evidence and evidence in compact_parent_source:
+                    continue
+                if path in {"quantity", "hours_per_month"}:
+                    parent.field_sources.pop(path, None)
+                    parent.field_evidence.pop(path, None)
+                    parent.locked_fields = [
+                        entry for entry in parent.locked_fields if entry != path
+                    ]
+                    continue
+                if not path.startswith("requirements."):
+                    continue
+                field = path.split(".", 1)[1]
+                parent.requirements.pop(field, None)
+                parent.field_sources.pop(path, None)
+                parent.field_evidence.pop(path, None)
+                parent.locked_fields = [entry for entry in parent.locked_fields if entry != path]
+
+            parent.original_source_text = source
+            parent.source_text = parent_owned_source
+            parent.field_sources["_owned_source_slice"] = "system_policy"
+            parent.field_evidence["_owned_source_slice_text"] = parent_owned_source
+
+            # Upgrade partially cleaned drafts too: any overflow fact whose
+            # literal evidence belongs to the Worker slice moves to the child,
+            # so no customer number can remain owned by both rows.
+            normalized_worker_source = re.sub(r"\s+", "", worker_owned_source).casefold()
+            child_overflow: list[UnmappedPricingFact] = []
+            parent_overflow: list[UnmappedPricingFact] = []
+            for fact in parent.unmapped_pricing_facts:
+                normalized_evidence = re.sub(r"\s+", "", fact.evidence).casefold()
+                if normalized_evidence and normalized_evidence in normalized_worker_source:
+                    child_overflow.append(fact)
+                else:
+                    parent_overflow.append(fact)
+            parent.unmapped_pricing_facts = parent_overflow
+            if child_overflow:
+                for worker in candidates:
+                    overflow_holder = ServiceRequirement(
+                        service="ec2",
+                        unmapped_pricing_facts=[
+                            fact.model_copy(deep=True) for fact in child_overflow
+                        ],
+                    )
+                    merge_unmapped_pricing_facts(worker, overflow_holder)
 
         if additions:
             parsed.services.extend(additions)
@@ -12866,7 +14786,7 @@ evidence 必须逐字来自客户原话。"""
             line_regions = cls._regions_in_text(line)
             prefix = cls._GLOBAL_REGION_LINE_PATTERN.search(line)
             if prefix:
-                label = line[prefix.end():].strip(" \t:：,，。.;；-—|｜")
+                label = line[prefix.end() :].strip(" \t:：,，。.;；-—|｜")
                 if not line_regions or cls._unverified_region_declaration_tail(label):
                     return label[:48] or "未识别地区"
                 continue
@@ -12878,7 +14798,7 @@ evidence 必须逐字来自客户原话。"""
                 continue
             workload = cls._WORKLOAD_REGION_LINE_PATTERN.search(line)
             if workload:
-                label = line[workload.end():].strip(" \t:：,，。.;；-—|｜")
+                label = line[workload.end() :].strip(" \t:：,，。.;；-—|｜")
                 if not line_regions or cls._unverified_region_declaration_tail(label):
                     return label[:48] or "未识别地区"
                 continue
@@ -12892,8 +14812,7 @@ evidence 必须逐字来自客户原话。"""
         if len(lines) >= 2:
             first = lines[0]
             numbered_rows = sum(
-                bool(re.match(r"^\s*\d{1,3}\s*[、.．):：-]", line))
-                for line in lines[1:]
+                bool(re.match(r"^\s*\d{1,3}\s*[、.．):：-]", line)) for line in lines[1:]
             )
             if (
                 numbered_rows >= 1
@@ -12996,11 +14915,10 @@ evidence 必须逐字来自客户原话。"""
             # original request. Replaying the literal source on the next
             # validation round must never restore the old unsupported region
             # and ask the same question again.
-            if (
-                item.region
-                and item.field_sources.get("region")
-                in {"customer_confirmation", "customer_correction"}
-            ):
+            if item.region and item.field_sources.get("region") in {
+                "customer_confirmation",
+                "customer_correction",
+            }:
                 item.locked_fields = sorted(set(item.locked_fields) | {"region"})
                 continue
 
@@ -13040,102 +14958,43 @@ evidence 必须逐字来自客户原话。"""
                 item.locked_fields = [field for field in item.locked_fields if field != "region"]
 
     @classmethod
-    def _collapse_explicit_auxiliary_duplicates(cls, text: str, parsed: ParsedIntent) -> None:
-        """Keep one aggregate row when one customer line is split by region.
+    def _apply_structured_quote_region(
+        cls,
+        parsed: ParsedIntent,
+        region: str | None,
+        *,
+        source_kind: str = "inherited_quote_region",
+    ) -> None:
+        """Apply one validated quote default without changing local regions.
 
-        A model may expand a single total EBS or transfer line once per source
-        region.  The customer explicitly described an aggregate, so multiplying
-        that same total by the number of regions would overquote it.
+        This consumes a structured preflight result; it does not infer a
+        region from prose. Component-local customer evidence and conflicts
+        always win, and global AWS services remain regionless here. In
+        particular, this function never creates or changes CloudFront's
+        independent ``traffic_geography`` billing field.
         """
 
-        line_markers = {
-            "ebs": ("云硬盘", "amazon ebs", "独立 ebs"),
-            "data_transfer": ("公网出网流量", "公网出站流量", "aws data transfer"),
-            "global_accelerator": (
-                "global accelerator",
-                "全球访问加速",
-                "全球加速 ga",
-            ),
-        }
-        source_lines = [line.strip().casefold() for line in text.splitlines() if line.strip()]
-        for service, markers in line_markers.items():
-            explicit_lines = [
-                line for line in source_lines if any(marker in line for marker in markers)
-            ]
-            if len(explicit_lines) != 1:
-                continue
-            indexes = [
-                index
-                for index, item in enumerate(parsed.services)
-                if cls._service_key(item.service) == service
-            ]
-            if len(indexes) <= 1:
-                continue
-            keep = indexes[0]
-            explicit_source = next(
-                line
-                for line in text.splitlines()
-                if any(marker in line.casefold() for marker in markers)
-            ).strip()
-            parsed.services[keep].source_text = explicit_source
-            if service in {"ebs", "global_accelerator"} and "全球" in explicit_source:
-                parsed.services[keep].region = "global"
-            remove = set(indexes[1:])
-            parsed.services = [
-                item for index, item in enumerate(parsed.services) if index not in remove
-            ]
-
-    @staticmethod
-    def _drop_specs_inferred_from_models(text: str, parsed: ParsedIntent) -> None:
-        """A named AWS model is not permission for the model to invent constraints.
-
-        CPU and memory remain constraints only when the customer wrote them next
-        to that service. AWS APIs will provide the authoritative specifications
-        for an explicitly named instance type.
-        """
-
-        def relevant_source(item: ServiceRequirement, model: str) -> str:
-            if item.source_text and model.casefold() in item.source_text.casefold():
-                return item.source_text
-            for segment in re.split(r"[。；;\n]+", text):
-                if model.casefold() in segment.casefold():
-                    return segment
-            return ""
-
-        def explicit_shape(source: str) -> tuple[bool, bool]:
-            paired = bool(
-                re.search(
-                    r"\d+(?:\.\d+)?\s*(?:核|vcpu|c)\s*[/,， ]*"
-                    r"\d+(?:\.\d+)?\s*(?:gib|gb|g)(?:\s*内存)?",
-                    source,
-                    re.IGNORECASE,
-                )
-            )
-            cpu = paired or bool(re.search(r"\d+(?:\.\d+)?\s*(?:核|vcpu)", source, re.IGNORECASE))
-            memory = paired or bool(
-                re.search(
-                    r"(?:内存|ram)\s*[:：]?\s*(?:约|大约|不低于|至少|为)?\s*"
-                    r"\d+(?:\.\d+)?\s*(?:gib|gb|g)|"
-                    r"\d+(?:\.\d+)?\s*(?:gib|gb|g)\s*(?:内存|ram)",
-                    source,
-                    re.IGNORECASE,
-                )
-            )
-            return cpu, memory
-
+        normalized_region = str(region or "").strip().casefold()
+        if normalized_region not in cls.official_aws_region_labels():
+            return
         for item in parsed.services:
-            requirements = item.requirements
-            model = str(requirements.get("requested_model") or "").strip()
-            if not model:
+            if cls._service_key(item.service) in cls._GLOBAL_REGION_SERVICE_KEYS:
                 continue
-            service = DeepSeekIntentParser._service_key(item.service)
-            if service not in {"ec2", "rds", "elasticache"}:
+            if item.field_sources.get("region") == "customer_region_conflict":
                 continue
-            cpu_explicit, memory_explicit = explicit_shape(relevant_source(item, model))
-            if not cpu_explicit:
-                requirements.pop("vcpu", None)
-            if not memory_explicit:
-                requirements.pop("memory_gib", None)
+            if item.field_sources.get("region") in {
+                "customer_confirmation",
+                "customer_correction",
+            }:
+                continue
+            owned_source = customer_owned_source(item)
+            if cls._single_explicit_component_region(owned_source) is not None:
+                continue
+            item.region = normalized_region
+            item.field_sources["region"] = source_kind
+            item.field_evidence.pop("region", None)
+
+
 
     @classmethod
     def _inherit_single_workload_region(
@@ -13274,6 +15133,8 @@ evidence 必须逐字来自客户原话。"""
                 "unmapped_pricing_facts",
                 "field_evidence",
                 "source_text",
+                "original_source_text",
+                "intake_source_fragments",
                 "query_action",
             }
             normalized["services"] = [
@@ -13311,6 +15172,8 @@ evidence 必须逐字来自客户原话。"""
                 "unmapped_pricing_facts",
                 "field_evidence",
                 "source_text",
+                "original_source_text",
+                "intake_source_fragments",
                 "query_action",
             }
             normalized_services: list[object] = []
@@ -13319,9 +15182,19 @@ evidence 必须逐字来自客户原话。"""
                     normalized_services.append(item)
                     continue
                 service = {key: value for key, value in item.items() if key in allowed}
-                service_name = str(service.get("service") or "").lower()
-                if service_name in {"redis", "valkey", "memcached"}:
-                    service["service"] = "elasticache"
+                raw_service_name = str(service.get("service") or "").strip()
+                service_name = DeepSeekIntentParser._service_key(raw_service_name)
+                if not service_name:
+                    # Preserve the component for independent identity
+                    # resolution instead of letting one malformed model label
+                    # invalidate the entire quote envelope.
+                    service_name = "unresolved_component"
+                service["service"] = service_name
+                if service_name == "elasticache" and raw_service_name.casefold() in {
+                    "redis",
+                    "valkey",
+                    "memcached",
+                }:
                     service.setdefault("calculator_service_name", "Amazon ElastiCache")
                 service.setdefault("query_action", None)
                 requirements = service.get("requirements")

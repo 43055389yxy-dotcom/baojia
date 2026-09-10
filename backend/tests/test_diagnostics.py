@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from app import aws_main
 from app.aws_main import app
 from app.core.diagnostics import diagnostic_log, redact_diagnostic_value
 
@@ -52,6 +53,22 @@ def test_diagnostic_exception_preserves_original_type_message_and_traceback() ->
     assert entry["context"]["aws_error_code"] == "ValidationException"
 
 
+def test_suppressed_exception_context_does_not_persist_discarded_raw_input() -> None:
+    diagnostic_log.configure(enabled=True)
+    diagnostic_log.clear()
+    try:
+        try:
+            raise ValueError("客户原始输入不应保留")
+        except ValueError:
+            raise RuntimeError("清洗失败") from None
+    except RuntimeError as error:
+        diagnostic_log.record_exception("cleaning_failed", error)
+
+    entry = diagnostic_log.snapshot(limit=1)[0]
+    assert "cause" not in entry["context"]
+    assert "客户原始输入不应保留" not in str(entry)
+
+
 def test_diagnostic_message_redacts_confirmation_links() -> None:
     diagnostic_log.configure(enabled=True)
     diagnostic_log.clear()
@@ -79,21 +96,26 @@ def test_clear_diagnostic_logs_does_not_log_the_clear_request() -> None:
     assert logs_response.json()["entries"] == []
 
 
-def test_local_api_error_returns_traceable_diagnostic_id() -> None:
+def test_local_api_error_returns_traceable_diagnostic_id(monkeypatch) -> None:
     diagnostic_log.configure(enabled=True)
     diagnostic_log.clear()
+    monkeypatch.setattr(aws_main.settings, "astraquote_mcp_internal_token", "test-token")
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/quotes/preview",
+            "/api/mcp/v2/prices",
             json={
-                "cloud_provider": "azure",
-                "customer_request": "1、Azure Virtual Machines",
+                "queries": [{
+                    "provider": "aws",
+                    "query_id": "diagnostic-test",
+                    "service_code": "AmazonEC2",
+                    "region": "ap-northeast-1",
+                }],
             },
         )
         logs_response = client.get("/api/debug/logs?limit=20")
 
-    assert response.status_code == 403
+    assert response.status_code == 401
     assert response.headers["x-diagnostic-request-id"].startswith("req_")
     details = response.json()["details"]
     assert details["diagnostic_id"].startswith("diag_")
@@ -102,5 +124,5 @@ def test_local_api_error_returns_traceable_diagnostic_id() -> None:
     entries = logs_response.json()["entries"]
     error = next(item for item in entries if item["diagnostic_id"] == details["diagnostic_id"])
     assert error["event"] == "quote_api_error"
-    assert error["context"]["error_code"] == "provider_boundary_violation"
+    assert error["context"]["error_code"] == "mcp_internal_auth_failed"
     assert "QuoteError" in error["context"]["traceback"]

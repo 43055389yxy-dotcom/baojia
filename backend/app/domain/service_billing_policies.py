@@ -7,7 +7,7 @@ from typing import Literal
 from app.domain.models import ServiceRequirement
 
 
-SERVICE_BILLING_POLICY_VERSION = "2026-08-29.1"
+SERVICE_BILLING_POLICY_VERSION = "2026-09-07.1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +84,13 @@ def no_additional_charge_decision(
     """
 
     identities = service_identities(requirement)
+    parent_code = requirement.field_sources.get("_official_calculator_parent_service_code")
+    selected_code = requirement.official_calculator_service_code
+    if parent_code and selected_code and parent_code.casefold() != selected_code.casefold():
+        # A selected official child is a distinct product. A free parent name
+        # cannot authorize a zero price for that child; its own billing
+        # contract must be matched first. No customer prose is consulted.
+        return None
     source = (requirement.source_text or "").casefold()
     applied = _all_present_fields(requirement)
 
@@ -129,27 +136,23 @@ def no_additional_charge_decision(
         )
 
     if "codedeploy" in identities:
-        on_premises = any(
-            marker in source
-            for marker in (
-                "on-prem",
-                "on premises",
-                "onpremises",
-                "本地实例",
-                "本地服务器",
-                "本地部署",
-            )
+        deployment_target = _identity(
+            str(requirement.requirements.get("deployment_target") or "")
         )
+        on_premises = deployment_target in {"onprem", "onpremises"}
         if not on_premises:
-            if "ec2" in source:
+            if deployment_target == "ec2":
                 deployment_model = "EC2 部署（无额外服务费）"
                 deployment_architecture = "使用 AWS CodeDeploy 部署到 Amazon EC2"
-            elif "lambda" in source:
+            elif deployment_target == "lambda":
                 deployment_model = "Lambda 部署（无额外服务费）"
                 deployment_architecture = "使用 AWS CodeDeploy 部署到 AWS Lambda"
-            elif "ecs" in source:
+            elif deployment_target == "ecs":
                 deployment_model = "ECS 部署（无额外服务费）"
                 deployment_architecture = "使用 AWS CodeDeploy 部署到 Amazon ECS"
+            elif deployment_target:
+                # A nonempty unknown target is not an AWS no-charge identity.
+                return None
             else:
                 deployment_model = "AWS 计算资源部署（无额外服务费）"
                 deployment_architecture = "使用 AWS CodeDeploy 部署到 EC2、Lambda 或 ECS"
@@ -166,19 +169,12 @@ def no_additional_charge_decision(
             )
 
     if "cloudformation" in identities:
-        paid_extension = any(
-            marker in source
-            for marker in (
-                "third-party",
-                "third party",
-                "第三方资源",
-                "第三方 provider",
-                "custom hook",
-                "customhook",
-                "自定义 hook",
-                "自定义hook",
-                "自定义钩子",
-            )
+        paid_extension = _has_positive(
+            requirement,
+            "resource_handler_operations",
+            "resource_handler_duration_seconds",
+            "hook_invocations",
+            "hook_duration_seconds",
         ) or any("official_usage_" in field for field in requirement.requirements)
         if not paid_extension:
             return NoAdditionalChargeDecision(

@@ -3,17 +3,17 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "aws-smart-quote-backend"
-version = "0.1.0"
-description = "Fail-closed AWS intelligent quotation backend"
+name = "astraquote-official-catalog-backend"
+version = "3.0.0"
+description = "Official multi-cloud price catalog relay and quote delivery backend"
 requires-python = ">=3.11"
 dependencies = [
   "boto3>=1.42.0,<2",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
-  "playwright>=1.54,<2",
   "pydantic>=2.11,<3",
   "pydantic-settings>=2.10,<3",
+  "python-multipart>=0.0.20,<1",
   "uvicorn[standard]>=0.35,<1",
 ]
 

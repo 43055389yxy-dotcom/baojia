@@ -50,6 +50,11 @@ REQUIREMENT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
         "user_hours_per_day",
         "hours_per_user_day",
     ),
+    "hours_per_user_per_month": (
+        "monthly_hours_per_user",
+        "user_hours_per_month",
+        "hours_per_user_month",
+    ),
     "storage_gib": (
         "storage_size_gib",
         "storage_gb",
@@ -131,6 +136,10 @@ SERVICE_REQUIREMENT_FIELD_ALIASES: dict[str, dict[str, str]] = {
         "node_count": "instance_count",
         "nodes": "instance_count",
     },
+    "secrets_manager": {
+        "requests": "api_calls",
+        "request_count": "api_calls",
+    },
 }
 
 
@@ -149,9 +158,7 @@ def _normalized_service_key(service: str | None) -> str:
     }.get(key, key)
 
 
-def pricing_directive_from_text(
-    text: str, *, service: str | None = None
-) -> dict[str, Any]:
+def pricing_directive_from_text(text: str, *, service: str | None = None) -> dict[str, Any]:
     """Extract an explicit purchase-plan correction from short customer text.
 
     Purchase plans are a small closed vocabulary and should not depend solely
@@ -176,14 +183,20 @@ def pricing_directive_from_text(
         return {}
 
     on_demand = any(
-        marker in compact
-        for marker in ("按需付费", "按需实例", "按需", "ondemand", "payasyougo")
+        marker in compact for marker in ("按需付费", "按需实例", "按需", "ondemand", "payasyougo")
     )
     reserved = any(
         marker in compact
         for marker in (
-            "预留实例", "预留", "reserved", "全预付", "部分预付", "无预付",
-            "allupfront", "partialupfront", "noupfront",
+            "预留实例",
+            "预留",
+            "reserved",
+            "全预付",
+            "部分预付",
+            "无预付",
+            "allupfront",
+            "partialupfront",
+            "noupfront",
         )
     ) or bool(re.search(r"(?:1|一|3|三)年", compact))
     reject_reserved = any(
@@ -243,16 +256,16 @@ def _alias_applies(canonical: str, service_key: str) -> bool:
     }:
         return False
     if canonical == "system_disk_gib" and service_key not in {
-            "ec2",
-            "amazon_ec2",
-            "compute",
+        "ec2",
+        "amazon_ec2",
+        "compute",
     }:
         return False
     if canonical == "volume_type" and service_key not in {
-            "ec2",
-            "amazon_ec2",
-            "compute",
-            "ebs",
+        "ec2",
+        "amazon_ec2",
+        "compute",
+        "ebs",
     }:
         return False
     storage_fields = {"storage_type", "storage_iops", "storage_throughput_mbps"}
@@ -286,9 +299,7 @@ def canonicalize_requirement_fields(
 
     normalized = dict(requirements)
     service_key = _normalized_service_key(service)
-    for alias, canonical in SERVICE_REQUIREMENT_FIELD_ALIASES.get(
-        service_key, {}
-    ).items():
+    for alias, canonical in SERVICE_REQUIREMENT_FIELD_ALIASES.get(service_key, {}).items():
         if canonical not in normalized and alias in normalized:
             normalized[canonical] = normalized[alias]
         normalized.pop(alias, None)
@@ -347,67 +358,205 @@ _GENERIC_CATALOG_MODEL_TOKEN = re.compile(
 
 
 _NUMERIC_REQUIREMENT_FIELDS = {
-    "vcpu", "memory_gib", "memory_mb", "ephemeral_storage_mb",
-    "system_disk_gib", "user_volume_gib", "total_system_disk_gib",
-    "total_worker_system_disk_gib", "hours_per_user_per_day",
-    "storage_gib", "total_storage_gib", "storage_gib_per_node",
-    "storage_gib_per_broker", "source_storage_gib_per_node",
-    "storage_iops", "storage_throughput_mbps",
-    "ebs_iops", "ebs_throughput_mbps", "hours_per_month", "broker_hours",
-    "instance_hours", "task_hours", "processing_hours", "control_plane_hours", "shard_hours",
-    "data_transfer_in_gib", "data_transfer_regional_gib",
-    "data_transfer_out_gib", "data_transfer_gib", "data_processed_gib",
-    "processed_bytes_gib", "processed_bytes_ec2_ip_gib_per_hour",
-    "requests", "request_count", "https_requests", "dns_queries",
-    "read_request_units", "write_request_units",
-    "api_calls", "io_requests", "put_payload_units", "data_in_gib",
-    "data_out_gib", "data_scanned_gib", "duration_ms", "input_tokens",
-    "output_tokens", "images", "custom_metrics", "alarms",
-    "new_connections_per_second", "average_connection_duration_seconds",
-    "active_connections_per_minute", "requests_per_second",
-    "rule_evaluations_per_request", "rule_evaluations_per_second", "lcu_count",
-    "utilization_percent", "snapshot_changed_gib", "backup_storage_gib",
-    "warm_storage_gib", "cold_storage_gib", "restore_gib", "cross_region_copy_gib",
-    "provisioned_throughput_mibps", "throughput_mbps", "rpu", "dpu_hours",
-    "throughput_mbps_per_tib", "connection_minutes",
-    "crawler_dpu_hours", "interactive_session_dpu_hours",
-    "master_vcpu", "master_memory_gib", "master_storage_gib_per_node",
-    "core_vcpu", "core_memory_gib", "core_storage_gib_per_node",
-    "task_vcpu", "task_memory_gib", "task_storage_gib_per_node",
-    "managed_storage_gib", "snapshot_storage_gib", "provisioned_dpu_hours",
-    "resource_count", "flow_runs", "bucket_count", "object_count",
-    "deployment_updates", "author_users", "reader_users", "session_capacity",
-    "spice_gib", "write_records", "memory_retention_hours",
-    "magnetic_retention_days", "kpu_hours",
+    "vcpu",
+    "memory_gib",
+    "memory_mb",
+    "ephemeral_storage_mb",
+    "system_disk_gib",
+    "user_volume_gib",
+    "total_system_disk_gib",
+    "total_worker_system_disk_gib",
+    "hours_per_user_per_day",
+    "hours_per_user_per_month",
+    "storage_gib",
+    "total_storage_gib",
+    "storage_gib_per_node",
+    "storage_gib_per_broker",
+    "source_storage_gib_per_node",
+    "storage_iops",
+    "storage_throughput_mbps",
+    "ebs_iops",
+    "ebs_throughput_mbps",
+    "hours_per_month",
+    "broker_hours",
+    "instance_hours",
+    "task_hours",
+    "processing_hours",
+    "control_plane_hours",
+    "shard_hours",
+    "data_transfer_in_gib",
+    "data_transfer_regional_gib",
+    "data_transfer_out_gib",
+    "data_transfer_gib",
+    "log_delivery_to_s3_gib",
+    "data_processed_gib",
+    "processed_bytes_gib",
+    "processed_bytes_gib_per_load_balancer",
+    "processed_bytes_ec2_ip_gib_per_hour",
+    "requests",
+    "request_count",
+    "https_requests",
+    "dns_queries",
+    "read_request_units",
+    "write_request_units",
+    "api_calls",
+    "io_requests",
+    "put_payload_units",
+    "data_in_gib",
+    "data_out_gib",
+    "data_scanned_gib",
+    "duration_ms",
+    "input_tokens",
+    "output_tokens",
+    "images",
+    "custom_metrics",
+    "alarms",
+    "new_connections_per_second",
+    "average_connection_duration_seconds",
+    "active_connections_per_minute",
+    "requests_per_second",
+    "rule_evaluations_per_request",
+    "rule_evaluations_per_second",
+    "lcu_count",
+    "utilization_percent",
+    "snapshot_changed_gib",
+    "backup_storage_gib",
+    "warm_storage_gib",
+    "cold_storage_gib",
+    "restore_gib",
+    "cross_region_copy_gib",
+    "provisioned_throughput_mibps",
+    "throughput_mbps",
+    "rpu",
+    "dpu_hours",
+    "throughput_mbps_per_tib",
+    "connection_minutes",
+    "crawler_dpu_hours",
+    "interactive_session_dpu_hours",
+    "master_vcpu",
+    "master_memory_gib",
+    "master_storage_gib_per_node",
+    "core_vcpu",
+    "core_memory_gib",
+    "core_storage_gib_per_node",
+    "task_vcpu",
+    "task_memory_gib",
+    "task_storage_gib_per_node",
+    "managed_storage_gib",
+    "snapshot_storage_gib",
+    "provisioned_dpu_hours",
+    "resource_count",
+    "flow_runs",
+    "bucket_count",
+    "object_count",
+    "deployment_updates",
+    "author_users",
+    "reader_users",
+    "session_capacity",
+    "spice_gib",
+    "write_records",
+    "memory_retention_hours",
+    "magnetic_retention_days",
+    "kpu_hours",
+    "message_size_kib",
+    "input_channel_hours",
+    "viewer_hours",
+    "transcode_minutes",
+    "channel_hours",
+    "output_hours",
+    "output_bandwidth_mbps",
+    "input_bitrate_mbps",
+    "output_bitrate_mbps",
 }
 
 
 _INTEGER_REQUIREMENT_FIELDS = {
-    "broker_count", "node_count", "data_nodes", "master_nodes",
-    "warm_node_count", "shards", "replicas_per_shard", "instance_count",
-    "replication_instances", "cluster_count", "tasks", "repositories",
-    "hosted_zones", "health_checks", "web_acls", "rules", "listeners",
-    "secret_count", "key_count", "vpc_count", "public_subnets",
-    "private_subnets", "availability_zones", "gateway_count", "accelerators",
-    "schedules", "scheduled_invocations", "read_replica_count",
-    "backup_retention_days", "snapshot_retention_days", "retention_days",
+    "broker_count",
+    "node_count",
+    "data_nodes",
+    "master_nodes",
+    "warm_node_count",
+    "shards",
+    "replicas_per_shard",
+    "instance_count",
+    "replication_instances",
+    "cluster_count",
+    "tasks",
+    "repositories",
+    "hosted_zones",
+    "health_checks",
+    "web_acls",
+    "rules",
+    "listeners",
+    "secret_count",
+    "key_count",
+    "vpc_count",
+    "public_subnets",
+    "private_subnets",
+    "availability_zones",
+    "gateway_count",
+    "accelerators",
+    "schedules",
+    "scheduled_invocations",
+    "read_replica_count",
+    "backup_retention_days",
+    "snapshot_retention_days",
+    "retention_days",
     "log_retention_days",
-    "outbound_messages", "inbound_messages", "image_scans", "queue_count",
-    "event_buses", "namespaces", "service_instances", "nodes",
-    "master_nodes", "core_nodes", "task_nodes", "provisioned_throughput_units",
+    "outbound_messages",
+    "inbound_messages",
+    "image_scans",
+    "queue_count",
+    "event_buses",
+    "namespaces",
+    "service_instances",
+    "nodes",
+    "master_nodes",
+    "core_nodes",
+    "task_nodes",
+    "provisioned_throughput_units",
     "user_count",
-    "messages", "flow_runs", "bucket_count", "object_count",
-    "deployment_updates", "author_users", "reader_users", "session_capacity",
-    "listener_count", "endpoint_count", "task_count", "replica_count",
-    "writer_nodes", "reader_nodes", "kpu_count", "write_records",
+    "messages",
+    "flow_runs",
+    "bucket_count",
+    "object_count",
+    "deployment_updates",
+    "author_users",
+    "reader_users",
+    "session_capacity",
+    "listener_count",
+    "endpoint_count",
+    "task_count",
+    "replica_count",
+    "writer_nodes",
+    "reader_nodes",
+    "kpu_count",
+    "write_records",
+    "device_count",
+    "things_registered",
+    "remote_actions",
+    "metric_datapoints",
+    "channel_count",
+    "output_count",
+    "output_fps",
 }
 
 
 _BOOLEAN_REQUIREMENT_FIELDS = {
-    "detailed_monitoring", "performance_insights", "enhanced_monitoring",
-    "rotation_enabled", "cluster_mode", "data_tiering", "dedicated_master",
-    "multi_az", "include_logs", "include_metrics", "advanced_security",
-    "reference_unit_only", "reference_lcu_unit_only", "data_transfer_monitoring",
+    "detailed_monitoring",
+    "performance_insights",
+    "enhanced_monitoring",
+    "rotation_enabled",
+    "cluster_mode",
+    "data_tiering",
+    "dedicated_master",
+    "multi_az",
+    "include_logs",
+    "include_metrics",
+    "advanced_security",
+    "reference_unit_only",
+    "reference_lcu_unit_only",
+    "data_transfer_monitoring",
 }
 
 
@@ -444,7 +593,9 @@ def sanitize_requirement_values(
         ):
             cleaned.pop("requested_model", None)
         else:
-            cleaned["requested_model"] = model.removeprefix("kafka.") if service_key == "msk" else model
+            cleaned["requested_model"] = (
+                model.removeprefix("kafka.") if service_key == "msk" else model
+            )
     elif model is not None:
         cleaned.pop("requested_model", None)
 
@@ -478,8 +629,18 @@ def sanitize_requirement_values(
             cleaned[field] = parsed
 
     boolean_values = {
-        "true": True, "yes": True, "on": True, "开启": True, "启用": True, "是": True,
-        "false": False, "no": False, "off": False, "关闭": False, "禁用": False, "否": False,
+        "true": True,
+        "yes": True,
+        "on": True,
+        "开启": True,
+        "启用": True,
+        "是": True,
+        "false": False,
+        "no": False,
+        "off": False,
+        "关闭": False,
+        "禁用": False,
+        "否": False,
     }
     for field in _BOOLEAN_REQUIREMENT_FIELDS:
         if field not in cleaned:
@@ -618,6 +779,7 @@ def _canonicalize_values(requirements: dict[str, Any], service: str) -> dict[str
         "data_transfer_regional_gib",
         "data_transfer_out_gib",
         "processed_bytes_gib",
+        "processed_bytes_gib_per_load_balancer",
         "backup_retention_days",
         "utilization_percent",
         "https_requests",
@@ -630,6 +792,7 @@ def _canonicalize_values(requirements: dict[str, Any], service: str) -> dict[str
         "data_transfer_regional_gib",
         "data_transfer_out_gib",
         "processed_bytes_gib",
+        "processed_bytes_gib_per_load_balancer",
     }
     for field in numeric_fields.intersection(normalized):
         parsed = _parse_numeric_value(normalized[field], gib=field in gib_fields)

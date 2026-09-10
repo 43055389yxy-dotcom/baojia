@@ -4,11 +4,8 @@ import math
 import re
 
 from app.core.errors import ManualConfirmationRequired
-from app.domain.customer_facts import scoped_amount
-from app.domain.service_billing_policies import (
-    SERVICE_BILLING_POLICY_VERSION,
-    no_additional_charge_decision,
-)
+from app.domain.customer_facts import customer_field_is_explicit, scoped_amount
+from app.domain.pricing_contracts import declared_shared_offer_usages
 from app.domain.models import (
     CandidateOption,
     PreviewSelection,
@@ -16,6 +13,10 @@ from app.domain.models import (
     SelectedResource,
     ServiceRequirement,
     UsageLine,
+)
+from app.domain.service_billing_policies import (
+    SERVICE_BILLING_POLICY_VERSION,
+    no_additional_charge_decision,
 )
 from app.integrations.auto_service_discovery import AutoServiceDiscovery
 from app.integrations.aws import AwsClients, PricingCatalog
@@ -37,6 +38,8 @@ _SERVICE_CODE_ALIASES = {
     "sqs": "AWSQueueService",
     "scheduler": "AWSEvents",
     "eventbridge": "AWSEvents",
+    "events": "AWSEvents",
+    "config": "AWSConfig",
     "eks": "AmazonEKS",
     "ecr": "AmazonECR",
     "backup": "AWSBackup",
@@ -48,6 +51,7 @@ _SERVICE_CODE_ALIASES = {
     "efs": "AmazonEFS",
     "sns": "AmazonSNS",
     "kinesis": "AmazonKinesis",
+    "kinesisfirehose": "AmazonKinesisFirehose",
     "emr": "ElasticMapReduce",
     "redshift": "AmazonRedshift",
     "athena": "AmazonAthena",
@@ -78,6 +82,42 @@ _SERVICE_CODE_ALIASES = {
     "managedprometheus": "AmazonPrometheus",
     "quicksight": "AmazonQuickSight",
     "pinpoint": "AmazonPinpoint",
+    "guardduty": "AmazonGuardDuty",
+    "textract": "AmazonTextract",
+    "comprehend": "comprehend",
+    "rekognition": "AmazonRekognition",
+    "transcribe": "transcribe",
+    "translate": "translate",
+    "polly": "AmazonPolly",
+    "transitgateway": "AmazonVPC",
+    "directconnect": "AWSDirectConnect",
+    "sitetositevpn": "AmazonVPC",
+    "vpcendpoint": "AmazonVPC",
+    "s3glacierdeeparchive": "AmazonS3GlacierDeepArchive",
+    "storagegateway": "AWSStorageGateway",
+    "datasync": "AWSDataSync",
+    "transfer": "AWSTransfer",
+    "transferfamily": "AWSTransfer",
+    "appstream": "AmazonAppStream",
+    "workmail": "AmazonWorkMail",
+    "codebuild": "CodeBuild",
+    "codepipeline": "AWSCodePipeline",
+    "codeartifact": "AWSCodeArtifact",
+    "codedeploy": "AWSCodeDeploy",
+    "cloudformation": "AWSCloudFormation",
+    "inspectorv2": "AmazonInspectorV2",
+    "macie": "AmazonMacie",
+    "securityhub": "AWSSecurityHub",
+    "auditmanager": "auditmanager",
+    "iot": "AWSIoT",
+    "iotdevicemanagement": "IoTDeviceManagement",
+    "iotdevicedefender": "IoTDeviceDefender",
+    "kinesisvideo": "AmazonKinesisVideo",
+    "ivs": "AmazonIVS",
+    "elementalmediaconvert": "AWSElementalMediaConvert",
+    "elementalmedialive": "AWSElementalMediaLive",
+    "elementalmediapackage": "AWSElementalMediaPackage",
+    "mediaconnect": "AWSMediaConnect",
 }
 
 # Fixed business templates sometimes use a service-qualified name while the
@@ -117,7 +157,133 @@ _CONFIGURATION_CONTEXT_FIELDS: dict[str, frozenset[str]] = {
             "protected_service",
         }
     ),
+    # DMS charges for provisioned replication capacity. Multiple migration
+    # tasks may share those instances, so the task count describes scheduling
+    # and topology but must not multiply or create another AWS meter.
+    "dms": frozenset({"task_count"}),
+    # X-Ray's official TracesStored meter charges traces recorded by the
+    # service. A separately supplied retained/stored subset is sampling and
+    # retention context, not a second copy of the same AWS meter.
+    "xray": frozenset({"traces_stored"}),
+    # Standard Site-to-Site VPN exposes a connection-hour meter. Traffic is
+    # still important capacity evidence, but AWS bills any applicable transfer
+    # by direction/destination through shared transfer dimensions rather than
+    # a fictional VPN processing-GB row.
+    "sitetositevpn": frozenset({"data_processed_gib", "vpn_tier"}),
+    # File Gateway cache is customer-managed local capacity. AWS charges the
+    # bytes written through the gateway, not the cache disk itself.
+    "storagegateway": frozenset({"cache_storage_gib", "gateway_type"}),
+    "datasync": frozenset({"task_mode"}),
+    "transfer": frozenset(
+        {"protocol", "storage_backend", "transfer_direction"}
+    ),
+    "scheduler": frozenset({"schedules"}),
+    # Targets describe the fleet receiving configurations. The chargeable
+    # amount is the total configurations actually received, which is already
+    # represented by configuration_retrievals.
+    "appconfig": frozenset({"targets_receiving_configuration"}),
+    "securityhub": frozenset({"resource_count"}),
+    "auditmanager": frozenset({"evidence_items"}),
+    "iot": frozenset({"device_count"}),
 }
+
+
+def _backup_dimension_is_compatible(
+    requirement: ServiceRequirement,
+    field: str,
+    values: object,
+) -> bool:
+    """Keep an AWS Backup meter inside the selected official child identity.
+
+    AWS publishes every protected resource and warm/cold/partial variant under
+    one offer.  The Calculator child selected by the customer is the product
+    identity boundary; a lower-priced EBS or cold-storage row must never be
+    substituted for EFS merely because both are measured in GB.
+    """
+
+    if _stem(requirement.service) != "backup":
+        return True
+    identity = _canonical(str(values))
+    protected = _canonical(
+        str(requirement.requirements.get("protected_service") or "")
+    )
+    for prefix in ("amazon", "aws"):
+        if protected.startswith(prefix):
+            protected = protected[len(prefix) :]
+    if protected.endswith("backup"):
+        protected = protected[: -len("backup")]
+    if protected and protected not in identity:
+        return False
+    if "lagv" in identity or "logicallyairgapped" in identity:
+        return False
+    if "earlydelete" in identity:
+        return False
+    if field == "backup_storage_gib":
+        return (
+            "storage" in identity
+            and "warm" in identity
+            and "restore" not in identity
+            and "partial" not in identity
+        )
+    if field == "warm_storage_gib":
+        return "warm" in identity and "storage" in identity and "restore" not in identity
+    if field == "cold_storage_gib":
+        return "cold" in identity and "storage" in identity and "restore" not in identity
+    if field == "restore_gib":
+        wants_cold = bool(requirement.requirements.get("cold_storage_gib"))
+        return (
+            "restore" in identity
+            and "partial" not in identity
+            and (("cold" in identity) if wants_cold else ("warm" in identity))
+        )
+    return True
+
+# These products have closed, provider-reviewed selectors that bind customer
+# fields to stable UsageType/Operation semantics. A generic profile may still
+# enrich labels and editable fields, but it must never inject its cheapest raw
+# dimension as a billing variant or fall back to an unrelated catalog row.
+_STRICT_SEMANTIC_SERVICES = frozenset(
+    {
+        "efs",
+        "fsx",
+        "emr",
+        "redshift",
+        "athena",
+        "directconnect",
+        "sitetositevpn",
+        "vpcendpoint",
+        "s3glacierdeeparchive",
+        "storagegateway",
+        "datasync",
+        "transfer",
+        "transferfamily",
+        "appstream",
+        "workmail",
+        "cloudmap",
+        "sns",
+        "scheduler",
+        "appconfig",
+        "eventbridge",
+        "stepfunctions",
+        "codebuild",
+        "codepipeline",
+        "codeartifact",
+        "cloudformation",
+        "inspectorv2",
+        "macie",
+        "securityhub",
+        "auditmanager",
+        "iot",
+        "iotdevicemanagement",
+        "iotdevicedefender",
+        "kinesisvideo",
+        "ivs",
+        "elementalmediaconvert",
+        "elementalmedialive",
+        "elementalmediapackage",
+        "mediaconnect",
+    }
+)
 
 
 def _canonical(value: str) -> str:
@@ -132,7 +298,10 @@ def _stem(value: str) -> str:
     for suffix in ("service", "services"):
         if result.endswith(suffix):
             result = result[: -len(suffix)]
-    return result
+    return {
+        "events": "eventbridge",
+        "awsevents": "eventbridge",
+    }.get(result, result)
 
 
 class GenericOfficialPlugin:
@@ -153,6 +322,26 @@ class GenericOfficialPlugin:
         self.catalog = catalog
         self.auto_discovery = auto_discovery
         self._unavailable_region_cache: set[tuple[str, str]] = set()
+
+    @staticmethod
+    def _is_managed_flink(requirement: ServiceRequirement) -> bool:
+        """Identify Flink from structured product identity only.
+
+        The cleaning boundary owns natural-language interpretation.  Catalog
+        adapters may inspect normalized identity fields, but must never reopen
+        the customer's prose to choose a billed AWS dimension.
+        """
+
+        identity = " ".join(
+            str(value or "")
+            for value in (
+                requirement.service,
+                requirement.product_identity,
+                requirement.calculator_service_name,
+                requirement.workload_name,
+            )
+        ).casefold()
+        return "flink" in identity
 
     def _service_identity_stems(self, requirement: ServiceRequirement) -> list[str]:
         return list(
@@ -785,6 +974,8 @@ class GenericOfficialPlugin:
         AWS UsageType details are not useful customer questions.
         """
 
+        if _stem(requirement.service) in _STRICT_SEMANTIC_SERVICES:
+            return
         raw_bindings = (profile or {}).get("field_bindings")
         dimensions = (profile or {}).get("dimensions")
         if not isinstance(raw_bindings, list) or not isinstance(dimensions, list):
@@ -803,7 +994,6 @@ class GenericOfficialPlugin:
             except (TypeError, ValueError):
                 continue
 
-        source = requirement.source_text or ""
         reader_billing_mode = str(
             requirement.requirements.get("_billing_variant_reader_billing_mode") or ""
         ).strip()
@@ -813,6 +1003,25 @@ class GenericOfficialPlugin:
                 by_field.setdefault(str(binding["field"]), []).append(binding)
 
         for field, bindings in by_field.items():
+            bindings = [
+                binding
+                for binding in bindings
+                if _backup_dimension_is_compatible(
+                    requirement,
+                    field,
+                    " ".join(
+                        str(binding.get(key) or "")
+                        for key in (
+                            "usage_type",
+                            "operation",
+                            "description",
+                            "product_family",
+                        )
+                    ),
+                )
+            ]
+            if not bindings:
+                continue
             if (
                 reader_billing_mode == "per_user"
                 and field == "session_capacity"
@@ -822,13 +1031,16 @@ class GenericOfficialPlugin:
             ):
                 continue
             if field == "hours_per_month":
-                has_value = bool(
-                    requirement.field_evidence.get("hours_per_month")
-                    or re.search(r"\d+(?:\.\d+)?\s*(?:小时|hours?|hrs?)", source, re.I)
+                has_value = customer_field_is_explicit(
+                    requirement, "hours_per_month"
                 )
             else:
                 value = requirement.requirements.get(field)
-                has_value = isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+                has_value = (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and value > 0
+                )
             if not has_value or requirement.requirements.get(f"_billing_variant_{field}"):
                 continue
             unique: dict[tuple[str, str, str], dict[str, object]] = {}
@@ -847,12 +1059,9 @@ class GenericOfficialPlugin:
             variants = positive or unique
             if field in {"author_users", "reader_users"}:
                 edition = str(requirement.requirements.get("edition") or "").casefold()
-                source_mentions_q = bool(
-                    re.search(
-                        r"amazon\s+q(?:\b|[^a-z])|quicksight\s+q(?:\b|[^a-z])|含\s*q(?:\b|[^a-z])",
-                        source,
-                        re.I,
-                    )
+                includes_amazon_q = bool(
+                    requirement.requirements.get("includes_amazon_q")
+                    or requirement.requirements.get("amazon_q_enabled")
                 )
                 matching_roles: dict[
                     tuple[str, str, str], dict[str, object]
@@ -861,7 +1070,7 @@ class GenericOfficialPlugin:
                     usage_folded = identity[0].casefold()
                     if edition in {"enterprise", "standard"} and edition not in usage_folded:
                         continue
-                    if usage_folded.endswith("-q") and not source_mentions_q:
+                    if usage_folded.endswith("-q") and not includes_amazon_q:
                         continue
                     matching_roles[identity] = binding
                 if matching_roles:
@@ -875,12 +1084,9 @@ class GenericOfficialPlugin:
                     requirement.requirements.get("session_capacity") or 0
                 )
                 annual_sessions = monthly_sessions * 12
-                source_mentions_q = bool(
-                    re.search(
-                        r"amazon\s+q(?:\b|[^a-z])|quicksight\s+q(?:\b|[^a-z])|含\s*q(?:\b|[^a-z])",
-                        source,
-                        re.I,
-                    )
+                includes_amazon_q = bool(
+                    requirement.requirements.get("includes_amazon_q")
+                    or requirement.requirements.get("amazon_q_enabled")
                 )
                 usable_session_plans: dict[
                     tuple[str, str, str], dict[str, object]
@@ -892,7 +1098,7 @@ class GenericOfficialPlugin:
                         for marker in ("-extra", "bonus", "report", "-cap-")
                     ):
                         continue
-                    if usage_folded.endswith("-q") and not source_mentions_q:
+                    if usage_folded.endswith("-q") and not includes_amazon_q:
                         continue
                     capacity_match = re.search(
                         r"reader-capacity-(\d+)k-usage$", usage_folded
@@ -935,23 +1141,6 @@ class GenericOfficialPlugin:
                     identity, _ = next(iter(semantic_variants.values()))
                     requirement.requirements[f"_billing_variant_{field}"] = identity[0]
                 continue
-            source_folded = source.casefold()
-            source_matches = [
-                identity
-                for label, (identity, _binding) in semantic_variants.items()
-                if any(
-                    marker in source_folded
-                    for marker in cls._billing_variant_source_markers(label)
-                )
-            ]
-            if len(source_matches) == 1:
-                key = f"_billing_variant_{field}"
-                requirement.requirements[key] = source_matches[0][0]
-                requirement.field_sources[f"requirements.{key}"] = "customer_text"
-                requirement.field_evidence[f"requirements.{key}"] = (
-                    "客户原话已明确收费方式"
-                )
-                continue
             # Prefer the ordinary/base product over optional add-ons even when
             # an add-on publishes a deceptively low unit rate.  Among equally
             # compatible base products, use the actual lowest positive rate.
@@ -979,7 +1168,9 @@ class GenericOfficialPlugin:
             )
 
             def default_rank(
-                item: tuple[str, tuple[tuple[str, str, str], dict[str, object]]]
+                item: tuple[str, tuple[tuple[str, str, str], dict[str, object]]],
+                *,
+                markers: tuple[str, ...] = addon_markers,
             ) -> tuple[int, int, float, str, str, str]:
                 label, (identity, binding) = item
                 searchable = " ".join(
@@ -995,7 +1186,7 @@ class GenericOfficialPlugin:
                 )
                 padded = f" {searchable} "
                 addon_penalty = int(
-                    any(marker in padded for marker in addon_markers)
+                    any(marker in padded for marker in markers)
                 )
                 price = prices.get(identity, 0)
                 missing_price = int(price <= 0)
@@ -1327,7 +1518,7 @@ class GenericOfficialPlugin:
             if selected_rates[position][1] is None and item[1] is not None:
                 selected_rates[position] = item
         auto_discovered = bool(profile_bound_rates) and is_unknown_service
-        strict_semantic_services = {"emr", "redshift", "athena"}
+        strict_semantic_services = _STRICT_SEMANTIC_SERVICES
         service_stem = _stem(requirement.service)
 
         # Known generic products already have complete official product rows in
@@ -1488,7 +1679,8 @@ class GenericOfficialPlugin:
                 )
                 if has_regional_shape_catalog:
                     raise ManualConfirmationRequired(
-                        "客户填写的型号与处理器或内存规格不一致，请从当前区域的 AWS 官方可售配置中选择",
+                        "客户填写的型号与处理器或内存规格不一致，"
+                        "请从当前区域的 AWS 官方可售配置中选择",
                         code="generic_official_specification_not_found",
                         service_code=service_code,
                         region=region,
@@ -1497,7 +1689,8 @@ class GenericOfficialPlugin:
                         requested_memory_gib=requested_memory,
                     )
                 raise ManualConfirmationRequired(
-                    "AWS 官方目录返回的计费项没有可核验的处理器和内存规格，系统不会用无关计费项猜价",
+                    "AWS 官方目录返回的计费项没有可核验的处理器和内存规格，"
+                    "系统不会用无关计费项猜价",
                     code="generic_official_shape_not_exposed",
                     service_code=service_code,
                     region=region,
@@ -1647,14 +1840,17 @@ class GenericOfficialPlugin:
             # lineage on the selected row so the universal fact ledger can
             # prove the value was used without re-reading customer prose.
             declared_fields = product.get("_astra_source_fields")
-            if isinstance(declared_fields, (list, tuple, set)):
+            has_declared_fields = isinstance(
+                declared_fields, (list, tuple, set)
+            ) and bool(declared_fields)
+            if has_declared_fields:
                 fields.update(
                     str(field)
                     for field in declared_fields
                     if isinstance(field, str) and field
                 )
             raw_bindings = (profile or {}).get("field_bindings")
-            if isinstance(raw_bindings, list):
+            if isinstance(raw_bindings, list) and not has_declared_fields:
                 for binding in raw_bindings:
                     if not isinstance(binding, dict):
                         continue
@@ -1703,6 +1899,8 @@ class GenericOfficialPlugin:
                     "AWS-Lambda-Duration-ARM",
                 }:
                     fields.update({"requests", "memory_mb", "duration_ms"})
+                    if requirement.requirements.get("architecture") not in (None, ""):
+                        fields.add("architecture")
             elif service_stem == "eks" and "amazoneks-hours:percluster" in str(
                 usage_type
             ).casefold():
@@ -1714,7 +1912,7 @@ class GenericOfficialPlugin:
                         "DDB-WriteUnits": {"write_request_units", "capacity_mode"},
                     }.get(str(attrs.get("group") or ""), set())
                 )
-            if attrs.get("instanceType"):
+            if attrs.get("instanceType") and not has_declared_fields:
                 fields.update(
                     {
                         "requested_model",
@@ -1739,6 +1937,30 @@ class GenericOfficialPlugin:
             )
             if requirement.requirements.get(field) not in (None, "", [], {})
         }
+        if service_stem == "kinesis":
+            capacity_mode = _canonical(
+                str(requirement.requirements.get("capacity_mode") or "provisioned")
+            )
+            if requirement.requirements.get("capacity_mode") not in (None, ""):
+                applied_fields.add("capacity_mode")
+            if (
+                capacity_mode
+                not in {"ondemand", "ondemandstandard", "ondemandadvantage"}
+                and requirement.requirements.get("data_out_gib")
+                not in (None, "")
+            ):
+                # Standard provisioned consumers read within the throughput
+                # supplied by the purchased shards; monthly read bytes are not
+                # a second AWS usage dimension. Retain the value as capacity
+                # context without manufacturing another billable line.
+                applied_fields.add("data_out_gib")
+        if service_stem == "ecr" and _canonical(
+            str(requirement.requirements.get("transfer_scope") or "")
+        ) in {"sameregion", "inregion"}:
+            # ECR image transfer to AWS services in the same Region is free.
+            # Keep the customer's volume and destination scope as explicit
+            # non-billable context; never reinterpret it as internet egress.
+            applied_fields.update({"data_transfer_out_gib", "transfer_scope"})
         for index, (description, amount, rate) in enumerate(selected_rates, start=1):
             price, unit, usage_type, operation, _ = rate
             if rate[1:4] in reserved_rate_identities:
@@ -1830,6 +2052,40 @@ class GenericOfficialPlugin:
             substitution_notices.append(
                 "DynamoDB 预留容量只能按每 100 个 RCU/WCU 一组购买；"
                 "本次已分别向上取整，并使用官方 Heavy Utilization 条款核价。"
+            )
+        if (
+            service_stem == "sitetositevpn"
+            and requirement.requirements.get("data_processed_gib") not in (None, "")
+        ):
+            substitution_notices.append(
+                "Site-to-Site VPN 的官方直接计费项为连接小时；客户提供的流量已作为容量上下文保留，"
+                "任何数据传输费用必须按实际方向和目的地通过共享 Data Transfer 计费项另行核算。"
+            )
+        if (
+            service_stem in {"transfer", "transferfamily"}
+            and requirement.requirements.get("data_processed_gib") not in (None, "")
+            and not customer_field_is_explicit(requirement, "transfer_direction")
+        ):
+            substitution_notices.append(
+                "客户未区分上传和下载；两者当前官方单位价相同，本次按上传计费身份核价。"
+            )
+        if (
+            service_stem == "s3glacierdeeparchive"
+            and requirement.requirements.get("data_retrieval_gib") not in (None, "")
+            and not customer_field_is_explicit(requirement, "retrieval_tier")
+        ):
+            substitution_notices.append(
+                "客户未指定恢复档位；本次采用 Standard Retrieval，不以更慢的 Bulk 档位压低价格。"
+            )
+        if (
+            service_stem == "opensearch"
+            and requirement.requirements.get("master_nodes")
+            and not requirement.requirements.get("master_requested_model")
+            and selected_instance_model
+        ):
+            substitution_notices.append(
+                "专用主节点未单独指定型号；本次按客户已指定的数据节点型号 "
+                f"{selected_instance_model} 核价，避免遗漏主节点费用。"
             )
         if not has_billable_cost or reference_rates:
             substitution_notices.append(
@@ -2109,65 +2365,116 @@ class GenericOfficialPlugin:
         """Resolve globally shared AWS charges without changing product identity."""
 
         lines: list[UsageLine] = []
-        if "data_transfer_out_gib" not in target_fields:
-            return lines
-        raw_amount = requirement.requirements.get("data_transfer_out_gib")
-        if isinstance(raw_amount, bool):
-            return lines
-        try:
-            numeric_amount = float(raw_amount)
-        except (TypeError, ValueError):
-            return lines
-        if numeric_amount <= 0:
-            return lines
-        amount = scoped_amount(
-            requirement,
-            "data_transfer_out_gib",
-            numeric_amount,
-            resource_count=float(
-                requirement.requirements.get("instance_count")
-                or requirement.requirements.get("node_count")
-                or requirement.requirements.get("nodes")
-                or requirement.quantity
-                or 1
-            ),
-        )
-
         region = requirement.region or default_region
-        service_code = _SHARED_OFFER_DIMENSIONS["data_transfer_out_gib"]
-        filters = {
-            "fromLocation": self.catalog.location(region),
-            "toLocation": "External",
-            "transferType": "AWS Outbound",
-        }
-        products = self.catalog.products(service_code, filters, max_pages=3)
-        if not products:
-            products = self.catalog.products(
-                service_code,
-                filters,
-                max_pages=3,
-                refresh=True,
+        if "data_transfer_out_gib" in target_fields:
+            raw_amount = requirement.requirements.get("data_transfer_out_gib")
+            if not isinstance(raw_amount, bool):
+                try:
+                    numeric_amount = float(raw_amount)
+                except (TypeError, ValueError):
+                    numeric_amount = 0.0
+                if numeric_amount > 0:
+                    amount = scoped_amount(
+                        requirement,
+                        "data_transfer_out_gib",
+                        numeric_amount,
+                        resource_count=float(
+                            requirement.requirements.get("instance_count")
+                            or requirement.requirements.get("node_count")
+                            or requirement.requirements.get("nodes")
+                            or requirement.quantity
+                            or 1
+                        ),
+                    )
+                    service_code = _SHARED_OFFER_DIMENSIONS[
+                        "data_transfer_out_gib"
+                    ]
+                    filters = {
+                        "fromLocation": self.catalog.location(region),
+                        "toLocation": "External",
+                        "transferType": "AWS Outbound",
+                    }
+                    products = self.catalog.products(
+                        service_code, filters, max_pages=3
+                    )
+                    if not products:
+                        products = self.catalog.products(
+                            service_code,
+                            filters,
+                            max_pages=3,
+                            refresh=True,
+                        )
+                    priced = [
+                        (rate[0], product)
+                        for product in products
+                        if (
+                            rate := PricingCatalog.on_demand_unit_rate(product)
+                        )
+                        is not None
+                    ]
+                    if priced:
+                        _, product = min(priced, key=lambda item: item[0])
+                        resolved_service, usage_type, operation = (
+                            PricingCatalog.billing_identity(product)
+                        )
+                        lines.append(
+                            UsageLine(
+                                key="dto",
+                                service_code=resolved_service,
+                                usage_type=usage_type,
+                                operation=operation,
+                                amount=float(amount),
+                                group="data-transfer",
+                                source_fields=["data_transfer_out_gib"],
+                            )
+                        )
+
+        for index, usage in enumerate(
+            declared_shared_offer_usages(requirement, target_fields), start=1
+        ):
+            if usage.billing_kind != "ebs_volume_storage":
+                continue
+            volume_type = usage.variant or "gp3"
+
+            def is_volume_storage(attributes: dict[str, str]) -> bool:
+                usage_type = str(attributes.get("usagetype") or "").casefold()
+                return usage_type.endswith(
+                    f"ebs:volumeusage.{volume_type}".casefold()
+                )
+
+            products = self.catalog.matching_products(
+                usage.service_code,
+                {
+                    "regionCode": region,
+                    "productFamily": "Storage",
+                    "volumeApiName": volume_type,
+                },
+                is_volume_storage,
+                max_pages=4,
+                fallback_filters={
+                    "regionCode": region,
+                    "volumeApiName": volume_type,
+                },
+                fallback_predicate=is_volume_storage,
             )
-        priced = [
-            (rate[0], product)
-            for product in products
-            if (rate := PricingCatalog.on_demand_unit_rate(product)) is not None
-        ]
-        if not priced:
-            return lines
-        _, product = min(priced, key=lambda item: item[0])
-        resolved_service, usage_type, operation = PricingCatalog.billing_identity(product)
-        lines.append(
-            UsageLine(
-                key="dto",
-                service_code=resolved_service,
-                usage_type=usage_type,
-                operation=operation,
-                amount=float(amount),
-                group="data-transfer",
-                source_fields=["data_transfer_out_gib"],
+            product = PricingCatalog.require_unique(
+                products,
+                context=f"共享 EBS {volume_type} 存储 ({region})",
             )
-        )
+            resolved_service, usage_type, operation = (
+                PricingCatalog.billing_identity(product)
+            )
+            lines.append(
+                UsageLine(
+                    key=f"xbs{index}",
+                    service_code=resolved_service,
+                    usage_type=usage_type,
+                    operation=operation,
+                    amount=usage.amount,
+                    group="ec2-storage",
+                    source_fields=list(usage.source_fields),
+                )
+            )
         return lines
 
     def official_field_candidates(
@@ -2295,10 +2602,24 @@ class GenericOfficialPlugin:
             current_generation: bool = False,
             exact_group: str | None = None,
             exact_usage_type: str | None = None,
+            usage_type_suffix: str | None = None,
+            exact_operation: str | None = None,
         ) -> tuple[float, str, str, str, dict[str, object]] | None:
             candidates = []
             for item in rates:
                 if exact_usage_type is not None and str(item[2]) != exact_usage_type:
+                    continue
+                if usage_type_suffix is not None:
+                    usage_type = str(item[2]).casefold()
+                    expected_suffix = usage_type_suffix.casefold()
+                    if not (
+                        usage_type == expected_suffix
+                        or usage_type.endswith(f"-{expected_suffix}")
+                    ):
+                        continue
+                if exact_operation is not None and str(
+                    item[3]
+                ).casefold() != exact_operation.casefold():
                     continue
                 product = item[4]
                 attrs = PricingCatalog.attributes(product)
@@ -2354,6 +2675,16 @@ class GenericOfficialPlugin:
             positive = [item for item in candidates if item[0] > 0] or candidates
             return min(positive, key=lambda item: (item[0], item[2], item[3])) if positive else None
 
+        def bind_source_fields(
+            rate: tuple[float, str, str, str, dict[str, object]],
+            source_fields: tuple[str, ...],
+        ) -> tuple[float, str, str, str, dict[str, object]]:
+            if not source_fields:
+                return rate
+            product = dict(rate[4])
+            product["_astra_source_fields"] = list(source_fields)
+            return (rate[0], rate[1], rate[2], rate[3], product)
+
         def add(
             result: list,
             description: str,
@@ -2363,16 +2694,84 @@ class GenericOfficialPlugin:
         ) -> None:
             rate = matching(**filters)
             if rate is not None:
-                if source_fields:
-                    product = dict(rate[4])
-                    product["_astra_source_fields"] = list(source_fields)
-                    rate = (rate[0], rate[1], rate[2], rate[3], product)
+                rate = bind_source_fields(rate, source_fields)
                 result.append((description, amount, rate))
 
         result: list[
             tuple[str, float | None, tuple[float, str, str, str, dict[str, object]]]
         ] = []
-        if service == "lambda":
+        if service == "appstream":
+            # AppStream publishes fleet, image-builder, app-block-builder and
+            # multi-session rows for the same instanceType. A customer asking
+            # for streamed-user runtime owns a Fleet workload; choosing the
+            # cheapest same-model builder row would be a different product.
+            model = str(requested.get("requested_model") or "").strip()
+            users = requested.get("user_count")
+            monthly_hours = requested.get("hours_per_user_per_month")
+            daily_hours = requested.get("hours_per_user_per_day")
+            effective_monthly_hours = (
+                float(monthly_hours)
+                if isinstance(monthly_hours, (int, float))
+                and not isinstance(monthly_hours, bool)
+                else (
+                    float(daily_hours) * 30
+                    if isinstance(daily_hours, (int, float))
+                    and not isinstance(daily_hours, bool)
+                    else None
+                )
+            )
+            amount = (
+                float(users) * effective_monthly_hours
+                if isinstance(users, (int, float))
+                and not isinstance(users, bool)
+                and effective_monthly_hours is not None
+                else None
+            )
+            source_fields = tuple(
+                field
+                for field in (
+                    "requested_model",
+                    "user_count",
+                    "hours_per_user_per_month",
+                    "hours_per_user_per_day",
+                )
+                if requested.get(field) not in (None, "")
+            )
+            add(
+                result,
+                "AppStream Fleet 实例小时价",
+                amount,
+                source_fields=source_fields,
+                include=("fleet",),
+                exclude=(
+                    "imagebuilder",
+                    "image builder",
+                    "appblockbuilder",
+                    "app block builder",
+                    "elasticfleet",
+                    "elastic fleet",
+                    "multisession",
+                    "multi-session",
+                ),
+                model=model or None,
+                unit_contains=("hour", "hrs"),
+            )
+        elif service == "workmail":
+            users = requested.get("user_count")
+            add(
+                result,
+                "WorkMail 标准邮箱用户月费",
+                (
+                    float(users)
+                    if isinstance(users, (int, float))
+                    and not isinstance(users, bool)
+                    else None
+                ),
+                source_fields=("user_count",) if users not in (None, "") else (),
+                usage_type_suffix="WorkMail-NormalTier-UserHrs",
+                unit_contains=("user-mo", "user-month"),
+            )
+        elif service == "lambda":
             requests = requested.get("requests") or requested.get("request_count")
             billed_requests = (
                 scoped_amount(requirement, "requests", float(requests))
@@ -2463,7 +2862,10 @@ class GenericOfficialPlugin:
                         if storage not in (None, "")
                         else None
                     ),
-                    selected_storage,
+                    bind_source_fields(
+                        selected_storage,
+                        ("storage_gib", "storage_class", "deployment_type"),
+                    ),
                 )
             )
 
@@ -2495,7 +2897,7 @@ class GenericOfficialPlugin:
                         (
                             label,
                             scoped_amount(requirement, field, float(amount)),
-                            selected,
+                            bind_source_fields(selected, (field,)),
                         )
                     )
             elif throughput_mode == "provisioned":
@@ -2505,6 +2907,10 @@ class GenericOfficialPlugin:
                         result,
                         "EFS 预置吞吐量单价",
                         float(provisioned),
+                        source_fields=(
+                            "provisioned_throughput_mibps",
+                            "throughput_mode",
+                        ),
                         include=("provisionedtp",),
                         unit_contains=("mibps-mo", "mbps-mo"),
                     )
@@ -2596,7 +3002,19 @@ class GenericOfficialPlugin:
                             if storage
                             else None
                         ),
-                        selected_storage,
+                        bind_source_fields(
+                            selected_storage,
+                            tuple(
+                                field
+                                for field in (
+                                    "storage_gib",
+                                    "file_system_type",
+                                    "storage_type",
+                                    "deployment_type",
+                                )
+                                if requested.get(field) not in (None, "")
+                            ),
+                        ),
                     )
                 )
 
@@ -2630,7 +3048,10 @@ class GenericOfficialPlugin:
                             scoped_amount(
                                 requirement, "throughput_mbps", float(throughput)
                             ),
-                            selected_throughput,
+                            bind_source_fields(
+                                selected_throughput,
+                                ("throughput_mbps", "file_system_type"),
+                            ),
                         )
                     )
 
@@ -2667,7 +3088,10 @@ class GenericOfficialPlugin:
                                 "backup_storage_gib",
                                 float(backup_storage),
                             ),
-                            selected_backup,
+                            bind_source_fields(
+                                selected_backup,
+                                ("backup_storage_gib", "file_system_type"),
+                            ),
                         )
                     )
                 return result
@@ -2738,7 +3162,20 @@ class GenericOfficialPlugin:
                         if storage
                         else None
                     ),
-                    selected,
+                    bind_source_fields(
+                        selected,
+                        tuple(
+                            field
+                            for field in (
+                                "storage_gib",
+                                "file_system_type",
+                                "storage_type",
+                                "throughput_mbps_per_tib",
+                                "deployment_type",
+                            )
+                            if requested.get(field) not in (None, "")
+                        ),
+                    ),
                 )
             )
             throughput = requested.get("throughput_mbps")
@@ -2781,9 +3218,128 @@ class GenericOfficialPlugin:
                             "throughput_mbps",
                             float(throughput),
                         ),
-                        selected_throughput,
+                        bind_source_fields(
+                            selected_throughput,
+                            ("throughput_mbps", "file_system_type"),
+                        ),
                     )
                 )
+        elif service == "s3glacierdeeparchive":
+            storage = requested.get("storage_gib")
+            if storage not in (None, ""):
+                add(
+                    result,
+                    "S3 Glacier Deep Archive 存储单价",
+                    scoped_amount(requirement, "storage_gib", float(storage)),
+                    source_fields=("storage_gib",),
+                    usage_type_suffix="TimedStorage-GDA-ByteHrs",
+                    unit_contains=("gb-mo", "gb-month"),
+                )
+            retrieval = requested.get("data_retrieval_gib")
+            if retrieval not in (None, ""):
+                retrieval_tier = _canonical(
+                    str(requested.get("retrieval_tier") or "standard")
+                )
+                suffix = (
+                    "Bulk-Retrieval-Bytes"
+                    if retrieval_tier == "bulk"
+                    else "Standard-Retrieval-Bytes"
+                )
+                add(
+                    result,
+                    "S3 Glacier Deep Archive 数据恢复单价",
+                    scoped_amount(
+                        requirement, "data_retrieval_gib", float(retrieval)
+                    ),
+                    source_fields=("data_retrieval_gib", "retrieval_tier"),
+                    usage_type_suffix=suffix,
+                    exact_operation="DeepArchiveRestoreObject",
+                    unit_contains=("gb", "gigabyte"),
+                )
+            return result
+        elif service == "storagegateway":
+            uploaded = requested.get("data_processed_gib")
+            if uploaded not in (None, ""):
+                add(
+                    result,
+                    "Storage Gateway 写入 AWS 数据单价",
+                    scoped_amount(
+                        requirement, "data_processed_gib", float(uploaded)
+                    ),
+                    source_fields=("data_processed_gib", "gateway_type"),
+                    usage_type_suffix="Uploaded-Bytes",
+                    unit_contains=("gb", "gigabyte"),
+                )
+            return result
+        elif service == "datasync":
+            transferred = requested.get("data_processed_gib")
+            if transferred not in (None, ""):
+                task_mode = _canonical(str(requested.get("task_mode") or "basic"))
+                suffix = (
+                    "Transferred-Bytes-Enhanced"
+                    if task_mode == "enhanced"
+                    else "Transferred-Bytes"
+                )
+                add(
+                    result,
+                    "AWS DataSync 数据复制单价",
+                    scoped_amount(
+                        requirement, "data_processed_gib", float(transferred)
+                    ),
+                    source_fields=("data_processed_gib", "task_mode"),
+                    usage_type_suffix=suffix,
+                    unit_contains=("gb", "gigabyte"),
+                )
+            return result
+        elif service in {"transfer", "transferfamily"}:
+            protocol = str(requested.get("protocol") or "sftp").strip().upper()
+            backend = str(requested.get("storage_backend") or "s3").strip().upper()
+            operation = f"{protocol}:{backend}"
+            endpoint_count = requested.get("endpoint_count")
+            if endpoint_count not in (None, ""):
+                add(
+                    result,
+                    "AWS Transfer Family 协议端点小时单价",
+                    scoped_amount(
+                        requirement,
+                        "endpoint_count",
+                        float(endpoint_count) * float(requirement.hours_per_month),
+                    ),
+                    source_fields=(
+                        "endpoint_count",
+                        "protocol",
+                        "storage_backend",
+                        "hours_per_month",
+                    ),
+                    usage_type_suffix="ProtocolHours",
+                    exact_operation=operation,
+                    unit_contains=("hour", "hrs"),
+                )
+            transferred = requested.get("data_processed_gib")
+            if transferred not in (None, ""):
+                direction = _canonical(
+                    str(requested.get("transfer_direction") or "upload")
+                )
+                suffix = (
+                    "DownloadBytes" if direction == "download" else "UploadBytes"
+                )
+                add(
+                    result,
+                    "AWS Transfer Family 数据传输单价",
+                    scoped_amount(
+                        requirement, "data_processed_gib", float(transferred)
+                    ),
+                    source_fields=(
+                        "data_processed_gib",
+                        "transfer_direction",
+                        "protocol",
+                        "storage_backend",
+                    ),
+                    usage_type_suffix=suffix,
+                    exact_operation=operation,
+                    unit_contains=("gb", "gigabyte"),
+                )
+            return result
         elif service == "kinesis":
             # A provisioned Kinesis stream is billed by shard-hour.  Treat an
             # explicit shard count as workload evidence instead of falling
@@ -2792,7 +3348,11 @@ class GenericOfficialPlugin:
             capacity_mode = _canonical(
                 str(requested.get("capacity_mode") or "provisioned")
             )
-            shards = requested.get("shards") or requested.get("shard_count")
+            shards = requested.get("shards")
+            shard_source_field = "shards"
+            if shards in (None, ""):
+                shards = requested.get("shard_count")
+                shard_source_field = "shard_count"
             if shards and capacity_mode not in {
                 "ondemand",
                 "ondemandstandard",
@@ -2806,6 +3366,7 @@ class GenericOfficialPlugin:
                         * float(shards)
                         * requirement.hours_per_month
                     ),
+                    source_fields=(shard_source_field, "capacity_mode"),
                     include_any=("storage-shardhour", "shardhourstorage"),
                     exclude=("extended",),
                     unit_contains=("shardhour", "shard hour"),
@@ -2832,7 +3393,11 @@ class GenericOfficialPlugin:
                     )
                     put_source_field = "data_in_gib"
             if put_payload_units in (None, ""):
-                requests = requested.get("requests") or requested.get("request_count")
+                requests = requested.get("requests")
+                put_source_field = "requests"
+                if requests in (None, ""):
+                    requests = requested.get("request_count")
+                    put_source_field = "request_count"
                 if requests not in (None, ""):
                     put_payload_units = scoped_amount(
                         requirement,
@@ -2857,6 +3422,7 @@ class GenericOfficialPlugin:
                         else "Kinesis 写入负载单价"
                     ),
                     float(put_payload_units),
+                    source_fields=(put_source_field, "capacity_mode"),
                     include_any=("putrequestpayloadunits", "putrequest"),
                     exclude=("enhanced",),
                     unit_contains=("putrequest", "request"),
@@ -2871,6 +3437,7 @@ class GenericOfficialPlugin:
                         scoped_amount(
                             requirement, "data_in_gib", float(data_in_gib)
                         ),
+                        source_fields=("data_in_gib", "capacity_mode"),
                         include=("ondemand",),
                         include_any=("incomingbytes", "ingest"),
                         exclude=("advantagecommitment", "extended", "enhanced"),
@@ -2884,11 +3451,95 @@ class GenericOfficialPlugin:
                         scoped_amount(
                             requirement, "data_out_gib", float(data_out_gib)
                         ),
+                        source_fields=("data_out_gib", "capacity_mode"),
                         include=("ondemand",),
                         include_any=("outgoingbytes", "retrieval"),
                         exclude=("advantagecommitment", "extended", "enhanced"),
                         unit_contains=("gb", "gib"),
                     )
+        elif service == "sns":
+            topic_type = _canonical(
+                str(requested.get("topic_type") or "standard")
+            )
+            requests = requested.get("requests")
+            deliveries = requested.get("deliveries")
+            transfer = requested.get("data_transfer_out_gib")
+            if topic_type == "fifo":
+                if requests not in (None, ""):
+                    add(
+                        result,
+                        "Amazon SNS FIFO 发布请求单价",
+                        float(requests),
+                        source_fields=("requests", "topic_type"),
+                        usage_type_suffix="F-Request-Tier1",
+                        unit_contains=("request",),
+                    )
+                if deliveries not in (None, ""):
+                    add(
+                        result,
+                        "Amazon SNS FIFO 订阅消息单价",
+                        float(deliveries),
+                        source_fields=("deliveries", "topic_type"),
+                        usage_type_suffix="F-DA-SQS",
+                        unit_contains=("message",),
+                    )
+                if transfer not in (None, ""):
+                    add(
+                        result,
+                        "Amazon SNS FIFO 订阅消息数据量单价",
+                        float(transfer),
+                        source_fields=("data_transfer_out_gib", "topic_type"),
+                        usage_type_suffix="F-Egress-SQS",
+                        unit_contains=("gb", "gib"),
+                    )
+            elif topic_type in {"standard", "standardtopic"}:
+                if requests not in (None, ""):
+                    add(
+                        result,
+                        "Amazon SNS Standard API 请求单价",
+                        float(requests),
+                        source_fields=("requests", "topic_type"),
+                        usage_type_suffix="Requests-Tier1",
+                        exclude=("f-request",),
+                        unit_contains=("request",),
+                    )
+                delivery_type = _canonical(
+                    str(requested.get("delivery_type") or "")
+                )
+                delivery_suffix = {
+                    "http": "DeliveryAttempts-HTTP",
+                    "https": "DeliveryAttempts-HTTP",
+                    "email": "DeliveryAttempts-SMTP",
+                    "smtp": "DeliveryAttempts-SMTP",
+                    "sqs": "DeliveryAttempts-SQS",
+                    "lambda": "DeliveryAttempts-LAMBDA",
+                    "firehose": "DeliveryAttempts-FIREHOSE",
+                    "kinesisfirehose": "DeliveryAttempts-FIREHOSE",
+                    "sms": "DeliveryAttempts-SMS",
+                }.get(delivery_type)
+                if deliveries not in (None, "") and delivery_suffix:
+                    add(
+                        result,
+                        "Amazon SNS Standard 通知投递单价",
+                        float(deliveries),
+                        source_fields=("deliveries", "delivery_type", "topic_type"),
+                        usage_type_suffix=delivery_suffix,
+                        unit_contains=("notification", "message"),
+                    )
+            else:
+                return []
+        elif service == "scheduler":
+            invocations = requested.get("scheduled_invocations")
+            if invocations not in (None, ""):
+                add(
+                    result,
+                    "Amazon EventBridge Scheduler 调用单价",
+                    float(invocations),
+                    source_fields=("scheduled_invocations",),
+                    usage_type_suffix="ScheduledInvocation",
+                    exact_operation="Invocation",
+                    unit_contains=("invocation",),
+                )
         elif service == "stepfunctions":
             # Step Functions exposes three unrelated dimensions under the
             # historical AmazonStates offer.  Bind the customer's workload
@@ -2911,7 +3562,9 @@ class GenericOfficialPlugin:
                         if transitions
                         else None
                     ),
-                    exact_group="SFN-StateTransitions",
+                    source_fields=("state_transitions", "workflow_type"),
+                    include_any=("statetransition", "state-transition"),
+                    unit_contains=("transition",),
                 )
             elif workflow_type in {"express", "expressworkflow", "expressworkflows"}:
                 requests = requested.get("requests") or requested.get("request_count")
@@ -2924,7 +3577,9 @@ class GenericOfficialPlugin:
                         if requests
                         else None
                     ),
-                    exact_group="SFN-ExpressWorkflows-Requests",
+                    source_fields=("requests", "workflow_type"),
+                    include=("express",),
+                    include_any=("request",),
                 )
                 add(
                     result,
@@ -2938,7 +3593,9 @@ class GenericOfficialPlugin:
                         if duration
                         else None
                     ),
-                    exact_group="SFN-ExpressWorkflows-Duration",
+                    source_fields=("duration_gb_seconds", "workflow_type"),
+                    include=("express",),
+                    include_any=("duration", "gb-second"),
                 )
             else:
                 # Unknown workflow types are pricing-significant.  Returning
@@ -2965,6 +3622,7 @@ class GenericOfficialPlugin:
                     if configuration_requests
                     else None
                 ),
+                source_fields=("configuration_requests",),
                 include=("appconfig-requests",),
             )
             add(
@@ -2979,6 +3637,7 @@ class GenericOfficialPlugin:
                     if configurations_received
                     else None
                 ),
+                source_fields=("configuration_retrievals",),
                 include=("appconfig-deployments",),
             )
             add(
@@ -2993,6 +3652,7 @@ class GenericOfficialPlugin:
                     if experiment_hours
                     else None
                 ),
+                source_fields=("experiment_hours",),
                 include=("appconfig-experimenthours",),
             )
         elif service == "eventbridge":
@@ -3012,6 +3672,7 @@ class GenericOfficialPlugin:
                     if events
                     else None
                 ),
+                source_fields=("events",),
                 include=("putevents",),
             )
             add(
@@ -3026,6 +3687,7 @@ class GenericOfficialPlugin:
                     if schema_events
                     else None
                 ),
+                source_fields=("schema_discovery_events",),
                 include=("discoveryevent",),
             )
             add(
@@ -3040,8 +3702,261 @@ class GenericOfficialPlugin:
                     if pipe_requests
                     else None
                 ),
+                source_fields=("pipes_requests",),
                 include=("piperequest",),
             )
+        elif service == "config":
+            recorded = requested.get("configuration_items_recorded")
+            recorded_source_fields = ("configuration_items_recorded",)
+            if recorded is None:
+                recorded = requested.get("resource_count")
+                recorded_source_fields = ("resource_count",)
+            if recorded is not None:
+                add(
+                    result,
+                    "AWS Config 配置项记录单价",
+                    float(recorded),
+                    source_fields=recorded_source_fields,
+                    include=("configurationitemrecorded",),
+                    exclude=("custom", "daily"),
+                )
+            evaluations = requested.get("rule_evaluations")
+            if evaluations is not None:
+                add(
+                    result,
+                    "AWS Config 规则评估单价",
+                    float(evaluations),
+                    source_fields=("rule_evaluations",),
+                    include=("configruleevaluations",),
+                    exclude=("internal", "proactive", "conformance"),
+                )
+        elif service == "transitgateway":
+            attachment_type = _canonical(
+                str(requested.get("attachment_type") or "vpc")
+            )
+            operation = {
+                "vpc": "transitgatewayvpc",
+                "directconnect": "transitgatewaydirectconnect",
+                "vpn": "transitgatewayvpn",
+                "peering": "transitgatewaypeering",
+                "connect": "transitgatewayconnect",
+            }.get(attachment_type)
+            if operation:
+                attachments = requested.get("attachments")
+                if attachments is not None:
+                    add(
+                        result,
+                        "AWS Transit Gateway Attachment 小时单价",
+                        float(attachments) * requirement.hours_per_month,
+                        source_fields=(
+                            "attachments",
+                            "hours_per_month",
+                            "attachment_type",
+                        ),
+                        include=("transitgateway-hours", operation),
+                        unit_contains=("hour",),
+                    )
+                processed = requested.get("data_processed_gib")
+                if processed is not None:
+                    add(
+                        result,
+                        "AWS Transit Gateway 数据处理 GB 单价",
+                        float(processed),
+                        source_fields=("data_processed_gib", "attachment_type"),
+                        include=("transitgateway-bytes", operation),
+                        unit_contains=("byte",),
+                    )
+        elif service == "directconnect":
+            connection_count = requested.get("connection_count")
+            count_source = "connection_count"
+            if connection_count in (None, ""):
+                connection_count = requirement.quantity
+                count_source = "quantity"
+            speed = requested.get("port_speed_gbps")
+            if speed in (None, ""):
+                return []
+            target_speed = f"{float(speed):g}g".casefold()
+            port_candidates = []
+            for rate in rates:
+                attrs = PricingCatalog.attributes(rate[4])
+                official_speed = str(attrs.get("portSpeed") or "").strip().casefold()
+                usage = str(rate[2] or "").casefold()
+                operation = str(rate[3] or "").casefold()
+                if official_speed != target_speed:
+                    continue
+                if "portusage:" not in usage or "hcportusage:" in usage:
+                    continue
+                if operation not in {"", "createdirectconnectport"}:
+                    continue
+                if not any(token in str(rate[1]).casefold() for token in ("hrs", "hour")):
+                    continue
+                port_candidates.append(rate)
+            if not port_candidates:
+                return []
+            port_rate = min(
+                [rate for rate in port_candidates if rate[0] > 0] or port_candidates,
+                key=lambda rate: (rate[0], rate[2], rate[3]),
+            )
+            port_product = dict(port_rate[4])
+            port_product["_astra_source_fields"] = [
+                count_source,
+                "port_speed_gbps",
+                "hours_per_month",
+            ]
+            port_rate = (*port_rate[:4], port_product)
+            result.append(
+                (
+                    "AWS Direct Connect Dedicated Port 小时单价",
+                    float(connection_count) * requirement.hours_per_month,
+                    port_rate,
+                )
+            )
+
+            transfer = requested.get("data_transfer_out_gib")
+            if transfer not in (None, ""):
+                billing_prefix = str(port_rate[2]).split("-", 1)[0].casefold()
+                transfer_candidates = []
+                for rate in rates:
+                    attrs = PricingCatalog.attributes(rate[4])
+                    usage = str(rate[2] or "").casefold()
+                    transfer_type = str(attrs.get("transferType") or "").casefold()
+                    if not usage.startswith(f"{billing_prefix}-"):
+                        continue
+                    if "dataxfer-out" not in usage:
+                        continue
+                    if transfer_type and "outbound" not in transfer_type:
+                        continue
+                    if not any(token in str(rate[1]).casefold() for token in ("gb", "gib")):
+                        continue
+                    transfer_candidates.append(rate)
+                if not transfer_candidates:
+                    return []
+                transfer_rate = min(
+                    [rate for rate in transfer_candidates if rate[0] > 0]
+                    or transfer_candidates,
+                    key=lambda rate: (rate[0], rate[2], rate[3]),
+                )
+                transfer_product = dict(transfer_rate[4])
+                transfer_product["_astra_source_fields"] = [
+                    "data_transfer_out_gib"
+                ]
+                transfer_rate = (*transfer_rate[:4], transfer_product)
+                result.append(
+                    (
+                        "AWS Direct Connect 出站数据传输单价",
+                        float(transfer),
+                        transfer_rate,
+                    )
+                )
+        elif service == "sitetositevpn":
+            tier = _canonical(str(requested.get("vpn_tier") or "standard"))
+            if tier not in {"standard", "standardvpn", "ipsec"}:
+                return []
+            connection_count = requested.get("connection_count")
+            count_source = "connection_count"
+            if connection_count in (None, ""):
+                connection_count = requirement.quantity
+                count_source = "quantity"
+            candidates = [
+                rate
+                for rate in rates
+                if re.fullmatch(
+                    r"(?:[a-z0-9]+-)?vpn-usage-hours:ipsec\.1",
+                    str(rate[2] or ""),
+                    re.I,
+                )
+                and str(rate[3] or "").casefold() == "createvpnconnection"
+                and any(
+                    token in str(rate[1]).casefold()
+                    for token in ("hrs", "hour")
+                )
+            ]
+            if not candidates:
+                return []
+            selected = min(
+                [rate for rate in candidates if rate[0] > 0] or candidates,
+                key=lambda rate: (rate[0], rate[2], rate[3]),
+            )
+            product = dict(selected[4])
+            product["_astra_source_fields"] = [
+                count_source,
+                "hours_per_month",
+            ]
+            selected = (*selected[:4], product)
+            result.append(
+                (
+                    "AWS Site-to-Site VPN 连接小时单价",
+                    float(connection_count) * requirement.hours_per_month,
+                    selected,
+                )
+            )
+        elif service == "vpcendpoint":
+            endpoint_type = _canonical(
+                str(requested.get("endpoint_type") or "interface")
+            )
+            if endpoint_type not in {"interface", "interfaceendpoint", "privatelink"}:
+                return []
+            endpoints = requested.get("endpoint_count")
+            count_source = "endpoint_count"
+            if endpoints in (None, ""):
+                endpoints = requirement.quantity
+                count_source = "quantity"
+
+            def exact_endpoint_rate(kind: str):
+                pattern = re.compile(
+                    rf"(?:[a-z0-9]+-)?vpcendpoint-{kind}", re.I
+                )
+                candidates = [
+                    rate
+                    for rate in rates
+                    if pattern.fullmatch(str(rate[2] or ""))
+                    and str(rate[3] or "").casefold() == "vpcendpoint"
+                ]
+                return (
+                    min(
+                        [rate for rate in candidates if rate[0] > 0]
+                        or candidates,
+                        key=lambda rate: (rate[0], rate[2], rate[3]),
+                    )
+                    if candidates
+                    else None
+                )
+
+            hourly = exact_endpoint_rate("hours")
+            if hourly is None:
+                return []
+            hourly_product = dict(hourly[4])
+            hourly_product["_astra_source_fields"] = [
+                count_source,
+                "hours_per_month",
+                "endpoint_type",
+            ]
+            hourly = (*hourly[:4], hourly_product)
+            result.append(
+                (
+                    "Interface VPC Endpoint 小时单价",
+                    float(endpoints) * requirement.hours_per_month,
+                    hourly,
+                )
+            )
+            processed = requested.get("data_processed_gib")
+            if processed not in (None, ""):
+                byte_rate = exact_endpoint_rate("bytes")
+                if byte_rate is None:
+                    return []
+                byte_product = dict(byte_rate[4])
+                byte_product["_astra_source_fields"] = [
+                    "data_processed_gib",
+                    "endpoint_type",
+                ]
+                byte_rate = (*byte_rate[:4], byte_product)
+                result.append(
+                    (
+                        "Interface VPC Endpoint 数据处理单价",
+                        float(processed),
+                        byte_rate,
+                    )
+                )
         elif service == "dynamodb":
             capacity_mode = str(requested.get("capacity_mode") or "").casefold()
             read_units = requested.get("read_request_units")
@@ -3113,25 +4028,100 @@ class GenericOfficialPlugin:
                 exclude=("local", "extended", "provisioned"),
             )
         elif service in {"ecs", "fargate"} and (
-            service == "fargate" or requested.get("launch_type") == "fargate"
+            service == "fargate"
+            or _canonical(str(requested.get("launch_type") or "")) == "fargate"
         ):
             tasks = float(requested.get("tasks") or requirement.quantity)
             task_hours = requested.get("task_hours")
+            runtime_field = "task_hours"
+            if task_hours in (None, ""):
+                task_hours = requirement.hours_per_month
+                runtime_field = "hours_per_month"
             vcpu = requested.get("task_vcpu")
             memory = requested.get("task_memory_gib")
-            compute_hours = float(task_hours) * tasks if task_hours else None
+            compute_hours = (
+                float(task_hours) * tasks if task_hours not in (None, "") else None
+            )
+            architecture = _canonical(
+                str(requested.get("architecture") or "x86_64")
+            )
+            operating_system = _canonical(
+                str(requested.get("operating_system") or "linux")
+            )
+            is_arm = architecture in {"arm", "arm64", "aarch64", "graviton"}
+            is_windows = operating_system.startswith("windows")
+            variant_tokens = (
+                ("windows",)
+                if is_windows
+                else (("arm",) if is_arm else ())
+            )
+            variant_exclusions = (
+                ("arm",)
+                if is_windows
+                else (("windows",) if is_arm else ("arm", "windows"))
+            )
+            common_source_fields = {
+                "launch_type",
+                "tasks",
+                runtime_field,
+                "quantity",
+            }
+            if requested.get("architecture") not in (None, ""):
+                common_source_fields.add("architecture")
+            if requested.get("operating_system") not in (None, ""):
+                common_source_fields.add("operating_system")
             add(
                 result,
                 "Fargate vCPU 小时单价",
                 compute_hours * float(vcpu) if compute_hours and vcpu else None,
-                include=("fargate-vcpu-hours",),
+                source_fields=tuple(
+                    sorted(common_source_fields | {"task_vcpu"})
+                ),
+                include=("fargate", "vcpu", *variant_tokens),
+                exclude=("spot", *variant_exclusions),
             )
             add(
                 result,
                 "Fargate 内存 GiB 小时单价",
                 compute_hours * float(memory) if compute_hours and memory else None,
-                include=("fargate-gb-hours",),
+                source_fields=tuple(
+                    sorted(common_source_fields | {"task_memory_gib"})
+                ),
+                include=("fargate", "gb-hours", *variant_tokens),
+                exclude=("spot", "ephemeral", *variant_exclusions),
             )
+        elif service == "ecr":
+            storage = requested.get("storage_gib")
+            add(
+                result,
+                "Amazon ECR 标准镜像存储单价",
+                float(storage) if storage else None,
+                source_fields=("storage_gib",),
+                include=("timedstorage-bytehrs",),
+                exclude=("archive", "retrieval"),
+            )
+        elif service == "cloudmap":
+            service_instances = requested.get("service_instances")
+            if service_instances not in (None, ""):
+                add(
+                    result,
+                    "AWS Cloud Map 服务注册资源月单价",
+                    float(service_instances),
+                    source_fields=("service_instances",),
+                    include=("cloud-map-resources",),
+                    unit_contains=("cloudmapresource",),
+                )
+            api_calls = requested.get("api_calls")
+            if api_calls not in (None, ""):
+                add(
+                    result,
+                    "AWS Cloud Map 服务发现 API 调用单价",
+                    float(api_calls),
+                    source_fields=("api_calls",),
+                    include=("cloud-map-api-calls",),
+                    exclude=("cloud-map-dir-api-calls",),
+                    unit_contains=("cloudmapapicall",),
+                )
         elif service == "emr":
             common_model = str(requested.get("requested_model") or "").strip()
             roles = (
@@ -3161,6 +4151,23 @@ class GenericOfficialPlugin:
                     or common_model
                     or ""
                 ).strip()
+                role_source_fields = [
+                    f"{field_prefix}_nodes",
+                    "hours_per_month",
+                    "quantity",
+                ]
+                for field in (
+                    f"{field_prefix}_requested_model",
+                    f"{field_prefix}_vcpu",
+                    f"{field_prefix}_memory_gib",
+                ):
+                    if requested.get(field) not in (None, ""):
+                        role_source_fields.append(field)
+                if (
+                    not requested.get(f"{field_prefix}_requested_model")
+                    and requested.get("requested_model") not in (None, "")
+                ):
+                    role_source_fields.append("requested_model")
                 add(
                     result,
                     f"Amazon EMR {label}实例小时价",
@@ -3169,6 +4176,7 @@ class GenericOfficialPlugin:
                         * float(count)
                         * requirement.hours_per_month
                     ),
+                    source_fields=tuple(sorted(set(role_source_fields))),
                     # The current AWS Price List publishes EMR instance
                     # surcharges as *BoxUsage* (older fixtures and regions also
                     # use InstanceUsage/RunJobFlow). Support all official names.
@@ -3261,6 +4269,7 @@ class GenericOfficialPlugin:
                 result,
                 "Athena 查询数据扫描单价",
                 float(scanned) / 1024 if scanned else None,
+                source_fields=("data_scanned_gib",),
                 include=("datascannedintb",),
                 exclude=("dpu", "capacity"),
             )
@@ -3270,6 +4279,7 @@ class GenericOfficialPlugin:
                     result,
                     "Athena 预置容量 DPU 小时单价",
                     float(capacity),
+                    source_fields=("provisioned_dpu_hours",),
                     include_any=("dpu", "capacity"),
                     unit_contains=("dpu", "hour", "hrs"),
                 )
@@ -3283,20 +4293,205 @@ class GenericOfficialPlugin:
             )
         elif service == "sagemaker":
             model = str(requested.get("requested_model") or "").strip()
+            explicit_instance_hours = requested.get("instance_hours")
+            instance_count = requested.get("instance_count")
+            if explicit_instance_hours is not None:
+                count = float(
+                    instance_count
+                    if instance_count is not None
+                    else requirement.quantity
+                )
+                amount = count * float(explicit_instance_hours)
+                source_fields = (
+                    (
+                        "instance_count"
+                        if instance_count is not None
+                        else "quantity"
+                    ),
+                    "instance_hours",
+                    "requested_model",
+                    "endpoint_type",
+                )
+            else:
+                count = float(
+                    instance_count
+                    if instance_count is not None
+                    else requirement.quantity
+                )
+                amount = count * requirement.hours_per_month
+                runtime_field = "hours_per_month"
+                source_fields = (
+                    (
+                        "instance_count"
+                        if instance_count is not None
+                        else "quantity"
+                    ),
+                    runtime_field,
+                    "requested_model",
+                    "endpoint_type",
+                )
             add(
                 result,
                 f"SageMaker {model or '实例'} 小时单价",
-                None,
+                amount,
+                source_fields=source_fields,
                 include=("hrs", "runinstance"),
                 exclude=("reserved", "spot"),
                 model=model or None,
             )
+        elif service == "textract":
+            pages = requested.get("document_pages")
+            analysis_type = _canonical(
+                str(requested.get("analysis_type") or "document_text")
+            )
+            processing_mode = _canonical(
+                str(requested.get("processing_mode") or "async")
+            )
+            analysis_suffixes = {
+                "documenttext": "textpagesprocessed",
+                "text": "textpagesprocessed",
+                "forms": "formspagesprocessed",
+                "tables": "tablespagesprocessed",
+                "expense": "expensepagesprocessed",
+                "id": "idpagesprocessed",
+            }
+            suffix = analysis_suffixes.get(analysis_type)
+            mode = "sync" if processing_mode == "sync" else "async"
+            if pages is not None and suffix:
+                add(
+                    result,
+                    "Amazon Textract 文档页处理单价",
+                    float(pages),
+                    source_fields=("document_pages",),
+                    include=(f"{mode}{suffix}",),
+                    unit_contains=("page",),
+                )
+        elif service == "comprehend":
+            characters = requested.get("characters")
+            analysis_type = _canonical(
+                str(requested.get("analysis_type") or "sentiment")
+            )
+            operations = {
+                "sentiment": "detectsentiment",
+                "entities": "detectentities",
+                "keyphrases": "detectkeyphrases",
+                "language": "detectdominantlanguage",
+                "syntax": "detectsyntax",
+                "pii": "detectpiientities",
+            }
+            operation = operations.get(analysis_type)
+            if characters is not None and operation:
+                add(
+                    result,
+                    "Amazon Comprehend 标准文本分析单价（每 100 字符一单位）",
+                    math.ceil(float(characters) / 100),
+                    source_fields=("characters",),
+                    include=(operation,),
+                    exclude=("custom", "endpoint", "storage"),
+                    unit_contains=("unit",),
+                )
+        elif service == "rekognition":
+            images = requested.get("images")
+            if images is not None:
+                add(
+                    result,
+                    "Amazon Rekognition 普通图片分析单价",
+                    float(images),
+                    source_fields=("images",),
+                    include=("imagesprocessed",),
+                    exclude=(
+                        "group1-",
+                        "group2-",
+                        "async",
+                        "custom",
+                        "properties",
+                    ),
+                    unit_contains=("image",),
+                )
+        elif service == "transcribe":
+            minutes = requested.get("audio_minutes")
+            transcription_type = _canonical(
+                str(requested.get("transcription_type") or "standard")
+            )
+            operations = {
+                "standard": "transcribeaudio",
+                "medical": "medicaltranscribeaudio",
+                "callanalytics": "callanalyticstranscribeaudio",
+            }
+            operation = operations.get(transcription_type)
+            if minutes is not None and operation:
+                exclusions = (
+                    ("medical", "callanalytics", "redaction", "toxicity", "clm")
+                    if transcription_type == "standard"
+                    else ()
+                )
+                add(
+                    result,
+                    "Amazon Transcribe 音频转写秒单价",
+                    float(minutes) * 60,
+                    source_fields=("audio_minutes",),
+                    include=(operation,),
+                    exclude=exclusions,
+                    unit_contains=("second",),
+                )
+        elif service == "translate":
+            characters = requested.get("characters")
+            translation_type = _canonical(
+                str(requested.get("translation_type") or "text")
+            )
+            operations = {
+                "text": "translatetext",
+                "document": "translatedocument",
+                "custom": "activecustomtranslationjob",
+            }
+            operation = operations.get(translation_type)
+            if characters is not None and operation:
+                add(
+                    result,
+                    "Amazon Translate 字符翻译单价",
+                    float(characters),
+                    source_fields=("characters",),
+                    include=(operation,),
+                    exclude=("office",) if translation_type == "document" else (),
+                    unit_contains=("character",),
+                )
+        elif service == "polly":
+            characters = requested.get("characters")
+            voice_engine = _canonical(
+                str(requested.get("voice_engine") or "standard")
+            )
+            usage_markers = {
+                "standard": "synthesizespeech-characters",
+                "neural": "synthesizespeechneural-characters",
+                "generative": "synthesizespeechgenerative-characters",
+            }
+            marker = usage_markers.get(voice_engine)
+            if characters is not None and marker:
+                add(
+                    result,
+                    "Amazon Polly 语音合成字符单价",
+                    float(characters),
+                    source_fields=("characters",),
+                    include=(marker,),
+                    exclude=("neural", "generative") if voice_engine == "standard" else (),
+                    unit_contains=("character",),
+                )
         elif service == "cognito":
+            users = requested.get("monthly_active_users")
+            user_field = "monthly_active_users"
+            if users in (None, ""):
+                users = requested.get("user_count")
+                user_field = "user_count"
             add(
                 result,
                 "Cognito User Pools MAU 单价",
-                None,
-                include=("cognitouserpoolsmau", "cognitouserpoolsoperation"),
+                (
+                    scoped_amount(requirement, user_field, float(users))
+                    if users not in (None, "")
+                    else None
+                ),
+                source_fields=(user_field,),
+                include_any=("cognitouserpoolsmau", "cognitouserpoolsoperation"),
                 exclude=("plus", "enterprise", "essentials", "lite", "asf", "mrr"),
             )
         elif service in {"secretsmanager", "secrets_manager"}:
@@ -3551,28 +4746,530 @@ class GenericOfficialPlugin:
                         unit_contains=("session",),
                     )
         elif service == "kms":
-            key_count = float(requested.get("key_count") or requirement.quantity)
+            requested_key_count = requested.get("key_count")
+            key_count = float(
+                requested_key_count
+                if requested_key_count is not None
+                else requirement.quantity
+            )
             add(
                 result,
                 "AWS KMS 客户托管密钥月费",
                 key_count,
+                source_fields=(
+                    ("key_count",)
+                    if requested_key_count is not None
+                    else ("quantity",)
+                ),
                 include=("kms-keys",),
                 exclude=("request",),
             )
+            requests = requested.get("requests")
+            request_source_fields = ("requests",)
+            if requests is None:
+                requests = requested.get("request_count")
+                request_source_fields = ("request_count",)
             add(
                 result,
                 "AWS KMS API 请求单价",
-                None,
+                float(requests) if requests is not None else None,
+                source_fields=request_source_fields,
                 include=("kms-requests",),
             )
         elif service == "xray":
-            traces = requested.get("traces_stored") or requested.get("trace_count")
+            traces = requested.get("traces_recorded")
+            trace_source_fields = ("traces_recorded",)
+            if traces is None:
+                traces = requested.get("traces_stored")
+                trace_source_fields = ("traces_stored",)
+            if traces is None:
+                traces = requested.get("trace_count")
+                trace_source_fields = ("trace_count",)
             add(
                 result,
-                "AWS X-Ray 存储 Trace 单价",
-                float(traces) if traces else None,
+                "AWS X-Ray 记录 Trace 单价",
+                float(traces) if traces is not None else None,
+                source_fields=trace_source_fields,
                 include=("xray-tracesstored",),
             )
+            retrieved = requested.get("traces_retrieved")
+            if retrieved is not None:
+                add(
+                    result,
+                    "AWS X-Ray 检索 Trace 单价",
+                    float(retrieved),
+                    source_fields=("traces_retrieved",),
+                    include=("xray-tracesaccessed", "xray-traces-retrieved"),
+                )
+        elif service == "codebuild":
+            build_minutes = requested.get("build_minutes")
+            if build_minutes is not None:
+                architecture = _canonical(
+                    str(requested.get("architecture") or "x86_64")
+                )
+                operating_system = _canonical(
+                    str(requested.get("operating_system") or "linux")
+                )
+                compute_type = _canonical(
+                    str(requested.get("compute_type") or "g1.medium")
+                )
+                compute_type = {
+                    "general1small": "g1.small",
+                    "general1medium": "g1.medium",
+                    "general1large": "g1.large",
+                    "general1xlarge": "g1.xlarge",
+                    "general12xlarge": "g1.2xlarge",
+                    "arm1small": "g1.small",
+                    "arm1medium": "g1.medium",
+                    "arm1large": "g1.large",
+                    "arm1xlarge": "g1.xlarge",
+                    "arm12xlarge": "g1.2xlarge",
+                    "g1small": "g1.small",
+                    "g1medium": "g1.medium",
+                    "g1large": "g1.large",
+                    "g1xlarge": "g1.xlarge",
+                    "g12xlarge": "g1.2xlarge",
+                }.get(compute_type, str(requested.get("compute_type") or "g1.medium"))
+                platform = (
+                    "ARM"
+                    if architecture in {"arm", "arm64", "aarch64", "graviton"}
+                    else "Windows"
+                    if operating_system.startswith("windows")
+                    else "Linux"
+                )
+                source_fields = tuple(
+                    field
+                    for field in (
+                        "build_minutes",
+                        "compute_type",
+                        "operating_system",
+                        "architecture",
+                    )
+                    if requested.get(field) not in (None, "")
+                )
+                add(
+                    result,
+                    "AWS CodeBuild 构建分钟单价",
+                    float(build_minutes),
+                    source_fields=source_fields,
+                    usage_type_suffix=f"Build-Min:{platform}:{compute_type}",
+                    unit_contains=("minute", "min"),
+                )
+        elif service == "codepipeline":
+            action_minutes = requested.get("action_execution_minutes")
+            if action_minutes is not None:
+                add(
+                    result,
+                    "AWS CodePipeline V2 Action 执行分钟单价",
+                    float(action_minutes),
+                    source_fields=("action_execution_minutes", "pipeline_type"),
+                    usage_type_suffix="actionExecutionMinute",
+                    unit_contains=("minute", "min"),
+                )
+            active_pipelines = requested.get("active_pipelines")
+            if active_pipelines is not None:
+                add(
+                    result,
+                    "AWS CodePipeline 活跃流水线月费",
+                    float(active_pipelines),
+                    source_fields=("active_pipelines", "pipeline_type"),
+                    usage_type_suffix="activePipeline",
+                    unit_contains=("pipeline",),
+                )
+        elif service == "codeartifact":
+            requests = requested.get("requests")
+            storage = requested.get("storage_gib")
+            if requests is not None:
+                add(
+                    result,
+                    "AWS CodeArtifact 请求单价",
+                    float(requests),
+                    source_fields=("requests",),
+                    usage_type_suffix="Requests",
+                    unit_contains=("request",),
+                )
+            if storage is not None:
+                add(
+                    result,
+                    "AWS CodeArtifact 制品存储单价",
+                    float(storage),
+                    source_fields=("storage_gib",),
+                    usage_type_suffix="TimedStorage-ByteHrs",
+                    unit_contains=("gb-mo", "gb-month"),
+                )
+        elif service == "cloudformation":
+            operations = requested.get("resource_handler_operations")
+            if operations is not None:
+                add(
+                    result,
+                    "AWS CloudFormation 第三方资源处理操作单价",
+                    float(operations),
+                    source_fields=("resource_handler_operations",),
+                    usage_type_suffix="Resource-Invocation-Count",
+                    exact_operation="ProcessResourceHandlers",
+                    unit_contains=("operation",),
+                )
+        elif service == "inspectorv2":
+            monthly_hours = float(requirement.hours_per_month or 730)
+            ec2_instances = requested.get("ec2_instances")
+            ecr_images = requested.get("ecr_images")
+            lambda_functions = requested.get("lambda_functions")
+            if ec2_instances is not None:
+                add(
+                    result,
+                    "Amazon Inspector EC2 持续扫描单价",
+                    float(ec2_instances) * monthly_hours,
+                    source_fields=("ec2_instances",),
+                    usage_type_suffix="EC2-Scanning",
+                    exclude=("free", "agentless"),
+                    unit_contains=("instance-hr", "instance-hour"),
+                )
+            if ecr_images is not None:
+                add(
+                    result,
+                    "Amazon Inspector ECR 镜像首次扫描单价",
+                    float(ecr_images),
+                    source_fields=("ecr_images",),
+                    usage_type_suffix="container-image-initial-scan",
+                    exclude=("free",),
+                    unit_contains=("assessment",),
+                )
+            if lambda_functions is not None:
+                add(
+                    result,
+                    "Amazon Inspector Lambda 标准扫描单价",
+                    float(lambda_functions) * monthly_hours,
+                    source_fields=("lambda_functions",),
+                    usage_type_suffix="Lambda-Standard-Scanning",
+                    exclude=("free",),
+                    unit_contains=("hour",),
+                )
+        elif service == "securityhub":
+            security_checks = requested.get("security_checks")
+            if security_checks is not None:
+                add(
+                    result,
+                    "AWS Security Hub CSPM 安全检查单价",
+                    float(security_checks),
+                    source_fields=("security_checks",),
+                    usage_type_suffix="PaidComplianceCheck",
+                    exclude=("azure", "free"),
+                    unit_contains=("security check",),
+                )
+        elif service == "auditmanager":
+            assessments = requested.get("resource_assessments")
+            if assessments is not None:
+                add(
+                    result,
+                    "AWS Audit Manager 资源评估单价",
+                    float(assessments),
+                    source_fields=("resource_assessments",),
+                    usage_type_suffix="Resource-Assessment-Collected",
+                    unit_contains=("assessment",),
+                )
+        elif service == "iot":
+            connection_minutes = requested.get("connection_minutes")
+            if connection_minutes is not None:
+                add(
+                    result,
+                    "AWS IoT Core 设备连接分钟单价",
+                    float(connection_minutes),
+                    source_fields=("connection_minutes", "device_count"),
+                    usage_type_suffix="ConnectionMinutes",
+                    unit_contains=("minute",),
+                )
+            messages = requested.get("messages")
+            if messages is not None:
+                size_kib = float(requested.get("message_size_kib") or 5)
+                billed_messages = float(messages) * max(1, math.ceil(size_kib / 5))
+                add(
+                    result,
+                    "AWS IoT Core MQTT 5 KiB 消息单价",
+                    billed_messages,
+                    source_fields=("messages", "message_size_kib"),
+                    usage_type_suffix="Messages",
+                    exclude=("lorawan", "direct", "free"),
+                    unit_contains=("message",),
+                )
+        elif service == "iotdevicemanagement":
+            things = requested.get("things_registered")
+            actions = requested.get("remote_actions")
+            if things is not None:
+                add(
+                    result,
+                    "AWS IoT Device Management Thing 注册单价",
+                    float(things),
+                    source_fields=("things_registered",),
+                    usage_type_suffix="ThingRegistration",
+                    unit_contains=("thing",),
+                )
+            if actions is not None:
+                add(
+                    result,
+                    "AWS IoT Device Management 远程操作单价",
+                    float(actions),
+                    source_fields=("remote_actions",),
+                    usage_type_suffix="JobExecutions",
+                    unit_contains=("remote action",),
+                )
+        elif service == "iotdevicedefender":
+            devices = requested.get("device_count")
+            datapoints = requested.get("metric_datapoints")
+            if devices is not None:
+                add(
+                    result,
+                    "AWS IoT Device Defender 设备审计单价",
+                    float(devices),
+                    source_fields=("device_count",),
+                    usage_type_suffix="Audit",
+                    unit_contains=("device",),
+                )
+            if datapoints is not None:
+                add(
+                    result,
+                    "AWS IoT Device Defender 规则检测指标数据点单价",
+                    float(datapoints),
+                    source_fields=("metric_datapoints",),
+                    usage_type_suffix="Detect",
+                    exclude=("ml",),
+                    unit_contains=("metric datapoint",),
+                )
+        elif service == "kinesisvideo":
+            incoming = requested.get("data_in_gib")
+            outgoing = requested.get("data_out_gib")
+            storage = requested.get("storage_gib")
+            if incoming is not None:
+                add(
+                    result,
+                    "Kinesis Video Streams 摄取数据单价",
+                    float(incoming),
+                    source_fields=("data_in_gib",),
+                    usage_type_suffix="BytesIn",
+                    exact_operation="PutMedia",
+                    unit_contains=("gb",),
+                )
+            if outgoing is not None:
+                add(
+                    result,
+                    "Kinesis Video Streams 消费读取单价",
+                    float(outgoing),
+                    source_fields=("data_out_gib",),
+                    usage_type_suffix="BytesOut",
+                    exact_operation="GetMedia",
+                    unit_contains=("gb",),
+                )
+            if storage is not None:
+                add(
+                    result,
+                    "Kinesis Video Streams 视频存储单价",
+                    float(storage),
+                    source_fields=("storage_gib",),
+                    usage_type_suffix="BytesHr",
+                    exact_operation="PutMedia",
+                    unit_contains=("gb-month", "gb-mo"),
+                )
+        elif service == "elementalmediaconvert":
+            minutes = requested.get("transcode_minutes")
+            tier = str(
+                requested.get("transcoding_tier")
+                or requested.get("_billing_variant_transcoding_tier")
+                or ""
+            ).casefold()
+            if minutes is not None and tier not in {"basic", "professional"}:
+                raise ManualConfirmationRequired(
+                    "MediaConvert 的标准化转码分钟需要确认 Basic 或 Professional 层级。",
+                    code="mediaconvert_tier_required",
+                    field="transcoding_tier",
+                    nearby_candidates=[
+                        {
+                            "model": "Basic 标准化转码分钟",
+                            "family": "billing_variant",
+                            "specifications": {
+                                "decision": "billing_variant:transcoding_tier:basic",
+                                "field": "transcoding_tier",
+                            },
+                            "rationale": "使用 AWS 官方 Basic Normalized Transcode Minute 维度。",
+                        },
+                        {
+                            "model": "Professional 标准化转码分钟",
+                            "family": "billing_variant",
+                            "specifications": {
+                                "decision": "billing_variant:transcoding_tier:professional",
+                                "field": "transcoding_tier",
+                            },
+                            "rationale": "使用 AWS 官方 Professional Normalized Transcode Minute 维度。",
+                        },
+                    ],
+                )
+            if minutes is not None:
+                add(
+                    result,
+                    f"MediaConvert {tier.title()} 标准化转码分钟单价",
+                    float(minutes),
+                    source_fields=("transcode_minutes", "resolution", "transcoding_tier"),
+                    usage_type_suffix=f"Normalized-Transcode-Minute-{tier.title()}",
+                    unit_contains=("minute",),
+                )
+        elif service == "elementalmediapackage":
+            incoming = requested.get("data_in_gib")
+            outgoing = requested.get("data_out_gib")
+            if incoming is not None:
+                add(
+                    result,
+                    "MediaPackage 摄取数据单价",
+                    float(incoming),
+                    source_fields=("data_in_gib",),
+                    usage_type_suffix="EMP-ingest-bytes",
+                    unit_contains=("gb",),
+                )
+            if outgoing is not None:
+                add(
+                    result,
+                    "MediaPackage Origin 打包输出单价",
+                    float(outgoing),
+                    source_fields=("data_out_gib",),
+                    usage_type_suffix="EMP-origin-packaging-bytes",
+                    unit_contains=("gb",),
+                )
+        elif service == "ivs":
+            if not requested.get("_billing_variant_stream_profile"):
+                raise ManualConfirmationRequired(
+                    "IVS Low-Latency 的输入价格取决于频道类型，输出价格还取决于清晰度和观众计费地区。",
+                    code="ivs_stream_profile_required",
+                    field="stream_profile",
+                    nearby_candidates=[
+                        {
+                            "model": "Standard · HD · 亚太观众",
+                            "family": "billing_variant",
+                            "specifications": {
+                                "decision": "billing_variant:stream_profile:standard_hd_asia_pacific",
+                                "field": "stream_profile",
+                            },
+                            "rationale": "标准频道、HD 输出，观众主要位于亚太。",
+                        },
+                        {
+                            "model": "Basic · HD · 亚太观众",
+                            "family": "billing_variant",
+                            "specifications": {
+                                "decision": "billing_variant:stream_profile:basic_hd_asia_pacific",
+                                "field": "stream_profile",
+                            },
+                            "rationale": "基础频道、HD 输出，观众主要位于亚太。",
+                        },
+                    ],
+                )
+        elif service == "elementalmedialive":
+            if not requested.get("_billing_variant_media_live_io_profile"):
+                raise ManualConfirmationRequired(
+                    "MediaLive 运行费由输入编码/分辨率/码率及输出编码/分辨率/帧率共同决定。",
+                    code="medialive_io_profile_required",
+                    field="media_live_io_profile",
+                    nearby_candidates=[
+                        {
+                            "model": "Standard · AVC HD 输入 · AVC HD 30fps 输出",
+                            "family": "billing_variant",
+                            "specifications": {
+                                "decision": "billing_variant:media_live_io_profile:standard_avc_hd_10mbps_avc_hd_30fps",
+                                "field": "media_live_io_profile",
+                            },
+                            "rationale": "标准双管线、AVC HD 常用输入输出档位。",
+                        },
+                        {
+                            "model": "Standard · HEVC HD 输入 · AVC HD 30fps 输出",
+                            "family": "billing_variant",
+                            "specifications": {
+                                "decision": "billing_variant:media_live_io_profile:standard_hevc_hd_20mbps_avc_hd_30fps",
+                                "field": "media_live_io_profile",
+                            },
+                            "rationale": "标准双管线、HEVC HD 输入与 AVC HD 输出。",
+                        },
+                    ],
+                )
+        elif service == "mediaconnect":
+            if not requested.get("_billing_variant_media_connect_output_profile"):
+                raise ManualConfirmationRequired(
+                    "MediaConnect Output 小时价取决于 20/50/100 Mbps 档位，传输费还取决于目的地。",
+                    code="mediaconnect_output_profile_required",
+                    field="media_connect_output_profile",
+                    nearby_candidates=[
+                        {
+                            "model": "20 Mbps Output · 互联网传出",
+                            "family": "billing_variant",
+                            "specifications": {
+                                "decision": "billing_variant:media_connect_output_profile:20mbps_internet",
+                                "field": "media_connect_output_profile",
+                            },
+                            "rationale": "按 20 Mbps 运行 Output，并按互联网传出计费。",
+                        },
+                        {
+                            "model": "50 Mbps Output · 互联网传出",
+                            "family": "billing_variant",
+                            "specifications": {
+                                "decision": "billing_variant:media_connect_output_profile:50mbps_internet",
+                                "field": "media_connect_output_profile",
+                            },
+                            "rationale": "按 50 Mbps 运行 Output，并按互联网传出计费。",
+                        },
+                        {
+                            "model": "100 Mbps Output · 互联网传出",
+                            "family": "billing_variant",
+                            "specifications": {
+                                "decision": "billing_variant:media_connect_output_profile:100mbps_internet",
+                                "field": "media_connect_output_profile",
+                            },
+                            "rationale": "按 100 Mbps 运行 Output，并按互联网传出计费。",
+                        },
+                    ],
+                )
+        elif service == "macie":
+            bucket_count = requested.get("bucket_count")
+            scanned = requested.get("data_scanned_gib")
+            if bucket_count is not None:
+                add(
+                    result,
+                    "Amazon Macie S3 Bucket 日常盘点单价",
+                    float(bucket_count) * 30,
+                    source_fields=("bucket_count",),
+                    usage_type_suffix="PaidDataInventoryEvaluation",
+                    exclude=("free",),
+                    unit_contains=("bucket-day",),
+                )
+            if scanned is not None:
+                add(
+                    result,
+                    "Amazon Macie 敏感数据发现扫描单价",
+                    float(scanned),
+                    source_fields=("data_scanned_gib",),
+                    usage_type_suffix="SensitiveDataDiscovery",
+                    exclude=("free",),
+                    unit_contains=("gb",),
+                )
+        elif service == "guardduty":
+            # GuardDuty publishes free-tier, S3/Lambda/RDS-specific and generic
+            # data-event dimensions in one offer.  Bind the two customer facts
+            # to the stable paid UsageType identities before comparing prices.
+            processed = requested.get("data_processed_gib")
+            if processed is not None:
+                add(
+                    result,
+                    "Amazon GuardDuty 数据事件分析 GB 单价",
+                    float(processed),
+                    source_fields=("data_processed_gib",),
+                    include=("paideventsanalyzed-bytes",),
+                    exclude=("free", "s3", "lambda", "rds", "malware"),
+                    unit_contains=("gb",),
+                )
+            events = requested.get("events")
+            if events is not None:
+                add(
+                    result,
+                    "Amazon GuardDuty CloudTrail 事件分析单价",
+                    float(events),
+                    source_fields=("events",),
+                    include=("paideventsanalyzed",),
+                    exclude=("bytes", "free", "s3", "lambda", "rds", "malware"),
+                    unit_contains=("event",),
+                )
         else:
             # Unknown services may expose many unrelated products. Returning no
             # match is safer than presenting an arbitrary dimension as a quote.
@@ -3665,6 +5362,22 @@ class GenericOfficialPlugin:
                 return False
             if product_variant == "influxdb" and "influx" not in text:
                 return False
+            if _stem(requirement.service) == "backup":
+                requested_backup_fields = (
+                    field
+                    for field in (
+                        "backup_storage_gib",
+                        "warm_storage_gib",
+                        "cold_storage_gib",
+                        "restore_gib",
+                    )
+                    if requested.get(field) not in (None, "")
+                )
+                if not any(
+                    _backup_dimension_is_compatible(requirement, field, text)
+                    for field in requested_backup_fields
+                ):
+                    return False
             return not any(
                 token in text
                 for token in (
@@ -3705,6 +5418,15 @@ class GenericOfficialPlugin:
             attrs, text = details(rate)
             unit = str(rate[1]).casefold()
             instance = str(attrs.get("instanceType") or "").casefold()
+            if _stem(requirement.service) in {"ecs", "fargate"} and (
+                _stem(requirement.service) == "fargate"
+                or _canonical(str(requested.get("launch_type") or ""))
+                == "fargate"
+            ):
+                # ECS Managed Instances expose ordinary EC2 instance types in
+                # the same offer. They are a different launch mode and can
+                # never supplement an explicitly selected Fargate task.
+                return False
             if not instance or not any(token in unit for token in ("hrs", "hour")):
                 return False
             if (
@@ -3750,6 +5472,135 @@ class GenericOfficialPlugin:
                 requirement.quantity * instance_count * requirement.hours_per_month,
                 hourly_instance,
             )
+
+            # One managed component can contain several independently billed
+            # instance roles. OpenSearch data nodes and dedicated-master nodes
+            # share the same official instance catalog. Keep the arithmetic
+            # here, after structured cleaning, instead of reopening prose.
+            if _stem(requirement.service) == "opensearch" and isinstance(
+                requested.get("master_nodes"), (int, float)
+            ) and not isinstance(requested.get("master_nodes"), bool):
+                master_count = float(requested["master_nodes"])
+                primary_index = next(
+                    (
+                        index
+                        for index, (_label, _amount, rate) in enumerate(result)
+                        if PricingCatalog.attributes(rate[4]).get("instanceType")
+                    ),
+                    None,
+                )
+                if master_count > 0 and primary_index is not None:
+                    primary_rate = result[primary_index][2]
+                    master_model = str(
+                        requested.get("master_requested_model") or model
+                    ).strip().casefold()
+                    master_vcpu = requested.get("master_vcpu")
+                    master_memory = requested.get("master_memory_gib")
+
+                    def master_instance(rate) -> bool:
+                        attrs, text = details(rate)
+                        unit = str(rate[1]).casefold()
+                        instance = str(attrs.get("instanceType") or "").casefold()
+                        if not instance or not any(
+                            token in unit for token in ("hrs", "hour")
+                        ):
+                            return False
+                        if master_model and master_model not in {
+                            instance,
+                            f"db.{instance}",
+                            f"cache.{instance}",
+                        }:
+                            return False
+                        try:
+                            if master_vcpu is not None and float(
+                                attrs.get("vcpu") or 0
+                            ) < float(master_vcpu):
+                                return False
+                        except (TypeError, ValueError):
+                            return False
+                        if master_memory is not None:
+                            memory = str(
+                                attrs.get("memory") or attrs.get("memoryGib") or ""
+                            )
+                            match = re.search(r"\d+(?:\.\d+)?", memory)
+                            if not match or float(match.group()) < float(master_memory):
+                                return False
+                        return not any(
+                            token in text
+                            for token in ("reserved", "spot", "serverless")
+                        )
+
+                    master_candidates = [
+                        rate for rate in safe_rates if master_instance(rate)
+                    ]
+                    positive_master = [
+                        rate for rate in master_candidates if rate[0] > 0
+                    ] or master_candidates
+                    master_rate = (
+                        min(
+                            positive_master,
+                            key=lambda rate: (rate[0], rate[2], rate[3]),
+                        )
+                        if positive_master
+                        else None
+                    )
+                    if master_rate is not None:
+                        master_amount = (
+                            requirement.quantity
+                            * master_count
+                            * requirement.hours_per_month
+                        )
+                        master_sources = {
+                            "master_nodes",
+                            "dedicated_master",
+                            *(
+                                {"master_requested_model"}
+                                if requested.get("master_requested_model")
+                                else {"requested_model"}
+                            ),
+                            *({"master_vcpu"} if master_vcpu is not None else set()),
+                            *(
+                                {"master_memory_gib"}
+                                if master_memory is not None
+                                else set()
+                            ),
+                        }
+
+                        def with_sources(rate, sources: set[str]):
+                            product = dict(rate[4])
+                            declared = product.get("_astra_source_fields")
+                            declared_values = (
+                                declared
+                                if isinstance(declared, (list, tuple, set))
+                                else ()
+                            )
+                            product["_astra_source_fields"] = sorted(
+                                {
+                                    *(
+                                        str(value)
+                                        for value in declared_values
+                                        if isinstance(value, str) and value
+                                    ),
+                                    *sources,
+                                }
+                            )
+                            return (*rate[:4], product)
+
+                        if master_rate[1:4] == primary_rate[1:4]:
+                            label, primary_amount, _ = result[primary_index]
+                            result[primary_index] = (
+                                f"{label}（数据节点及专用主节点）",
+                                float(primary_amount or 0) + master_amount,
+                                with_sources(primary_rate, master_sources),
+                            )
+                        else:
+                            result.append(
+                                (
+                                    "AWS 官方专用主节点实例小时价",
+                                    master_amount,
+                                    with_sources(master_rate, master_sources),
+                                )
+                            )
         elif _stem(requirement.service) == "memorydb" and model and (
             min_vcpu is not None or min_memory is not None
         ):
@@ -3785,6 +5636,25 @@ class GenericOfficialPlugin:
                     by_field.setdefault(field, []).append(binding)
 
             for field, bindings in by_field.items():
+                bindings = [
+                    binding
+                    for binding in bindings
+                    if _backup_dimension_is_compatible(
+                        requirement,
+                        field,
+                        " ".join(
+                            str(binding.get(key) or "")
+                            for key in (
+                                "usage_type",
+                                "operation",
+                                "description",
+                                "product_family",
+                            )
+                        ),
+                    )
+                ]
+                if not bindings:
+                    continue
                 reader_billing_mode = str(
                     requested.get("_billing_variant_reader_billing_mode") or ""
                 ).strip()
@@ -3906,14 +5776,14 @@ class GenericOfficialPlugin:
                         if value not in (None, ""):
                             storage_source_fields.append("storage_gib")
                     kpu_count = requested.get("kpu_count")
+                    is_flink = GenericOfficialPlugin._is_managed_flink(requirement)
                     is_flink_storage = any(
-                        "runningapplicationstorage" in str(binding.get("usage_type") or "").casefold()
-                        and "interactive" not in str(binding.get("usage_type") or "").casefold()
+                        "runningapplicationstorage"
+                        in str(binding.get("usage_type") or "").casefold()
+                        and "interactive"
+                        not in str(binding.get("usage_type") or "").casefold()
                         for binding in bindings
-                    ) and "flink" in (
-                        f"{requirement.calculator_service_name or ''} "
-                        f"{requirement.source_text or ''}"
-                    ).casefold()
+                    ) and is_flink
                     if (
                         value in (None, "")
                         and is_flink_storage
@@ -3928,45 +5798,52 @@ class GenericOfficialPlugin:
                             * float(requirement.quantity)
                         )
                 elif field == "hours_per_month":
-                    hours_are_explicit = bool(
-                        requirement.field_evidence.get("hours_per_month")
-                        or re.search(
-                            r"\d+(?:\.\d+)?\s*(?:小时|hours?|hrs?)",
-                            requirement.source_text or "",
-                            re.I,
-                        )
+                    hours_are_explicit = customer_field_is_explicit(
+                        requirement, "hours_per_month"
                     )
                     value = requirement.hours_per_month if hours_are_explicit else None
                 else:
                     value = requested.get(field)
-                if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+                if (
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or value <= 0
+                ):
                     continue
                 selected_usage_type = str(
                     requested.get(f"_billing_variant_{field}") or ""
                 ).strip()
-                if not selected_usage_type and "flink" in (
-                    f"{requirement.calculator_service_name or ''} "
-                    f"{requirement.source_text or ''}"
-                ).casefold():
+                if (
+                    not selected_usage_type
+                    and GenericOfficialPlugin._is_managed_flink(requirement)
+                ):
                     selected_usage_type = next(
                         (
                             str(binding.get("usage_type") or "")
                             for binding in bindings
                             if (
                                 field == "kpu_hours"
-                                and "kpu-hour-java" in str(binding.get("usage_type") or "").casefold()
+                                and "kpu-hour-java"
+                                in str(binding.get("usage_type") or "").casefold()
                             )
                             or (
                                 field == "storage_gib"
-                                and "runningapplicationstorage" in str(binding.get("usage_type") or "").casefold()
-                                and "interactive" not in str(binding.get("usage_type") or "").casefold()
+                                and "runningapplicationstorage"
+                                in str(binding.get("usage_type") or "").casefold()
+                                and "interactive"
+                                not in str(binding.get("usage_type") or "").casefold()
                             )
                         ),
                         "",
                     )
 
-                def bound_rate(rate, *, candidates=bindings) -> bool:
-                    if selected_usage_type and str(rate[2]) != selected_usage_type:
+                def bound_rate(
+                    rate,
+                    *,
+                    candidates=bindings,
+                    required_usage_type=selected_usage_type,
+                ) -> bool:
+                    if required_usage_type and str(rate[2]) != required_usage_type:
                         return False
                     for binding in candidates:
                         if str(rate[1]).casefold() != str(binding.get("unit") or "").casefold():
@@ -4059,7 +5936,12 @@ class GenericOfficialPlugin:
                 )
                 and any(
                     token in details(rate)[1]
-                    for token in ("backup", "warm storage")
+                    for token in ("backup", "warm storage", "warmstorage")
+                )
+                and _backup_dimension_is_compatible(
+                    requirement,
+                    "backup_storage_gib",
+                    details(rate)[1],
                 ),
             ),
             (
@@ -4158,7 +6040,17 @@ class GenericOfficialPlugin:
                 continue
             value = requested.get(field)
             if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                previous_count = len(result)
                 choose(description, float(value), predicate)
+                if len(result) > previous_count:
+                    selected_description, selected_amount, selected_rate = result[-1]
+                    selected_product = dict(selected_rate[4])
+                    selected_product["_astra_source_fields"] = [field]
+                    result[-1] = (
+                        selected_description,
+                        selected_amount,
+                        (*selected_rate[:4], selected_product),
+                    )
 
         if result:
             return result

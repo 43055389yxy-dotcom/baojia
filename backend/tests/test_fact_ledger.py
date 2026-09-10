@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.core.config import Settings
 from app.core.errors import ManualConfirmationRequired
 from app.domain.component_integrity import overlay_customer_fields
+from app.domain.customer_configuration import preserve_customer_configuration
 from app.domain.customer_facts import field_scope, record_customer_fact_metadata
 from app.domain.fact_ledger import (
     bind_fact_consumptions,
@@ -58,6 +59,14 @@ def test_product_neutral_number_inventory_ignores_names_and_keeps_all_units() ->
         ("15T", 15 * 1024),
         ("30天", 30),
     ]
+
+
+def test_product_neutral_number_inventory_keeps_explicit_lcu_usage() -> None:
+    atoms = customer_quantitative_atoms(
+        "Application Load Balancer：1 个 ALB，平均 1 LCU，数量 1。"
+    )
+
+    assert any(atom.raw.casefold() == "1 lcu" and atom.value == 1 for atom in atoms)
 
 
 def test_selected_official_model_preserves_original_shape_facts_for_every_service() -> None:
@@ -124,6 +133,105 @@ def test_selected_official_model_preserves_original_shape_facts_for_every_servic
     assert unconsumed_customer_pricing_facts(requirement, selection) == []
 
 
+def test_selected_model_shape_survives_product_preservation_and_stale_draft_repair() -> None:
+    """Draft migration must not rediscover an intentionally replaced shape."""
+
+    source = "Redis，2个节点，单节点4核16G，1主1从"
+    requirement = ServiceRequirement(
+        service="elasticache",
+        calculator_service_name="Amazon ElastiCache for Redis",
+        component_key="cmp_redis_replay_1",
+        product_identity="elasticache_redis",
+        source_text=source,
+        original_source_text=source,
+        requirements={
+            "engine": "redis",
+            "node_count": 2,
+            "vcpu": 4,
+            "memory_gib": 16,
+        },
+        field_sources={
+            "requirements.node_count": "customer_text",
+            "requirements.vcpu": "customer_text",
+            "requirements.memory_gib": "customer_text",
+        },
+        field_evidence={
+            "requirements.node_count": "2个节点",
+            "requirements.vcpu": "4核16G",
+            "requirements.memory_gib": "单节点4核16G",
+        },
+    )
+    finalize_customer_fact_ledger(requirement)
+
+    requirement.requirements["requested_model"] = "cache.m7g.xlarge"
+    requirement.field_sources["requirements.requested_model"] = (
+        "customer_confirmation"
+    )
+    requirement.field_evidence["requirements.requested_model"] = (
+        "客户从官方可用型号中选择"
+    )
+    for field in ("vcpu", "memory_gib"):
+        requirement.requirements.pop(field)
+        path = f"requirements.{field}"
+        requirement.field_sources[path] = "customer_confirmation_removed"
+        requirement.field_evidence[path] = (
+            "客户已选择官方型号，以该型号规格替代原 CPU/内存约束"
+        )
+    requirement.field_sources["_customer_shape_replaced_by_model"] = (
+        "customer_confirmation"
+    )
+    # Simulate an unrelated old-draft migration forcing one ledger rebuild.
+    requirement.field_sources.pop("_customer_fact_ledger_fingerprint", None)
+    intent = ParsedIntent(customer_summary=source, services=[requirement])
+
+    preserve_customer_configuration(intent)
+    assert intent.services[0].service == "elasticache"
+
+    DeepSeekIntentParser.reconcile_customer_pricing_facts(intent)
+
+    repaired = intent.services[0]
+    assert customer_fact_ledger_is_current(repaired)
+    facts = {fact.path: fact for fact in repaired.customer_pricing_facts}
+    assert facts["requirements.vcpu"].value == 4
+    assert facts["requirements.vcpu"].evidence == "4核16G"
+    assert facts["requirements.memory_gib"].value == 16
+    assert facts["requirements.memory_gib"].evidence == "单节点4核16G"
+    QuoteService._require_complete_literal_fact_coverage(intent)
+
+
+def test_customer_fact_ledger_does_not_depend_on_product_name_or_route_alias() -> None:
+    """Arbitrary customer/display names cannot invalidate numeric facts."""
+
+    requirement = ServiceRequirement(
+        service="elasticache",
+        calculator_service_name="Amazon ElastiCache for Redis",
+        component_key="cmp_stable_facts_1",
+        product_identity="elasticache_redis",
+        source_text="我们内部叫会话高速缓存，2个节点，单节点4核16G",
+        requirements={"node_count": 2, "vcpu": 4, "memory_gib": 16},
+        field_sources={
+            "requirements.node_count": "customer_text",
+            "requirements.vcpu": "customer_text",
+            "requirements.memory_gib": "customer_text",
+        },
+        field_evidence={
+            "requirements.node_count": "2个节点",
+            "requirements.vcpu": "4核16G",
+            "requirements.memory_gib": "单节点4核16G",
+        },
+    )
+    finalize_customer_fact_ledger(requirement)
+    original_facts = requirement.customer_pricing_facts.copy()
+
+    # Simulate AI/provider/display layers using different names for the same
+    # already-resolved product. Only classification metadata changes.
+    requirement.service = "redis"
+    requirement.calculator_service_name = "客户自定义缓存名称"
+
+    assert customer_fact_ledger_is_current(requirement)
+    assert requirement.customer_pricing_facts == original_facts
+
+
 def test_mapped_top_level_quantity_removes_same_overflow_fact() -> None:
     requirement = ServiceRequirement(
         service="eks",
@@ -144,6 +252,30 @@ def test_mapped_top_level_quantity_removes_same_overflow_fact() -> None:
     remove_facts_mapped_to_fields(requirement)
 
     assert requirement.unmapped_pricing_facts == []
+
+
+def test_single_resource_quantity_is_neutral_context_but_larger_counts_fail_closed() -> None:
+    def requirement(quantity: int) -> ServiceRequirement:
+        return ServiceRequirement(
+            service="s3",
+            quantity=quantity,
+            field_sources={"quantity": "customer_text"},
+            field_evidence={"quantity": f"数量{quantity}"},
+        )
+
+    selection = SelectedResource(
+        service="s3",
+        display_name="Amazon S3",
+        region="ap-southeast-6",
+        model="S3 Standard",
+        architecture="对象存储",
+        specifications={},
+        official_product={"source": "AWS"},
+        rationale="official",
+    )
+
+    assert unconsumed_customer_pricing_facts(requirement(1), selection) == []
+    assert unconsumed_customer_pricing_facts(requirement(2), selection) == ["quantity"]
 
 
 def test_equal_overflow_value_with_distinct_evidence_is_preserved() -> None:
@@ -567,11 +699,26 @@ def test_fact_table_records_unit_scope_evidence_and_component_owner() -> None:
 
     assert [(record.path, record.unit, record.scope) for record in records] == [
         ("quantity", "台", "component_total"),
-        ("requirements.memory_gib", "G", "per_node"),
+        ("requirements.memory_gib", "GiB", "per_node"),
         ("requirements.vcpu", "vCPU", "per_node"),
     ]
     assert all(record.component_key == "cmp_worker_5678" for record in records)
     assert all(record.source_block_key == "src_block_1" for record in records)
+
+
+def test_normalized_gib_fact_does_not_keep_the_source_tb_unit() -> None:
+    requirement = ServiceRequirement(
+        service="backup",
+        component_key="cmp_backup_unit",
+        requirements={"backup_storage_gib": 5120},
+        field_sources={"requirements.backup_storage_gib": "customer_text"},
+        field_evidence={"requirements.backup_storage_gib": "备份容量5TB"},
+    )
+
+    [record] = customer_pricing_fact_records(requirement)
+
+    assert record.value == 5120
+    assert record.unit == "GiB"
 
 
 def test_same_source_fact_owned_by_two_components_is_rejected() -> None:
@@ -795,8 +942,8 @@ def test_plain_machine_count_uses_managed_component_count_field() -> None:
     assert component.field_evidence["requirements.data_nodes"] == "5台"
 
 
-def test_ledger_upgrade_rebinds_plain_count_after_managed_identity_resolution() -> None:
-    """A pre-canonical ledger must not freeze a managed node count as missing."""
+def test_legacy_ledger_cannot_guess_missing_count_after_identity_resolution() -> None:
+    """Rebinding a missing node count requires official intake, not raw regex."""
 
     source = "ElasticSearch，5台，单台16核128G，磁盘4T"
     component = ServiceRequirement(
@@ -828,12 +975,9 @@ def test_ledger_upgrade_rebinds_plain_count_after_managed_identity_resolution() 
 
     repaired = intent.services[0]
     assert repaired.quantity == 1
-    assert repaired.requirements["data_nodes"] == 5
-    assert repaired.field_evidence["requirements.data_nodes"] == "5台"
-    assert any(
-        fact.path == "requirements.data_nodes" and fact.value == 5
-        for fact in repaired.customer_pricing_facts
-    )
+    assert "data_nodes" not in repaired.requirements
+    assert not any(fact.path == "requirements.data_nodes" for fact in repaired.customer_pricing_facts)
+    assert DeepSeekIntentParser._uncovered_quantitative_claim_issues(source, repaired)
 
 
 def test_plain_machine_count_uses_top_level_quantity_when_template_has_no_member_count() -> None:

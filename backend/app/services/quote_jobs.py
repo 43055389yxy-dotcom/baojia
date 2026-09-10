@@ -22,6 +22,7 @@ class QuoteJob:
     events: list[dict[str, str]] = field(default_factory=list)
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
+    cleaned_request: str | None = None
     updated_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
     def public(self) -> dict[str, Any]:
@@ -31,6 +32,7 @@ class QuoteJob:
             "events": self.events,
             "result": self.result,
             "error": self.error,
+            "cleaned_request": self.cleaned_request,
             "updated_at": self.updated_at,
         }
 
@@ -38,15 +40,20 @@ class QuoteJob:
 class QuoteJobManager:
     """Small in-memory queue for official API quote jobs."""
 
+    _CONFIGURATION_HEARTBEAT_INTERVAL_SECONDS = 15.0
+
     def __init__(
         self,
         quote_service: QuoteService,
         provider_name: str = "AWS",
         provider_key: Literal["aws", "azure"] = "aws",
+        preview_timeout_seconds: float = 300.0,
     ):
         self._quote_service = quote_service
         self._provider_name = provider_name
         self._provider_key = provider_key
+        self._preview_timeout_seconds = max(float(preview_timeout_seconds), 0.01)
+        self.instance_id = f"worker-{uuid.uuid4().hex}"
         self._jobs: dict[str, QuoteJob] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
 
@@ -132,6 +139,10 @@ class QuoteJobManager:
             # live channels by the frontend.
             if stage in {"ai_prompt", "ai_response", "ai_result"}:
                 return
+            if stage == "input_cleaned":
+                job.cleaned_request = message
+                await self._event(job, "input_cleaned", "原始输入已清洗，后续仅使用标准化配置")
+                return
             await self._event(job, stage, message)
 
         try:
@@ -188,16 +199,38 @@ class QuoteJobManager:
 
     async def _run_preview(self, job: QuoteJob, request: QuoteRequest) -> None:
         job.status = "running"
+        self._heartbeat_configuration_reprocessing(request)
+        heartbeat_task = asyncio.create_task(
+            self._renew_configuration_reprocessing_lease(request)
+        )
         await self._event(job, "queue", "配置核验任务已启动")
 
         async def report(stage: str, message: str) -> None:
+            self._heartbeat_configuration_reprocessing(request)
+            if stage == "input_cleaned":
+                job.cleaned_request = message
+                await self._event(job, "input_cleaned", "原始输入已清洗，后续仅使用标准化配置")
+                return
             await self._event(job, stage, message)
 
         try:
-            result = await self._quote_service.preview(request, report)
+            result = await asyncio.wait_for(
+                self._quote_service.preview(request, report),
+                timeout=self._preview_timeout_seconds,
+            )
             job.result = result.model_dump(mode="json")
             job.status = "completed"
             await self._event(job, "done", "全部组件已完成配置核验")
+        except TimeoutError:
+            self._recover_configuration_review(request)
+            job.status = "failed"
+            job.error = {
+                "status": "manual_confirmation",
+                "code": "configuration_processing_timeout",
+                "message": "配置处理超过安全时限，已停止本次任务并保留原配置。",
+                "details": {},
+            }
+            await self._event(job, "error", "配置处理超时，原配置已保留")
         except QuoteError as exc:
             diagnostic_id = diagnostic_log.record_exception(
                 "preview_job_failed",
@@ -246,6 +279,9 @@ class QuoteJobManager:
                 },
             }
             await self._event(job, "error", "配置核验发生内部错误")
+        finally:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
 
     def _recover_configuration_review(self, request: QuoteRequest) -> None:
         recover = getattr(
@@ -253,6 +289,32 @@ class QuoteJobManager:
         )
         if callable(recover):
             recover(request.draft_id, request.customer_request)
+
+    def _heartbeat_configuration_reprocessing(self, request: QuoteRequest) -> None:
+        heartbeat = getattr(
+            self._quote_service, "heartbeat_configuration_reprocessing", None
+        )
+        if callable(heartbeat):
+            heartbeat(request.draft_id, self.instance_id)
+
+    async def _renew_configuration_reprocessing_lease(
+        self, request: QuoteRequest,
+    ) -> None:
+        """Keep a quiet AI/catalog call distinguishable from a dead worker."""
+        while True:
+            await asyncio.sleep(self._CONFIGURATION_HEARTBEAT_INTERVAL_SECONDS)
+            self._heartbeat_configuration_reprocessing(request)
+
+    async def shutdown(self) -> None:
+        """Cancel in-memory jobs and release their persisted processing leases."""
+        tasks = [task for task in self._tasks.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        release = getattr(self._quote_service, "release_configuration_reprocessing", None)
+        if callable(release):
+            release(self.instance_id)
 
     @staticmethod
     async def _event(job: QuoteJob, stage: str, message: str) -> None:

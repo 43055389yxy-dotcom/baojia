@@ -1,20 +1,26 @@
+"""AstraQuote official multi-cloud pricing API.
+
+The legacy AWS interpretation, selection, confirmation and BCM quote runtime
+is deliberately not imported here. GPT makes quote decisions; this process
+only exposes signed official-price reads and the sales browser relay.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import time
 import uuid
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import quote
 
-from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
-from app.core.data_paths import AWS_DATA_ROOT
 from app.core.diagnostics import (
     bind_request_id,
     current_request_id,
@@ -22,139 +28,46 @@ from app.core.diagnostics import (
     reset_request_id,
 )
 from app.core.errors import QuoteError
-from app.domain.models import (
-    ConfigurationFeedbackSubmission,
-    ConfirmationSessionResponse,
-    ConfirmationSubmission,
-    ErrorResponse,
-    QuotePreviewResponse,
-    QuoteRequest,
-    QuoteResponse,
-    SalesRegionPreflightRequest,
-    SalesRegionPreflightResponse,
-    ServiceKind,
-    ServiceRequirement,
+from app.domain.models import ErrorResponse
+from app.integrations.aws import AwsClients
+from app.services.aws_query_executor import ReadOnlyAwsQueryExecutor
+from app.services.gpt_quote_relay import GptQuoteRelayStore, GptRelayError
+from app.services.mcp_v2_pricing import (
+    AttributeValuesRequest,
+    DescribeServiceRequest,
+    GetPricesRequest,
+    OfficialPricingService,
+    ProductSearchRequest,
 )
-from app.integrations.auto_service_discovery import AutoServiceDiscovery
-from app.integrations.aws import AwsClients, PricingCatalog, RegionResolver
-from app.integrations.aws_adaptation_audit import AwsAdaptationAudit
-from app.integrations.aws_product_registry import AwsProductRegistry
-from app.integrations.aws_regions import commercial_aws_region_options
-from app.integrations.catalog_warmup import CommonCatalogWarmer
-from app.integrations.component_result_cache import ValidatedComponentResultCache
-from app.integrations.deepseek import DeepSeekIntentParser
-from app.integrations.prompt_library import prompt_library_payload, update_prompt_text
-from app.services.bcm_estimator import BcmWorkloadEstimator
-from app.services.confirmation_sessions import ConfirmationSessionStore
-from app.services.plugins import (
-    AlbPlugin,
-    ApiGatewayPlugin,
-    CloudFrontPlugin,
-    CloudWatchPlugin,
-    DataTransferPlugin,
-    EbsPlugin,
-    Ec2Plugin,
-    EventBridgeSchedulerPlugin,
-    GlobalAcceleratorPlugin,
-    MskPlugin,
-    NatGatewayPlugin,
-    OpenSearchPlugin,
-    PluginRegistry,
-    RdsPlugin,
-    RedisPlugin,
-    Route53Plugin,
-    S3Plugin,
-    SesPlugin,
-    SqsPlugin,
-    WafPlugin,
-)
-from app.services.plugins.generic_official import GenericOfficialPlugin
-from app.services.quote_jobs import QuoteJobManager
-from app.services.quote_service import QuoteService
+from app.services.quote_artifacts import QuoteArtifactError, QuoteArtifactStore
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 diagnostic_log.configure(
     enabled=settings.app_env.strip().lower() not in {"production", "prod"}
 )
+
 clients = AwsClients.from_settings(settings)
-regions = RegionResolver(clients)
-catalog = PricingCatalog(clients, regions)
-product_registry = AwsProductRegistry(database_path=AWS_DATA_ROOT / "aws_product_registry.sqlite3")
-adaptation_audit = AwsAdaptationAudit(product_registry)
-auto_service_discovery = AutoServiceDiscovery(
-    catalog,
-    database_path=AWS_DATA_ROOT / "auto_service_profiles.sqlite3",
-    product_registry=product_registry,
-)
-plugins = PluginRegistry(
-    [
-        Ec2Plugin(clients, catalog),
-        RdsPlugin(clients, catalog),
-        RedisPlugin(clients, catalog),
-        S3Plugin(clients, catalog),
-        AlbPlugin(clients, catalog),
-        CloudFrontPlugin(clients, catalog),
-        Route53Plugin(clients, catalog),
-        WafPlugin(clients, catalog),
-        SqsPlugin(clients, catalog),
-        SesPlugin(clients, catalog),
-        CloudWatchPlugin(clients, catalog),
-        EbsPlugin(clients, catalog),
-        DataTransferPlugin(clients, catalog),
-        GlobalAcceleratorPlugin(clients, catalog),
-        MskPlugin(clients, catalog),
-        ApiGatewayPlugin(clients, catalog),
-        EventBridgeSchedulerPlugin(clients, catalog),
-        OpenSearchPlugin(clients, catalog),
-        NatGatewayPlugin(clients, catalog),
-    ]
-)
-estimator = BcmWorkloadEstimator(clients, settings)
-confirmation_sessions = ConfirmationSessionStore(
-    AWS_DATA_ROOT / "aws_confirmation_sessions.sqlite3",
-    "aws",
-)
-quote_service = QuoteService(
-    DeepSeekIntentParser(
-        settings,
-        auto_service_discovery,
-        ValidatedComponentResultCache(AWS_DATA_ROOT / "validated_component_results.sqlite3"),
-    ),
-    plugins,
-    estimator,
-    None,
-    confirmation_sessions,
-    settings.ai_display_name,
-    GenericOfficialPlugin(clients, catalog, auto_service_discovery),
-)
-quote_jobs = QuoteJobManager(quote_service, "AWS", "aws")
-warmup_clients = AwsClients.from_settings(settings)
-warmup_regions = RegionResolver(warmup_clients)
-warmup_catalog = PricingCatalog(warmup_clients, warmup_regions)
-catalog_warmer = CommonCatalogWarmer(warmup_clients, warmup_catalog)
-last_healthy_aws: dict[str, Any] = {}
-last_aws_health_probe_at = 0.0
-aws_health_probe_lock = asyncio.Lock()
-AWS_HEALTH_CACHE_SECONDS = 60.0
+mcp_v2_pricing = OfficialPricingService(ReadOnlyAwsQueryExecutor(clients))
+gpt_quote_relay = GptQuoteRelayStore()
+quote_artifacts = QuoteArtifactStore()
 
 app = FastAPI(
-    title="AWS 智能报价 API",
-    version="1.0.0",
-    description="仅处理 AWS 报价；Microsoft Azure 数据与任务不可访问。",
+    title="AstraQuote 多云报价 API",
+    version="3.0.0",
+    description="提供官方云价目读取与销售报价任务入口。",
 )
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.app_cors_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT"],
-    allow_headers=["Content-Type"],
-    expose_headers=["X-Diagnostic-Request-Id"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-AstraQuote-MCP-Token"],
 )
 
 
 @app.middleware("http")
-async def attach_diagnostic_request_id(request: Request, call_next):
+async def attach_request_context(request: Request, call_next):
     request_id = request.headers.get("X-Diagnostic-Request-Id") or f"req_{uuid.uuid4().hex}"
     request.state.diagnostic_request_id = request_id
     token = bind_request_id(request_id)
@@ -162,9 +75,8 @@ async def attach_diagnostic_request_id(request: Request, call_next):
     try:
         response = await call_next(request)
         response.headers["X-Diagnostic-Request-Id"] = request_id
-        # Diagnostic maintenance must not create a fresh diagnostic record.
-        # Otherwise "clear logs" immediately leaves behind its own POST entry,
-        # so a refreshed test page can never truthfully start at zero.
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
         if request.url.path != "/api/health" and not request.url.path.startswith(
             "/api/debug/logs"
         ):
@@ -177,7 +89,6 @@ async def attach_diagnostic_request_id(request: Request, call_next):
                 context={
                     "method": request.method,
                     "path": request.url.path,
-                    "query": str(request.url.query),
                     "status_code": response.status_code,
                     "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
                 },
@@ -186,67 +97,6 @@ async def attach_diagnostic_request_id(request: Request, call_next):
         return response
     finally:
         reset_request_id(token)
-
-
-def _require_aws_request(request: QuoteRequest) -> None:
-    if request.cloud_provider != "aws":
-        raise QuoteError(
-            "provider_boundary_violation",
-            "AWS 报价程序禁止处理 Microsoft Azure 任务。",
-            {"expected": "aws", "received": request.cloud_provider},
-            403,
-        )
-
-
-def _require_aws_token(token: str) -> None:
-    if not token.startswith("aws_"):
-        raise QuoteError(
-            "provider_boundary_violation",
-            "AWS 报价程序禁止读取 Microsoft Azure 确认链接。",
-            {"expected_prefix": "aws_"},
-            403,
-        )
-
-
-@app.on_event("startup")
-async def start_aws_catalog_maintenance() -> None:
-    async def warm_catalogs() -> None:
-        await asyncio.sleep(15)
-        await asyncio.to_thread(catalog_warmer.warm)
-
-    async def sync_registry() -> None:
-        await asyncio.sleep(5)
-        try:
-            await asyncio.to_thread(product_registry.sync)
-            await asyncio.to_thread(product_registry.sync_region_availability)
-        except Exception:
-            logger.exception("AWS full product registry synchronization failed")
-
-    async def maintain_profiles() -> None:
-        await asyncio.sleep(60)
-        while True:
-            try:
-                await asyncio.to_thread(auto_service_discovery.refresh_stale_profiles)
-            except Exception:
-                logger.exception("AWS official field profile maintenance failed")
-            await asyncio.sleep(6 * 60 * 60)
-
-    app.state.warm_task = asyncio.create_task(warm_catalogs())
-    app.state.registry_task = asyncio.create_task(sync_registry())
-    app.state.profile_task = asyncio.create_task(maintain_profiles())
-
-
-@app.on_event("shutdown")
-async def stop_aws_catalog_maintenance() -> None:
-    for task_name in ("warm_task", "registry_task", "profile_task"):
-        task = getattr(app.state, task_name, None)
-        if task is None:
-            continue
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
 
 
 @app.exception_handler(QuoteError)
@@ -274,7 +124,7 @@ async def quote_error_handler(request: Request, exc: QuoteError) -> JSONResponse
 
 @app.exception_handler(Exception)
 async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResponse:
-    logger.exception("Unexpected AWS quote API failure", exc_info=exc)
+    logger.exception("Unexpected AstraQuote V2 API failure", exc_info=exc)
     request_id = getattr(request.state, "diagnostic_request_id", None) or current_request_id()
     diagnostic_id = diagnostic_log.record_exception(
         "unexpected_quote_api_error",
@@ -284,16 +134,26 @@ async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResp
     )
     payload = ErrorResponse(
         code="internal_error",
-        message="AWS 报价程序内部错误；本次未生成猜测价格。",
-        details={
-            "diagnostic_id": diagnostic_id,
-            "request_id": request_id,
-            "error_type": type(exc).__name__,
-        }
+        message="报价服务内部错误，本次未生成猜测结果。",
+        details={"diagnostic_id": diagnostic_id, "request_id": request_id}
         if diagnostic_id
         else {},
     )
     return JSONResponse(status_code=500, content=payload.model_dump(mode="json"))
+
+
+def _require_mcp_internal_token(request: Request) -> None:
+    expected = settings.astraquote_mcp_internal_token
+    if not expected:
+        raise QuoteError(
+            "mcp_internal_auth_not_configured",
+            "AstraQuote MCP 内部认证尚未配置。",
+            {},
+            503,
+        )
+    supplied = request.headers.get("X-AstraQuote-MCP-Token", "")
+    if not supplied or not secrets.compare_digest(supplied, expected):
+        raise QuoteError("mcp_internal_auth_failed", "AstraQuote MCP 内部认证失败。", {}, 401)
 
 
 @app.get("/api/debug/logs")
@@ -304,14 +164,14 @@ async def get_diagnostic_logs(limit: int = 500, since: str | None = None) -> JSO
         content={
             "enabled": True,
             "environment": settings.app_env,
-            "provider": "aws",
+            "provider": "multi-cloud",
             "entries": diagnostic_log.snapshot(limit=limit, since=since),
         }
     )
 
 
-@app.post("/api/debug/logs/clear")
-async def clear_diagnostic_logs() -> Any:
+@app.post("/api/debug/logs/clear", response_model=None)
+async def clear_diagnostic_logs() -> dict[str, bool] | JSONResponse:
     if not diagnostic_log.enabled:
         return JSONResponse(status_code=404, content={"message": "诊断日志仅在测试环境开放"})
     diagnostic_log.clear()
@@ -320,327 +180,178 @@ async def clear_diagnostic_logs() -> Any:
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    global last_aws_health_probe_at
-
-    def check() -> dict[str, Any]:
-        health_config = Config(
-            connect_timeout=2,
-            read_timeout=4,
-            retries={"max_attempts": 1, "mode": "standard"},
-        )
-        identity: dict[str, Any] = {}
-        pricing: dict[str, Any] = {}
-        preferences: dict[str, Any] = {}
-        try:
-            identity = clients.session.client("sts", config=health_config).get_caller_identity()
-            pricing = clients.session.client(
-                "pricing",
-                region_name=settings.aws_pricing_region,
-                config=health_config,
-            ).describe_services(ServiceCode="AmazonEC2", MaxResults=1)
-            preferences = clients.session.client(
-                "bcm-pricing-calculator",
-                region_name="us-east-1",
-                config=health_config,
-            ).get_preferences()
-        except (BotoCoreError, ClientError):
-            logger.warning("AWS health probe timed out or was unavailable")
-        result = {
-            "awsAccount": identity.get("Account"),
-            "awsArn": identity.get("Arn"),
-            "pricingCatalog": bool(pricing.get("Services")),
-            "bcmReady": bool(preferences)
-            and (bool(settings.bcm_workload_estimate_ids) or settings.bcm_allow_estimate_create),
-        }
-        if result["awsAccount"] and result["pricingCatalog"] and result["bcmReady"]:
-            last_healthy_aws.clear()
-            last_healthy_aws.update(result)
-        return result if result["awsAccount"] else dict(last_healthy_aws)
-
-    now = time.monotonic()
-    if last_healthy_aws and now - last_aws_health_probe_at < AWS_HEALTH_CACHE_SECONDS:
-        result = dict(last_healthy_aws)
-    else:
-        # Multiple browser tabs poll this endpoint.  Only one request may run
-        # the three external AWS checks; all other requests reuse the latest
-        # known result instead of competing with actual quote work.
-        async with aws_health_probe_lock:
-            now = time.monotonic()
-            if last_healthy_aws and now - last_aws_health_probe_at < AWS_HEALTH_CACHE_SECONDS:
-                result = dict(last_healthy_aws)
-            else:
-                try:
-                    result = await asyncio.wait_for(asyncio.to_thread(check), timeout=8)
-                except TimeoutError:
-                    result = dict(last_healthy_aws) or {
-                        "awsAccount": None,
-                        "awsArn": None,
-                        "pricingCatalog": False,
-                        "bcmReady": False,
-                    }
-                finally:
-                    last_aws_health_probe_at = time.monotonic()
-    ready = bool(settings.ai_api_key) and bool(result.get("bcmReady"))
+    relay = gpt_quote_relay.health()
     return {
-        "status": "ok" if ready else "configuration_required",
-        "calculatorReady": ready,
-        "pricingMode": "bcm_api",
-        "aiProvider": settings.ai_display_name,
-        "provider": "aws",
-        **result,
+        "status": "ok",
+        "provider": "multi-cloud",
+        "workflow": "astraquote-v3",
+        "quoteRelay": relay["status"],
     }
 
 
-@app.get("/api/aws-product-registry")
-async def get_product_registry(details: bool = False) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "coverage": product_registry.coverage(),
-        "adaptationAudit": adaptation_audit.report(),
-        "catalogSource": "AWS Bulk Price List",
-        "componentIsolation": "region-only inheritance",
-        "providerBoundary": "aws-only; Azure data access forbidden",
+@app.get("/api/mcp/v2/health")
+async def mcp_v2_health(request: Request) -> dict[str, Any]:
+    _require_mcp_internal_token(request)
+    return {
+        "status": "ready",
+        "workflow_version": "3.0.0",
+        "internal_ai_enabled": False,
+        "role": "official cloud catalog client",
+        "price_sources": [
+            "AWS Price List API",
+            "Azure Retail Prices API",
+            "Oracle Cloud Price List API",
+            "Google Cloud Billing Catalog API",
+        ],
     }
-    if details:
-        payload["products"] = product_registry.list_products()
-    return payload
 
 
-class PromptUpdate(BaseModel):
-    content: str = Field(min_length=1, max_length=50000)
+@app.post("/api/mcp/v2/describe-service")
+async def mcp_v2_describe_service(
+    request: Request,
+    payload: DescribeServiceRequest,
+) -> dict[str, Any]:
+    _require_mcp_internal_token(request)
+    return await asyncio.to_thread(mcp_v2_pricing.describe_service, payload)
 
 
-@app.get("/api/prompt-library")
-async def get_prompt_library() -> dict[str, object]:
-    return prompt_library_payload()
+@app.post("/api/mcp/v2/attribute-values")
+async def mcp_v2_attribute_values(
+    request: Request,
+    payload: AttributeValuesRequest,
+) -> dict[str, Any]:
+    _require_mcp_internal_token(request)
+    return await asyncio.to_thread(mcp_v2_pricing.get_attribute_values, payload)
 
 
-@app.put("/api/prompt-library/{key}")
-async def update_prompt_library_item(key: str, request: PromptUpdate) -> dict[str, object]:
-    try:
-        update_prompt_text(key, request.content)
-    except KeyError:
-        return JSONResponse(status_code=404, content={"message": "提示词模块不存在"})
-    except ValueError as exc:
-        return JSONResponse(status_code=422, content={"message": str(exc)})
-    return prompt_library_payload()
+@app.post("/api/mcp/v2/search-products")
+async def mcp_v2_search_products(
+    request: Request,
+    payload: ProductSearchRequest,
+) -> dict[str, Any]:
+    _require_mcp_internal_token(request)
+    return await asyncio.to_thread(mcp_v2_pricing.search_products, payload)
 
 
-@app.get("/api/cache/status")
-async def cache_status() -> dict[str, object]:
-    return {"provider": "aws", "catalog": catalog_warmer.status.as_dict()}
+@app.post("/api/mcp/v2/prices")
+async def mcp_v2_get_prices(
+    request: Request,
+    payload: GetPricesRequest,
+) -> dict[str, Any]:
+    _require_mcp_internal_token(request)
+    return await asyncio.to_thread(mcp_v2_pricing.get_prices, payload)
 
 
-@app.post("/api/quotes/preview", response_model=QuotePreviewResponse)
-async def preview_quote(request: QuoteRequest) -> QuotePreviewResponse:
-    _require_aws_request(request)
-    return await quote_service.preview(request)
+class GptRelayQuoteRequest(BaseModel):
+    customer_request: str = Field(min_length=3, max_length=12000)
+    cloud_provider: Literal["aws", "azure", "oci", "gcp"] = "aws"
+    pricing_mode: Literal["on_demand", "reserved"] = "on_demand"
+    reserved_term_years: list[Literal[1, 3]] = Field(default_factory=list, max_length=2)
+    payment_option: Literal[
+        "not_applicable", "no_upfront", "partial_upfront", "all_upfront"
+    ] = "not_applicable"
+    include_on_demand_scenario: bool = True
+    utilization_percent: int = Field(default=100, ge=1, le=100)
+    display_result_on_page: bool = False
 
 
-def _sales_region_options() -> list[dict[str, str]]:
-    return [
-        {"code": code, "label": label}
-        for code, label in commercial_aws_region_options()
-    ]
-
-
-@app.post(
-    "/api/quotes/region-preflight",
-    response_model=SalesRegionPreflightResponse,
-)
-async def sales_region_preflight(
-    request: SalesRegionPreflightRequest,
-) -> SalesRegionPreflightResponse:
-    result = await quote_service.identify_sales_region(request.customer_request)
-    official_regions = set(DeepSeekIntentParser.official_aws_region_labels())
-    detected = [
-        str(region)
-        for region in result.get("regions", [])
-        if isinstance(region, str) and region in official_regions
-    ]
-    requires_confirmation = bool(result.get("requires_confirmation")) or not detected
-    return SalesRegionPreflightResponse(
-        detected_regions=detected,
-        selected_region=detected[0] if len(detected) == 1 else None,
-        requires_confirmation=requires_confirmation,
-        options=_sales_region_options() if requires_confirmation else [],
+def _gpt_relay_error_response(exc: GptRelayError) -> JSONResponse:
+    status = 404 if exc.code == "gpt_relay_job_not_found" else 422
+    return JSONResponse(
+        status_code=status,
+        content={"code": exc.code, "message": str(exc), "details": exc.details},
     )
 
 
-class AwsConfigurationOptionsRequest(BaseModel):
-    service: str = Field(min_length=2, max_length=80, pattern=r"^[a-z0-9_\-]+$")
-    region: str = Field(min_length=5, max_length=32)
-    requirements: dict[str, Any] = Field(default_factory=dict)
-
-
-@app.post("/api/aws/configuration-field-options")
-async def get_configuration_field_options(
-    request: AwsConfigurationOptionsRequest,
-) -> dict[str, list[Any]]:
-    aliases = {"aurora": "rds", "redis": "elasticache", "valkey": "elasticache"}
+@app.post("/api/quote-relay/jobs", response_model=None)
+async def create_gpt_relay_job(request: GptRelayQuoteRequest) -> dict[str, Any] | JSONResponse:
     try:
-        kind = ServiceKind(aliases.get(request.service, request.service))
-    except ValueError:
-        return {}
-    requirement = ServiceRequirement(
-        service=request.service,
-        region=request.region,
-        requirements=request.requirements,
-    )
-    provider = getattr(plugins.get(kind), "configuration_field_options", None)
-    if not callable(provider):
-        return {}
-    try:
-        options = await asyncio.wait_for(
-            asyncio.to_thread(provider, requirement, request.region),
-            timeout=8,
+        return gpt_quote_relay.create(
+            request.customer_request,
+            {
+                "pricing_mode": request.pricing_mode,
+                "cloud_provider": request.cloud_provider,
+                "reserved_term_years": list(dict.fromkeys(request.reserved_term_years)),
+                "payment_option": request.payment_option,
+                "include_on_demand_scenario": request.include_on_demand_scenario,
+                "utilization_percent": request.utilization_percent,
+                "display_result_on_page": request.display_result_on_page,
+            },
         )
+    except GptRelayError as exc:
+        return _gpt_relay_error_response(exc)
+
+
+@app.get("/api/quote-relay/jobs/{job_id}", response_model=None)
+async def get_gpt_relay_job(job_id: str) -> dict[str, Any] | JSONResponse:
+    try:
+        return gpt_quote_relay.public_get(job_id)
+    except GptRelayError as exc:
+        return _gpt_relay_error_response(exc)
+
+
+@app.post("/api/quote-relay/jobs/{job_id}/cancel", response_model=None)
+async def cancel_gpt_relay_job(job_id: str) -> dict[str, Any] | JSONResponse:
+    try:
+        return gpt_quote_relay.cancel(job_id)
+    except GptRelayError as exc:
+        return _gpt_relay_error_response(exc)
+
+
+@app.get("/api/quote-relay/health")
+async def gpt_relay_health() -> dict[str, Any]:
+    return gpt_quote_relay.health()
+
+
+@app.get("/api/quote-artifacts/{token}", response_model=None)
+async def download_quote_artifact(token: str) -> StreamingResponse | JSONResponse:
+    try:
+        artifact = quote_artifacts.get(token)
+    except QuoteArtifactError as exc:
+        status = 410 if exc.code == "quote_artifact_expired" else 404
+        return JSONResponse(
+            status_code=status,
+            content={"code": exc.code, "message": str(exc)},
+        )
+    try:
+        response = await asyncio.to_thread(
+            clients.regional("s3", artifact["region"]).get_object,
+            Bucket=artifact["bucket"],
+            Key=artifact["key"],
+        )
+        body = response["Body"]
     except Exception:
-        return {}
-    if not isinstance(options, dict):
-        return {}
-    return {
-        str(field): [value for value in values if isinstance(value, (str, int, float, bool))]
-        for field, values in options.items()
-        if isinstance(field, str) and isinstance(values, list)
-    }
-
-
-@app.get(
-    "/api/confirmation-sessions/{token}",
-    response_model=ConfirmationSessionResponse,
-)
-async def get_confirmation_session(token: str) -> ConfirmationSessionResponse | JSONResponse:
-    _require_aws_token(token)
-    session = confirmation_sessions.get(token)
-    if session is None:
-        return JSONResponse(status_code=404, content={"message": "确认单不存在或已失效"})
-    if session.status == "pending":
-        hydrated = await quote_service.hydrate_confirmation_session_choices(session)
-        if hydrated.confirmation_items != session.confirmation_items:
-            confirmation_sessions.replace_pending_confirmation_items(
-                token,
-                hydrated.confirmation_items,
-            )
-        session = hydrated
-    reprocess_request = confirmation_sessions.begin_configuration_reprocessing(token)
-    if reprocess_request is not None:
-        quote_jobs.start_preview(reprocess_request)
-        session = confirmation_sessions.get(token) or session
-    return session
-
-
-@app.post(
-    "/api/confirmation-sessions/{token}",
-    response_model=ConfirmationSessionResponse,
-)
-async def submit_confirmation_session(
-    token: str,
-    submission: ConfirmationSubmission,
-) -> ConfirmationSessionResponse | JSONResponse:
-    _require_aws_token(token)
-    try:
-        session = confirmation_sessions.submit(
-            token,
-            submission.answers,
-            processor_architecture=submission.processor_architecture,
+        logger.exception("Private quote artifact could not be read from S3")
+        return JSONResponse(
+            status_code=502,
+            content={
+                "code": "quote_artifact_read_failed",
+                "message": "报价文件暂时无法下载，请稍后重试。",
+            },
         )
-    except ValueError as exc:
-        return JSONResponse(status_code=422, content={"message": str(exc)})
-    if session is None:
-        return JSONResponse(status_code=404, content={"message": "确认单不存在或已失效"})
-    reprocess_request = confirmation_sessions.begin_configuration_reprocessing(token)
-    if reprocess_request is not None:
-        quote_jobs.start_preview(reprocess_request)
-        session = confirmation_sessions.get(token) or session
-    return session
+
+    async def chunks():
+        try:
+            while True:
+                chunk = await asyncio.to_thread(body.read, 64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            await asyncio.to_thread(body.close)
+
+    filename = str(artifact["filename"]).replace('"', "").replace("\r", "").replace("\n", "")
+    return StreamingResponse(
+        chunks(),
+        media_type=artifact["content_type"],
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=quote.xlsx; filename*=UTF-8''"
+                f"{quote(filename)}"
+            ),
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
-@app.post(
-    "/api/confirmation-sessions/{token}/approve",
-    response_model=ConfirmationSessionResponse,
-)
-async def approve_confirmation_configuration(
-    token: str,
-) -> ConfirmationSessionResponse | JSONResponse:
-    _require_aws_token(token)
-    try:
-        session = confirmation_sessions.approve_configuration(token)
-    except ValueError as exc:
-        return JSONResponse(status_code=409, content={"message": str(exc)})
-    if session is None:
-        return JSONResponse(status_code=404, content={"message": "确认单不存在或已失效"})
-    return session
-
-
-@app.post(
-    "/api/confirmation-sessions/{token}/feedback",
-    response_model=ConfirmationSessionResponse,
-)
-async def submit_configuration_feedback(
-    token: str,
-    submission: ConfigurationFeedbackSubmission,
-) -> ConfirmationSessionResponse | JSONResponse:
-    _require_aws_token(token)
-    try:
-        session = confirmation_sessions.submit_configuration_feedback(
-            token,
-            feedback=submission.feedback,
-            component_feedback=submission.component_feedback,
-            component_updates=submission.component_updates,
-        )
-    except ValueError as exc:
-        return JSONResponse(status_code=409, content={"message": str(exc)})
-    if session is None:
-        return JSONResponse(status_code=404, content={"message": "确认单不存在或已失效"})
-    reprocess_request = confirmation_sessions.begin_configuration_reprocessing(token)
-    if reprocess_request is not None:
-        quote_jobs.start_preview(reprocess_request)
-        session = confirmation_sessions.get(token) or session
-    return session
-
-
-@app.post("/api/quotes", response_model=QuoteResponse)
-async def create_quote(request: QuoteRequest) -> QuoteResponse:
-    _require_aws_request(request)
-    return await quote_service.create_quote(request)
-
-
-@app.post("/api/quote-jobs")
-async def start_quote_job(request: QuoteRequest) -> dict[str, str]:
-    _require_aws_request(request)
-    job = quote_jobs.start(request)
-    return {"job_id": job.job_id, "status": job.status}
-
-
-@app.post("/api/preview-jobs")
-async def start_preview_job(request: QuoteRequest) -> dict[str, str]:
-    _require_aws_request(request)
-    job = quote_jobs.start_preview(request)
-    return {"job_id": job.job_id, "status": job.status}
-
-
-@app.get("/api/quote-jobs/{job_id}")
-async def get_quote_job(job_id: str) -> JSONResponse:
-    if not job_id.startswith("aws-"):
-        raise QuoteError(
-            "provider_boundary_violation",
-            "AWS 报价程序禁止读取 Microsoft Azure 任务。",
-            {"expected_prefix": "aws-"},
-            403,
-        )
-    job = quote_jobs.get(job_id)
-    if job is None:
-        return JSONResponse(status_code=404, content={"message": "报价任务不存在"})
-    return JSONResponse(content=job.public())
-
-
-@app.post("/api/quote-jobs/{job_id}/cancel")
-async def cancel_quote_job(job_id: str) -> dict[str, bool]:
-    if not job_id.startswith("aws-"):
-        raise QuoteError(
-            "provider_boundary_violation",
-            "AWS 报价程序禁止取消 Microsoft Azure 任务。",
-            {"expected_prefix": "aws-"},
-            403,
-        )
-    return {"cancelled": await quote_jobs.cancel(job_id)}
+__all__ = ["app", "gpt_quote_relay", "mcp_v2_pricing", "quote_artifacts", "settings"]

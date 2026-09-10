@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from app.core.errors import ManualConfirmationRequired
 from app.domain.models import ServiceRequirement
 from app.integrations.auto_service_discovery import (
@@ -95,6 +97,44 @@ def test_distinct_official_products_never_share_a_profile_cache_key() -> None:
     )
 
 
+@pytest.mark.parametrize("region", [None, "", "global", "Global", " GLOBAL "])
+def test_catalog_region_scope_is_identical_for_cache_and_profile(tmp_path, region):
+    discovery = AutoServiceDiscovery(AppFlowCatalog(), tmp_path / "profiles.sqlite3")
+    profile = discovery.ensure_profile(service_key="appflow", display_name="Amazon AppFlow", region=region)
+    assert profile["region"] == "global"
+    assert discovery.get_profile("appflow", "global")["region"] == "global"
+    assert discovery._profile_key("appflow", region) == discovery._profile_key("appflow", "global")
+
+
+def test_cache_rejects_payload_from_different_region(tmp_path):
+    discovery = AutoServiceDiscovery(AppFlowCatalog(), tmp_path / "profiles.sqlite3")
+    discovery.ensure_profile(service_key="appflow", display_name="Amazon AppFlow", region="us-east-1")
+    with discovery._connect() as connection:
+        row = connection.execute("SELECT profile_key, payload_json FROM auto_service_profiles").fetchone()
+        payload = json.loads(row["payload_json"])
+        payload["region"] = "us-west-2"
+        connection.execute("UPDATE auto_service_profiles SET payload_json=? WHERE profile_key=?",
+                           (json.dumps(payload), row["profile_key"]))
+    assert discovery.get_profile("appflow", "us-east-1") is None
+
+
+@pytest.mark.parametrize("legacy_region", [None, "Global", " GLOBAL "])
+def test_legacy_cache_payload_is_normalized_without_refetching(tmp_path, legacy_region):
+    catalog = AppFlowCatalog()
+    discovery = AutoServiceDiscovery(catalog, tmp_path / "profiles.sqlite3")
+    discovery.ensure_profile(service_key="appflow", display_name="Amazon AppFlow", region="global")
+    calls = catalog.product_calls
+    with discovery._connect() as connection:
+        row = connection.execute("SELECT profile_key, payload_json FROM auto_service_profiles").fetchone()
+        payload = json.loads(row["payload_json"])
+        payload["region"] = legacy_region
+        connection.execute("UPDATE auto_service_profiles SET payload_json=? WHERE profile_key=?",
+                           (json.dumps(payload), row["profile_key"]))
+    profile = discovery.ensure_profile(service_key="appflow", display_name="Amazon AppFlow", region=None)
+    assert profile["region"] == "global"
+    assert catalog.product_calls == calls
+
+
 def test_dynamic_profiles_expose_configuration_facts_before_ai_extraction() -> None:
     fields = set(_dimension_fields([]))
 
@@ -160,6 +200,33 @@ def test_official_profiles_name_common_billing_dimensions_semantically() -> None
             "operation": "Send",
         }
     )[0] == "attachments_gib"
+
+
+def test_backup_restore_and_storage_tiers_keep_distinct_official_fields() -> None:
+    assert _dimension_field(
+        {
+            "unit": "GB",
+            "usage_type": "APS1-Restore-WarmBytes-EFS",
+            "operation": "RestoreRecoveryPoint",
+            "description": "per GB for restore from warm backup storage for EFS",
+        }
+    ) == ("restore_gib", "恢复数据量（GiB）")
+    assert _dimension_field(
+        {
+            "unit": "GB-month",
+            "usage_type": "APS1-WarmStorage-ByteHrs-EFS",
+            "operation": "Storage",
+            "description": "warm backup storage for EFS",
+        }
+    ) == ("warm_storage_gib", "热备份存储（GiB/月）")
+    assert _dimension_field(
+        {
+            "unit": "GB-month",
+            "usage_type": "APS1-ColdStorage-ByteHrs-EFS",
+            "operation": "Storage",
+            "description": "cold backup storage for EFS",
+        }
+    ) == ("cold_storage_gib", "冷备份存储（GiB/月）")
 
 
 def test_flat_rate_plans_keep_subscription_overage_and_included_quotas() -> None:
