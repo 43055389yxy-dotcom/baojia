@@ -194,7 +194,7 @@ async def mcp_v2_health(request: Request) -> dict[str, Any]:
     _require_mcp_internal_token(request)
     return {
         "status": "ready",
-        "workflow_version": "3.2.0",
+        "workflow_version": "3.5.0",
         "internal_ai_enabled": False,
         "role": "official cloud catalog client",
         "price_sources": [
@@ -202,6 +202,12 @@ async def mcp_v2_health(request: Request) -> dict[str, Any]:
             "Azure Retail Prices API",
             "Oracle Cloud Price List API",
             "Google Cloud Billing Catalog API",
+            "Tencent Cloud official API",
+            "Alibaba Cloud official API",
+            "Huawei Cloud official API",
+            "Baidu AI Cloud official API",
+            "Volcengine official API",
+            "CTyun official API",
         ],
         "provider_catalogs": mcp_v2_pricing.catalog_availability(),
     }
@@ -245,7 +251,18 @@ async def mcp_v2_get_prices(
 
 class GptRelayQuoteRequest(BaseModel):
     customer_request: str = Field(min_length=3, max_length=12000)
-    cloud_provider: Literal["aws", "azure", "oci", "gcp"] = "aws"
+    cloud_provider: Literal[
+        "aws",
+        "azure",
+        "oci",
+        "gcp",
+        "tencent",
+        "alibaba",
+        "huawei",
+        "baidu",
+        "volcengine",
+        "ctyun",
+    ] = "aws"
     pricing_scenarios: list[
         Literal["on_demand", "one_year_commitment", "three_year_commitment"]
     ] = Field(default_factory=lambda: ["on_demand"], min_length=1, max_length=3)

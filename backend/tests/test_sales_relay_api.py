@@ -17,6 +17,12 @@ from app.services.mcp_v2_pricing import OfficialPricingService
         ("azure", ["on_demand", "one_year_commitment", "three_year_commitment"]),
         ("oci", ["on_demand"]),
         ("gcp", ["on_demand", "one_year_commitment", "three_year_commitment"]),
+        ("tencent", ["on_demand", "one_year_commitment", "three_year_commitment"]),
+        ("alibaba", ["on_demand", "one_year_commitment", "three_year_commitment"]),
+        ("huawei", ["on_demand", "one_year_commitment", "three_year_commitment"]),
+        ("baidu", ["on_demand", "one_year_commitment", "three_year_commitment"]),
+        ("volcengine", ["on_demand", "one_year_commitment", "three_year_commitment"]),
+        ("ctyun", ["on_demand", "one_year_commitment", "three_year_commitment"]),
     ],
 )
 def test_sales_api_preserves_the_provider_and_exact_selected_scenarios(

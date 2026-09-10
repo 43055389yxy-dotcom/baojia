@@ -158,7 +158,7 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .sales-section-heading p { margin: 4px 0 0; color: #708ea3; font-size: 11px; }
 .sales-section-heading > span { color: #4d748d; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; letter-spacing: .12em; }
 .sales-choice-row { display: grid; gap: 10px; }
-.sales-provider-row { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 32px; }
+.sales-provider-row { grid-template-columns: repeat(5, minmax(0, 1fr)); margin-bottom: 32px; }
 .sales-provider-row label {
   position: relative;
   display: grid;

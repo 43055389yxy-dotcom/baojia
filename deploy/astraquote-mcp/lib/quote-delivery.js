@@ -44,6 +44,12 @@ function shortQuoteFilename(record) {
     azure: 'Azure',
     oci: 'OCI',
     gcp: 'GCP',
+    tencent: '腾讯云',
+    alibaba: '阿里云',
+    huawei: '华为云',
+    baidu: '百度云',
+    volcengine: '火山引擎',
+    ctyun: '天翼云',
   }[record.cloud_provider] || 'Cloud';
   const suffix = String(record.quote_id || '')
     .replace(/[^a-z0-9]/gi, '')
@@ -68,6 +74,12 @@ const PROVIDER_SCENARIO_LABELS = Object.freeze({
     one_year_commitment: '1 年承诺使用',
     three_year_commitment: '3 年承诺使用',
   },
+  tencent: { on_demand: '按量计费', one_year_commitment: '1 年包年', three_year_commitment: '3 年包年' },
+  alibaba: { on_demand: '按量付费', one_year_commitment: '1 年订阅', three_year_commitment: '3 年订阅' },
+  huawei: { on_demand: '按需计费', one_year_commitment: '1 年包年', three_year_commitment: '3 年包年' },
+  baidu: { on_demand: '后付费', one_year_commitment: '1 年预付费', three_year_commitment: '3 年预付费' },
+  volcengine: { on_demand: '按量计费', one_year_commitment: '1 年包年', three_year_commitment: '3 年包年' },
+  ctyun: { on_demand: '按量计费', one_year_commitment: '1 年包年', three_year_commitment: '3 年包年' },
 });
 
 function scenarioLabel(record, scenario) {

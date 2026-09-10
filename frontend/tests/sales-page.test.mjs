@@ -18,6 +18,12 @@ test("sales portal keeps its internal job identity private and recovers active j
   assert.match(page, /Microsoft Azure|微软 Azure/);
   assert.match(page, /Oracle Cloud/);
   assert.match(page, /Google Cloud/);
+  assert.match(page, /腾讯云/);
+  assert.match(page, /阿里云/);
+  assert.match(page, /华为云/);
+  assert.match(page, /百度智能云/);
+  assert.match(page, /火山引擎/);
+  assert.match(page, /天翼云/);
   assert.match(page, /client_request_id/);
   assert.doesNotMatch(page, /generate_calculator_link|官方报价链接|Calculator/);
   assert.match(page, /查看报价结果/);

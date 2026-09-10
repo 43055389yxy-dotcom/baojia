@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.4.0';
+const VERSION = '3.5.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -31,7 +31,10 @@ const region = z.string().min(3).max(40);
 const serviceCode = z.string().min(2).max(120);
 const componentKey = z.string().regex(/^cmp_[A-Za-z0-9_-]{4,76}$/);
 const factId = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,79}$/);
-const cloudProvider = z.enum(['aws', 'azure', 'oci', 'gcp']);
+const cloudProvider = z.enum([
+  'aws', 'azure', 'oci', 'gcp',
+  'tencent', 'alibaba', 'huawei', 'baidu', 'volcengine', 'ctyun',
+]);
 
 const describeServiceInput = z.object({ service_code: serviceCode }).strict();
 
@@ -93,11 +96,76 @@ const gcpPriceQuery = z.object({
   ),
 }).strict();
 
+const responsePath = z.string().regex(
+  /^(?:[A-Za-z0-9_-]{1,120})(?:\.[A-Za-z0-9_-]{1,120}){0,19}$/,
+).max(360);
+
+const commercialRateField = z.object({
+  unit_price_path: responsePath,
+  item_id_path: responsePath.optional(),
+  currency_code: z.string().regex(/^[A-Z]{3}$/).default('CNY'),
+  currency_path: responsePath.optional(),
+  unit: z.string().min(1).max(120).optional(),
+  unit_path: responsePath.optional(),
+  description_path: responsePath.optional(),
+  pricing_model_path: responsePath.optional(),
+  tier_start_path: responsePath.optional(),
+  tier_end_path: responsePath.optional(),
+}).strict();
+
+const limitedRecord = (maximum, description) => z.record(jsonValue).refine(
+  (value) => Object.keys(value).length <= maximum,
+  description,
+);
+
+const authenticatedCloudPriceQueryShape = {
+  query_id: z.string().min(1).max(100),
+  endpoint: z.string().min(4).max(255).describe(
+    'Official provider API hostname only. Protocol, path, credentials and authorization are forbidden.',
+  ),
+  service: z.string().regex(/^[A-Za-z0-9._-]{1,80}$/),
+  action: z.string().regex(/^[A-Za-z0-9._-]{0,160}$/).default(''),
+  version: z.string().min(1).max(40).optional(),
+  region: z.string().min(2).max(80),
+  method: z.enum(['GET', 'POST']).default('POST'),
+  path: z.string().min(1).max(1000).default('/'),
+  query_parameters: limitedRecord(100, 'At most 100 official query parameters are allowed.').default({}),
+  body: limitedRecord(200, 'At most 200 official request fields are allowed.').default({}),
+  response_items_path: responsePath.optional(),
+  response_filters: z.record(z.string().min(1).max(500)).refine(
+    (value) => Object.keys(value).length <= 12,
+    'At most 12 exact official response filters are allowed.',
+  ).default({}),
+  item_id_paths: z.array(responsePath).max(12).default([]),
+  rate_fields: z.array(commercialRateField).max(24).default([]).describe(
+    'GPT-declared official response paths. The MCP dereferences them mechanically and never chooses a rate.',
+  ),
+  next_page_path: responsePath.optional(),
+};
+
+const authenticatedCloudPriceQuery = (provider) => z.object({
+  provider: z.literal(provider),
+  ...authenticatedCloudPriceQueryShape,
+}).strict();
+
+const tencentPriceQuery = authenticatedCloudPriceQuery('tencent');
+const alibabaPriceQuery = authenticatedCloudPriceQuery('alibaba');
+const huaweiPriceQuery = authenticatedCloudPriceQuery('huawei');
+const baiduPriceQuery = authenticatedCloudPriceQuery('baidu');
+const volcenginePriceQuery = authenticatedCloudPriceQuery('volcengine');
+const ctyunPriceQuery = authenticatedCloudPriceQuery('ctyun');
+
 const priceQuery = z.discriminatedUnion('provider', [
   awsPriceQuery,
   azurePriceQuery,
   ociPriceQuery,
   gcpPriceQuery,
+  tencentPriceQuery,
+  alibabaPriceQuery,
+  huaweiPriceQuery,
+  baiduPriceQuery,
+  volcenginePriceQuery,
+  ctyunPriceQuery,
 ]);
 
 const getPricesInput = z.object({
@@ -327,7 +395,7 @@ function buildServer(workflow) {
 
   server.registerTool('get_prices', {
     title: 'Batch query official cloud prices',
-    description: 'Dispatches caller-supplied parameters to AWS, Azure, OCI or GCP official price catalogs and returns raw candidates. needs_refinement is non-terminal: GPT must refine the unfinished queries and continue. GPT chooses and calculates.',
+    description: 'Dispatches caller-supplied parameters to the selected cloud provider official catalog API and returns raw candidates. needs_refinement is non-terminal: GPT must refine unfinished queries and continue. GPT alone chooses the product and calculates the quote.',
     inputSchema: getPricesInput,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, guarded((args) => workflow.getPrices(args)));

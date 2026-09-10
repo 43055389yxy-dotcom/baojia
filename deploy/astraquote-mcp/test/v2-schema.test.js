@@ -43,11 +43,11 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
     'build_estimate',
   ]);
   assert.match(INSTRUCTIONS, /GPT.*理解.*选择.*计算/s);
-  assert.match(INSTRUCTIONS, /AWS.*Azure.*Oracle.*Google/s);
+  assert.match(INSTRUCTIONS, /AWS.*Azure.*Oracle.*Google.*腾讯云.*阿里云.*华为云.*百度智能云.*火山引擎.*天翼云/s);
   assert.doesNotMatch(INSTRUCTIONS, /Calculator|import_estimate|模板映射/i);
 });
 
-test('get_prices accepts four provider-specific raw query shapes', async (t) => {
+test('get_prices accepts all ten provider-specific raw query shapes', async (t) => {
   const { client, server } = await connectedClient();
   t.after(async () => {
     await client.close();
@@ -71,11 +71,47 @@ test('get_prices accepts four provider-specific raw query shapes', async (t) => 
           provider: 'gcp', query_id: 'gcp-1', operation: 'list_services',
           response_filters: { displayName: 'Compute Engine' }, max_pages: 4,
         },
+        {
+          provider: 'tencent', query_id: 'tencent-1', endpoint: 'cvm.tencentcloudapi.com',
+          service: 'cvm', action: 'InquiryPriceRunInstances', version: '2017-03-12',
+          region: 'ap-guangzhou', response_items_path: 'Response.Price',
+          item_id_paths: ['InstanceType'], rate_fields: [{ unit_price_path: 'InstancePrice.UnitPrice' }],
+        },
+        {
+          provider: 'alibaba', query_id: 'alibaba-1', endpoint: 'ecs.cn-hangzhou.aliyuncs.com',
+          service: 'ecs', action: 'DescribePrice', version: '2014-05-26', region: 'cn-hangzhou',
+          response_items_path: 'PriceInfo', item_id_paths: ['Price.TradePrice'],
+          rate_fields: [{ unit_price_path: 'Price.TradePrice' }],
+        },
+        {
+          provider: 'huawei', query_id: 'huawei-1', endpoint: 'bss.myhuaweicloud.com',
+          service: 'bss', region: 'cn-north-4', path: '/v2/inquiry/price',
+          response_items_path: 'official.items', item_id_paths: ['id'],
+          rate_fields: [{ unit_price_path: 'amount' }],
+        },
+        {
+          provider: 'baidu', query_id: 'baidu-1', endpoint: 'billing.baidubce.com',
+          service: 'billing', region: 'bj', path: '/v1/price/query',
+          response_items_path: 'result.items', item_id_paths: ['id'],
+          rate_fields: [{ unit_price_path: 'price' }],
+        },
+        {
+          provider: 'volcengine', query_id: 'volcengine-1', endpoint: 'open.volcengineapi.com',
+          service: 'billing', action: 'QueryPriceForPayAsYouGo', version: '2022-01-01',
+          region: 'cn-beijing', response_items_path: 'Result.Items', item_id_paths: ['Id'],
+          rate_fields: [{ unit_price_path: 'Price' }],
+        },
+        {
+          provider: 'ctyun', query_id: 'ctyun-1', endpoint: 'ctapi-global.ctapi.ctyun.cn',
+          service: 'ecs', region: 'bb9fdb42056f11eda1610242ac110002',
+          path: '/v4/order/new-query-price', response_items_path: 'returnObj',
+          item_id_paths: ['masterOrderId'], rate_fields: [{ unit_price_path: 'totalPrice' }],
+        },
       ],
     },
   });
   assert.equal(result.isError, undefined);
-  assert.equal(result.structuredContent.input.queries.length, 4);
+  assert.equal(result.structuredContent.input.queries.length, 10);
   assert.equal(result.structuredContent.input.queries[3].response_filters.displayName, 'Compute Engine');
 });
 

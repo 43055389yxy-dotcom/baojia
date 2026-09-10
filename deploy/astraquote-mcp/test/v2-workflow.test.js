@@ -408,6 +408,40 @@ test('provider pricing semantics cannot reuse AWS reserved rules for Azure', asy
   );
 });
 
+test('a signed cloud quote must bind the positive official commercial rate selected by GPT', async (t) => {
+  const positiveRate = {
+    rate_id: 'tencent:item-1:paid',
+    official_item_id: 'item-1',
+    unit_price: '0.25',
+    currency: 'CNY',
+    unit: 'hour',
+    is_zero_rate: false,
+  };
+  const { workflow, directory } = fixture({
+    provider: 'tencent',
+    rateCandidates: [positiveRate],
+  });
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const batch = await priceBatch(workflow, 'tencent');
+
+  await assert.rejects(
+    workflow.buildEstimate(quoteInput(batch.price_batch_id, { provider: 'tencent' })),
+    (error) => error.code === 'official_price_evidence_invalid'
+      && error.details.violations.some((item) => item.includes('commercial_rate_selection_required')),
+  );
+
+  const input = quoteInput(batch.price_batch_id, {
+    provider: 'tencent',
+    evidence: [{
+      query_id: 'price-1',
+      official_item_ids: ['item-1'],
+      official_rate_ids: [positiveRate.rate_id],
+    }],
+  });
+  const result = await workflow.buildEstimate(input);
+  assert.equal(result.status, 'displayed_on_page');
+});
+
 test('OCI public catalog cannot be presented as a one-year public commitment price', async (t) => {
   const { workflow, directory } = fixture({ provider: 'oci' });
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));

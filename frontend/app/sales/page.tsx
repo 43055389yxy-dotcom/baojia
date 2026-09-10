@@ -7,7 +7,9 @@ const ACTIVE_JOB_KEY = "astraquote.sales.active-job.v1";
 const PENDING_SUBMISSION_KEY = "astraquote.sales.pending-submission.v1";
 
 type ScenarioKey = "on_demand" | "one_year_commitment" | "three_year_commitment";
-type CloudProvider = "aws" | "azure" | "oci" | "gcp";
+type CloudProvider =
+  | "aws" | "azure" | "oci" | "gcp"
+  | "tencent" | "alibaba" | "huawei" | "baidu" | "volcengine" | "ctyun";
 
 type PageScenarioCost = {
   scenario_key: ScenarioKey;
@@ -80,6 +82,36 @@ const PROVIDER_SCENARIOS: Record<CloudProvider, Array<{ key: ScenarioKey; label:
     { key: "one_year_commitment", label: "1 年承诺使用" },
     { key: "three_year_commitment", label: "3 年承诺使用" },
   ],
+  tencent: [
+    { key: "on_demand", label: "按量计费" },
+    { key: "one_year_commitment", label: "1 年包年" },
+    { key: "three_year_commitment", label: "3 年包年" },
+  ],
+  alibaba: [
+    { key: "on_demand", label: "按量付费" },
+    { key: "one_year_commitment", label: "1 年订阅" },
+    { key: "three_year_commitment", label: "3 年订阅" },
+  ],
+  huawei: [
+    { key: "on_demand", label: "按需计费" },
+    { key: "one_year_commitment", label: "1 年包年" },
+    { key: "three_year_commitment", label: "3 年包年" },
+  ],
+  baidu: [
+    { key: "on_demand", label: "后付费" },
+    { key: "one_year_commitment", label: "1 年预付费" },
+    { key: "three_year_commitment", label: "3 年预付费" },
+  ],
+  volcengine: [
+    { key: "on_demand", label: "按量计费" },
+    { key: "one_year_commitment", label: "1 年包年" },
+    { key: "three_year_commitment", label: "3 年包年" },
+  ],
+  ctyun: [
+    { key: "on_demand", label: "按量计费" },
+    { key: "one_year_commitment", label: "1 年包年" },
+    { key: "three_year_commitment", label: "3 年包年" },
+  ],
 };
 
 const PROVIDER_META: Record<CloudProvider, { label: string; mark: string; detail: string }> = {
@@ -87,7 +119,18 @@ const PROVIDER_META: Record<CloudProvider, { label: string; mark: string; detail
   azure: { label: "微软 Azure", mark: "AZ", detail: "Microsoft Cloud" },
   oci: { label: "Oracle Cloud", mark: "OCI", detail: "Oracle Infrastructure" },
   gcp: { label: "Google Cloud", mark: "GCP", detail: "Google Cloud Platform" },
+  tencent: { label: "腾讯云", mark: "TC", detail: "Tencent Cloud" },
+  alibaba: { label: "阿里云", mark: "ALI", detail: "Alibaba Cloud" },
+  huawei: { label: "华为云", mark: "HW", detail: "Huawei Cloud" },
+  baidu: { label: "百度智能云", mark: "BD", detail: "Baidu AI Cloud" },
+  volcengine: { label: "火山引擎", mark: "VE", detail: "Volcengine" },
+  ctyun: { label: "天翼云", mark: "CT", detail: "CTyun" },
 };
+
+const PROVIDER_ORDER: CloudProvider[] = [
+  "aws", "azure", "oci", "gcp", "tencent",
+  "alibaba", "huawei", "baidu", "volcengine", "ctyun",
+];
 
 function estimateWindow() {
   return "5～10 分钟";
@@ -411,7 +454,7 @@ export default function SalesQuotePage() {
                 <span>01 / 03</span>
               </div>
               <div className="sales-choice-row sales-provider-row">
-                {(["aws", "azure", "oci", "gcp"] as const).map((value) => {
+                {PROVIDER_ORDER.map((value) => {
                   const catalog = health?.provider_catalogs?.[value];
                   const provider = PROVIDER_META[value];
                   return (

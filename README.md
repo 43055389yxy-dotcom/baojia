@@ -1,44 +1,24 @@
-# AWS 与 Microsoft Azure 智能报价
+# AstraQuote 多云智能报价
 
-面向销售场景的 AWS 自然语言报价系统。AI 只把客户描述转换成结构化需求；产品型号、规格、区域支持、`usageType`、`operation` 均由 AWS 官方 API 发现；最终金额仅采用 AWS Billing and Cost Management Pricing Calculator 返回的 `cost` / `totalCost`。
+AstraQuote 面向销售报价场景，当前统一支持 AWS、Microsoft Azure、Oracle Cloud、Google Cloud、腾讯云、阿里云、华为云、百度智能云、火山引擎和天翼云。
 
-同一页面也提供独立的 Microsoft Azure 报价引擎。销售编号会被视为组件硬边界；系统为每个组件启动隔离的 AI 参数解析，再由 Azure 服务插件查询 Microsoft Azure Retail Prices API。公开报价无需 Azure 账号；可选连接 Azure 订阅后，系统还能通过 Resource SKUs API 验证订阅级 VM 规格与区域限制。
+GPT 负责需求理解、组件拆分、官方查询参数、产品与 SKU 选择、用量换算、阶梯价计算和方案比较；MCP 只负责调用所选厂商官方价格目录/询价 API、保存官方候选与费率身份、校验事实和金额、生成 Excel，并把报价与下载链接返回销售页面。各云厂商的产品、区域、购买方式和优惠语义彼此隔离，不会用 AWS 产品或规则替代其他云。
 
-Azure 支持 Pay-as-you-go、1/3 年预留、1/3 年 Savings Plan 和 Spot。最终报价展示 `productId`、`skuId`、`meterId`、`armSkuName`、单位价格、月用量和组件小计，并明确标注不包含 EA/MCA/CSP 协议折扣。
-
-两套引擎共享销售工作流、客户确认、任务进度和报价数据模型，但提示词、字段模板、官方目录、服务插件、计费规则与缓存命名空间完全隔离。Azure 官方目录和已验证组件结果使用独立 SQLite 持久化缓存，后台预热常用区域与服务。
-
-当前首批插件：
-
-- Amazon EC2
-- Amazon EBS
-- Amazon RDS
-- Amazon ElastiCache for Redis OSS / Valkey
-- Application Load Balancer
-- Amazon S3 Standard
-- Amazon CloudFront
-
-系统遵循 fail-closed 原则：只要产品、计费维度或区域支持不能唯一确认，就返回“需要人工确认”，不会用本地价格表或模型猜价。
+系统遵循 fail-closed 原则：查询超过 10 个候选时要求 GPT 继续收窄，不截断；缺少官方价格证据、事实未消费或金额无法对账时停止发布。正式商业报价不抵扣 Free Tier、Always Free、免费试用、促销赠送或账户信用额度。
 
 ## 架构
 
 ```text
-销售粘贴客户原话
-    -> AI 单次生成结构化报价意图（禁止型号和价格猜测）
-    -> 后端校验并标准化区域、数量、规格与购买方式
-    -> 对应 AWS 服务插件
-       -> 服务 API：规格、引擎、区域支持
-       -> AWS Price List API：产品属性、usageType、operation
-    -> 先排除不适合业务的系列，再按官方价格选择最低成本合格型号
-    -> bcm-pricing-calculator Workload Estimate
-       -> 行项目 cost
-       -> totalCost
-    -> 单一推荐方案 / 必要的替代说明
+销售粘贴客户资料并选定云厂商
+    -> GPT 清洗并删除原文，生成 RequirementIR 与 Fact Ledger
+    -> GPT 为每个组件组织该厂商官方目录/询价请求
+    -> MCP 签名并执行只读官方 API，返回完整小结果集与费率身份
+    -> GPT 继续收窄候选、选型、换算用量并计算各方案
+    -> MCP 编译校验 RequirementIR -> ResourceIR -> BillingUsageIR -> PriceIR
+    -> 生成精简客户版 Excel 与销售页下载链接
 ```
 
-页面默认是一键流程：销售直接粘贴客户原话。AI 只调用一次完成结构化，之后由确定性服务适配器查询官方规格并提交 BCM。最终金额以 BCM 返回的行项目 `cost` / `totalCost` 为准。EC2 系统盘与公网流量、RDS 存储、ALB 小时费与 LCU、S3 存储、CloudFront 流量与请求等会作为独立行项目提交。
-
-页面会展示脱敏后的实时执行记录，包括 AI 计划校验、各服务官方发现、销售选择复核和 BCM 返回状态。系统提示词、凭证以及完整 AWS 原始响应不会发送到浏览器。
+报价任务保存阶段与 `price_batch_id`。断线恢复只补缺失查询或交付步骤，已经成功的官方查价、文件生成和页面交付不会重复执行。
 
 ## 本地启动
 
@@ -68,11 +48,9 @@ npm run dev
 
 打开 `http://localhost:3000`。
 
-## 凭证与 BCM Estimate
+## 官方 API 凭证
 
-应用仅使用 boto3 默认凭证链。推荐部署到 AWS 时使用 IAM Role；本地开发使用 AWS Profile。不要把 AK/SK 写进 `.env` 或前端变量。
-
-默认每次报价创建一个带 `Application=aws-smart-quote` 标签的独立 Workload Estimate 并保留，便于审计，不会修改账号中已有的其他 Estimate。大规模生产环境也可以配置专用复用池并通过 `BCM_WORKLOAD_ESTIMATE_IDS` 指定。
+AWS 使用 boto3 默认凭证链；Azure 与 OCI 使用公开价格目录；GCP 使用 Billing Catalog API Key。腾讯云、阿里云、华为云、百度智能云、火山引擎和天翼云使用只读子账号密钥。所有密钥只保存在后端运行环境，禁止写入 Git、前端或 MCP 参数。
 
 详细环境变量见 [`backend/.env.example`](backend/.env.example)。
 

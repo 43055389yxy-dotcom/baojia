@@ -1,11 +1,17 @@
 # AstraQuote 生产部署
 
-生产版本使用一个 MCP 汇聚四个云厂商的官方价目接口：
+生产版本使用一个 MCP 汇聚十个云厂商的官方价目或询价接口：
 
 - AWS Price List API
 - Microsoft Azure Retail Prices API
 - Oracle Cloud Infrastructure Price List API
 - Google Cloud Billing Catalog API
+- 腾讯云官方目录/询价 API
+- 阿里云官方目录/询价 API
+- 华为云官方目录/询价 API
+- 百度智能云官方目录/询价 API
+- 火山引擎官方目录/询价 API
+- 天翼云官方目录/询价 API
 
 销售在报价页选择云厂商。GPT 负责理解需求、组织官网查询参数、选择官方价格项、换算用量和计算报价；MCP 只负责执行官方查询、保存原始证据、做 schema / 事实归属 / 金额加总一致性等机械校验，并交付页面结果或 Excel。
 
@@ -29,6 +35,25 @@ GCP_BILLING_API_KEY=...
 
 API Key 只用于访问官方目录，MCP 不接收也不向 GPT 返回密钥。
 
+腾讯云、阿里云、华为云、百度智能云、火山引擎和天翼云使用各自只读子账号的访问密钥。在 `backend.env` 配置以下变量；不要写入 Git：
+
+```text
+TENCENTCLOUD_SECRET_ID=...
+TENCENTCLOUD_SECRET_KEY=...
+ALIBABA_CLOUD_ACCESS_KEY_ID=...
+ALIBABA_CLOUD_ACCESS_KEY_SECRET=...
+HUAWEICLOUD_ACCESS_KEY=...
+HUAWEICLOUD_SECRET_KEY=...
+BAIDUCLOUD_ACCESS_KEY_ID=...
+BAIDUCLOUD_SECRET_ACCESS_KEY=...
+VOLCENGINE_ACCESS_KEY=...
+VOLCENGINE_SECRET_KEY=...
+CTYUN_ACCESS_KEY=...
+CTYUN_SECRET_KEY=...
+```
+
+这些密钥只由后端签名器读取。GPT 只提供官方 endpoint、查询动作、区域、精确参数和响应字段路径，不能读取或提交密钥。
+
 Excel 交付需要配置私有 S3 和稳定下载入口；结果只回到销售页面，不发送企业微信：
 
 ```text
@@ -43,7 +68,7 @@ ASTRAQUOTE_PUBLIC_BASE_URL=https://baojia.tontiancloud.com
 
 1. `describe_service`：查询 AWS Price List 服务元数据。
 2. `get_attribute_values`：查询 AWS 官方属性值。
-3. `get_prices`：按 GPT 提供的参数查询 AWS、Azure、OCI 或 GCP 官方价目。
+3. `get_prices`：按 GPT 提供的精确参数查询所选云厂商的官方价目或询价接口。
 4. `get_quote_job_status`：读取已保存的报价阶段和批次。
 5. `resume_quote_job`：只返回下一缺失步骤，不重跑已成功动作。
 6. `build_estimate`：验证 GPT 选中的官方证据与计算结果，然后生成 Excel 并返回销售页面。

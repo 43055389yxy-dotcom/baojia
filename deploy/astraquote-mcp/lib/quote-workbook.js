@@ -42,6 +42,12 @@ const PROVIDER_SCENARIO_LABELS = Object.freeze({
     one_year_commitment: '1 年承诺使用折合月费',
     three_year_commitment: '3 年承诺使用折合月费',
   },
+  tencent: { on_demand: '按量月费', one_year_commitment: '1 年包年折合月费', three_year_commitment: '3 年包年折合月费' },
+  alibaba: { on_demand: '按量月费', one_year_commitment: '1 年订阅折合月费', three_year_commitment: '3 年订阅折合月费' },
+  huawei: { on_demand: '按需月费', one_year_commitment: '1 年包年折合月费', three_year_commitment: '3 年包年折合月费' },
+  baidu: { on_demand: '后付费月费', one_year_commitment: '1 年预付费折合月费', three_year_commitment: '3 年预付费折合月费' },
+  volcengine: { on_demand: '按量月费', one_year_commitment: '1 年包年折合月费', three_year_commitment: '3 年包年折合月费' },
+  ctyun: { on_demand: '按量月费', one_year_commitment: '1 年包年折合月费', three_year_commitment: '3 年包年折合月费' },
 });
 
 function scenarioLabel(record, scenario) {

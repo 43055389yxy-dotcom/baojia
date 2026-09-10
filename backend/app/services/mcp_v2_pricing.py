@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, Literal
@@ -12,6 +13,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.services.aws_query_executor import ReadOnlyAwsQueryExecutor
+from app.services.official_cloud_clients import OfficialCloudApiClient
 
 
 class StrictModel(BaseModel):
@@ -120,8 +122,105 @@ class GcpPriceQuery(StrictModel):
         return self
 
 
+class CommercialRateField(StrictModel):
+    """Caller-declared paths to a price value in one official response item.
+
+    GPT identifies the fields from the provider's official API contract. The
+    MCP only dereferences them and creates stable evidence identities.
+    """
+
+    unit_price_path: str = Field(min_length=1, max_length=360)
+    item_id_path: str | None = Field(default=None, min_length=1, max_length=360)
+    currency_code: str = Field(default="CNY", pattern=r"^[A-Z]{3}$")
+    currency_path: str | None = Field(default=None, min_length=1, max_length=360)
+    unit: str | None = Field(default=None, min_length=1, max_length=120)
+    unit_path: str | None = Field(default=None, min_length=1, max_length=360)
+    description_path: str | None = Field(default=None, min_length=1, max_length=360)
+    pricing_model_path: str | None = Field(default=None, min_length=1, max_length=360)
+    tier_start_path: str | None = Field(default=None, min_length=1, max_length=360)
+    tier_end_path: str | None = Field(default=None, min_length=1, max_length=360)
+
+    @model_validator(mode="after")
+    def validate_paths(self) -> CommercialRateField:
+        for value in (
+            self.unit_price_path,
+            self.item_id_path,
+            self.currency_path,
+            self.unit_path,
+            self.description_path,
+            self.pricing_model_path,
+            self.tier_start_path,
+            self.tier_end_path,
+        ):
+            if value is not None:
+                _validate_response_path(value)
+        return self
+
+
+class AuthenticatedCatalogQuery(StrictModel):
+    query_id: str = Field(min_length=1, max_length=100)
+    endpoint: str = Field(min_length=4, max_length=255)
+    service: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9._-]+$")
+    action: str = Field(default="", max_length=160, pattern=r"^[A-Za-z0-9._-]*$")
+    version: str | None = Field(default=None, min_length=1, max_length=40)
+    region: str = Field(min_length=2, max_length=80)
+    method: Literal["GET", "POST"] = "POST"
+    path: str = Field(default="/", min_length=1, max_length=1000)
+    query_parameters: dict[str, Any] = Field(default_factory=dict, max_length=100)
+    body: dict[str, Any] = Field(default_factory=dict, max_length=200)
+    response_items_path: str | None = Field(default=None, min_length=1, max_length=360)
+    response_filters: dict[str, str] = Field(default_factory=dict, max_length=12)
+    item_id_paths: list[str] = Field(default_factory=list, max_length=12)
+    rate_fields: list[CommercialRateField] = Field(default_factory=list, max_length=24)
+    next_page_path: str | None = Field(default=None, min_length=1, max_length=360)
+
+    @model_validator(mode="after")
+    def validate_official_request(self) -> AuthenticatedCatalogQuery:
+        _validate_authenticated_catalog_query(self)
+        _validate_objective_response_filters(self.response_filters)
+        for path in self.item_id_paths:
+            _validate_response_path(path)
+        for path in (self.response_items_path, self.next_page_path):
+            if path is not None:
+                _validate_response_path(path)
+        return self
+
+
+class TencentPriceQuery(AuthenticatedCatalogQuery):
+    provider: Literal["tencent"] = "tencent"
+
+
+class AlibabaPriceQuery(AuthenticatedCatalogQuery):
+    provider: Literal["alibaba"] = "alibaba"
+
+
+class HuaweiPriceQuery(AuthenticatedCatalogQuery):
+    provider: Literal["huawei"] = "huawei"
+
+
+class BaiduPriceQuery(AuthenticatedCatalogQuery):
+    provider: Literal["baidu"] = "baidu"
+
+
+class VolcenginePriceQuery(AuthenticatedCatalogQuery):
+    provider: Literal["volcengine"] = "volcengine"
+
+
+class CtyunPriceQuery(AuthenticatedCatalogQuery):
+    provider: Literal["ctyun"] = "ctyun"
+
+
 PriceQueryInput = Annotated[
-    AwsPriceQuery | AzurePriceQuery | OciPriceQuery | GcpPriceQuery,
+    AwsPriceQuery
+    | AzurePriceQuery
+    | OciPriceQuery
+    | GcpPriceQuery
+    | TencentPriceQuery
+    | AlibabaPriceQuery
+    | HuaweiPriceQuery
+    | BaiduPriceQuery
+    | VolcenginePriceQuery
+    | CtyunPriceQuery,
     Field(discriminator="provider"),
 ]
 # Backward-compatible class name for callers that construct an AWS query
@@ -138,6 +237,132 @@ class GetPricesRequest(StrictModel):
         if len(set(query_ids)) != len(query_ids):
             raise ValueError("query_id must be unique within one batch")
         return self
+
+
+AUTHENTICATED_PROVIDERS = (
+    "tencent",
+    "alibaba",
+    "huawei",
+    "baidu",
+    "volcengine",
+    "ctyun",
+)
+
+PROVIDER_SOURCE_LABELS = {
+    "tencent": "Tencent Cloud official API",
+    "alibaba": "Alibaba Cloud official API",
+    "huawei": "Huawei Cloud official API",
+    "baidu": "Baidu AI Cloud official API",
+    "volcengine": "Volcengine official API",
+    "ctyun": "CTyun official API",
+}
+
+_PROVIDER_CREDENTIAL_ENV = {
+    "tencent": ("TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY"),
+    "alibaba": (
+        "ALIBABA_CLOUD_ACCESS_KEY_ID",
+        "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
+    ),
+    "huawei": ("HUAWEICLOUD_ACCESS_KEY", "HUAWEICLOUD_SECRET_KEY"),
+    "baidu": ("BAIDUCLOUD_ACCESS_KEY_ID", "BAIDUCLOUD_SECRET_ACCESS_KEY"),
+    "volcengine": ("VOLCENGINE_ACCESS_KEY", "VOLCENGINE_SECRET_KEY"),
+    "ctyun": ("CTYUN_ACCESS_KEY", "CTYUN_SECRET_KEY"),
+}
+
+_PROVIDER_OFFICIAL_SUFFIXES = {
+    "tencent": (".tencentcloudapi.com",),
+    "alibaba": (".aliyuncs.com",),
+    "huawei": (".myhuaweicloud.com", ".huaweicloud.com"),
+    "baidu": (".baidubce.com",),
+    "volcengine": (".volcengineapi.com",),
+    "ctyun": (".ctyun.cn",),
+}
+
+_SAFE_ACTION = re.compile(
+    r"^(?:describe|list|get|query|inquiry|inquire|check|search|show|batchquery)",
+    re.IGNORECASE,
+)
+_SAFE_REST_PATH = re.compile(
+    r"(?:price|pricing|inquiry|rating|describe|query|list|flavou?r|sku|product|region|zone|spec)",
+    re.IGNORECASE,
+)
+_SENSITIVE_PARAMETER = re.compile(
+    r"(?:secret|password|private.?key|access.?key|authorization|security.?token)",
+    re.IGNORECASE,
+)
+
+
+def _provider_credentials_from_environment() -> dict[str, dict[str, str]]:
+    return {
+        provider: {
+            "access_key_id": os.getenv(access_key_env, ""),
+            "secret_access_key": os.getenv(secret_key_env, ""),
+        }
+        for provider, (access_key_env, secret_key_env) in _PROVIDER_CREDENTIAL_ENV.items()
+    }
+
+
+def _credentials_available(credentials: dict[str, str]) -> bool:
+    return bool(
+        str(credentials.get("access_key_id") or "")
+        and str(credentials.get("secret_access_key") or "")
+    )
+
+
+def _validate_response_path(path: str) -> None:
+    parts = path.split(".")
+    if (
+        not parts
+        or len(parts) > 20
+        or any(
+            not part
+            or len(part) > 120
+            or not part.replace("_", "").replace("-", "").isalnum()
+            for part in parts
+        )
+    ):
+        raise ValueError("official response paths must be dotted JSON field paths")
+
+
+def _validate_authenticated_catalog_query(query: AuthenticatedCatalogQuery) -> None:
+    endpoint = query.endpoint.strip().lower().rstrip(".")
+    suffixes = _PROVIDER_OFFICIAL_SUFFIXES[query.provider]
+    if (
+        "://" in endpoint
+        or "/" in endpoint
+        or ":" in endpoint
+        or not any(endpoint.endswith(suffix) for suffix in suffixes)
+    ):
+        raise ValueError(f"{query.provider} query must use an official endpoint")
+    query.endpoint = endpoint
+    if (
+        not query.path.startswith("/")
+        or ".." in query.path
+        or "?" in query.path
+        or "#" in query.path
+        or "//" in query.path
+    ):
+        raise ValueError("official API path is invalid")
+    if query.provider in {"tencent", "alibaba", "volcengine"}:
+        if not query.action or not query.version:
+            raise ValueError(f"{query.provider} queries require action and version")
+    if not (
+        (query.action and _SAFE_ACTION.match(query.action))
+        or _SAFE_REST_PATH.search(query.path)
+    ):
+        raise ValueError("only official read-only discovery or price operations are allowed")
+    for key in (*query.query_parameters.keys(), *query.body.keys()):
+        if _SENSITIVE_PARAMETER.search(str(key)):
+            raise ValueError("credentials and authorization fields cannot be supplied by GPT")
+    serialized_size = len(
+        json.dumps(
+            {"query": query.query_parameters, "body": query.body},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    if serialized_size > 128 * 1024:
+        raise ValueError("official API request exceeds the 128 KiB boundary")
 
 
 class OfficialPricingService:
@@ -159,6 +384,8 @@ class OfficialPricingService:
         *,
         http_get: Any = httpx.get,
         gcp_api_key: str | None = None,
+        authenticated_request: Any | None = None,
+        provider_credentials: dict[str, dict[str, str]] | None = None,
     ) -> None:
         self._executor = executor
         self._http_get = http_get
@@ -167,6 +394,14 @@ class OfficialPricingService:
             if gcp_api_key is None
             else gcp_api_key
         )
+        self._provider_credentials = (
+            _provider_credentials_from_environment()
+            if provider_credentials is None
+            else provider_credentials
+        )
+        self._authenticated_request = authenticated_request or OfficialCloudApiClient(
+            self._provider_credentials
+        ).execute
 
     def catalog_availability(self) -> dict[str, dict[str, Any]]:
         return {
@@ -180,6 +415,21 @@ class OfficialPricingService:
                     if self._gcp_api_key
                     else "Google Cloud 官方价格接口待配置 API Key"
                 ),
+            },
+            **{
+                provider: {
+                    "available": _credentials_available(
+                        self._provider_credentials.get(provider) or {}
+                    ),
+                    "message": (
+                        f"{PROVIDER_SOURCE_LABELS[provider]} 可用"
+                        if _credentials_available(
+                            self._provider_credentials.get(provider) or {}
+                        )
+                        else f"{PROVIDER_SOURCE_LABELS[provider]}待配置访问密钥"
+                    ),
+                }
+                for provider in AUTHENTICATED_PROVIDERS
             },
         }
 
@@ -262,8 +512,10 @@ class OfficialPricingService:
             result = self._get_azure_prices(query)
         elif isinstance(query, OciPriceQuery):
             result = self._get_oci_prices(query)
-        else:
+        elif isinstance(query, GcpPriceQuery):
             result = self._get_gcp_catalog(query)
+        else:
+            result = self._get_authenticated_catalog(query)
         identified = {"query_id": query.query_id, "provider": query.provider, **result}
         narrowed = _require_refinement_for_large_result(
             query,
@@ -271,10 +523,18 @@ class OfficialPricingService:
             maximum=self.MAX_RETURNED_CANDIDATES,
         )
         if narrowed.get("status") != "needs_refinement":
-            narrowed["official_rate_candidates"] = _official_rate_candidates(
+            rate_candidates = _official_rate_candidates(
                 query.provider,
                 narrowed,
+                query=query,
             )
+            narrowed["official_rate_candidates"] = rate_candidates
+            official_item_ids = list(narrowed.get("official_item_ids") or [])
+            for candidate in rate_candidates:
+                item_id = str(candidate.get("official_item_id") or "")
+                if item_id and item_id not in official_item_ids:
+                    official_item_ids.append(item_id)
+            narrowed["official_item_ids"] = official_item_ids
         return narrowed
 
     def _price_list_products(self, request: ProductSearchRequest) -> list[dict[str, Any]]:
@@ -456,6 +716,49 @@ class OfficialPricingService:
             "source": "Google Cloud Billing Catalog API",
         }
 
+    def _get_authenticated_catalog(
+        self, query: AuthenticatedCatalogQuery
+    ) -> dict[str, Any]:
+        if not _credentials_available(
+            self._provider_credentials.get(query.provider) or {}
+        ):
+            raise OfficialCatalogQueryError(
+                f"{query.provider} official API credentials are not configured",
+                code=f"{query.provider}_credentials_not_configured",
+            )
+        payload = self._authenticated_request(query)
+        extracted: Any = (
+            _candidate_field(payload, query.response_items_path)
+            if query.response_items_path
+            else payload
+        )
+        if isinstance(extracted, list):
+            raw_items = extracted
+        elif isinstance(extracted, dict):
+            raw_items = [extracted]
+        else:
+            raw_items = []
+        items = _filter_official_candidates(raw_items, query.response_filters)
+        item_ids = [
+            _authenticated_item_id(query.provider, item, query.item_id_paths)
+            for item in items
+            if isinstance(item, dict)
+        ]
+        next_page_token = (
+            _candidate_field(payload, query.next_page_path)
+            if query.next_page_path
+            else None
+        )
+        return {
+            "status": _identity_status(len(item_ids)),
+            "operation": query.action or query.path,
+            "official_item_ids": item_ids,
+            "items": items,
+            "response_filters": query.response_filters,
+            "next_page_token": next_page_token,
+            "source": PROVIDER_SOURCE_LABELS[query.provider],
+        }
+
     def _official_json(self, url: str, *, params: dict[str, Any]) -> dict[str, Any]:
         response = self._http_get(url, params=params, timeout=30.0)
         response.raise_for_status()
@@ -501,13 +804,48 @@ def _validate_objective_response_filters(filters: dict[str, str]) -> None:
             raise ValueError("response_filters values must be non-empty strings")
 
 
-def _candidate_field(candidate: dict[str, Any], field: str) -> Any:
+def _candidate_field(candidate: Any, field: str | None) -> Any:
+    if not field:
+        return None
     current: Any = candidate
     for part in field.split("."):
-        if not isinstance(current, dict) or part not in current:
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+            continue
+        if isinstance(current, list) and part.isdigit():
+            index = int(part)
+            if index >= len(current):
+                return None
+            current = current[index]
+            continue
+        else:
             return None
-        current = current[part]
     return current
+
+
+def _authenticated_item_id(
+    provider: str,
+    item: dict[str, Any],
+    item_id_paths: list[str],
+) -> str:
+    identity_values = {
+        path: _candidate_field(item, path)
+        for path in item_id_paths
+        if _candidate_field(item, path) is not None
+    }
+    if identity_values:
+        return "|".join(str(value).strip() for value in identity_values.values())
+    identity: Any = identity_values or item
+    digest = hashlib.sha256(
+        json.dumps(
+            identity,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    return f"{provider}:item:{digest}"
 
 
 def _filter_official_candidates(
@@ -707,7 +1045,12 @@ def _rate_candidate(
     }
 
 
-def _official_rate_candidates(provider: str, result: dict[str, Any]) -> list[dict[str, Any]]:
+def _official_rate_candidates(
+    provider: str,
+    result: dict[str, Any],
+    *,
+    query: PriceQueryInput | None = None,
+) -> list[dict[str, Any]]:
     """Flatten official price dimensions without selecting or calculating them."""
     candidates: list[dict[str, Any]] = []
     if provider == "aws":
@@ -831,6 +1174,43 @@ def _official_rate_candidates(provider: str, result: dict[str, Any]) -> list[dic
                     )
                     if candidate:
                         candidates.append(candidate)
+    elif provider in AUTHENTICATED_PROVIDERS and isinstance(
+        query, AuthenticatedCatalogQuery
+    ):
+        for item in result.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            default_item_id = _authenticated_item_id(
+                provider,
+                item,
+                query.item_id_paths,
+            )
+            for index, field in enumerate(query.rate_fields):
+                item_id_value = _candidate_field(item, field.item_id_path)
+                item_id = (
+                    str(item_id_value).strip()
+                    if item_id_value is not None and str(item_id_value).strip()
+                    else default_item_id
+                )
+                currency = _candidate_field(item, field.currency_path)
+                unit = _candidate_field(item, field.unit_path)
+                candidate = _rate_candidate(
+                    provider,
+                    item_id,
+                    unit_price=_candidate_field(item, field.unit_price_path),
+                    currency=str(currency or field.currency_code),
+                    unit=unit if unit is not None else field.unit,
+                    pricing_model=_candidate_field(item, field.pricing_model_path),
+                    description=_candidate_field(item, field.description_path),
+                    tier_start=_candidate_field(item, field.tier_start_path),
+                    tier_end=_candidate_field(item, field.tier_end_path),
+                    source_identity={
+                        "rate_field_index": index,
+                        "unit_price_path": field.unit_price_path,
+                    },
+                )
+                if candidate:
+                    candidates.append(candidate)
     return candidates
 
 

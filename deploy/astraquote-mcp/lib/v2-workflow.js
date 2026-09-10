@@ -284,6 +284,12 @@ function validateProviderScenarioSemantics(input) {
     aws: 'reserved',
     azure: 'provider_commitment',
     gcp: 'provider_commitment',
+    tencent: 'provider_commitment',
+    alibaba: 'provider_commitment',
+    huawei: 'provider_commitment',
+    baidu: 'provider_commitment',
+    volcengine: 'provider_commitment',
+    ctyun: 'provider_commitment',
   }[input.cloud_provider];
   const violations = [];
   for (const scenario of input.pricing_scenarios || []) {
@@ -588,6 +594,9 @@ class AstraQuoteV2Workflow {
   }
 
   validatePriceEvidence(input, priceBatch) {
+    const signedCatalogProviders = new Set([
+      'tencent', 'alibaba', 'huawei', 'baidu', 'volcengine', 'ctyun',
+    ]);
     const priceResults = new Map(
       (priceBatch.result.results || []).map((result) => [result.query_id, result]),
     );
@@ -620,6 +629,12 @@ class AstraQuoteV2Workflow {
           rateCandidates.map((rate) => [rate.rate_id, rate]),
         );
         const selectedRates = ref.official_rate_ids || [];
+        if (signedCatalogProviders.has(input.cloud_provider) && rateCandidates.length === 0) {
+          violations.push(`commercial_rate_evidence_missing:${component.component_key}:${ref.query_id}`);
+        }
+        if (signedCatalogProviders.has(input.cloud_provider) && selectedRates.length === 0) {
+          violations.push(`commercial_rate_selection_required:${component.component_key}:${ref.query_id}`);
+        }
         if (result.status === 'ambiguous' && selected.length === 0) {
           violations.push(`official_item_selection_required:${component.component_key}:${ref.query_id}`);
         }

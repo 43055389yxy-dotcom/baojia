@@ -1,10 +1,10 @@
 # AstraQuote 官方多云报价原则
 
-GPT 是脑子，AstraQuote MCP 只是手。销售在报价页选定 AWS、微软 Azure、Oracle Cloud 或 Google Cloud；GPT 不得改换厂商，MCP 不得根据客户文字猜厂商。
+GPT 是脑子，AstraQuote MCP 只是手。销售在报价页选定 AWS、微软 Azure、Oracle Cloud、Google Cloud、腾讯云、阿里云、华为云、百度智能云、火山引擎或天翼云；GPT 不得改换厂商，MCP 不得根据客户文字猜厂商。
 
 MCP 只做这些机械动作：调用官方价目 API、保存并返回候选和官方身份、核对 schema/事实归属/官方证据/金额加总、保存恢复阶段，以及生成 Excel 并把报价与下载链接返回销售页面。需求理解、组件拆分、产品/SKU 选择、默认值选择、用量换算、阶梯价计算、方案比较和最终金额都由 GPT 完成。MCP 的加总校验只是检查 GPT 提交的分项之和是否等于总额，不是替 GPT 计价。系统不发送企业微信或其他 WebHook。
 
-只使用以下官方价格源：AWS Price List API、Azure Retail Prices API、Oracle Cloud Price List API、Google Cloud Billing Catalog API。不使用官方计算器、浏览器填表、本地折扣表、历史报价或猜测价格，也不生成官方计算器链接。
+只使用所选云厂商的官方价格目录、询价或订单试算 API：AWS Price List API、Azure Retail Prices API、Oracle Cloud Price List API、Google Cloud Billing Catalog API，以及腾讯云、阿里云、华为云、百度智能云、火山引擎、天翼云各自的官方只读目录/询价 API。不使用浏览器填表、本地折扣表、历史报价或猜测价格，也不生成官方计算器链接。
 
 ## 安全与数据边界
 
@@ -20,6 +20,7 @@ MCP 只做这些机械动作：调用官方价目 API、保存并返回候选和
 - Azure：GPT 提供 Retail Prices API 的 OData `filter`、币种和官方分页链接。
 - OCI：GPT 可按官方 `part_number` 和币种查询；不知道 part number 时可提供 `response_filters`，按官方 JSON 字段做精确匹配。
 - GCP：GPT 先列服务，再按 `service_id` 列 SKU；可提供 `response_filters` 和 `max_pages`，让 MCP 跨官方分页执行 GPT 指定的精确字段过滤。
+- 腾讯云、阿里云、华为云、百度智能云、火山引擎、天翼云：GPT 根据该厂商官方 API 文档提供精确 `endpoint`、服务、只读查询/询价动作、版本、区域、请求参数、候选列表路径、官方身份路径和费率字段路径。密钥由服务器环境管理，GPT 不得传入或看到。MCP 只校验官方域名和只读动作、签名并发送原请求、机械读取 GPT 指定的官方返回字段；不得补业务参数、替 GPT 选型号或计算金额。
 
 `response_filters` 只是 GPT 指定的“官方 JSON 字段路径 = 精确值”。MCP 只机械过滤，不生成过滤值、不判断哪项更适合，也不把前几条结果冒充完整结果。
 
@@ -29,7 +30,7 @@ MCP 返回原始官方候选、`official_item_ids`，并把候选中的官方费
 
 单次查询命中不超过 10 条时返回完整候选；超过 10 条或仍有下一页时返回 `needs_refinement`、`terminal=false`、命中数/下界、原查询和客观可筛选字段，不返回“前 10 条”冒充完整结果。`needs_refinement` 是正常的非终态，不是阻塞或失败；GPT 必须在当前报价中自行继续收窄，不得只汇报待办后结束，MCP 不替 GPT 选。
 
-计价方案必须使用销售所选云厂商自己的官方语义：AWS 为按需及 1/3 年预留实例全预付，Azure 为即用即付及 1/3 年预留，GCP 为按需及 1/3 年承诺使用；OCI 公共价目只支持公开按量价，没有账户合同价证据时只报该方案。四个云不共享产品、SKU、区域或优惠语义，其他云不得替代 AWS，AWS 规则也不得套到其他云。
+计价方案必须使用销售所选云厂商自己的官方语义：AWS 为按需及 1/3 年预留实例全预付，Azure 为即用即付及 1/3 年预留，GCP 为按需及 1/3 年承诺使用；OCI 公共价目只支持公开按量价，没有账户合同价证据时只报该方案；腾讯云、阿里云、华为云、百度智能云、火山引擎和天翼云分别使用自身官方按量及包年/订阅/预付费语义。十个云不共享产品、SKU、区域或优惠语义，其他云不得替代 AWS，AWS 的产品和计价规则也不得套到其他云。
 
 每个方案的 `monthly_cost` 必须是该组件按客户要求的全部数量计算后的折合月费，不是单台价格。全预付方案按“整批官方预付总额 ÷ 合同月数 + 该方案未覆盖的持续月费”填写折合月费，并把整批一次性预付金额写入 `upfront_cost`。例如官方 1 年全预付为 1,747 USD/台、客户需要 3 台，则该组件 `upfront_cost=5241.00`、预付部分折合月费为 436.75 USD/月。没有预留或承诺优惠的磁盘、存储、流量、请求等组件，使用 `on_demand_fallback`，在 1/3 年方案中保留相同按需月费且预付额为 0；除非该资源有官方免费依据，否则不得填写 0。`pricing_scenarios` 必须分别加总各组件整批折合月费与整批预付总额。
 

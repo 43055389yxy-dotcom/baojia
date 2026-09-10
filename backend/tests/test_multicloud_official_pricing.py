@@ -5,11 +5,18 @@ from typing import Any
 import pytest
 
 from app.services.mcp_v2_pricing import (
+    AlibabaPriceQuery,
     AzurePriceQuery,
+    BaiduPriceQuery,
+    CommercialRateField,
+    CtyunPriceQuery,
     GcpPriceQuery,
     GetPricesRequest,
+    HuaweiPriceQuery,
     OciPriceQuery,
     OfficialPricingService,
+    TencentPriceQuery,
+    VolcenginePriceQuery,
 )
 
 
@@ -37,6 +44,16 @@ class _HttpRecorder:
     def __call__(self, url: str, *, params: dict[str, Any], timeout: float) -> _FakeResponse:
         self.calls.append((url, dict(params)))
         return _FakeResponse(next(self.payloads))
+
+
+class _AuthenticatedRecorder:
+    def __init__(self, payloads: list[dict[str, Any]]) -> None:
+        self.payloads = iter(payloads)
+        self.calls: list[Any] = []
+
+    def __call__(self, query: Any) -> dict[str, Any]:
+        self.calls.append(query)
+        return next(self.payloads)
 
 
 def test_azure_and_oci_are_raw_official_catalog_queries() -> None:
@@ -283,3 +300,146 @@ def test_oci_response_filters_are_caller_supplied_and_return_only_exact_matches(
     assert result["items"] == [
         {"partNumber": "B2", "displayName": "Object Storage"}
     ]
+
+
+@pytest.mark.parametrize(
+    ("query_type", "provider", "endpoint"),
+    [
+        (TencentPriceQuery, "tencent", "cvm.tencentcloudapi.com"),
+        (AlibabaPriceQuery, "alibaba", "ecs.cn-hangzhou.aliyuncs.com"),
+        (HuaweiPriceQuery, "huawei", "bss.myhuaweicloud.com"),
+        (BaiduPriceQuery, "baidu", "bcc.bj.baidubce.com"),
+        (VolcenginePriceQuery, "volcengine", "open.volcengineapi.com"),
+        (CtyunPriceQuery, "ctyun", "ctapi-global.ctapi.ctyun.cn"),
+    ],
+)
+def test_authenticated_clouds_preserve_raw_candidates_and_declared_rates(
+    query_type: type[Any],
+    provider: str,
+    endpoint: str,
+) -> None:
+    authenticated = _AuthenticatedRecorder(
+        [
+            {
+                "result": {
+                    "items": [
+                        {
+                            "sku": "small-2c4g",
+                            "name": "2 vCPU / 4 GiB",
+                            "price": "0.125",
+                            "currency": "CNY",
+                            "unit": "hour",
+                        }
+                    ]
+                }
+            }
+        ]
+    )
+    service = OfficialPricingService(
+        _UnusedAwsExecutor(),
+        authenticated_request=authenticated,
+        provider_credentials={
+            provider: {"access_key_id": "configured", "secret_access_key": "configured"}
+        },
+    )
+    query = query_type(
+        query_id=f"{provider}-compute",
+        endpoint=endpoint,
+        service="compute",
+        action="QueryPrice" if provider != "ctyun" else "",
+        version="2020-01-01" if provider not in {"huawei", "baidu", "ctyun"} else None,
+        region="cn-test-1",
+        method="POST",
+        path="/v1/query-price" if provider in {"huawei", "baidu", "ctyun"} else "/",
+        response_items_path="result.items",
+        item_id_paths=["sku"],
+        rate_fields=[
+            CommercialRateField(
+                unit_price_path="price",
+                currency_path="currency",
+                unit_path="unit",
+                description_path="name",
+            )
+        ],
+    )
+
+    result = service.get_prices(GetPricesRequest(queries=[query]))["results"][0]
+
+    assert result["provider"] == provider
+    assert result["status"] == "exact"
+    assert result["official_item_ids"] == ["small-2c4g"]
+    assert result["items"][0]["name"] == "2 vCPU / 4 GiB"
+    assert result["official_rate_candidates"][0]["unit_price"] == "0.125"
+    assert result["official_rate_candidates"][0]["official_item_id"] == "small-2c4g"
+    assert authenticated.calls[0].provider == provider
+
+
+def test_authenticated_cloud_large_result_requires_refinement_without_truncation() -> None:
+    authenticated = _AuthenticatedRecorder(
+        [
+            {
+                "result": {
+                    "items": [
+                        {"sku": f"sku-{index}", "family": "general"}
+                        for index in range(11)
+                    ]
+                }
+            }
+        ]
+    )
+    service = OfficialPricingService(
+        _UnusedAwsExecutor(),
+        authenticated_request=authenticated,
+        provider_credentials={
+            "tencent": {"access_key_id": "configured", "secret_access_key": "configured"}
+        },
+    )
+
+    result = service.get_prices(
+        GetPricesRequest(
+            queries=[
+                TencentPriceQuery(
+                    query_id="tencent-too-broad",
+                    endpoint="cvm.tencentcloudapi.com",
+                    service="cvm",
+                    action="DescribeInstanceTypeConfigs",
+                    version="2017-03-12",
+                    region="ap-guangzhou",
+                    response_items_path="result.items",
+                    item_id_paths=["sku"],
+                )
+            ]
+        )
+    )["results"][0]
+
+    assert result["status"] == "needs_refinement"
+    assert result["matched_count"] == 11
+    assert result["official_item_ids"] == []
+    assert "items" not in result
+    assert result["refinement_fields"]
+
+
+@pytest.mark.parametrize(
+    ("query_type", "endpoint"),
+    [
+        (TencentPriceQuery, "example.com"),
+        (AlibabaPriceQuery, "ecs.example.com"),
+        (HuaweiPriceQuery, "localhost"),
+        (BaiduPriceQuery, "127.0.0.1"),
+        (VolcenginePriceQuery, "metadata.google.internal"),
+        (CtyunPriceQuery, "example.cn"),
+    ],
+)
+def test_authenticated_cloud_queries_reject_non_official_hosts(
+    query_type: type[Any], endpoint: str
+) -> None:
+    with pytest.raises(ValueError, match="official endpoint"):
+        query_type(
+            query_id="bad-host",
+            endpoint=endpoint,
+            service="compute",
+            action="QueryPrice",
+            version="2020-01-01",
+            region="cn-test-1",
+            path="/v1/query-price",
+        )

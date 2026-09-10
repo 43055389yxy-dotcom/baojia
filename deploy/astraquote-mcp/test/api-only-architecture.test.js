@@ -9,7 +9,7 @@ const { InMemoryTransport } = require('@modelcontextprotocol/sdk/inMemory.js');
 
 const { buildServer, INSTRUCTIONS } = require('../server');
 
-test('public MCP is an official four-cloud catalog API-only workflow', async (t) => {
+test('public MCP is an official ten-cloud catalog API-only workflow', async (t) => {
   const workflow = {
     describeService: async (input) => ({ status: 'ok', input }),
     getAttributeValues: async (input) => ({ status: 'ok', input }),
@@ -38,6 +38,12 @@ test('public MCP is an official four-cloud catalog API-only workflow', async (t)
   assert.match(INSTRUCTIONS, /Azure Retail Prices API/);
   assert.match(INSTRUCTIONS, /Oracle Cloud Price List API/);
   assert.match(INSTRUCTIONS, /Google Cloud Billing Catalog API/);
+  assert.match(INSTRUCTIONS, /腾讯云/);
+  assert.match(INSTRUCTIONS, /阿里云/);
+  assert.match(INSTRUCTIONS, /华为云/);
+  assert.match(INSTRUCTIONS, /百度智能云/);
+  assert.match(INSTRUCTIONS, /火山引擎/);
+  assert.match(INSTRUCTIONS, /天翼云/);
 });
 
 test('production and sales entry have no Calculator runtime or option', () => {
