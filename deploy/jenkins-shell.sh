@@ -2,63 +2,145 @@
 set -euo pipefail
 
 APP_DIR="${WORKSPACE:?Jenkins workspace is unavailable}"
-RELAY_SOURCE_DIR="/home/ec2-user/astraquote/source"
-RELAY_SERVICE="astraquote-gpt-relay.service"
-RELAY_VENV="/home/ec2-user/astraquote/gpt-relay-venv"
+RELAY_HOST_ROOT="/home/ec2-user/astraquote"
+RELAY_STAGE_NAME=".relay-stage-${GIT_COMMIT:-manual}"
+RELAY_WORKER_COMMAND="/home/ec2-user/astraquote/gpt-relay-venv/bin/python /home/ec2-user/astraquote/source/tools/gpt_quote_relay_worker.py"
 
-run_as_relay_user() {
-  if [ "$(id -un)" = "ec2-user" ]; then
-    "$@"
-  else
-    sudo -n -u ec2-user "$@"
-  fi
+stage_host_browser_relay() {
+  echo "Staging the desktop relay source on the Docker host"
+  tar -C "$APP_DIR" \
+    --exclude='backend/.venv' \
+    --exclude='backend/.pytest_cache' \
+    --exclude='backend/.ruff_cache' \
+    --exclude='backend/.cache' \
+    --exclude='backend/artifacts' \
+    --exclude='**/__pycache__' \
+    --exclude='**/*.pyc' \
+    -cf - backend tools policies \
+    | docker run --rm -i \
+      -e RELAY_STAGE_NAME="$RELAY_STAGE_NAME" \
+      -v "$RELAY_HOST_ROOT:/host/astraquote" \
+      --entrypoint /bin/sh \
+      astraquote:production -ceu '
+        stage="/host/astraquote/$RELAY_STAGE_NAME"
+        rm -rf "$stage"
+        mkdir -p "$stage"
+        tar -xf - -C "$stage"
+        test -f "$stage/tools/gpt_quote_relay_worker.py"
+        test -f "$stage/backend/app/services/gpt_quote_prompt.py"
+        test -f "$stage/policies/sales-selection-policy.json"
+        chown -R 1000:1000 "$stage"
+      '
 }
 
-run_as_root() {
-  if [ "$(id -u)" -eq 0 ]; then
-    "$@"
-  else
-    sudo -n "$@"
-  fi
+stop_host_browser_relay() {
+  echo "Stopping the exact desktop relay worker; systemd will restart it"
+  docker run --rm --pid=host \
+    -e RELAY_WORKER_COMMAND="$RELAY_WORKER_COMMAND" \
+    --entrypoint /bin/sh \
+    astraquote:production -ceu '
+      found=0
+      stopped_pids=""
+      for cmdline in /proc/[0-9]*/cmdline; do
+        test -r "$cmdline" || continue
+        command=$(tr "\000" " " < "$cmdline")
+        case "$command" in
+          "$RELAY_WORKER_COMMAND "*)
+            pid=${cmdline#/proc/}
+            pid=${pid%/cmdline}
+            kill -TERM "$pid"
+            found=1
+            stopped_pids="$stopped_pids $pid"
+            ;;
+        esac
+      done
+      if test "$found" -ne 1; then
+        echo "AstraQuote desktop relay worker was not running on the Docker host" >&2
+        exit 1
+      fi
+      for attempt in 1 2 3 4 5 6; do
+        still_running=0
+        for pid in $stopped_pids; do
+          if kill -0 "$pid" 2>/dev/null; then
+            still_running=1
+          fi
+        done
+        test "$still_running" -eq 1 || exit 0
+        sleep 5
+      done
+      echo "AstraQuote desktop relay worker did not stop cleanly" >&2
+      exit 1
+    '
+}
+
+activate_host_browser_relay() {
+  echo "Activating the staged desktop relay source"
+  docker run --rm \
+    -e RELAY_STAGE_NAME="$RELAY_STAGE_NAME" \
+    -v "$RELAY_HOST_ROOT:/host/astraquote" \
+    --entrypoint /bin/sh \
+    astraquote:production -ceu '
+      stage="/host/astraquote/$RELAY_STAGE_NAME"
+      target=/host/astraquote/source
+      test -d "$stage/backend"
+      test -d "$stage/tools"
+      test -d "$stage/policies"
+      mkdir -p "$target"
+      for name in backend tools policies; do
+        previous="/host/astraquote/.relay-previous-$name"
+        rm -rf "$previous"
+        if test -e "$target/$name"; then
+          mv "$target/$name" "$previous"
+        fi
+        mv "$stage/$name" "$target/$name"
+        rm -rf "$previous"
+      done
+      rmdir "$stage"
+      chown -R 1000:1000 "$target/backend" "$target/tools" "$target/policies"
+    '
+}
+
+wait_for_host_browser_relay() {
+  echo "Waiting for systemd to restart the desktop relay worker"
+  docker run --rm --pid=host \
+    -e RELAY_WORKER_COMMAND="$RELAY_WORKER_COMMAND" \
+    --entrypoint /bin/sh \
+    astraquote:production -ceu '
+      for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        candidate=""
+        for cmdline in /proc/[0-9]*/cmdline; do
+          test -r "$cmdline" || continue
+          command=$(tr "\000" " " < "$cmdline")
+          case "$command" in
+            "$RELAY_WORKER_COMMAND "*)
+              candidate=${cmdline#/proc/}
+              candidate=${candidate%/cmdline}
+              break
+              ;;
+          esac
+        done
+        if test -n "$candidate"; then
+          sleep 5
+          if test -r "/proc/$candidate/cmdline"; then
+            command=$(tr "\000" " " < "/proc/$candidate/cmdline")
+            case "$command" in
+              "$RELAY_WORKER_COMMAND "*) exit 0 ;;
+            esac
+          fi
+        else
+          sleep 5
+        fi
+      done
+      echo "AstraQuote desktop relay worker was not restarted by systemd" >&2
+      exit 1
+    '
 }
 
 update_host_browser_relay() {
-  command -v rsync >/dev/null
-  test -x "$RELAY_VENV/bin/python"
-
-  run_as_root install -d -o ec2-user -g ec2-user \
-    "$RELAY_SOURCE_DIR/backend" \
-    "$RELAY_SOURCE_DIR/tools" \
-    "$RELAY_SOURCE_DIR/policies"
-
-  # Run rsync as root so a locked-down Jenkins workspace remains readable;
-  # --chown keeps every runtime file owned by the desktop relay account.
-  run_as_root rsync -a --delete --chown=ec2-user:ec2-user \
-    --exclude='.venv/' \
-    --exclude='.pytest_cache/' \
-    --exclude='.ruff_cache/' \
-    --exclude='.cache/' \
-    --exclude='artifacts/' \
-    --exclude='__pycache__/' \
-    --exclude='*.pyc' \
-    "$APP_DIR/backend/" "$RELAY_SOURCE_DIR/backend/"
-  run_as_root rsync -a --delete --chown=ec2-user:ec2-user \
-    --exclude='__pycache__/' \
-    --exclude='*.pyc' \
-    "$APP_DIR/tools/" "$RELAY_SOURCE_DIR/tools/"
-  run_as_root rsync -a --delete --chown=ec2-user:ec2-user \
-    "$APP_DIR/policies/" "$RELAY_SOURCE_DIR/policies/"
-
-  run_as_relay_user "$RELAY_VENV/bin/python" -m compileall -q \
-    "$RELAY_SOURCE_DIR/backend/app" \
-    "$RELAY_SOURCE_DIR/tools"
-
-  run_as_root install -m 0644 \
-    "$APP_DIR/deploy/desktop/astraquote-gpt-relay.service" \
-    "/etc/systemd/system/$RELAY_SERVICE"
-  run_as_root systemctl daemon-reload
-  run_as_root systemctl restart "$RELAY_SERVICE"
-  run_as_root systemctl is-active --quiet "$RELAY_SERVICE"
+  stage_host_browser_relay
+  stop_host_browser_relay
+  activate_host_browser_relay
+  wait_for_host_browser_relay
 }
 
 for config_file in \
@@ -94,9 +176,10 @@ docker compose -p astraquote \
   up -d --no-build
 
 for attempt in {1..24}; do
-  if docker exec astraquote curl -fsS http://127.0.0.1:3000/api/backend/api/health >/dev/null \
-    && docker exec astraquote curl -fsS http://127.0.0.1:8200/readyz >/dev/null \
-    && docker exec astraquote curl -fsS http://127.0.0.1:8001/readyz >/dev/null; then
+  if docker exec astraquote curl -fsS http://127.0.0.1:3000/api/backend/api/health >/dev/null 2>&1 \
+    && docker exec astraquote curl -fsS http://127.0.0.1:8200/readyz >/dev/null 2>&1 \
+    && docker exec astraquote curl -fsS http://127.0.0.1:8001/readyz >/dev/null 2>&1; then
+    echo "AstraQuote container endpoints are ready"
     # The logged-in ChatGPT browser worker is a host systemd service, not a
     # container. Keep its source and policy on exactly the same revision as
     # the frontend/backend/MCP before declaring the deployment successful.
@@ -112,5 +195,7 @@ for attempt in {1..24}; do
   sleep 5
 done
 
+echo "AstraQuote container endpoints did not become ready" >&2
+docker ps -a --filter "name=^/astraquote$"
 docker logs --tail 120 astraquote
 exit 1
