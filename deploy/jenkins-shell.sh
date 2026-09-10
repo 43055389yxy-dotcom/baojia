@@ -3,7 +3,12 @@ set -euo pipefail
 
 APP_DIR="${WORKSPACE:?Jenkins workspace is unavailable}"
 
-test -f /home/ec2-user/astraquote/config/backend.env
+for config_file in \
+  /home/ec2-user/astraquote/config/backend.env \
+  /home/ec2-user/astraquote/config/mcp.env \
+  /home/ec2-user/astraquote/config/oauth.env; do
+  test -f "$config_file"
+done
 test -d /home/ec2-user/astraquote/data
 
 # Jenkins 已通过“源码管理”检出代码。将工作区打包送入 Docker，
