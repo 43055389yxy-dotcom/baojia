@@ -50,4 +50,11 @@ MCP 返回原始官方候选、`official_item_ids`，并把候选中的官方费
 
 `submission_code` 和 `relay_job_id` 只用于系统内部任务绑定、恢复和撤回保护，不在销售页面展示，也不参与选型或计价。撤回后禁止交付。
 
-最终答复最后单独输出两行：第一行只能是 `ASTRAQUOTE_STATUS: displayed_on_page` 或 `ASTRAQUOTE_STATUS: blocked`。第二行以 `ASTRAQUOTE_SUMMARY:` 开头，用一句话说明页面报价和 Excel 下载链接是否就绪；blocked 时只说明唯一阻塞原因。
+## 最终状态协议
+
+浏览器中继只识别最终答复末尾的机器码，不根据自然语言猜测任务是否结束：
+
+- 报价与 Excel 下载链接已经在销售页面就绪时，最后单独输出 `ASTRAQUOTE_STATUS: displayed_on_page`，下一行输出 `ASTRAQUOTE_SUMMARY: <一句话结果>`。
+- 经 `get_quote_job_status` / `resume_quote_job` 检查且安全重试后，仍存在确定且无法在当前任务中恢复的单一阻塞原因时，最后单独输出 `ASTRAQUOTE_STOP_CODE: AQ-QUOTE-BLOCKED`，下一行输出 `ASTRAQUOTE_SUMMARY: <一句话客户可读原因>`。中继识别该码后会立即停止任务并将销售状态改为“报价未完成”。输出终止码后不得再调用工具或承诺稍后继续。
+
+`needs_refinement`、`terminal=false`、价格查询仍在进行、尚有缺失 `query_id`、临时超时、临时连接失败、阶段性结果或仍有可执行恢复步骤，都不得输出终止码，也不得结束为阶段汇报；必须继续收窄、重试或从保存阶段续跑。只有永久缺少所选云厂商能力、不可恢复的认证/权限/配置缺失、官方接口确定拒绝且当前任务无法继续，或编译器发现无法通过当前任务修正的正式发布阻塞，才允许输出终止码。不得把自然语言中的“失败”“无法报价”“停止”等词当作机器码。

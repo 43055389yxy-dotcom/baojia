@@ -10,6 +10,10 @@ FINAL_STATUS_PATTERN = re.compile(
     r"ASTRAQUOTE_STATUS\s*[:：]\s*(displayed_on_page|delivered|blocked)",
     re.IGNORECASE,
 )
+FINAL_STOP_CODE_PATTERN = re.compile(
+    r"ASTRAQUOTE_STOP_CODE\s*[:：]\s*AQ-QUOTE-BLOCKED",
+    re.IGNORECASE,
+)
 FINAL_SUMMARY_PATTERN = re.compile(
     r"ASTRAQUOTE_SUMMARY\s*[:：]\s*(.+)", re.IGNORECASE
 )
@@ -151,11 +155,19 @@ def build_quote_continuation_prompt(
 
 
 def parse_final_response(text: str) -> tuple[str, str]:
-    status_match = FINAL_STATUS_PATTERN.search(text)
-    summary_match = FINAL_SUMMARY_PATTERN.search(text)
-    if not status_match:
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    if len(lines) < 2:
         summary = text.strip()[-800:] or "ChatGPT 尚未返回 AstraQuote 最终状态。"
         return "incomplete", summary
-    status = status_match.group(1).lower()
-    summary = summary_match.group(1).strip() if summary_match else text.strip()[-800:]
+
+    marker_line, summary_line = lines[-2:]
+    summary_match = FINAL_SUMMARY_PATTERN.fullmatch(summary_line)
+    status_match = FINAL_STATUS_PATTERN.fullmatch(marker_line)
+    stop_match = FINAL_STOP_CODE_PATTERN.fullmatch(marker_line)
+    if not summary_match or (not status_match and not stop_match):
+        summary = text.strip()[-800:] or "ChatGPT 尚未返回 AstraQuote 最终状态。"
+        return "incomplete", summary
+
+    status = "blocked" if stop_match else status_match.group(1).lower()
+    summary = summary_match.group(1).strip()
     return status, summary[:1600]

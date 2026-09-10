@@ -434,6 +434,45 @@ def test_completion_markers_are_still_parsed_outside_the_browser_driver() -> Non
     assert summary == "月费 12.34 USD，Excel 和下载链接已在报价页生成。"
 
 
+def test_explicit_quote_stop_code_marks_an_unrecoverable_quote_blocked() -> None:
+    status, summary = parse_final_response(
+        "已确认当前连接没有该云厂商的正式报价能力。\n"
+        "ASTRAQUOTE_STOP_CODE: AQ-QUOTE-BLOCKED\n"
+        "ASTRAQUOTE_SUMMARY: 当前云厂商的官方报价连接不可用。"
+    )
+
+    assert status == "blocked"
+    assert summary == "当前云厂商的官方报价连接不可用。"
+
+
+def test_legacy_blocked_status_remains_compatible() -> None:
+    status, summary = parse_final_response(
+        "ASTRAQUOTE_STATUS: blocked\n"
+        "ASTRAQUOTE_SUMMARY: 当前任务缺少不可恢复的官方授权。"
+    )
+
+    assert status == "blocked"
+    assert summary == "当前任务缺少不可恢复的官方授权。"
+
+
+def test_terminal_code_mentioned_before_the_final_lines_is_not_accepted() -> None:
+    status, _summary = parse_final_response(
+        "不要在处理中输出 ASTRAQUOTE_STOP_CODE: AQ-QUOTE-BLOCKED。\n"
+        "当前价格查询仍在继续。"
+    )
+
+    assert status == "incomplete"
+
+
+def test_failure_prose_without_stop_code_is_not_a_terminal_signal() -> None:
+    status, summary = parse_final_response(
+        "这次暂时无法正式报价，当前连接尚未提供该云厂商的价格查询能力。"
+    )
+
+    assert status == "incomplete"
+    assert "暂时无法正式报价" in summary
+
+
 def test_stage_summary_without_final_marker_requires_continuation() -> None:
     status, summary = parse_final_response(
         "当前已确认 EC2 和 RDS 官方价格。Redis 与 S3 仍需继续收窄，"

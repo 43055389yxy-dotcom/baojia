@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.5.0';
+const VERSION = '3.5.1';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -402,14 +402,14 @@ function buildServer(workflow) {
 
   server.registerTool('get_quote_job_status', {
     title: 'Read a resumable quote job checkpoint',
-    description: 'Returns only persisted stage, price batch and delivery state. It never reruns a completed step.',
+    description: 'Returns only persisted stage, price batch and delivery state. It never reruns a completed step. If the saved state proves the job is permanently unrecoverable, follow the server final-state protocol and emit AQ-QUOTE-BLOCKED.',
     inputSchema: quoteJobInput,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, guarded((args) => workflow.getQuoteJobStatus(args)));
 
   server.registerTool('resume_quote_job', {
     title: 'Resume a quote job from its saved stage',
-    description: 'Returns the next missing action and saved identifiers. It does not restart price queries, files or delivery.',
+    description: 'Returns the next missing action and saved identifiers. It does not restart price queries, files or delivery. If recovery is definitively impossible, follow the server final-state protocol and emit AQ-QUOTE-BLOCKED.',
     inputSchema: quoteJobInput,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, guarded((args) => workflow.resumeQuoteJob(args)));

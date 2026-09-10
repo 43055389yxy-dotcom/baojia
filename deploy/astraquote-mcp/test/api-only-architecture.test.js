@@ -44,6 +44,8 @@ test('public MCP is an official ten-cloud catalog API-only workflow', async (t) 
   assert.match(INSTRUCTIONS, /百度智能云/);
   assert.match(INSTRUCTIONS, /火山引擎/);
   assert.match(INSTRUCTIONS, /天翼云/);
+  assert.match(INSTRUCTIONS, /ASTRAQUOTE_STOP_CODE: AQ-QUOTE-BLOCKED/);
+  assert.match(INSTRUCTIONS, /不得.*needs_refinement.*终止码/s);
 });
 
 test('production and sales entry have no Calculator runtime or option', () => {
