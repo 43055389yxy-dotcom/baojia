@@ -45,7 +45,7 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
     'build_estimate',
   ]);
   const getPrices = listed.tools.find((tool) => tool.name === 'get_prices');
-  assert.ok(getPrices.inputSchema.required.includes('queries'));
+  assert.ok(!getPrices.inputSchema.required?.includes('queries'));
   assert.equal(getPrices.inputSchema.properties.queries.type, 'array');
   assert.equal(getPrices.inputSchema.properties.queries.maxItems, 50);
   assert.match(JSON.stringify(getPrices.inputSchema.properties.queries), /provider/);
@@ -62,6 +62,43 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   assert.match(INSTRUCTIONS, /同一个.*price_batch_id.*合并/s);
   assert.match(INSTRUCTIONS, /created.*立即执行.*不得只汇报/s);
   assert.doesNotMatch(INSTRUCTIONS, /Calculator|import_estimate|模板映射/i);
+});
+
+test('lower-reasoning callers get an executable recovery guide instead of -32602 for empty prices', async (t) => {
+  const { client, server } = await connectedClient();
+  t.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const result = await client.callTool({ name: 'get_prices', arguments: {} });
+
+  assert.equal(result.isError, undefined);
+  assert.equal(result.structuredContent.status, 'needs_query_plan');
+  assert.equal(result.structuredContent.terminal, false);
+  assert.equal(result.structuredContent.must_continue, true);
+  assert.equal(result.structuredContent.next_tool, 'get_prices');
+  assert.deepEqual(result.structuredContent.supported_fast_paths.aws, [
+    'describe_service', 'get_attribute_values', 'get_prices',
+  ]);
+  assert.deepEqual(result.structuredContent.supported_fast_paths.oci, ['get_prices']);
+});
+
+test('AWS and OCI discovery fields are visible in the tool schema', async (t) => {
+  const { client, server } = await connectedClient();
+  t.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const tools = (await client.listTools()).tools;
+  const describe = tools.find((tool) => tool.name === 'describe_service');
+  const getPrices = tools.find((tool) => tool.name === 'get_prices');
+  const priceSchema = JSON.stringify(getPrices.inputSchema);
+
+  assert.ok(describe.inputSchema.properties.search_text);
+  assert.ok(describe.inputSchema.properties.service_code);
+  assert.match(priceSchema, /catalog_search/);
 });
 
 test('get_prices accepts all ten provider-specific raw query shapes', async (t) => {
@@ -181,7 +218,7 @@ test('query lifecycle metadata is visible in the MCP schema and survives tool va
   t.after(async () => { await client.close(); await server.close(); });
   const tool = (await client.listTools()).tools.find((item) => item.name === 'get_prices');
   assert.equal(tool.inputSchema.properties.query_contexts.type, 'array');
-  assert.ok(!tool.inputSchema.required.includes('query_contexts'));
+  assert.ok(!tool.inputSchema.required?.includes('query_contexts'));
   const queryContexts = [{
     query_id: 'replacement', purpose: 'pricing', component_key: 'cmp_example_0001',
     billing_key: 'storage', scenario_key: 'on_demand', supersedes_query_ids: ['legacy-attempt'],

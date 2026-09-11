@@ -42,6 +42,7 @@ from app.services.mcp_v2_pricing import (
     OfficialPricingService,
     ProductSearchRequest,
 )
+from app.services.official_catalog_identity_cache import OfficialCatalogIdentityCache
 from app.services.quote_artifacts import QuoteArtifactError, QuoteArtifactStore
 
 logger = logging.getLogger(__name__)
@@ -51,7 +52,10 @@ diagnostic_log.configure(
 )
 
 clients = AwsClients.from_settings(settings)
-mcp_v2_pricing = OfficialPricingService(ReadOnlyAwsQueryExecutor(clients))
+mcp_v2_pricing = OfficialPricingService(
+    ReadOnlyAwsQueryExecutor(clients),
+    catalog_identity_cache=OfficialCatalogIdentityCache(),
+)
 gpt_quote_relay = GptQuoteRelayStore()
 quote_artifacts = QuoteArtifactStore()
 

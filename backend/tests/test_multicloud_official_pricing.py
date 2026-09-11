@@ -18,6 +18,7 @@ from app.services.mcp_v2_pricing import (
     TencentPriceQuery,
     VolcenginePriceQuery,
 )
+from app.services.official_catalog_identity_cache import OfficialCatalogIdentityCache
 from app.services.official_cloud_clients import OfficialCloudClientError
 
 
@@ -353,6 +354,109 @@ def test_oci_response_filters_are_caller_supplied_and_return_only_exact_matches(
     assert result["items"] == [
         {"partNumber": "B2", "displayName": "Object Storage"}
     ]
+
+
+def test_oci_catalog_search_finds_official_part_numbers_without_guessing() -> None:
+    http = _HttpRecorder(
+        [
+            {
+                "items": [
+                    {
+                        "partNumber": "B1",
+                        "displayName": "Virtual Machine Standard E5 OCPU",
+                        "metricName": "OCPU Per Hour",
+                    },
+                    {
+                        "partNumber": "B2",
+                        "displayName": "Object Storage - Standard Storage",
+                        "metricName": "Gigabyte Storage Capacity Per Month",
+                    },
+                ]
+            }
+        ]
+    )
+    service = OfficialPricingService(_UnusedAwsExecutor(), http_get=http)
+
+    result = service.get_prices(
+        GetPricesRequest(
+            queries=[
+                OciPriceQuery(
+                    query_id="oci-object-storage-discovery",
+                    currency_code="USD",
+                    catalog_search="object storage",
+                )
+            ]
+        )
+    )["results"][0]
+
+    assert result["status"] == "exact"
+    assert result["query_mode"] == "catalog_discovery"
+    assert result["official_item_ids"] == ["B2"]
+    assert result["next_action"] == "reuse_part_number_for_exact_price_query"
+    assert result["next_query"] == {
+        "provider": "oci",
+        "part_number": "B2",
+        "currency_code": "USD",
+    }
+    assert http.calls[0][1] == {"currencyCode": "USD"}
+
+
+def test_oci_query_requires_a_part_number_or_catalog_discovery_filter() -> None:
+    with pytest.raises(ValueError, match="part_number, catalog_search, or response_filters"):
+        OciPriceQuery(query_id="too-wide", currency_code="USD")
+
+
+def test_oci_discovery_cache_reuses_only_official_identity_not_price_or_search_text(
+    tmp_path: Any,
+) -> None:
+    cache = OfficialCatalogIdentityCache(tmp_path)
+    live_http = _HttpRecorder(
+        [
+            {
+                "items": [
+                    {
+                        "partNumber": "B2",
+                        "displayName": "Object Storage - Standard Storage",
+                        "metricName": "Gigabyte Storage Capacity Per Month",
+                        "currencyCodeLocalizations": [
+                            {
+                                "currencyCode": "USD",
+                                "prices": [{"model": "PAY_AS_YOU_GO", "value": 0.0255}],
+                            }
+                        ],
+                    }
+                ]
+            }
+        ]
+    )
+    query = OciPriceQuery(
+        query_id="oci-object-storage-discovery",
+        currency_code="USD",
+        catalog_search="object storage",
+    )
+    first_service = OfficialPricingService(
+        _UnusedAwsExecutor(),
+        http_get=live_http,
+        catalog_identity_cache=cache,
+    )
+    first = first_service.get_prices(GetPricesRequest(queries=[query]))["results"][0]
+
+    cached_service = OfficialPricingService(
+        _UnusedAwsExecutor(),
+        http_get=_HttpRecorder([]),
+        catalog_identity_cache=cache,
+    )
+    cached = cached_service.get_prices(
+        GetPricesRequest(queries=[query.model_copy(update={"query_id": "oci-cached"})])
+    )["results"][0]
+
+    assert first["catalog_cache_hit"] is False
+    assert cached["catalog_cache_hit"] is True
+    assert cached["official_item_ids"] == ["B2"]
+    assert "currencyCodeLocalizations" not in cached["items"][0]
+    database_bytes = cache.target.read_bytes().lower()
+    assert b"object storage" not in database_bytes
+    assert b"0.0255" not in database_bytes
 
 
 @pytest.mark.parametrize(

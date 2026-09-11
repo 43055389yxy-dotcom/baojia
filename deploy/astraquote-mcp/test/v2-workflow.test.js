@@ -759,7 +759,7 @@ test('a created relay job tells GPT to build non-empty queries before price look
     job_id: relayJobId,
     submission_code: '9',
     status: 'processing',
-    quote_options: { cloud_provider: 'alibaba', pricing_scenarios: ['on_demand'] },
+    quote_options: { cloud_provider: 'aws', pricing_scenarios: ['on_demand'] },
   }));
   const previous = process.env.ASTRAQUOTE_GPT_RELAY_DIR;
   process.env.ASTRAQUOTE_GPT_RELAY_DIR = relayDirectory;
@@ -782,6 +782,11 @@ test('a created relay job tells GPT to build non-empty queries before price look
   assert.match(resumed.next_action, /non-empty queries array/);
   assert.match(resumed.next_action, /Execute now/);
   assert.match(resumed.next_action, /Do not describe or list the remaining steps/);
+  assert.equal(status.cloud_provider, 'aws');
+  assert.deepEqual(status.provider_execution_path.map((step) => step.tool), [
+    'describe_service', 'get_attribute_values', 'get_prices', 'build_estimate',
+  ]);
+  assert.equal(status.provider_execution_path[0].when, 'service_code_unknown');
   assert.equal(status.terminal, false);
   assert.equal(status.must_continue, true);
   assert.equal(resumed.terminal, false);

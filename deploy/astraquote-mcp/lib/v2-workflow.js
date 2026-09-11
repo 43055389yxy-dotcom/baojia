@@ -108,6 +108,48 @@ const CREATED_PRICE_NEXT_ACTION = [
   'Correct any caller-input validation error and retry in this response.',
 ].join(' ');
 
+function providerExecutionPath(provider) {
+  if (provider === 'aws') {
+    return [
+      {
+        tool: 'describe_service',
+        when: 'service_code_unknown',
+        input: 'service_code or short search_text',
+      },
+      {
+        tool: 'get_attribute_values',
+        when: 'official_filter_value_unknown',
+        input: 'service_code, attribute_name',
+      },
+      {
+        tool: 'get_prices',
+        when: 'service_code_and_narrow_filters_ready',
+        input: 'non-empty queries with provider, query_id, service_code, region, filters',
+      },
+      { tool: 'build_estimate', when: 'all_selected_official_evidence_is_ready' },
+    ];
+  }
+  if (provider === 'oci') {
+    return [
+      {
+        tool: 'get_prices',
+        when: 'part_number_unknown',
+        input: 'non-empty queries with provider, query_id, currency_code, catalog_search',
+      },
+      {
+        tool: 'get_prices',
+        when: 'part_number_selected',
+        input: 'same price_batch_id and exact part_number query',
+      },
+      { tool: 'build_estimate', when: 'all_selected_official_evidence_is_ready' },
+    ];
+  }
+  return [
+    { tool: 'get_prices', when: 'official_query_is_ready', input: 'non-empty queries' },
+    { tool: 'build_estimate', when: 'all_selected_official_evidence_is_ready' },
+  ];
+}
+
 const DEFAULT_RESULT_BYTE_BUDGET = 128 * 1024;
 
 function resultByteBudget(value) {
@@ -814,13 +856,19 @@ class AstraQuoteV2Workflow {
 
   getQuoteJobStatus(input) {
     const job = assertRelayIdentity(input);
+    const cloudProvider = String(
+      job.quote_options?.cloud_provider || job.cloud_provider || 'aws',
+    );
+    const executionPath = providerExecutionPath(cloudProvider);
     const checkpoint = this.store.getCheckpoint(input.relay_job_id);
     if (!checkpoint) {
       return {
         relay_job_id: input.relay_job_id,
         relay_status: job.status,
+        cloud_provider: cloudProvider,
         stage: 'created',
         next_action: CREATED_PRICE_NEXT_ACTION,
+        provider_execution_path: executionPath,
         terminal: false,
         must_continue: true,
       };
@@ -828,6 +876,7 @@ class AstraQuoteV2Workflow {
     return {
       relay_job_id: input.relay_job_id,
       relay_status: job.status,
+      cloud_provider: cloudProvider,
       stage: checkpoint.stage,
       price_batch_id: checkpoint.price_batch_id || null,
       incomplete_query_ids: checkpoint.incomplete_query_ids || [],
@@ -837,6 +886,7 @@ class AstraQuoteV2Workflow {
       superseded_query_ids: checkpoint.superseded_query_ids || [],
       discovery_query_count: checkpoint.discovery_query_count,
       progress_guidance: PROGRESS_GUIDANCE,
+      provider_execution_path: executionPath,
       quote_id: checkpoint.quote_id || null,
       failed_stage: checkpoint.failed_stage || null,
       error: checkpoint.error || undefined,

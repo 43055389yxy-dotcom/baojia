@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.10.0';
+const VERSION = '3.11.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -36,7 +36,15 @@ const cloudProvider = z.enum([
   'tencent', 'alibaba', 'huawei', 'baidu', 'volcengine', 'ctyun',
 ]);
 
-const describeServiceInput = z.object({ service_code: serviceCode }).strict();
+const describeServiceInput = z.object({
+  service_code: serviceCode.optional().describe(
+    'Exact AWS Price List ServiceCode when already known.',
+  ),
+  search_text: z.string().min(2).max(120).optional().describe(
+    'Short official-name fragment used to discover ServiceCode from AWS DescribeServices. Do not pass customer prose.',
+  ),
+  max_results: z.number().int().min(1).max(1000).default(1000),
+}).strict();
 
 const attributeValuesInput = z.object({
   service_code: serviceCode,
@@ -74,6 +82,12 @@ const ociPriceQuery = z.object({
   provider: z.literal('oci'),
   query_id: z.string().min(1).max(100),
   part_number: z.string().min(1).max(120).optional(),
+  catalog_search: z.string().min(2).max(240).optional().describe(
+    'Caller-chosen official product words. AstraQuote mechanically searches Oracle catalog text and returns part-number candidates; it does not select one.',
+  ),
+  refresh_catalog: z.boolean().default(false).describe(
+    'Normally false. Set true only after a cached Oracle identity no longer resolves through the live official API; prices are never read from this identity cache.',
+  ),
   currency_code: z.string().regex(/^[A-Z]{3}$/).describe(
     'Official request currency selected by GPT for this quote. No currency is assumed.',
   ),
@@ -220,8 +234,8 @@ const queryContext = z.object({
 }).strict();
 
 const getPricesInputSchema = z.object({
-  queries: z.array(priceQuery).min(1).max(50).describe(
-    'Current incremental query group. For a long quote, GPT chooses a suitably small group from response complexity and continues the same price_batch_id; this is a transport ceiling, not a required batch size.',
+  queries: z.array(priceQuery).max(50).default([]).describe(
+    'Non-empty current incremental query group. If omitted accidentally, the tool returns a compact recovery guide instead of a protocol error; retry immediately with real queries. For a long quote, GPT chooses a suitably small group from response complexity and continues the same price_batch_id.',
   ),
   query_contexts: z.array(queryContext).max(500).optional().describe(
     'Task bookkeeping only, never sent to a cloud API. May annotate queries in this call or the saved batch. Same component/billing/scenario scope shares a requirement; successful replacement rates retire old failures without deleting history. Omit for legacy clients.',
@@ -270,6 +284,27 @@ function parseGetPricesInput(args) {
     })),
   };
   throw error;
+}
+
+function emptyPriceQueryGuide() {
+  return {
+    status: 'needs_query_plan',
+    terminal: false,
+    quote_terminal: false,
+    must_continue: true,
+    code: 'price_queries_required',
+    message: 'No official price query was supplied. Build the smallest useful query group and retry now.',
+    next_tool: 'get_prices',
+    required_argument: 'queries',
+    supported_fast_paths: {
+      aws: ['describe_service', 'get_attribute_values', 'get_prices'],
+      oci: ['get_prices'],
+    },
+    provider_guidance: {
+      aws: 'If ServiceCode is unknown, call describe_service with search_text. Use returned AttributeNames with get_attribute_values, then call get_prices.',
+      oci: 'If partNumber is unknown, call get_prices with provider=oci, currency_code, query_id and catalog_search. Reuse the returned exact partNumber.',
+    },
+  };
 }
 
 const getPriceResultsInput = z.object({
@@ -547,28 +582,31 @@ function buildServer(workflow) {
   );
 
   server.registerTool('describe_service', {
-    title: 'Describe an AWS Price List service',
-    description: 'AWS-only auxiliary discovery. It returns official attributes and never chooses a service for GPT.',
+    title: 'Discover or describe an AWS Price List service',
+    description: 'AWS official catalog discovery. Supply exact service_code when known; otherwise supply a short search_text such as EC2 or RDS. The result gives official ServiceCode candidates, AttributeNames and the exact next tools. AstraQuote never chooses a service for GPT.',
     inputSchema: describeServiceInput,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, guarded((args) => workflow.describeService(args)));
 
   server.registerTool('get_attribute_values', {
     title: 'Get official AWS attribute values',
-    description: 'Returns official values of one Price List attribute. It never chooses a value for GPT.',
+    description: 'AWS official catalog discovery after describe_service. Supply one returned service_code and one returned AttributeName. Use the official values to form narrow get_prices filters; AstraQuote never chooses a value for GPT.',
     inputSchema: attributeValuesInput,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, guarded((args) => workflow.getAttributeValues(args)));
 
   server.registerTool('get_prices', {
     title: 'Batch query official cloud prices',
-    description: 'Requires a non-empty incremental queries array. For a long quote, GPT chooses a suitably small current group based on query breadth and expected response size, then continues the same price_batch_id; do not launch speculative catalog scans. Full official results are persisted. If response_compacted=true, read only required details with get_price_results. For an authenticated cloud, first provide provider, service and region while omitting endpoint so AstraQuote can reuse a verified route from its persistent knowledge store. Provide a new official endpoint and response contract only when no cached route matches. Invalid or unsupported parameter values are correctable: use the returned recovery and parameter knowledge, repair only the rejected fields, and retry. needs_refinement and retryable query failures are non-terminal. GPT alone chooses products, parameter values, batch grouping and quote totals.',
+    description: 'Queries official prices and persists every result. AWS fast path: use service_code, region and narrow filters; if service_code or filter values are unknown, first use describe_service and get_attribute_values. Oracle fast path: use part_number and currency_code; if part_number is unknown, send catalog_search here, choose from the returned official candidates, then retry with the exact part_number. Oracle discovery caches only official identity fields, never prices; set refresh_catalog=true only when a cached identity fails against the live API. Always send a non-empty incremental queries array; an accidental empty call returns a recovery guide and is not terminal. Continue long quotes in the same price_batch_id. If response_compacted=true, fetch only needed query IDs with get_price_results. Authenticated-cloud routes are reused by provider, service and region; discover an official read-only route only when none matches. needs_refinement and correctable failures must be repaired in the current task. GPT alone chooses products, parameters, grouping and totals.',
     // Keep the JSON Schema visible to MCP clients. ZodEffects produced by
     // superRefine serializes as an empty object in the MCP SDK, so cross-field
     // checks run inside the guarded handler instead.
     inputSchema: getPricesInputSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, guarded((args) => workflow.getPrices(parseGetPricesInput(args))));
+  }, guarded((args) => {
+    const input = parseGetPricesInput(args);
+    return input.queries.length > 0 ? workflow.getPrices(input) : emptyPriceQueryGuide();
+  }));
 
   server.registerTool('get_price_results', {
     title: 'Read selected saved official price results',

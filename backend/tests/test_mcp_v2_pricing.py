@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 import app.aws_main as aws_main
 from app.services.mcp_v2_pricing import (
     BaiduPriceQuery,
+    DescribeServiceRequest,
     GetPricesRequest,
     OfficialPricingService,
     PriceQuery,
@@ -22,6 +23,46 @@ class FakeExecutor:
     def execute(self, **kwargs):
         self.calls.append(kwargs)
         return self.responses.pop(0)
+
+
+def test_describe_service_discovers_aws_service_code_from_official_catalog() -> None:
+    executor = FakeExecutor(
+        [
+            {
+                "Services": [
+                    {
+                        "ServiceCode": "AmazonEC2",
+                        "AttributeNames": ["instanceType", "operatingSystem", "tenancy"],
+                    },
+                    {
+                        "ServiceCode": "AmazonRDS",
+                        "AttributeNames": ["databaseEngine", "instanceType", "deploymentOption"],
+                    },
+                ]
+            }
+        ]
+    )
+    service = OfficialPricingService(executor)
+
+    result = service.describe_service(DescribeServiceRequest(search_text="RDS"))
+
+    assert result["status"] == "exact"
+    assert result["matched_count"] == 1
+    assert result["candidate_service_codes"] == ["AmazonRDS"]
+    assert result["next_action"] == "inspect_attribute_values_or_query_prices"
+    assert result["workflow"]["next_tools"] == ["get_attribute_values", "get_prices"]
+    assert result["workflow"]["service_code"] == "AmazonRDS"
+    assert result["workflow"]["attribute_names"] == [
+        "databaseEngine",
+        "instanceType",
+        "deploymentOption",
+    ]
+    assert executor.calls[0]["parameters"] == {}
+
+
+def test_describe_service_requires_a_narrow_official_identifier() -> None:
+    with pytest.raises(ValueError, match="service_code or search_text"):
+        DescribeServiceRequest()
 
 
 def _price_product(sku: str, dimensions: dict[str, object]) -> str:
@@ -187,6 +228,13 @@ def test_get_prices_batches_queries_and_returns_every_official_dimension() -> No
     } >= {
         ("regionCode", "ap-southeast-1"),
         ("instanceType", "m7g.large"),
+    }
+    missing = result["results"][1]
+    assert missing["next_action"] == "verify_filter_values_with_get_attribute_values"
+    assert missing["recovery"] == {
+        "tool": "get_attribute_values",
+        "service_code": "AmazonS3",
+        "attribute_names": ["storageClass"],
     }
 
 

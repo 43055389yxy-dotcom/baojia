@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.services.aws_query_executor import ReadOnlyAwsQueryExecutor
 from app.services.cloud_quote_profiles import active_market_profile
+from app.services.official_catalog_identity_cache import OfficialCatalogIdentityCache
 from app.services.official_cloud_clients import (
     OfficialCloudApiClient,
     OfficialCloudClientError,
@@ -32,15 +33,25 @@ class OfficialCatalogQueryError(RuntimeError):
 
 
 class DescribeServiceRequest(StrictModel):
+    service_code: str | None = Field(default=None, min_length=2, max_length=120)
+    search_text: str | None = Field(default=None, min_length=2, max_length=120)
+    max_results: int = Field(default=1000, ge=1, le=1000)
+
+    @model_validator(mode="after")
+    def validate_discovery_selector(self) -> DescribeServiceRequest:
+        if not self.service_code and not self.search_text:
+            raise ValueError("service_code or search_text is required")
+        return self
+
+
+class AttributeValuesRequest(StrictModel):
     service_code: str = Field(min_length=2, max_length=120)
-
-
-class AttributeValuesRequest(DescribeServiceRequest):
     attribute_name: str = Field(min_length=1, max_length=160)
     max_results: int = Field(default=1000, ge=1, le=1000)
 
 
-class ProductSearchRequest(DescribeServiceRequest):
+class ProductSearchRequest(StrictModel):
+    service_code: str = Field(min_length=2, max_length=120)
     region: str = Field(default="global", min_length=3, max_length=40)
     filters: dict[str, str] = Field(default_factory=dict)
     max_results: int = Field(default=100, ge=1, le=1000)
@@ -92,12 +103,18 @@ class OciPriceQuery(StrictModel):
     provider: Literal["oci"] = "oci"
     query_id: str = Field(min_length=1, max_length=100)
     part_number: str | None = Field(default=None, min_length=1, max_length=120)
+    catalog_search: str | None = Field(default=None, min_length=2, max_length=240)
+    refresh_catalog: bool = False
     currency_code: str = Field(pattern=r"^[A-Z]{3}$")
     response_filters: dict[str, str] = Field(default_factory=dict, max_length=12)
 
     @model_validator(mode="after")
     def validate_response_filters(self) -> OciPriceQuery:
         _validate_objective_response_filters(self.response_filters)
+        if not self.part_number and not self.catalog_search and not self.response_filters:
+            raise ValueError(
+                "part_number, catalog_search, or response_filters is required"
+            )
         return self
 
 
@@ -468,6 +485,7 @@ class OfficialPricingService:
         gcp_api_key: str | None = None,
         authenticated_request: Any | None = None,
         provider_credentials: dict[str, dict[str, str]] | None = None,
+        catalog_identity_cache: OfficialCatalogIdentityCache | None = None,
     ) -> None:
         self._executor = executor
         self._http_get = http_get
@@ -484,6 +502,7 @@ class OfficialPricingService:
         self._authenticated_request = authenticated_request or OfficialCloudApiClient(
             self._provider_credentials
         ).execute
+        self._catalog_identity_cache = catalog_identity_cache
 
     def catalog_availability(self) -> dict[str, dict[str, Any]]:
         return {
@@ -526,19 +545,80 @@ class OfficialPricingService:
         }
 
     def describe_service(self, request: DescribeServiceRequest) -> dict[str, Any]:
+        parameters = (
+            {"ServiceCode": request.service_code}
+            if request.service_code
+            else {}
+        )
         payload = self._executor.execute(
             service="pricing",
             operation="describe_services",
             region="us-east-1",
-            parameters={"ServiceCode": request.service_code},
-            max_items=100,
+            parameters=parameters,
+            max_items=request.max_results,
         )
-        services = _collect(payload, "Services")
+        services = [
+            service
+            for service in _collect(payload, "Services")
+            if isinstance(service, dict)
+        ]
+        if request.search_text:
+            services = [
+                service
+                for service in services
+                if _text_search_matches(service, request.search_text)
+            ]
+        services.sort(key=lambda item: str(item.get("ServiceCode") or ""))
+        matched_count = len(services)
+        returned_services = services[:20]
+        if matched_count == 0:
+            status = "not_found"
+            next_action = "retry_describe_service_with_a_shorter_official_name_fragment"
+        elif matched_count == 1:
+            status = "exact"
+            next_action = "inspect_attribute_values_or_query_prices"
+        elif matched_count <= 20:
+            status = "ambiguous"
+            next_action = "choose_one_official_service_code"
+        else:
+            status = "needs_refinement"
+            next_action = "narrow_search_text"
+        service_codes = [
+            str(item.get("ServiceCode"))
+            for item in returned_services
+            if item.get("ServiceCode")
+        ]
+        workflow: dict[str, Any] = {
+            "next_tools": ["describe_service"],
+            "required_selector": "service_code or search_text",
+        }
+        if matched_count == 1:
+            selected = services[0]
+            workflow = {
+                "next_tools": ["get_attribute_values", "get_prices"],
+                "service_code": str(selected.get("ServiceCode") or ""),
+                "attribute_names": list(selected.get("AttributeNames") or []),
+                "get_attribute_values_required": ["service_code", "attribute_name"],
+                "aws_price_query_required": [
+                    "provider",
+                    "query_id",
+                    "service_code",
+                    "region",
+                    "filters",
+                ],
+            }
         return {
-            "status": _identity_status(len(services)),
+            "status": status,
             "provider": "aws",
             "service_code": request.service_code,
-            "services": services,
+            "search_text": request.search_text,
+            "matched_count": matched_count,
+            "returned_count": len(returned_services),
+            "results_truncated": matched_count > len(returned_services),
+            "candidate_service_codes": service_codes,
+            "services": returned_services,
+            "next_action": next_action,
+            "workflow": workflow,
             "source": "AWS Price List API",
         }
 
@@ -689,7 +769,7 @@ class OfficialPricingService:
             _priced_product(product, term_key="OnDemand")
             for product in self._price_list_products(query)
         ]
-        return {
+        result = {
             "status": _identity_status(len(normalized)),
             "pricing_model": "on_demand",
             "service_code": query.service_code,
@@ -702,6 +782,7 @@ class OfficialPricingService:
             "products": normalized,
             "source": "AWS Price List API",
         }
+        return _with_aws_next_action(query, result)
 
     def _get_aws_reserved(self, query: AwsPriceQuery) -> dict[str, Any]:
         normalized: list[dict[str, Any]] = []
@@ -721,7 +802,7 @@ class OfficialPricingService:
         status = "not_found" if not normalized else (
             "exact" if len(normalized) == 1 and term_count == 1 else "ambiguous"
         )
-        return {
+        result = {
             "status": status,
             "pricing_model": "reserved",
             "term_years": query.term_years,
@@ -738,6 +819,7 @@ class OfficialPricingService:
             "products": normalized,
             "source": "AWS Price List API",
         }
+        return _with_aws_next_action(query, result)
 
     def _get_azure_prices(self, query: AzurePriceQuery) -> dict[str, Any]:
         url = query.next_page_url or self.AZURE_URL
@@ -763,22 +845,84 @@ class OfficialPricingService:
         params: dict[str, Any] = {"currencyCode": query.currency_code}
         if query.part_number:
             params["partNumber"] = query.part_number
-        payload = self._official_json(self.OCI_URL, params=params)
-        raw_items = payload.get("items") if isinstance(payload.get("items"), list) else []
-        items = _filter_official_candidates(raw_items, query.response_filters)
+        cache_key = None
+        cached_items = None
+        if query.catalog_search and not query.part_number and self._catalog_identity_cache:
+            cache_key = self._catalog_identity_cache.key(
+                "oci",
+                {
+                    "catalog_search": query.catalog_search.casefold(),
+                    "response_filters": query.response_filters,
+                },
+            )
+            if not query.refresh_catalog:
+                cached_items = self._catalog_identity_cache.get(cache_key)
+        catalog_cache_hit = cached_items is not None
+        if cached_items is not None:
+            raw_items = cached_items
+        else:
+            payload = self._official_json(self.OCI_URL, params=params)
+            raw_items = (
+                payload.get("items")
+                if isinstance(payload.get("items"), list)
+                else []
+            )
+        searched_items = (
+            [
+                item
+                for item in raw_items
+                if isinstance(item, dict)
+                and _text_search_matches(item, query.catalog_search)
+            ]
+            if query.catalog_search
+            else raw_items
+        )
+        items = _filter_official_candidates(searched_items, query.response_filters)
+        if cache_key and cached_items is None and self._catalog_identity_cache:
+            self._catalog_identity_cache.set(
+                cache_key,
+                [
+                    _oci_catalog_identity(item)
+                    for item in items
+                    if isinstance(item, dict) and item.get("partNumber")
+                ],
+            )
         item_ids = [
             str(item.get("partNumber"))
             for item in items
             if isinstance(item, dict) and item.get("partNumber")
         ]
-        return {
+        result = {
             "status": _identity_status(len(item_ids)),
+            "query_mode": (
+                "exact_part_number" if query.part_number else "catalog_discovery"
+            ),
             "official_item_ids": item_ids,
             "items": items,
+            "catalog_search": query.catalog_search,
+            "catalog_cache_hit": catalog_cache_hit,
             "response_filters": query.response_filters,
             "currency": query.currency_code,
             "source": "Oracle Cloud Price List API",
         }
+        if not query.part_number and len(item_ids) == 1:
+            result.update(
+                {
+                    "next_action": "reuse_part_number_for_exact_price_query",
+                    "next_query": {
+                        "provider": "oci",
+                        "part_number": item_ids[0],
+                        "currency_code": query.currency_code,
+                    },
+                }
+            )
+        elif not query.part_number and len(item_ids) > 1:
+            result["next_action"] = "refine_catalog_search_or_response_filters"
+        elif not query.part_number:
+            result["next_action"] = "retry_catalog_search_with_official_product_terms"
+        else:
+            result["next_action"] = "use_official_rate_candidates"
+        return result
 
     def _get_gcp_catalog(self, query: GcpPriceQuery) -> dict[str, Any]:
         if not self._gcp_api_key:
@@ -1118,11 +1262,65 @@ def _identity_status(count: int) -> str:
     return "ambiguous"
 
 
+def _with_aws_next_action(
+    query: AwsPriceQuery,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    status = result.get("status")
+    if status == "not_found":
+        return {
+            **result,
+            "terminal": False,
+            "retryable": True,
+            "next_action": "verify_filter_values_with_get_attribute_values",
+            "recovery": {
+                "tool": "get_attribute_values",
+                "service_code": query.service_code,
+                "attribute_names": sorted(query.filters),
+            },
+        }
+    if status == "ambiguous":
+        return {
+            **result,
+            "terminal": False,
+            "next_action": "refine_filters_with_official_attribute_values",
+            "recovery": {
+                "tool": "get_attribute_values",
+                "service_code": query.service_code,
+                "attribute_names": sorted(query.filters),
+            },
+        }
+    return {**result, "next_action": "use_official_rate_candidates"}
+
+
 def _validate_objective_response_filters(filters: dict[str, str]) -> None:
     for field, value in filters.items():
         _validate_response_path(field)
         if not isinstance(value, str) or not value.strip() or len(value) > 500:
             raise ValueError("response_filters values must be non-empty strings")
+
+
+def _text_search_matches(candidate: dict[str, Any], search_text: str) -> bool:
+    """Match caller-chosen discovery words against official textual fields.
+
+    This is deliberately generic catalog filtering: GPT supplies the search
+    words, while the adapter only checks the provider's returned strings. It
+    does not map customer product names to a service or SKU.
+    """
+
+    terms = [
+        term.casefold()
+        for term in re.findall(r"[\w.-]+", search_text, flags=re.UNICODE)
+        if term.strip("._-")
+    ]
+    if not terms:
+        return False
+    haystack = " ".join(
+        value.casefold()
+        for values in _flatten_scalar_fields(candidate).values()
+        for value in values
+    )
+    return all(term in haystack for term in terms)
 
 
 def _candidate_field(candidate: Any, field: str | None, *, default: Any = None) -> Any:
@@ -1189,6 +1387,28 @@ def _filter_official_candidates(
             for field, expected in filters.items()
         )
     ]
+
+
+def _oci_catalog_identity(item: dict[str, Any]) -> dict[str, Any]:
+    """Keep provider identity/selection labels while excluding commercial rates."""
+
+    identity_fields = (
+        "partNumber",
+        "displayName",
+        "serviceCategory",
+        "metricName",
+        "unitOfMeasure",
+        "model",
+        "productName",
+        "serviceName",
+        "skuName",
+        "shape",
+    )
+    return {
+        field: item[field]
+        for field in identity_fields
+        if isinstance(item.get(field), (str, int, float, bool))
+    }
 
 
 def _flatten_scalar_fields(value: Any, *, prefix: str = "") -> dict[str, set[str]]:

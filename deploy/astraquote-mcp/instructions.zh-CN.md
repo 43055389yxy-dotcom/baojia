@@ -12,9 +12,17 @@ MCP 只做这些机械动作：调用官方价目 API、保存并返回候选和
 
 第一步由 GPT 完整清洗客户资料、拆分组件并建立 Fact Ledger。每个客户数字必须有唯一 `fact_id`、数值、单位、作用域和唯一组件归属。清洗通过后立即丢弃客户原话；后续只用标准化组件和 Fact Ledger，不得向 MCP 传递客户原文。
 
+## 常规高推理档执行捷径
+
+当前 MCP 只有 7 个工具：`describe_service`、`get_attribute_values`、`get_prices`、`get_price_results`、`get_quote_job_status`、`resume_quote_job`、`build_estimate`。不得臆造 `create_quote`、`export_excel` 等不存在的工具；正式报价校验、Excel 和销售页交付都由一次 `build_estimate` 完成。已有任务先读取状态并按 `next_action` 继续；新建阶段直接查价，不能停在计划说明。
+
+AWS 有两条路：已知官方 `service_code` 时直接调用 `get_prices`；不知道时先用短官方名称调用 `describe_service(search_text=...)`，从返回的 `candidate_service_codes` 选择，再按返回的 `AttributeNames` 调 `get_attribute_values` 取得精确值，最后调用 `get_prices`。Oracle Cloud 也有两条路：已知 `part_number` 时直接查价；不知道时用 `get_prices` 的 `catalog_search` 搜索官方目录，从返回候选中选择并用精确 `part_number` 重查。Oracle 目录发现只持久化官方身份和选择标签，不缓存价格；后续报价仍用精确 part number 实时查官方价格。缓存身份在官方 API 中不再有效时才设置 `refresh_catalog=true` 重新发现。目录发现只是提供候选，产品与 SKU 仍由 GPT 决定。
+
+若误把 `get_prices` 的 `queries` 留空，工具会返回 `needs_query_plan` 和上述可执行路径，而不是把任务判为失败；必须在当前回复内补齐查询并重试。官方目录没有直接命中时，GPT 先缩短官方名称或利用工具返回的客观字段继续收窄；仍无命中才到该厂商官方文档、官方 SDK 或官方 OpenAPI 查找新的只读道路。新道路通过官方只读响应验证后保存，随后回到同一报价任务、同一价格批次继续，不另开报价。
+
 ## 查价与选择
 
-`get_prices` 支持一次批量提交多个查询。`queries` 必须是非空数组；每个查询必须带 `provider` 和唯一 `query_id`，其他必填参数由 GPT 在每次调用前读取当前工具 schema，并根据已清洗的标准化组件配置和官方资料自行生成。阶段为 `created` 表示尚未保存价格查询批次：必须先形成结构化查询计划，不得直接空参调用。收到 `created` 后必须在当前回复中立即执行查询，不得只汇报状态、复述计划、列出待办或等待下一轮。工具入参校验返回 `-32602`、`Required at ...` 或其他必填字段错误时，表示 GPT 本次调用遗漏了参数，不表示 AstraQuote 缺少参数定义或官方查价能力。这是可修正的非终态错误：重新读取 schema，补齐参数并重试，不得以此停止报价。
+`get_prices` 支持一次批量提交多个查询。真正查价时 `queries` 必须是非空数组；每个查询必须带 `provider` 和唯一 `query_id`，其他必填参数由 GPT 在每次调用前读取当前工具 schema，并根据已清洗的标准化组件配置和官方资料自行生成。阶段为 `created` 表示尚未保存价格查询批次：必须先形成结构化查询计划，不得只做空调用。收到 `created` 后必须在当前回复中立即执行查询，不得只汇报状态、复述计划、列出待办或等待下一轮。工具入参校验返回 `-32602`、`Required at ...` 或其他必填字段错误时，表示 GPT 本次调用遗漏了参数，不表示 AstraQuote 缺少参数定义或官方查价能力。这是可修正的非终态错误：重新读取 schema，补齐参数并重试，不得以此停止报价。
 
 长报价必须由 GPT 根据当前查询的宽窄、官方分页规模、候选数量和预计响应体积动态拆成小批，不使用“每批固定 20 个”之类的业务规则。每一批只查询当前组件正式报价真正需要的价格身份，不为试错一次展开全产品、全规格、全地域目录；宽查询先收窄，再继续下一批。所有批次始终属于同一个报价任务、同一个 `price_batch_id`，后台会自动合并，不创建新对话框、不重新提交任务，也不在批次之间暂停等待销售回复。每次调用都沿用工具返回的 `price_batch_id`，已经成功的 `query_id` 会直接复用，只补尚未完成的查询。
 
@@ -30,9 +38,9 @@ MCP 只做这些机械动作：调用官方价目 API、保存并返回候选和
 
 探索过程中已经取得真实费率时，GPT 可把该查询从 discovery 补充为带归属的 pricing 并直接复用，避免重复请求。尚未分类的旧失败查询不能自动证明整单永久阻塞，应先由 GPT 核对它是否仍是必要计费项。
 
-- AWS：GPT 提供 `service_code`、区域、Filters 和 OnDemand/Reserved 条款；不调用账号级 Reserved Offering 或 Savings Plans API。
+- AWS：GPT 提供 `service_code`、区域、Filters 和 OnDemand/Reserved 条款；不知道 `service_code` 时用 `describe_service.search_text` 从官方 `DescribeServices` 发现，不知道 Filter 值时用 `get_attribute_values` 读取官方允许值；不调用账号级 Reserved Offering 或 Savings Plans API。
 - Azure：GPT 提供 Retail Prices API 的 OData `filter`、本次官方请求币种和官方分页链接。
-- OCI：GPT 可按官方 `part_number` 和本次官方请求币种查询；不知道 part number 时可提供 `response_filters`，按官方 JSON 字段做精确匹配。
+- OCI：GPT 可按官方 `part_number` 和本次官方请求币种查询；不知道 part number 时先提供 `catalog_search` 搜索官方目录，也可叠加 `response_filters` 按官方 JSON 字段做精确匹配。唯一候选会返回可直接复用的 `next_query`，多个候选则继续由 GPT 收窄或选择。
 - GCP：GPT 先列服务，再按 `service_id` 列 SKU；可提供本次官方请求币种、`response_filters` 和 `max_pages`，让 MCP 跨官方分页执行 GPT 指定的精确字段过滤。
 - 腾讯云、阿里云、华为云、百度智能云、火山引擎、天翼云：GPT 先用云厂商、服务和区域查找已验证道路。只有尚无可用道路时，才根据该厂商官方 API 文档提供精确 `endpoint`、只读查询/询价动作、版本、请求参数、候选列表路径、官方身份路径和费率字段路径。密钥由服务器环境管理，GPT 不得传入或看到。MCP 只校验官方域名和只读动作、签名并发送原请求、机械读取 GPT 指定的官方返回字段；不得补业务参数、替 GPT 选型号或计算金额。
 
