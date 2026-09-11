@@ -18,6 +18,7 @@ from app.services.mcp_v2_pricing import (
     TencentPriceQuery,
     VolcenginePriceQuery,
 )
+from app.services.official_cloud_clients import OfficialCloudClientError
 
 
 class _UnusedAwsExecutor:
@@ -443,3 +444,175 @@ def test_authenticated_cloud_queries_reject_non_official_hosts(
             region="cn-test-1",
             path="/v1/query-price",
         )
+
+
+@pytest.mark.parametrize(
+    ("query_type", "endpoint"),
+    [
+        (TencentPriceQuery, "cvm.tencentcloudapi.com"),
+        (AlibabaPriceQuery, "ecs.cn-hangzhou.aliyuncs.com"),
+        (HuaweiPriceQuery, "ecs.cn-north-4.myhuaweicloud.com"),
+        (BaiduPriceQuery, "bcc.bj.baidubce.com"),
+        (VolcenginePriceQuery, "open.volcengineapi.com"),
+        (CtyunPriceQuery, "ctapi-global.ctapi.ctyun.cn"),
+    ],
+)
+def test_authenticated_cloud_queries_reject_mutating_operations(
+    query_type: type[Any], endpoint: str
+) -> None:
+    with pytest.raises(ValueError, match="read-only"):
+        query_type(
+            query_id="unsafe-write",
+            endpoint=endpoint,
+            service="compute",
+            action="CreateInstance",
+            version="2020-01-01",
+            region="cn-test-1",
+            path="/v1/create-instance",
+        )
+
+
+def test_authenticated_query_failure_returns_machine_recovery_plan() -> None:
+    def fail(_: Any) -> dict[str, Any]:
+        raise OfficialCloudClientError(
+            "The official request is missing OrderType.",
+            code="alibaba_missing_parameter",
+            category="invalid_request",
+            retryable=True,
+            details={
+                "http_status": 400,
+                "provider_code": "MissingParameter",
+                "request_id": "request-123",
+            },
+        )
+
+    service = OfficialPricingService(
+        _UnusedAwsExecutor(),
+        authenticated_request=fail,
+        provider_credentials={
+            "alibaba": {
+                "access_key_id": "configured",
+                "secret_access_key": "configured",
+            }
+        },
+    )
+
+    result = service.get_prices(
+        GetPricesRequest(
+            queries=[
+                AlibabaPriceQuery(
+                    query_id="tair-price",
+                    endpoint="r-kvstore.ap-southeast-1.aliyuncs.com",
+                    service="r-kvstore",
+                    action="DescribePrice",
+                    version="2015-01-01",
+                    region="ap-southeast-1",
+                )
+            ]
+        )
+    )["results"][0]
+
+    assert result["status"] == "query_failed"
+    assert result["terminal"] is False
+    assert result["error_category"] == "invalid_request"
+    assert result["recovery"]["next_action"] == "repair_official_request_schema"
+    assert result["recovery"]["allowed_sources"] == [
+        "official_documentation",
+        "official_sdk",
+        "official_openapi",
+        "official_pricing_calculator",
+    ]
+
+
+def test_successful_authenticated_route_returns_verifiable_learning_metadata() -> None:
+    authenticated = _AuthenticatedRecorder(
+        [{"result": {"items": [{"sku": "sku-1", "price": "1.25"}]}}]
+    )
+    service = OfficialPricingService(
+        _UnusedAwsExecutor(),
+        authenticated_request=authenticated,
+        provider_credentials={
+            "alibaba": {
+                "access_key_id": "configured",
+                "secret_access_key": "configured",
+            }
+        },
+    )
+    result = service.get_prices(
+        GetPricesRequest(
+            queries=[
+                AlibabaPriceQuery(
+                    query_id="ecs-price",
+                    endpoint="ecs.ap-southeast-1.aliyuncs.com",
+                    service="ecs",
+                    action="DescribePrice",
+                    version="2014-05-26",
+                    region="ap-southeast-1",
+                    response_items_path="result.items",
+                    item_id_paths=["sku"],
+                    rate_fields=[CommercialRateField(unit_price_path="price")],
+                    official_source_url=(
+                        "https://help.aliyun.com/document_detail/25499.html"
+                    ),
+                )
+            ]
+        )
+    )["results"][0]
+
+    route = result["route_verification"]
+    assert route["auth_scheme"] == "alibaba_rpc_hmac_sha1"
+    assert route["official_source_url"].startswith("https://help.aliyun.com/")
+    assert route["request_schema_hash"].startswith("sha256:")
+    assert route["response_schema_hash"].startswith("sha256:")
+    assert route["sdk_version"] == "astraquote-direct-signer/1"
+    assert route["failure_count"] == 0
+    assert route["confidence"] > 0
+    assert route["expires_at"] > route["last_verified_at"]
+
+
+def test_transient_official_transport_failure_is_retried_without_changing_query() -> None:
+    calls = 0
+
+    def eventually_succeeds(_: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OfficialCloudClientError(
+                "The official endpoint temporarily disconnected.",
+                code="tencent_transport_error",
+                category="transport",
+                retryable=True,
+            )
+        return {"result": {"items": [{"sku": "sku-1", "price": "1.25"}]}}
+
+    service = OfficialPricingService(
+        _UnusedAwsExecutor(),
+        authenticated_request=eventually_succeeds,
+        provider_credentials={
+            "tencent": {
+                "access_key_id": "configured",
+                "secret_access_key": "configured",
+            }
+        },
+    )
+    result = service.get_prices(
+        GetPricesRequest(
+            queries=[
+                TencentPriceQuery(
+                    query_id="cvm-price",
+                    endpoint="cvm.tencentcloudapi.com",
+                    service="cvm",
+                    action="InquiryPriceRunInstances",
+                    version="2017-03-12",
+                    region="ap-guangzhou",
+                    response_items_path="result.items",
+                    item_id_paths=["sku"],
+                    rate_fields=[CommercialRateField(unit_price_path="price")],
+                )
+            ]
+        )
+    )["results"][0]
+
+    assert calls == 2
+    assert result["status"] == "exact"
+    assert result["attempt_count"] == 2

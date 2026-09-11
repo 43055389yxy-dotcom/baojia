@@ -44,6 +44,9 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   ]);
   assert.match(INSTRUCTIONS, /GPT.*理解.*选择.*计算/s);
   assert.match(INSTRUCTIONS, /AWS.*Azure.*Oracle.*Google.*腾讯云.*阿里云.*华为云.*百度智能云.*火山引擎.*天翼云/s);
+  assert.match(INSTRUCTIONS, /官方文档.*官方 SDK/s);
+  assert.match(INSTRUCTIONS, /route_id.*连续失败.*隔离/s);
+  assert.match(INSTRUCTIONS, /第三方网页.*绝不能作为价格证据/s);
   assert.doesNotMatch(INSTRUCTIONS, /Calculator|import_estimate|模板映射/i);
 });
 
@@ -113,6 +116,28 @@ test('get_prices accepts all ten provider-specific raw query shapes', async (t) 
   assert.equal(result.isError, undefined);
   assert.equal(result.structuredContent.input.queries.length, 10);
   assert.equal(result.structuredContent.input.queries[3].response_filters.displayName, 'Compute Engine');
+});
+
+test('get_prices accepts a learned route id without repeating transport details', async (t) => {
+  const { client, server } = await connectedClient();
+  t.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const result = await client.callTool({
+    name: 'get_prices',
+    arguments: {
+      queries: [{
+        provider: 'alibaba', query_id: 'alibaba-reuse',
+        route_id: 'aqr_aaaaaaaaaaaaaaaaaaaaaaaa',
+        region: 'ap-southeast-1', query_parameters: { ProductCode: 'ecs' },
+      }],
+    },
+  });
+
+  assert.equal(result.isError, undefined);
+  assert.equal(result.structuredContent.input.queries[0].route_id, 'aqr_aaaaaaaaaaaaaaaaaaaaaaaa');
 });
 
 test('build_estimate carries provider, official item evidence and no calculator fields', async (t) => {

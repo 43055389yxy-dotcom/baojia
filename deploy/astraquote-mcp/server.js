@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.5.1';
+const VERSION = '3.6.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -120,15 +120,19 @@ const limitedRecord = (maximum, description) => z.record(jsonValue).refine(
 
 const authenticatedCloudPriceQueryShape = {
   query_id: z.string().min(1).max(100),
-  endpoint: z.string().min(4).max(255).describe(
+  route_id: z.string().regex(/^aqr_[a-f0-9]{24}$/).optional().describe(
+    'Previously verified official read-only route. Supply current quote parameters; saved quote-specific values are never reused.',
+  ),
+  endpoint: z.string().min(4).max(255).optional().describe(
     'Official provider API hostname only. Protocol, path, credentials and authorization are forbidden.',
   ),
-  service: z.string().regex(/^[A-Za-z0-9._-]{1,80}$/),
-  action: z.string().regex(/^[A-Za-z0-9._-]{0,160}$/).default(''),
+  service: z.string().regex(/^[A-Za-z0-9._-]{1,80}$/).optional(),
+  action: z.string().regex(/^[A-Za-z0-9._-]{0,160}$/).optional(),
   version: z.string().min(1).max(40).optional(),
-  region: z.string().min(2).max(80),
-  method: z.enum(['GET', 'POST']).default('POST'),
-  path: z.string().min(1).max(1000).default('/'),
+  region: z.string().min(2).max(80).optional(),
+  method: z.enum(['GET', 'POST']).optional(),
+  path: z.string().min(1).max(1000).optional(),
+  region_parameter: z.enum(['RegionId', 'Region', 'none']).optional(),
   query_parameters: limitedRecord(100, 'At most 100 official query parameters are allowed.').default({}),
   body: limitedRecord(200, 'At most 200 official request fields are allowed.').default({}),
   response_items_path: responsePath.optional(),
@@ -141,6 +145,10 @@ const authenticatedCloudPriceQueryShape = {
     'GPT-declared official response paths. The MCP dereferences them mechanically and never chooses a rate.',
   ),
   next_page_path: responsePath.optional(),
+  official_source_url: z.string().url().max(2000).optional().describe(
+    'Official API or documentation URL used to verify a newly discovered route.',
+  ),
+  sdk_version: z.string().min(1).max(120).optional(),
 };
 
 const authenticatedCloudPriceQuery = (provider) => z.object({
@@ -374,9 +382,12 @@ function normalizeBuildEstimateInput(input) {
 }
 
 function buildServer(workflow) {
+  const learnedRouteInstructions = typeof workflow.routeInstructions === 'function'
+    ? workflow.routeInstructions()
+    : '';
   const server = new McpServer(
     { name: 'astraquote-official-pricing', version: VERSION },
-    { instructions: INSTRUCTIONS },
+    { instructions: [INSTRUCTIONS, learnedRouteInstructions].filter(Boolean).join('\n\n') },
   );
 
   server.registerTool('describe_service', {

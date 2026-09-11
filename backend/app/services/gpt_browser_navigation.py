@@ -27,6 +27,17 @@ def active_quote_poll_order(active_quotes: Mapping[str, Any]) -> tuple[str, ...]
     return tuple(active_quotes.keys())
 
 
+def should_extend_quote_deadline(
+    *,
+    deadline_reached: bool,
+    generation_active: bool,
+    retry_visible: bool,
+) -> bool:
+    """Do not turn visible browser activity into a false quote failure."""
+
+    return deadline_reached and (generation_active or retry_visible)
+
+
 def is_transient_browser_poll_exception(exc: BaseException) -> bool:
     """Classify a DOM replacement during polling as retryable.
 

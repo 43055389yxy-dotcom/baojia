@@ -4,6 +4,8 @@ import base64
 import hashlib
 import hmac
 import json
+import re
+import ssl
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta, timezone
@@ -14,9 +16,27 @@ import httpx
 
 
 class OfficialCloudClientError(RuntimeError):
-    def __init__(self, message: str, *, code: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        category: str = "official_api_error",
+        retryable: bool = False,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.category = category
+        self.retryable = retryable
+        self.details = details or {}
+
+
+_BAIDU_CHAIN_ONLY_TLS_HOSTS = frozenset({"bcc.sin.baidubce.com"})
+_SENSITIVE_TEXT = re.compile(
+    r"(?i)(accesskeyid|access[_-]?key|secret|signature|authorization)"
+    r"(?:\s*[:=]\s*|%3[dD])[^&\s,}\]]+"
+)
 
 
 def _sha256(value: bytes) -> str:
@@ -41,6 +61,34 @@ def _parameter_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value)
+
+
+def _flatten_rpc_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    """Flatten RPC repeated parameters before both signing and transport.
+
+    Alibaba RPC APIs sign the exact flattened key/value pairs that are sent on
+    the wire.  Empty collections and nulls are omitted from both views so a
+    value cannot be signed and then silently dropped by the HTTP client.
+    """
+
+    flattened: dict[str, Any] = {}
+
+    def visit(prefix: str, value: Any) -> None:
+        if value is None or value == [] or value == {}:
+            return
+        if isinstance(value, list):
+            for index, item in enumerate(value, start=1):
+                visit(f"{prefix}.{index}", item)
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                visit(f"{prefix}.{key}", item)
+            return
+        flattened[prefix] = value
+
+    for key, value in parameters.items():
+        visit(str(key), value)
+    return flattened
 
 
 def _encoded_query(parameters: dict[str, Any]) -> str:
@@ -77,24 +125,64 @@ class OfficialCloudApiClient:
             raise OfficialCloudClientError(
                 f"{query.provider} official API credentials are not configured",
                 code=f"{query.provider}_credentials_not_configured",
+                category="credentials",
             )
         method, url, params, content, headers = getattr(
             self, f"_prepare_{query.provider}"
         )(query, access_key, secret_key)
-        response = self._request(
-            method,
-            url,
-            params=params or None,
-            content=content or None,
-            headers=headers,
-            timeout=30.0,
-        )
-        response.raise_for_status()
-        payload = response.json()
+        request_options: dict[str, Any] = {
+            "params": params or None,
+            "content": content or None,
+            "headers": headers,
+            "timeout": 30.0,
+            "follow_redirects": False,
+        }
+        if (
+            query.provider == "baidu"
+            and query.endpoint in _BAIDU_CHAIN_ONLY_TLS_HOSTS
+        ):
+            tls_context = ssl.create_default_context()
+            tls_context.check_hostname = False
+            tls_context.verify_mode = ssl.CERT_REQUIRED
+            request_options["verify"] = tls_context
+        try:
+            response = self._request(method, url, **request_options)
+        except Exception as exc:
+            raise OfficialCloudClientError(
+                "The official cloud API could not be reached.",
+                code=f"{query.provider}_transport_error",
+                category="transport",
+                retryable=True,
+                details={"exception_type": type(exc).__name__},
+            ) from exc
+
+        try:
+            payload = response.json()
+        except Exception as exc:
+            payload = None
+            if int(getattr(response, "status_code", 200) or 200) < 400:
+                raise OfficialCloudClientError(
+                    "Official cloud API returned an invalid JSON response.",
+                    code="official_catalog_invalid_response",
+                    category="response_schema",
+                    retryable=True,
+                    details={
+                        "http_status": int(
+                            getattr(response, "status_code", 200) or 200
+                        )
+                    },
+                ) from exc
+
+        status_code = int(getattr(response, "status_code", 200) or 200)
+        if status_code >= 400:
+            raise _official_api_error(query.provider, payload, status_code)
         if not isinstance(payload, dict):
             raise OfficialCloudClientError(
                 "Official cloud API returned a non-object JSON payload",
                 code="official_catalog_invalid_response",
+                category="response_schema",
+                retryable=True,
+                details={"http_status": status_code},
             )
         return payload
 
@@ -149,7 +237,7 @@ class OfficialCloudApiClient:
         query: Any, access_key: str, secret_key: str
     ) -> tuple[str, str, dict[str, Any], bytes, dict[str, str]]:
         method = query.method.upper()
-        parameters = {
+        parameters = _flatten_rpc_parameters({
             "AccessKeyId": access_key,
             "Action": query.action,
             "Format": "JSON",
@@ -159,12 +247,14 @@ class OfficialCloudApiClient:
             "Timestamp": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "Version": str(query.version),
             **query.query_parameters,
-        }
-        if query.region and not any(
-            key.casefold() == "regionid" for key in parameters
-        ):
-            parameters["RegionId"] = query.region
-        parameters.update(query.body)
+            **query.body,
+        })
+        region_parameter = getattr(query, "region_parameter", None) or "RegionId"
+        has_region = any(
+            key.casefold() in {"region", "regionid"} for key in parameters
+        )
+        if query.region and region_parameter != "none" and not has_region:
+            parameters[region_parameter] = query.region
         canonical = _encoded_query(parameters)
         string_to_sign = (
             f"{method}&%2F&{quote(canonical, safe='-_.~')}"
@@ -225,7 +315,6 @@ class OfficialCloudApiClient:
             f"SignedHeaders={';'.join(signed_names)}, Signature={signature}"
         )
         return method, f"https://{query.endpoint}{query.path}", params, body, headers
-
     @staticmethod
     def _prepare_baidu(
         query: Any, access_key: str, secret_key: str
@@ -342,3 +431,105 @@ class OfficialCloudApiClient:
             ),
         }
         return method, f"https://{query.endpoint}{query.path}", params, body, headers
+
+
+def _first_text(payload: Any, paths: tuple[tuple[str, ...], ...]) -> str:
+    for path in paths:
+        current = payload
+        for part in path:
+            if not isinstance(current, dict) or part not in current:
+                current = None
+                break
+            current = current[part]
+        if current is not None and str(current).strip():
+            return str(current).strip()
+    return ""
+
+
+def _redact_error_text(value: str) -> str:
+    redacted = _SENSITIVE_TEXT.sub(lambda match: f"{match.group(1)}=[REDACTED]", value)
+    return redacted[:800]
+
+
+def _official_api_error(
+    provider: str, payload: Any, status_code: int
+) -> OfficialCloudClientError:
+    code = _first_text(
+        payload,
+        (
+            ("Code",),
+            ("code",),
+            ("error_code",),
+            ("Response", "Error", "Code"),
+            ("ResponseMetadata", "Error", "Code"),
+            ("statusCode",),
+        ),
+    ) or f"http_{status_code}"
+    message = _first_text(
+        payload,
+        (
+            ("Message",),
+            ("message",),
+            ("error_msg",),
+            ("Response", "Error", "Message"),
+            ("ResponseMetadata", "Error", "Message"),
+        ),
+    ) or f"Official cloud API returned HTTP {status_code}."
+    request_id = _first_text(
+        payload,
+        (
+            ("RequestId",),
+            ("requestId",),
+            ("request_id",),
+            ("Response", "RequestId"),
+            ("ResponseMetadata", "RequestId"),
+        ),
+    )
+    folded = f"{code} {message}".casefold()
+    if any(
+        token in folded
+        for token in (
+            "signaturedoesnotmatch",
+            "invalidsignature",
+            "signature mismatch",
+            "signature not match",
+        )
+    ):
+        category, retryable = "request_signing", True
+    elif status_code == 429 or any(
+        token in folded for token in ("throttl", "rate limit", "too many")
+    ):
+        category, retryable = "rate_limit", True
+    elif status_code in {401, 403} or any(
+        token in folded
+        for token in ("unauthor", "forbidden", "permission")
+    ):
+        category, retryable = "authorization", False
+    elif status_code == 404 or any(
+        token in folded for token in ("notfound", "not found", "unknown action")
+    ):
+        category, retryable = "route_not_found", True
+    elif status_code == 400 or any(
+        token in folded
+        for token in ("missingparameter", "invalidparameter", "invalid parameter")
+    ):
+        category, retryable = "invalid_request", True
+    elif status_code >= 500:
+        category, retryable = "provider_unavailable", True
+    else:
+        category, retryable = "official_api_error", False
+    details: dict[str, Any] = {
+        "http_status": status_code,
+        "provider_code": code,
+    }
+    if request_id:
+        details["request_id"] = request_id
+    snake_code = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", code)
+    normalized_code = re.sub(r"[^a-z0-9]+", "_", snake_code.casefold()).strip("_")
+    return OfficialCloudClientError(
+        _redact_error_text(message),
+        code=f"{provider}_{normalized_code or f'http_{status_code}'}",
+        category=category,
+        retryable=retryable,
+        details=details,
+    )

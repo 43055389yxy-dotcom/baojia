@@ -17,6 +17,7 @@ from app.services.gpt_browser_navigation import (
     is_single_use_permission_action,
     is_tool_permission_prompt,
     is_transient_browser_poll_exception,
+    should_extend_quote_deadline,
 )
 from app.services.gpt_quote_prompt import (
     build_quote_continuation_prompt,
@@ -591,6 +592,29 @@ def test_stale_dom_reference_is_retryable_without_failing_the_quote() -> None:
     assert is_transient_browser_poll_exception(stale_error)
     assert is_transient_browser_poll_exception(transport_timeout)
     assert not is_transient_browser_poll_exception(permanent_error)
+
+
+def test_visible_generation_or_retry_control_extends_quote_deadline() -> None:
+    assert should_extend_quote_deadline(
+        deadline_reached=True,
+        generation_active=True,
+        retry_visible=False,
+    )
+    assert should_extend_quote_deadline(
+        deadline_reached=True,
+        generation_active=False,
+        retry_visible=True,
+    )
+    assert not should_extend_quote_deadline(
+        deadline_reached=True,
+        generation_active=False,
+        retry_visible=False,
+    )
+    assert not should_extend_quote_deadline(
+        deadline_reached=False,
+        generation_active=True,
+        retry_visible=False,
+    )
 
 
 def test_submitted_processing_job_can_be_reattached_after_worker_restart(

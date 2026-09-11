@@ -194,7 +194,7 @@ async def mcp_v2_health(request: Request) -> dict[str, Any]:
     _require_mcp_internal_token(request)
     return {
         "status": "ready",
-        "workflow_version": "3.5.0",
+        "workflow_version": "3.6.0",
         "internal_ai_enabled": False,
         "role": "official cloud catalog client",
         "price_sources": [

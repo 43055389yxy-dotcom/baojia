@@ -13,9 +13,18 @@ import os
 import socket
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+
+from selenium import webdriver
+from selenium.common.exceptions import WebDriverException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.remote.webelement import WebElement
+from selenium.webdriver.support.ui import WebDriverWait
 
 from app.services.gpt_browser_navigation import (
     active_quote_poll_order,
@@ -28,6 +37,7 @@ from app.services.gpt_browser_navigation import (
     is_single_use_permission_action,
     is_tool_permission_prompt,
     is_transient_browser_poll_exception,
+    should_extend_quote_deadline,
 )
 from app.services.gpt_quote_prompt import (
     build_quote_continuation_prompt,
@@ -35,13 +45,6 @@ from app.services.gpt_quote_prompt import (
     parse_final_response,
 )
 from app.services.gpt_quote_relay import GptQuoteRelayStore, utc_now
-from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.firefox.options import Options
-from selenium.webdriver.remote.webelement import WebElement
-from selenium.webdriver.support.ui import WebDriverWait
 
 CHATGPT_URL = os.environ.get("ASTRAQUOTE_CHATGPT_URL", "https://chatgpt.com/projects")
 PROJECT_NAME = os.environ.get("ASTRAQUOTE_CHATGPT_PROJECT", "baojia")
@@ -583,13 +586,23 @@ class ChatGptBrowser:
             raise RuntimeError("报价工作页已离开对应会话。")
         self._scroll_to_latest()
         if self._approve_tool_if_needed():
-            quote.stable_since = time.monotonic()
+            now = time.monotonic()
+            quote.stable_since = now
+            quote.deadline = now + QUOTE_TIMEOUT_SECONDS
             return None
         retry = self._text_control(("重试", "Retry"))
         if retry is not None:
             now = time.monotonic()
-            if now >= quote.deadline:
-                raise TimeoutError(f"ChatGPT quote did not finish in {QUOTE_TIMEOUT_SECONDS} seconds")
+            if should_extend_quote_deadline(
+                deadline_reached=now >= quote.deadline,
+                generation_active=False,
+                retry_visible=True,
+            ):
+                if completion_check is not None and completion_check():
+                    return None
+                quote.deadline = now + QUOTE_TIMEOUT_SECONDS
+                quote.retry_visible_since = now
+                quote.retry_clicked = False
             if quote.retry_visible_since is None:
                 quote.retry_visible_since = now
             if not quote.retry_clicked and now - quote.retry_visible_since >= 60:
@@ -603,27 +616,42 @@ class ChatGptBrowser:
         messages = self._visible(
             driver.find_elements(By.CSS_SELECTOR, "[data-message-author-role='assistant']")
         )
-        if len(messages) < quote.minimum_assistant_messages:
-            if time.monotonic() >= quote.deadline:
-                raise TimeoutError(
-                    f"ChatGPT quote did not finish in {QUOTE_TIMEOUT_SECONDS} seconds"
-                )
-            return None
-        current = messages[-1].text.strip() if messages else ""
         now = time.monotonic()
-        if current:
-            quote.saw_assistant = True
-            if current != quote.last_text:
-                quote.last_text = current
-                quote.stable_since = now
         stop_buttons = self._visible(
             driver.find_elements(
                 By.CSS_SELECTOR,
                 "button[data-testid='stop-button'], button[aria-label*='Stop'], button[aria-label*='停止']",
             )
         )
+        if len(messages) < quote.minimum_assistant_messages:
+            if should_extend_quote_deadline(
+                deadline_reached=now >= quote.deadline,
+                generation_active=bool(stop_buttons),
+                retry_visible=False,
+            ):
+                quote.deadline = now + QUOTE_TIMEOUT_SECONDS
+                return None
+            if now >= quote.deadline:
+                raise TimeoutError(
+                    f"ChatGPT quote did not finish in {QUOTE_TIMEOUT_SECONDS} seconds"
+                )
+            return None
+        current = messages[-1].text.strip() if messages else ""
+        if current:
+            quote.saw_assistant = True
+            if current != quote.last_text:
+                quote.last_text = current
+                quote.stable_since = now
+                quote.deadline = now + QUOTE_TIMEOUT_SECONDS
         if quote.saw_assistant and not stop_buttons and now - quote.stable_since >= 8:
             return quote.last_text
+        if should_extend_quote_deadline(
+            deadline_reached=now >= quote.deadline,
+            generation_active=bool(stop_buttons),
+            retry_visible=False,
+        ):
+            quote.deadline = now + QUOTE_TIMEOUT_SECONDS
+            return None
         if now >= quote.deadline:
             raise TimeoutError(f"ChatGPT quote did not finish in {QUOTE_TIMEOUT_SECONDS} seconds")
         return None

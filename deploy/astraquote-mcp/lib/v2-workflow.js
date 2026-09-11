@@ -7,6 +7,7 @@ const { isDeepStrictEqual } = require('node:util');
 
 const { V2QuoteStore } = require('./v2-quote-store');
 const { QuoteDeliveryService } = require('./quote-delivery');
+const { PricingRouteStore } = require('./pricing-route-store');
 
 function uniqueComponentKeys(entries) {
   const seen = new Set();
@@ -455,10 +456,18 @@ class AstraQuoteV2Workflow {
     backend,
     store = new V2QuoteStore(),
     deliverer = new QuoteDeliveryService(),
+    routeStore,
   }) {
     this.backend = backend;
     this.store = store;
     this.deliverer = deliverer;
+    this.routeStore = routeStore || new PricingRouteStore({
+      directory: path.join(this.store.directory, 'pricing-routes'),
+    });
+  }
+
+  routeInstructions() {
+    return this.routeStore.instructions();
   }
 
   describeService(input) {
@@ -472,7 +481,8 @@ class AstraQuoteV2Workflow {
   async getPrices(input) {
     const relayJobId = input.relay_job_id || null;
     if (relayJobId) assertRelayIdentity(input);
-    const queryIds = input.queries.map((query) => query.query_id);
+    const materializedQueries = input.queries.map((query) => this.routeStore.materialize(query));
+    const queryIds = materializedQueries.map((query) => query.query_id);
     if (new Set(queryIds).size !== queryIds.length) {
       const error = new Error('Every official price query must have a unique query_id.');
       error.code = 'duplicate_price_query_id';
@@ -494,7 +504,7 @@ class AstraQuoteV2Workflow {
       (existing?.request?.queries || []).map((item) => [item.query_id, item]),
     );
     const pendingQueries = [];
-    for (const query of input.queries) {
+    for (const query of materializedQueries) {
       const priorResult = existingResults.get(query.query_id);
       if (priorResult && ['exact', 'ambiguous'].includes(priorResult.status)) {
         if (!isDeepStrictEqual(existingQueries.get(query.query_id), query)) {
@@ -511,11 +521,12 @@ class AstraQuoteV2Workflow {
     const result = pendingQueries.length > 0
       ? await this.backend.getPrices({ queries: pendingQueries })
       : { status: 'completed', result_count: 0, results: [] };
+    const learnedRoutes = this.routeStore.recordBatch(pendingQueries, result.results || []);
     const priceBatchId = existing?.price_batch_id || `aqpb_${randomUUID()}`;
     const mergedResults = new Map(existingResults);
     for (const item of result.results || []) mergedResults.set(item.query_id, item);
     const mergedQueries = new Map(existingQueries);
-    for (const query of input.queries) mergedQueries.set(query.query_id, query);
+    for (const query of materializedQueries) mergedQueries.set(query.query_id, query);
     const incompleteQueryIds = [...mergedQueries.keys()].filter((queryId) => {
       const item = mergedResults.get(queryId);
       return !item || !['exact', 'ambiguous'].includes(item.status);
@@ -547,8 +558,9 @@ class AstraQuoteV2Workflow {
     return {
       ...mergedResult,
       price_batch_id: priceBatchId,
+      learned_routes: learnedRoutes,
       resumed_batch: Boolean(existing),
-      reused_query_ids: input.queries
+      reused_query_ids: materializedQueries
         .filter((query) => !pendingQueries.includes(query))
         .map((query) => query.query_id),
       queried_query_ids: pendingQueries.map((query) => query.query_id),

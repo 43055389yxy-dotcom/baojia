@@ -5,6 +5,7 @@ import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, Literal
 from urllib.parse import quote, urlparse
@@ -13,7 +14,10 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.services.aws_query_executor import ReadOnlyAwsQueryExecutor
-from app.services.official_cloud_clients import OfficialCloudApiClient
+from app.services.official_cloud_clients import (
+    OfficialCloudApiClient,
+    OfficialCloudClientError,
+)
 
 
 class StrictModel(BaseModel):
@@ -166,6 +170,7 @@ class AuthenticatedCatalogQuery(StrictModel):
     region: str = Field(min_length=2, max_length=80)
     method: Literal["GET", "POST"] = "POST"
     path: str = Field(default="/", min_length=1, max_length=1000)
+    region_parameter: Literal["RegionId", "Region", "none"] | None = None
     query_parameters: dict[str, Any] = Field(default_factory=dict, max_length=100)
     body: dict[str, Any] = Field(default_factory=dict, max_length=200)
     response_items_path: str | None = Field(default=None, min_length=1, max_length=360)
@@ -173,6 +178,8 @@ class AuthenticatedCatalogQuery(StrictModel):
     item_id_paths: list[str] = Field(default_factory=list, max_length=12)
     rate_fields: list[CommercialRateField] = Field(default_factory=list, max_length=24)
     next_page_path: str | None = Field(default=None, min_length=1, max_length=360)
+    official_source_url: str | None = Field(default=None, min_length=8, max_length=2000)
+    sdk_version: str | None = Field(default=None, min_length=1, max_length=120)
 
     @model_validator(mode="after")
     def validate_official_request(self) -> AuthenticatedCatalogQuery:
@@ -278,12 +285,42 @@ _PROVIDER_OFFICIAL_SUFFIXES = {
     "ctyun": (".ctyun.cn",),
 }
 
+_PROVIDER_OFFICIAL_SOURCE_SUFFIXES = {
+    "tencent": (".tencentcloudapi.com", ".tencentcloud.com", ".tencent.com"),
+    "alibaba": (".aliyuncs.com", ".aliyun.com"),
+    "huawei": (".myhuaweicloud.com", ".huaweicloud.com"),
+    "baidu": (".baidubce.com", ".baidu.com"),
+    "volcengine": (".volcengineapi.com", ".volcengine.com"),
+    "ctyun": (".ctyun.cn",),
+}
+
+_PROVIDER_AUTH_SCHEMES = {
+    "tencent": "tc3_hmac_sha256",
+    "alibaba": "alibaba_rpc_hmac_sha1",
+    "huawei": "huawei_sdk_hmac_sha256",
+    "baidu": "bce_auth_v1_hmac_sha256",
+    "volcengine": "volcengine_hmac_sha256",
+    "ctyun": "ctyun_eop_hmac_sha256",
+}
+
 _SAFE_ACTION = re.compile(
     r"^(?:describe|list|get|query|inquiry|inquire|check|search|show|batchquery)",
     re.IGNORECASE,
 )
 _SAFE_REST_PATH = re.compile(
     r"(?:price|pricing|inquiry|rating|describe|query|list|flavou?r|sku|product|region|zone|spec)",
+    re.IGNORECASE,
+)
+_MUTATING_ACTION = re.compile(
+    r"^(?:create|run|start|stop|restart|reboot|update|modify|delete|remove|"
+    r"terminate|purchase|buy|pay|renew|resize|upgrade|downgrade|allocate|"
+    r"release|bind|unbind|attach|detach|enable|disable|reset|set)",
+    re.IGNORECASE,
+)
+_MUTATING_REST_PATH = re.compile(
+    r"/(?:create|run|start|stop|restart|reboot|update|modify|delete|remove|"
+    r"terminate|purchase|buy|pay|renew|resize|upgrade|downgrade|allocate|"
+    r"release|bind|unbind|attach|detach|enable|disable|reset|set)(?:/|-|$)",
     re.IGNORECASE,
 )
 _SENSITIVE_PARAMETER = re.compile(
@@ -346,6 +383,13 @@ def _validate_authenticated_catalog_query(query: AuthenticatedCatalogQuery) -> N
     if query.provider in {"tencent", "alibaba", "volcengine"}:
         if not query.action or not query.version:
             raise ValueError(f"{query.provider} queries require action and version")
+    if query.region_parameter is not None and query.provider != "alibaba":
+        raise ValueError("region_parameter is only supported for Alibaba RPC APIs")
+    if (
+        (query.action and _MUTATING_ACTION.match(query.action))
+        or _MUTATING_REST_PATH.search(query.path)
+    ):
+        raise ValueError("only official read-only discovery or price operations are allowed")
     if not (
         (query.action and _SAFE_ACTION.match(query.action))
         or _SAFE_REST_PATH.search(query.path)
@@ -363,6 +407,23 @@ def _validate_authenticated_catalog_query(query: AuthenticatedCatalogQuery) -> N
     )
     if serialized_size > 128 * 1024:
         raise ValueError("official API request exceeds the 128 KiB boundary")
+    if query.official_source_url:
+        parsed_source = urlparse(query.official_source_url)
+        source_host = (parsed_source.hostname or "").casefold().rstrip(".")
+        if (
+            parsed_source.scheme != "https"
+            or parsed_source.username
+            or parsed_source.password
+            or parsed_source.port not in {None, 443}
+            or not any(
+                source_host == suffix.removeprefix(".")
+                or source_host.endswith(suffix)
+                for suffix in _PROVIDER_OFFICIAL_SOURCE_SUFFIXES[query.provider]
+            )
+        ):
+            raise ValueError(
+                f"{query.provider} official_source_url must use an official HTTPS domain"
+            )
 
 
 class OfficialPricingService:
@@ -421,8 +482,18 @@ class OfficialPricingService:
                     "available": _credentials_available(
                         self._provider_credentials.get(provider) or {}
                     ),
+                    "credential_configured": _credentials_available(
+                        self._provider_credentials.get(provider) or {}
+                    ),
+                    "readiness": (
+                        "configured_unverified"
+                        if _credentials_available(
+                            self._provider_credentials.get(provider) or {}
+                        )
+                        else "credentials_missing"
+                    ),
                     "message": (
-                        f"{PROVIDER_SOURCE_LABELS[provider]} 可用"
+                        f"{PROVIDER_SOURCE_LABELS[provider]} 已配置，按产品动态验证"
                         if _credentials_available(
                             self._provider_credentials.get(provider) or {}
                         )
@@ -489,17 +560,45 @@ class OfficialPricingService:
         return {"status": "completed", "result_count": len(results), "results": results}
 
     def _safe_price_result(self, query: PriceQueryInput) -> dict[str, Any]:
-        try:
-            return self._get_price_result(query)
-        except Exception as exc:
-            return {
-                "query_id": query.query_id,
-                "provider": query.provider,
-                "status": "query_failed",
-                "code": getattr(exc, "code", None) or "official_catalog_query_failed",
-                "message": str(exc),
-                "official_item_ids": [],
-            }
+        last_error: Exception | None = None
+        category, retryable = "official_api_error", False
+        for attempt in range(1, 4):
+            try:
+                result = self._get_price_result(query)
+                if attempt > 1:
+                    result["attempt_count"] = attempt
+                return result
+            except Exception as exc:
+                last_error = exc
+                category, retryable = _error_recovery_traits(exc)
+                if (
+                    attempt >= 3
+                    or category
+                    not in {"transport", "rate_limit", "provider_unavailable"}
+                ):
+                    break
+        assert last_error is not None
+        recovery = _recovery_plan(category, retryable)
+        details = getattr(last_error, "details", {})
+        return {
+            "query_id": query.query_id,
+            "provider": query.provider,
+            "status": "query_failed",
+            "terminal": not retryable,
+            "retryable": retryable,
+            "error_category": category,
+            "code": getattr(last_error, "code", None)
+            or "official_catalog_query_failed",
+            "message": _safe_error_message(str(last_error)),
+            "details": details if isinstance(details, dict) else {},
+            "recovery": recovery,
+            "route_fingerprint": (
+                _route_fingerprint(query)
+                if isinstance(query, AuthenticatedCatalogQuery)
+                else None
+            ),
+            "official_item_ids": [],
+        }
 
     def _get_price_result(self, query: PriceQueryInput) -> dict[str, Any]:
         if isinstance(query, AwsPriceQuery):
@@ -757,6 +856,7 @@ class OfficialPricingService:
             "response_filters": query.response_filters,
             "next_page_token": next_page_token,
             "source": PROVIDER_SOURCE_LABELS[query.provider],
+            "route_verification": _route_verification(query, payload),
         }
 
     def _official_json(self, url: str, *, params: dict[str, Any]) -> dict[str, Any]:
@@ -766,6 +866,163 @@ class OfficialPricingService:
         if not isinstance(payload, dict):
             raise ValueError("Official catalog returned a non-object JSON payload")
         return payload
+
+
+def _schema_shape(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 12:
+        return "depth_limit"
+    if isinstance(value, dict):
+        return {
+            str(key): _schema_shape(item, depth=depth + 1)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, list):
+        shapes = {
+            json.dumps(
+                _schema_shape(item, depth=depth + 1),
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            for item in value[:20]
+        }
+        return [json.loads(item) for item in sorted(shapes)]
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    return "string"
+
+
+def _schema_hash(value: Any) -> str:
+    encoded = json.dumps(
+        _schema_shape(value),
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _route_identity(query: AuthenticatedCatalogQuery) -> dict[str, Any]:
+    return {
+        "provider": query.provider,
+        "endpoint": query.endpoint,
+        "service": query.service,
+        "action": query.action,
+        "version": query.version,
+        "region": query.region,
+        "region_parameter": query.region_parameter,
+        "method": query.method,
+        "path": query.path,
+        "request_schema_hash": _schema_hash(
+            {
+                "query_parameters": query.query_parameters,
+                "body": query.body,
+            }
+        ),
+    }
+
+
+def _route_fingerprint(query: AuthenticatedCatalogQuery) -> str:
+    encoded = json.dumps(
+        _route_identity(query),
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _route_verification(
+    query: AuthenticatedCatalogQuery, payload: dict[str, Any]
+) -> dict[str, Any]:
+    verified_at = datetime.now(UTC)
+    source_url = query.official_source_url or (
+        f"https://{query.endpoint}{query.path}"
+    )
+    return {
+        **_route_identity(query),
+        "route_fingerprint": _route_fingerprint(query),
+        "response_schema_hash": _schema_hash(payload),
+        "response_items_path": query.response_items_path,
+        "item_id_paths": list(query.item_id_paths),
+        "rate_fields": [item.model_dump(mode="json") for item in query.rate_fields],
+        "next_page_path": query.next_page_path,
+        "auth_scheme": _PROVIDER_AUTH_SCHEMES[query.provider],
+        "sdk_version": query.sdk_version or "astraquote-direct-signer/1",
+        "last_verified_at": verified_at.isoformat(),
+        "failure_count": 0,
+        "confidence": 0.65,
+        "revalidate_after": (verified_at + timedelta(days=7)).isoformat(),
+        "expires_at": (verified_at + timedelta(days=30)).isoformat(),
+        "official_source_url": source_url,
+    }
+
+
+def _safe_error_message(value: str) -> str:
+    without_queries = re.sub(r"(https://[^?\s]+)\?[^\s]+", r"\1?[REDACTED]", value)
+    without_secrets = re.sub(
+        r"(?i)(accesskeyid|access[_-]?key|secret|signature|authorization)"
+        r"(?:\s*[:=]\s*|%3[dD])[^&\s,}\]]+",
+        lambda match: f"{match.group(1)}=[REDACTED]",
+        without_queries,
+    )
+    return without_secrets[:800]
+
+
+def _error_recovery_traits(exc: Exception) -> tuple[str, bool]:
+    if isinstance(exc, OfficialCloudClientError):
+        return exc.category, exc.retryable
+    code = str(getattr(exc, "code", "") or "").casefold()
+    message = str(exc).casefold()
+    folded = f"{code} {message}"
+    if any(token in folded for token in ("signaturedoesnotmatch", "invalidsignature")):
+        return "request_signing", True
+    if any(token in folded for token in ("timeout", "temporar", "connection", "tls", "ssl")):
+        return "transport", True
+    if any(token in folded for token in ("429", "throttl", "rate limit")):
+        return "rate_limit", True
+    if any(token in folded for token in ("400", "missing parameter", "invalid parameter")):
+        return "invalid_request", True
+    if any(token in folded for token in ("404", "not found", "unknown action")):
+        return "route_not_found", True
+    if any(token in folded for token in ("401", "403", "unauthor", "forbidden")):
+        return "authorization", False
+    if isinstance(exc, (ValueError, KeyError, TypeError)):
+        return "response_schema", True
+    return "official_api_error", False
+
+
+def _recovery_plan(category: str, retryable: bool) -> dict[str, Any]:
+    next_actions = {
+        "invalid_request": "repair_official_request_schema",
+        "route_not_found": "discover_alternate_official_route",
+        "response_schema": "revalidate_official_response_schema",
+        "transport": "retry_or_discover_official_endpoint",
+        "rate_limit": "retry_with_backoff",
+        "provider_unavailable": "retry_with_backoff",
+        "request_signing": "revalidate_canonical_request_and_signing_contract",
+        "authorization": "verify_cloud_read_and_billing_access",
+        "credentials": "configure_official_api_credentials",
+        "official_api_error": "inspect_official_error_contract",
+    }
+    return {
+        "retryable": retryable,
+        "next_action": next_actions.get(category, "inspect_official_error_contract"),
+        "allowed_sources": [
+            "official_documentation",
+            "official_sdk",
+            "official_openapi",
+            "official_pricing_calculator",
+        ],
+        "third_party_price_forbidden": True,
+        "mutating_api_forbidden": True,
+    }
 
 
 def _collect(payload: dict[str, Any], key: str) -> list[Any]:
