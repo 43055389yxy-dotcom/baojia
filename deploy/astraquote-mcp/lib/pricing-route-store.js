@@ -20,6 +20,8 @@ const ROUTE_FIELDS = Object.freeze([
   'region_parameter', 'method', 'path', 'response_items_path', 'item_id_paths',
   'rate_fields', 'next_page_path', 'official_source_url', 'sdk_version',
 ]);
+const ROUTE_SCHEMA_VERSION = 'astraquote-pricing-route/2';
+const ROUTE_STORE_SCHEMA_VERSION = 'astraquote-pricing-routes/2';
 
 
 function routeId(fingerprint) {
@@ -35,7 +37,8 @@ function cleanRouteVerification(verification) {
     }
   }
   for (const field of [
-    'route_fingerprint', 'auth_scheme', 'request_schema_hash', 'response_schema_hash',
+    'route_contract_version', 'route_fingerprint', 'auth_scheme',
+    'request_schema_hash', 'response_schema_hash',
     'last_verified_at', 'revalidate_after', 'expires_at',
   ]) {
     if (verification[field] !== undefined && verification[field] !== null) {
@@ -58,13 +61,13 @@ class PricingRouteStore {
 
   load() {
     if (!fs.existsSync(this.target)) {
-      return { schema_version: 'astraquote-pricing-routes/1', routes: [] };
+      return { schema_version: ROUTE_STORE_SCHEMA_VERSION, routes: [] };
     }
     try {
       const payload = JSON.parse(fs.readFileSync(this.target, 'utf8'));
       return Array.isArray(payload.routes)
         ? payload
-        : { schema_version: 'astraquote-pricing-routes/1', routes: [] };
+        : { schema_version: ROUTE_STORE_SCHEMA_VERSION, routes: [] };
     } catch (error) {
       throw new PricingRouteStoreError('Verified pricing routes could not be read.', {
         code: 'pricing_route_store_corrupt',
@@ -89,6 +92,12 @@ class PricingRouteStore {
     if (!route) {
       throw new PricingRouteStoreError('Verified pricing route was not found.', {
         code: 'pricing_route_not_found', details: { route_id: id },
+      });
+    }
+    if (route.schema_version !== ROUTE_SCHEMA_VERSION) {
+      throw new PricingRouteStoreError('Verified pricing route must be revalidated.', {
+        code: 'pricing_route_revalidation_required',
+        details: { route_id: route.route_id, reason: 'route_schema_changed' },
       });
     }
     return route;
@@ -156,6 +165,7 @@ class PricingRouteStore {
     const learned = [];
     for (const result of results || []) {
       if (result?.route_verification
+        && Number(result.route_verification.route_contract_version) === 2
         && ['exact', 'ambiguous'].includes(result.status)
         && Array.isArray(result.official_item_ids)
         && result.official_item_ids.length > 0) {
@@ -172,7 +182,7 @@ class PricingRouteStore {
         const record = {
           ...(previous || {}),
           ...verification,
-          schema_version: 'astraquote-pricing-route/1',
+          schema_version: ROUTE_SCHEMA_VERSION,
           route_id: id,
           status: 'active',
           confidence,
@@ -222,7 +232,7 @@ class PricingRouteStore {
       };
     }
     this.save({
-      schema_version: 'astraquote-pricing-routes/1',
+      schema_version: ROUTE_STORE_SCHEMA_VERSION,
       updated_at: now,
       routes: payload.routes,
     });
@@ -231,7 +241,8 @@ class PricingRouteStore {
 
   instructions() {
     const routes = this.load().routes
-      .filter((route) => route.status === 'active' && Date.parse(route.expires_at) > Date.now())
+      .filter((route) => route.schema_version === ROUTE_SCHEMA_VERSION
+        && route.status === 'active' && Date.parse(route.expires_at) > Date.now())
       .sort((left, right) => Number(right.confidence) - Number(left.confidence))
       .slice(0, 40)
       .map((route) => ({

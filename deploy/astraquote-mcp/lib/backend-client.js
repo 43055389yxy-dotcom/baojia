@@ -1,12 +1,15 @@
 'use strict';
 
 class BackendError extends Error {
-  constructor(message, { status = 502, code = 'backend_error', details = {} } = {}) {
+  constructor(message, {
+    status = 502, code = 'backend_error', details = {}, retryable = false,
+  } = {}) {
     super(message);
     this.name = 'BackendError';
     this.status = status;
     this.code = code;
     this.details = details;
+    this.retryable = retryable;
   }
 }
 
@@ -52,6 +55,7 @@ class AstraQuoteBackendClient {
           status: 503,
           code: timedOut ? 'backend_timeout' : 'backend_unavailable',
           details: { path },
+          retryable: true,
         },
       );
     } finally {
@@ -65,11 +69,27 @@ class AstraQuoteBackendClient {
       payload = {};
     }
     if (!response.ok) {
-      throw new BackendError(payload.message || `AstraQuote backend returned HTTP ${response.status}.`, {
-        status: response.status,
-        code: payload.code || 'backend_rejected_request',
-        details: payload.details || {},
-      });
+      const validationDetails = Array.isArray(payload.detail)
+        ? { violations: payload.detail.map((item) => ({
+          path: Array.isArray(item.loc) ? item.loc.join('.') : '',
+          message: String(item.msg || 'Invalid request field.'),
+          type: String(item.type || 'validation_error'),
+        })) }
+        : {};
+      const isSchemaError = response.status === 422;
+      throw new BackendError(
+        payload.message || (isSchemaError
+          ? 'AstraQuote rejected the request schema. Correct the listed fields and retry.'
+          : `AstraQuote backend returned HTTP ${response.status}.`),
+        {
+          status: response.status,
+          code: payload.code || (isSchemaError
+            ? 'backend_request_schema_invalid'
+            : 'backend_rejected_request'),
+          details: payload.details || validationDetails,
+          retryable: payload.retryable === true || isSchemaError,
+        },
+      );
     }
     return payload;
   }

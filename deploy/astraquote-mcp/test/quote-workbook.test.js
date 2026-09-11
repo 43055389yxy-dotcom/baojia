@@ -63,7 +63,7 @@ test('creates a compact Excel workbook from verified quote data', async () => {
   assert.ok(Buffer.isBuffer(buffer));
   assert.equal(buffer.subarray(0, 2).toString('ascii'), 'PK');
   assert.equal(sheet.getCell('A1').value, '序号');
-  assert.equal(sheet.getCell('G1').value, '月费');
+  assert.equal(sheet.getCell('G1').value, '月费（USD）');
   assert.equal(sheet.getCell('G2').value, 245.67);
   assert.equal(sheet.getCell('A3').value, '合计');
   assert.equal(sheet.getCell('G3').value.result, 245.67);
@@ -118,9 +118,9 @@ test('renders every selected pricing scenario as a separate component column', a
   ];
 
   const { sheet } = await readWorkbook(record);
-  assert.equal(sheet.getCell('G1').value, '按需月费');
-  assert.equal(sheet.getCell('H1').value, '1 年预留折合月费');
-  assert.equal(sheet.getCell('I1').value, '3 年预留折合月费');
+  assert.equal(sheet.getCell('G1').value, '按需月费（USD）');
+  assert.equal(sheet.getCell('H1').value, '1 年预留折合月费（USD）');
+  assert.equal(sheet.getCell('I1').value, '3 年预留折合月费（USD）');
   assert.equal(sheet.getCell('G2').value, 245.67);
   assert.equal(sheet.getCell('H2').value, 183.92);
   assert.equal(sheet.getCell('I2').value, 117.58);
@@ -128,6 +128,15 @@ test('renders every selected pricing scenario as a separate component column', a
   assert.equal(sheet.getCell('H3').value.result, 183.92);
   assert.equal(sheet.getCell('A4').value, '预付费合计');
   assert.equal(sheet.getCell('I4').value, 4232.88);
+});
+
+test('renders CNY quotes with an explicit CNY header and RMB number format', async () => {
+  const record = verifiedRecord();
+  record.currency = 'CNY';
+  const { sheet } = await readWorkbook(record);
+  assert.equal(sheet.getCell('G1').value, '月费（CNY）');
+  assert.equal(sheet.getCell('G2').numFmt, '"¥"#,##0.00');
+  assert.equal(sheet.getCell('G3').numFmt, '"¥"#,##0.00');
 });
 
 test('refuses to render an unverified quote', async () => {

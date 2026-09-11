@@ -84,6 +84,10 @@ const PROVIDER_SCENARIO_LABELS = Object.freeze({
 
 function scenarioLabel(record, scenario) {
   if (scenario.label) return String(scenario.label).slice(0, 40);
+  const quoteLabel = (record.pricing_scenarios || []).find(
+    (item) => item.scenario_key === scenario.scenario_key,
+  )?.label;
+  if (quoteLabel) return String(quoteLabel).slice(0, 40);
   return PROVIDER_SCENARIO_LABELS[record.cloud_provider]?.[scenario.scenario_key]
     || scenario.scenario_key;
 }
@@ -126,7 +130,7 @@ function buildPageResult(record) {
   }));
   return {
     schema_version: 'astraquote-page-result/1',
-    currency: record.currency || 'USD',
+    currency: record.currency,
     region: record.default_region || '',
     components,
     scenarios,

@@ -176,6 +176,7 @@ def test_gcp_catalog_requires_key_and_returns_raw_skus() -> None:
                     query_id="gcp-skus",
                     operation="list_skus",
                     service_id="6F81-5844-456A",
+                    currency_code="USD",
                 )
             ]
         )
@@ -195,6 +196,7 @@ def test_gcp_catalog_requires_key_and_returns_raw_skus() -> None:
                     query_id="gcp-skus",
                     operation="list_skus",
                     service_id="6F81-5844-456A",
+                    currency_code="USD",
                 )
             ]
         )
@@ -213,7 +215,13 @@ def test_gcp_service_discovery_does_not_send_sku_only_currency_parameter() -> No
 
     result = service.get_prices(
         GetPricesRequest(
-            queries=[GcpPriceQuery(query_id="gcp-services", operation="list_services")]
+            queries=[
+                GcpPriceQuery(
+                    query_id="gcp-services",
+                    operation="list_services",
+                    currency_code="USD",
+                )
+            ]
         )
     )
 
@@ -226,6 +234,7 @@ def test_azure_next_page_url_is_restricted_to_official_host() -> None:
         AzurePriceQuery(
             query_id="bad-page",
             next_page_url="https://example.com/steal",
+            currency_code="USD",
         )
 
 
@@ -256,6 +265,7 @@ def test_gcp_response_filters_narrow_paginated_official_results_without_mcp_sele
                 GcpPriceQuery(
                     query_id="gcp-compute-service",
                     operation="list_services",
+                    currency_code="USD",
                     response_filters={"displayName": "Compute Engine"},
                     max_pages=4,
                 )
@@ -290,6 +300,7 @@ def test_oci_response_filters_are_caller_supplied_and_return_only_exact_matches(
             queries=[
                 OciPriceQuery(
                     query_id="oci-object-storage",
+                    currency_code="USD",
                     response_filters={"displayName": "Object Storage"},
                 )
             ]
@@ -472,6 +483,20 @@ def test_authenticated_cloud_queries_reject_mutating_operations(
         )
 
 
+def test_authenticated_cloud_queries_reject_batch_mutating_actions() -> None:
+    with pytest.raises(ValueError, match="read-only"):
+        AlibabaPriceQuery(
+            query_id="unsafe-batch-write",
+            endpoint="ecs.cn-hangzhou.aliyuncs.com",
+            service="ecs",
+            action="BatchCreateInstances",
+            version="2014-05-26",
+            region="cn-hangzhou",
+            path="/v1/query",
+            official_source_url="https://help.aliyun.com/",
+        )
+
+
 def test_authenticated_query_failure_returns_machine_recovery_plan() -> None:
     def fail(_: Any) -> dict[str, Any]:
         raise OfficialCloudClientError(
@@ -550,7 +575,11 @@ def test_successful_authenticated_route_returns_verifiable_learning_metadata() -
                     region="ap-southeast-1",
                     response_items_path="result.items",
                     item_id_paths=["sku"],
-                    rate_fields=[CommercialRateField(unit_price_path="price")],
+                    rate_fields=[
+                        CommercialRateField(
+                            unit_price_path="price", currency_code="CNY"
+                        )
+                    ],
                     official_source_url=(
                         "https://help.aliyun.com/document_detail/25499.html"
                     ),
@@ -560,6 +589,7 @@ def test_successful_authenticated_route_returns_verifiable_learning_metadata() -
     )["results"][0]
 
     route = result["route_verification"]
+    assert route["route_contract_version"] == 2
     assert route["auth_scheme"] == "alibaba_rpc_hmac_sha1"
     assert route["official_source_url"].startswith("https://help.aliyun.com/")
     assert route["request_schema_hash"].startswith("sha256:")
@@ -607,7 +637,11 @@ def test_transient_official_transport_failure_is_retried_without_changing_query(
                     region="ap-guangzhou",
                     response_items_path="result.items",
                     item_id_paths=["sku"],
-                    rate_fields=[CommercialRateField(unit_price_path="price")],
+                    rate_fields=[
+                        CommercialRateField(
+                            unit_price_path="price", currency_code="CNY"
+                        )
+                    ],
                 )
             ]
         )

@@ -277,44 +277,24 @@ function normalizeScenarioCosts(input) {
   return input;
 }
 
-function validateProviderScenarioSemantics(input) {
-  const allowedQuoteScenarios = input.cloud_provider === 'oci'
-    ? new Set(['on_demand'])
-    : new Set(SCENARIO_KEYS);
-  const commitmentBasis = {
-    aws: 'reserved',
-    azure: 'provider_commitment',
-    gcp: 'provider_commitment',
-    tencent: 'provider_commitment',
-    alibaba: 'provider_commitment',
-    huawei: 'provider_commitment',
-    baidu: 'provider_commitment',
-    volcengine: 'provider_commitment',
-    ctyun: 'provider_commitment',
-  }[input.cloud_provider];
+function validateScenarioSemantics(input) {
   const violations = [];
-  for (const scenario of input.pricing_scenarios || []) {
-    if (!allowedQuoteScenarios.has(scenario.scenario_key)) {
-      violations.push(`scenario_not_available_for_provider:${scenario.scenario_key}`);
-    }
-  }
   for (const service of input.services || []) {
     for (const scenario of service.scenario_costs || []) {
       if (scenario.scenario_key === 'on_demand' && scenario.pricing_basis !== 'on_demand') {
         violations.push(`on_demand_basis_invalid:${service.component_key}`);
       }
-      if (scenario.scenario_key !== 'on_demand'
-        && ![commitmentBasis, 'on_demand_fallback'].includes(scenario.pricing_basis)) {
+      if (scenario.scenario_key !== 'on_demand' && scenario.pricing_basis === 'on_demand') {
         violations.push(
-          `provider_commitment_basis_invalid:${service.component_key}:${scenario.scenario_key}`,
+          `commitment_basis_invalid:${service.component_key}:${scenario.scenario_key}`,
         );
       }
     }
   }
   if (violations.length > 0) {
-    const error = new Error('Pricing scenarios do not match the selected cloud provider.');
-    error.code = 'provider_pricing_scenario_invalid';
-    error.details = { cloud_provider: input.cloud_provider, violations };
+    const error = new Error('Pricing scenario keys and pricing bases are structurally inconsistent.');
+    error.code = 'pricing_scenario_semantics_invalid';
+    error.details = { violations };
     throw error;
   }
   return input;
@@ -328,7 +308,7 @@ function officialCosts(input) {
     upfront: 0,
     monthly,
     total_12_months: monthly * 12,
-    currency: input.currency || 'USD',
+    currency: input.currency,
     pricing_scenarios: input.pricing_scenarios || [],
     line_items: services.map((service) => ({
       component_key: service.component_key,
@@ -518,9 +498,27 @@ class AstraQuoteV2Workflow {
       pendingQueries.push(query);
     }
 
-    const result = pendingQueries.length > 0
-      ? await this.backend.getPrices({ queries: pendingQueries })
-      : { status: 'completed', result_count: 0, results: [] };
+    let result;
+    try {
+      result = pendingQueries.length > 0
+        ? await this.backend.getPrices({ queries: pendingQueries })
+        : { status: 'completed', result_count: 0, results: [] };
+    } catch (error) {
+      if (relayJobId) {
+        this.store.putCheckpoint(relayJobId, {
+          stage: 'pricing_request_rejected',
+          price_batch_id: existing?.price_batch_id || null,
+          incomplete_query_ids: pendingQueries.map((query) => query.query_id),
+          error: {
+            code: error?.code || 'official_price_request_failed',
+            message: error?.message || 'Official price request failed.',
+            details: error?.details || {},
+            retryable: error?.retryable === true,
+          },
+        });
+      }
+      throw error;
+    }
     const learnedRoutes = this.routeStore.recordBatch(pendingQueries, result.results || []);
     const priceBatchId = existing?.price_batch_id || `aqpb_${randomUUID()}`;
     const mergedResults = new Map(existingResults);
@@ -586,7 +584,7 @@ class AstraQuoteV2Workflow {
       incomplete_query_ids: checkpoint.incomplete_query_ids || [],
       quote_id: checkpoint.quote_id || null,
       failed_stage: checkpoint.failed_stage || null,
-      error: checkpoint.stage === 'failed' ? checkpoint.error : undefined,
+      error: checkpoint.error || undefined,
       result: checkpoint.stage === 'delivery_completed' ? checkpoint.result : undefined,
     };
   }
@@ -595,6 +593,7 @@ class AstraQuoteV2Workflow {
     const status = this.getQuoteJobStatus(input);
     const nextActions = {
       created: 'Continue official price queries with get_prices.',
+      pricing_request_rejected: 'Correct the rejected request using the saved field-level details, then retry get_prices.',
       pricing_partial: 'Query only incomplete_query_ids; keep the saved price batch.',
       pricing_completed: 'Reuse price_batch_id and continue with build_estimate.',
       estimate_validated: 'Resume artifact generation and sales-page delivery only.',
@@ -641,6 +640,7 @@ class AstraQuoteV2Workflow {
           rateCandidates.map((rate) => [rate.rate_id, rate]),
         );
         const selectedRates = ref.official_rate_ids || [];
+        const selectedRateCurrencies = new Set();
         if (signedCatalogProviders.has(input.cloud_provider) && rateCandidates.length === 0) {
           violations.push(`commercial_rate_evidence_missing:${component.component_key}:${ref.query_id}`);
         }
@@ -666,6 +666,35 @@ class AstraQuoteV2Workflow {
           }
           if (rate.is_zero_rate === true || Number(rate.unit_price) === 0) {
             violations.push(`free_or_zero_rate_forbidden:${component.component_key}:${ref.query_id}:${rateId}`);
+          }
+          if (String(rate.currency || '').toUpperCase() !== input.currency) {
+            violations.push(
+              `price_currency_mismatch:${component.component_key}:${ref.query_id}:${rateId}:${rate.currency || 'missing'}:${input.currency}`,
+            );
+          }
+          selectedRateCurrencies.add(String(rate.currency || '').toUpperCase());
+        }
+        if (selectedRateCurrencies.size > 1) {
+          violations.push(
+            `mixed_price_currencies:${component.component_key}:${ref.query_id}:${[...selectedRateCurrencies].join(',')}`,
+          );
+        }
+        if (selectedRates.length === 0 && rateCandidates.length > 0) {
+          const selectedItemRates = rateCandidates.filter(
+            (rate) => selected.includes(rate.official_item_id),
+          );
+          const itemCurrencies = new Set(
+            selectedItemRates.map((rate) => String(rate.currency || '').toUpperCase()),
+          );
+          if (itemCurrencies.size > 0 && !itemCurrencies.has(input.currency)) {
+            violations.push(
+              `price_currency_mismatch:${component.component_key}:${ref.query_id}:selected_items:${[...itemCurrencies].join(',')}:${input.currency}`,
+            );
+          }
+          if (itemCurrencies.size > 1) {
+            violations.push(
+              `mixed_price_currencies:${component.component_key}:${ref.query_id}:${[...itemCurrencies].join(',')}`,
+            );
           }
         }
         for (const itemId of selected) {
@@ -882,7 +911,7 @@ class AstraQuoteV2Workflow {
       error.code = 'price_batch_relay_context_mismatch';
       throw error;
     }
-    const normalizedInput = validateProviderScenarioSemantics(
+    const normalizedInput = validateScenarioSemantics(
       normalizeScenarioCosts(normalizeComponentCosts(relayBoundInput)),
     );
     validateCustomerDocumentMetadata(normalizedInput);
@@ -965,5 +994,5 @@ module.exports = {
   officialCosts,
   prepareOfficialApiSubmission,
   validateCustomerDocumentMetadata,
-  validateProviderScenarioSemantics,
+  validateScenarioSemantics,
 };

@@ -51,9 +51,22 @@ const PROVIDER_SCENARIO_LABELS = Object.freeze({
 });
 
 function scenarioLabel(record, scenario) {
-  return PROVIDER_SCENARIO_LABELS[record.cloud_provider || 'aws']?.[scenario.scenario_key]
-    || scenario.label
+  return scenario.label
+    || PROVIDER_SCENARIO_LABELS[record.cloud_provider || 'aws']?.[scenario.scenario_key]
     || null;
+}
+
+function currencyNumberFormat(currency) {
+  const formats = {
+    CNY: '"¥"#,##0.00',
+    USD: '"$"#,##0.00',
+    EUR: '"€"#,##0.00',
+    GBP: '"£"#,##0.00',
+    JPY: '"¥"#,##0',
+    KRW: '"₩"#,##0',
+  };
+  const code = String(currency || '').toUpperCase();
+  return formats[code] || `"${code.replace(/"/g, '')} "#,##0.00`;
 }
 
 function friendlyRegion(value) {
@@ -216,6 +229,7 @@ async function buildQuoteWorkbook(record) {
     : [];
   const rows = componentDetails(record);
   const priceColumnCount = scenarios.length || 1;
+  const moneyFormat = currencyNumberFormat(record.currency);
   if (rows.some((row) => row.slice(6, 6 + priceColumnCount).some((value) => !Number.isFinite(value)))) {
     const error = new Error('Every quote component must have a verified monthly cost.');
     error.code = 'component_monthly_cost_required';
@@ -251,9 +265,10 @@ async function buildQuoteWorkbook(record) {
     { width: 42 },
   ];
 
+  const currencySuffix = record.currency ? `（${record.currency}）` : '';
   const priceHeaders = scenarios.length > 0
-    ? scenarios.map((scenario) => scenarioLabel(record, scenario))
-    : ['月费'];
+    ? scenarios.map((scenario) => `${scenarioLabel(record, scenario)}${currencySuffix}`)
+    : [`月费${currencySuffix}`];
   const headers = ['序号', '云服务', '区域', '型号 / 方案', '数量', '配置', ...priceHeaders, '参考单价', '备注'];
   const headerRow = sheet.getRow(1);
   headerRow.values = headers;
@@ -279,7 +294,7 @@ async function buildQuoteWorkbook(record) {
     row.getCell(1).alignment = { horizontal: 'center', vertical: 'top' };
     row.getCell(5).alignment = { horizontal: 'center', vertical: 'top', wrapText: true };
     for (let column = 7; column < 7 + priceColumnCount; column += 1) {
-      row.getCell(column).numFmt = '"$"#,##0.00';
+      row.getCell(column).numFmt = moneyFormat;
       row.getCell(column).alignment = { horizontal: 'right', vertical: 'top' };
     }
   }
@@ -309,7 +324,7 @@ async function buildQuoteWorkbook(record) {
     applyBorder(cell);
   });
   for (let column = 7; column < 7 + priceColumnCount; column += 1) {
-    totalRow.getCell(column).numFmt = '"$"#,##0.00';
+    totalRow.getCell(column).numFmt = moneyFormat;
   }
 
   let lastPrintableRow = totalRow.number;
@@ -330,7 +345,7 @@ async function buildQuoteWorkbook(record) {
       applyBorder(cell);
     });
     for (let column = 7; column < 7 + priceColumnCount; column += 1) {
-      upfrontRow.getCell(column).numFmt = '"$"#,##0.00';
+      upfrontRow.getCell(column).numFmt = moneyFormat;
     }
     lastPrintableRow = upfrontRow.number;
   }
@@ -343,6 +358,7 @@ async function buildQuoteWorkbook(record) {
 
 module.exports = {
   buildQuoteWorkbook,
+  currencyNumberFormat,
   componentDetails,
   conciseReason,
   friendlyRegion,

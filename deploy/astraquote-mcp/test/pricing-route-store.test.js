@@ -17,6 +17,7 @@ function verifiedResult(overrides = {}) {
     official_item_ids: ['ecs.g8i.xlarge'],
     official_rate_candidates: [{ unit_price: '1.25', is_zero_rate: false }],
     route_verification: {
+      route_contract_version: 2,
       route_fingerprint: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       provider: 'alibaba',
       endpoint: 'business.aliyuncs.com',
@@ -29,7 +30,7 @@ function verifiedResult(overrides = {}) {
       path: '/',
       response_items_path: 'Data.ModuleDetails.ModuleDetail',
       item_id_paths: ['ModuleCode'],
-      rate_fields: [{ unit_price_path: 'CostAfterDiscount' }],
+      rate_fields: [{ unit_price_path: 'CostAfterDiscount', currency_code: 'CNY' }],
       auth_scheme: 'alibaba_rpc_hmac_sha1',
       request_schema_hash: 'sha256:request',
       response_schema_hash: 'sha256:response',
@@ -66,6 +67,18 @@ test('verified official route is learned without persisting quote-specific reque
   assert.doesNotMatch(persisted, /must-not-persist|customer-specific-sku|CustomerSecretValue/);
   assert.match(persisted, /request_schema_hash/);
   assert.match(persisted, /official_source_url/);
+});
+
+
+test('a route without current currency provenance is not learned', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-routes-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const store = new PricingRouteStore({ directory });
+  const legacy = verifiedResult();
+  delete legacy.route_verification.route_contract_version;
+
+  assert.deepEqual(store.recordBatch([], [legacy]), []);
+  assert.equal(store.load().routes.length, 0);
 });
 
 
@@ -129,6 +142,27 @@ test('a learned route is revalidated on schedule instead of being trusted foreve
     (error) => error.code === 'pricing_route_revalidation_required'
       && error.details.revalidation_due === true
       && error.details.expired === false,
+  );
+});
+
+
+test('routes learned before explicit currency provenance are forced through revalidation', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-routes-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const store = new PricingRouteStore({ directory });
+  const [learned] = store.recordBatch([], [verifiedResult()]);
+  const target = path.join(directory, 'pricing-routes.json');
+  const payload = JSON.parse(fs.readFileSync(target, 'utf8'));
+  payload.routes[0].schema_version = 'astraquote-pricing-route/1';
+  fs.writeFileSync(target, JSON.stringify(payload));
+
+  assert.throws(
+    () => store.materialize({
+      provider: 'alibaba', query_id: 'old-currency-default', route_id: learned.route_id,
+      region: 'ap-southeast-1', query_parameters: {}, body: {}, response_filters: {},
+    }),
+    (error) => error.code === 'pricing_route_revalidation_required'
+      && error.details.reason === 'route_schema_changed',
   );
 });
 

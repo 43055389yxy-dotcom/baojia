@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.6.0';
+const VERSION = '3.7.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -63,7 +63,9 @@ const azurePriceQuery = z.object({
   provider: z.literal('azure'),
   query_id: z.string().min(1).max(100),
   filter: z.string().max(4000).optional(),
-  currency_code: z.string().regex(/^[A-Z]{3}$/).default('USD'),
+  currency_code: z.string().regex(/^[A-Z]{3}$/).describe(
+    'Official request currency selected by GPT for this quote. No currency is assumed.',
+  ),
   api_version: z.enum(['2021-10-01', '2023-01-01-preview']).default('2023-01-01-preview'),
   next_page_url: z.string().url().max(8000).optional(),
 }).strict();
@@ -72,7 +74,9 @@ const ociPriceQuery = z.object({
   provider: z.literal('oci'),
   query_id: z.string().min(1).max(100),
   part_number: z.string().min(1).max(120).optional(),
-  currency_code: z.string().regex(/^[A-Z]{3}$/).default('USD'),
+  currency_code: z.string().regex(/^[A-Z]{3}$/).describe(
+    'Official request currency selected by GPT for this quote. No currency is assumed.',
+  ),
   response_filters: z.record(z.string().min(1).max(500)).refine(
     (value) => Object.keys(value).length <= 12,
     'At most 12 caller-supplied exact response filters are allowed.',
@@ -86,7 +90,9 @@ const gcpPriceQuery = z.object({
   service_id: z.string().regex(/^[A-Za-z0-9._-]{1,240}$/).optional(),
   page_size: z.number().int().min(1).max(5000).default(5000),
   page_token: z.string().max(4000).optional(),
-  currency_code: z.string().regex(/^[A-Z]{3}$/).default('USD'),
+  currency_code: z.string().regex(/^[A-Z]{3}$/).optional().describe(
+    'Official request currency selected by GPT for this quote. No currency is assumed.',
+  ),
   response_filters: z.record(z.string().min(1).max(500)).refine(
     (value) => Object.keys(value).length <= 12,
     'At most 12 caller-supplied exact response filters are allowed.',
@@ -96,14 +102,26 @@ const gcpPriceQuery = z.object({
   ),
 }).strict();
 
-const responsePath = z.string().regex(
-  /^(?:[A-Za-z0-9_-]{1,120})(?:\.[A-Za-z0-9_-]{1,120}){0,19}$/,
-).max(360);
+function isResponsePath(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 360) return false;
+  if (value.startsWith('/')) {
+    const parts = value.split('/').slice(1);
+    return parts.length <= 20 && parts.every((part) => (
+      !/[\u0000-\u001f]/.test(part) && !/~(?:[^01]|$)/.test(part)
+    ));
+  }
+  return /^(?:[A-Za-z0-9_-]{1,120})(?:\.[A-Za-z0-9_-]{1,120}){0,19}$/.test(value);
+}
+
+const responsePath = z.string().min(1).max(360).refine(
+  isResponsePath,
+  'Use a dotted field path or RFC 6901 JSON Pointer.',
+);
 
 const commercialRateField = z.object({
   unit_price_path: responsePath,
   item_id_path: responsePath.optional(),
-  currency_code: z.string().regex(/^[A-Z]{3}$/).default('CNY'),
+  currency_code: z.string().regex(/^[A-Z]{3}$/).optional(),
   currency_path: responsePath.optional(),
   unit: z.string().min(1).max(120).optional(),
   unit_path: responsePath.optional(),
@@ -111,7 +129,15 @@ const commercialRateField = z.object({
   pricing_model_path: responsePath.optional(),
   tier_start_path: responsePath.optional(),
   tier_end_path: responsePath.optional(),
-}).strict();
+}).strict().superRefine((value, context) => {
+  if (!value.currency_code && !value.currency_path) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Declare currency_path or an official documented currency_code.',
+      path: ['currency_code'],
+    });
+  }
+});
 
 const limitedRecord = (maximum, description) => z.record(jsonValue).refine(
   (value) => Object.keys(value).length <= maximum,
@@ -132,7 +158,9 @@ const authenticatedCloudPriceQueryShape = {
   region: z.string().min(2).max(80).optional(),
   method: z.enum(['GET', 'POST']).optional(),
   path: z.string().min(1).max(1000).optional(),
-  region_parameter: z.enum(['RegionId', 'Region', 'none']).optional(),
+  region_parameter: z.string().regex(/^(?:none|[A-Za-z][A-Za-z0-9_.-]{0,119})$/).optional().describe(
+    'Optional official region parameter name. Prefer placing exact provider parameters in query_parameters or body.',
+  ),
   query_parameters: limitedRecord(100, 'At most 100 official query parameters are allowed.').default({}),
   body: limitedRecord(200, 'At most 200 official request fields are allowed.').default({}),
   response_items_path: responsePath.optional(),
@@ -183,7 +211,29 @@ const getPricesInput = z.object({
   price_batch_id: z.string().regex(/^aqpb_[a-f0-9-]{36}$/).optional().describe(
     'Saved batch to extend during resume. Existing successful query_ids are reused.',
   ),
-}).strict();
+}).strict().superRefine((value, context) => {
+  value.queries.forEach((query, index) => {
+    if (query.provider === 'gcp' && query.operation === 'list_skus' && !query.currency_code) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'GCP SKU price queries require the official request currency.',
+        path: ['queries', index, 'currency_code'],
+      });
+    }
+    if (['tencent', 'alibaba', 'huawei', 'baidu', 'volcengine', 'ctyun'].includes(query.provider)
+      && !query.route_id) {
+      for (const field of ['endpoint', 'service', 'region']) {
+        if (!query[field]) {
+          context.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `A new official route requires GPT to provide ${field}; a learned route may use route_id.`,
+            path: ['queries', index, field],
+          });
+        }
+      }
+    }
+  });
+});
 
 const fact = z.object({
   fact_id: factId,
@@ -212,6 +262,7 @@ const officialPriceEvidence = z.object({
 
 const componentScenarioCost = z.object({
   scenario_key: scenarioKey,
+  label: z.string().min(1).max(40).optional().describe('GPT 根据本次官方方案给出的客户可读名称。'),
   pricing_basis: z.enum(['on_demand', 'reserved', 'provider_commitment', 'on_demand_fallback']),
   monthly_cost: z.string().regex(/^\d+(?:\.\d{1,10})?$/).describe(
     '该组件按客户要求的全部数量计算后的折合月费，不是单台价格。全预付方案须把整批预付额除以合同月数，并加上该方案未覆盖的持续月费。',
@@ -225,6 +276,7 @@ const componentScenarioCost = z.object({
 
 const quoteScenarioTotal = z.object({
   scenario_key: scenarioKey,
+  label: z.string().min(1).max(40).optional().describe('GPT 根据本次官方方案给出的客户可读名称。'),
   monthly_total: z.string().regex(/^\d+(?:\.\d{1,10})?$/).describe(
     '整张报价在该方案下的折合月费，必须等于所有组件整批折合月费之和。',
   ),
@@ -300,7 +352,9 @@ const buildEstimateInput = z.object({
   cloud_provider: cloudProvider,
   relay_job_id: z.string().regex(/^gpt-[a-f0-9]{32}$/).optional().describe('销售前端提供的内部任务编号，用于撤回后的交付保护。'),
   default_region: region,
-  currency: z.string().regex(/^[A-Z]{3}$/).default('USD'),
+  currency: z.string().regex(/^[A-Z]{3}$/).describe(
+    '整张报价使用的官方币种，必须与所选官方费率证据一致；不得静默换汇。',
+  ),
   price_batch_id: z.string().regex(/^aqpb_[a-f0-9-]{36}$/),
   display_result_on_page: z.boolean().optional().describe(
     '兼容字段；当前所有报价均生成 Excel 并返回销售页面，不发送 WebHook。',
@@ -332,12 +386,15 @@ function ok(payload) {
 }
 
 function fail(error) {
+  const retryable = error.retryable === true
+    || ['backend_timeout', 'backend_unavailable'].includes(error.code);
   const payload = {
     status: 'failed',
     code: error.code || 'astraquote_v3_tool_failed',
     message: error.message || 'AstraQuote tool failed.',
     details: error.details || {},
-    retryable: ['backend_timeout', 'backend_unavailable'].includes(error.code),
+    retryable,
+    terminal: !retryable,
   };
   return { isError: true, content: [{ type: 'text', text: JSON.stringify(payload) }] };
 }

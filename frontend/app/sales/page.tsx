@@ -147,12 +147,12 @@ function safeSubmissionError(status: number) {
   return "报价提交失败，请检查填写内容后重试。";
 }
 
-function money(value: string | undefined, currency = "USD") {
+function money(value: string | undefined, currency: string) {
   const amount = Number(value ?? 0);
   const formatted = Number.isFinite(amount)
     ? amount.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
     : "0.00";
-  return `${formatted} ${currency}`;
+  return `${formatted}${currency ? ` ${currency}` : ""}`;
 }
 
 function quoteCopyText(job: RelayJob) {

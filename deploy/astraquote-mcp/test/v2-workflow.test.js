@@ -59,12 +59,13 @@ function quoteInput(priceBatchId, {
   evidence = [{ query_id: 'price-1', official_item_ids: ['item-1'] }],
   monthly = '12.34',
   display = false,
+  currency = 'USD',
 } = {}) {
   return {
     quote_name: 'Official API quote',
     cloud_provider: provider,
     default_region: provider === 'azure' ? 'eastasia' : 'global',
-    currency: 'USD',
+    currency,
     price_batch_id: priceBatchId,
     display_result_on_page: display,
     expected_monthly_total: monthly,
@@ -170,6 +171,7 @@ test('get_prices persists learned official routes and can reuse a route id', asy
         query_id: received.query_id, provider: 'alibaba', status: 'exact',
         official_item_ids: ['item-1'], items: [{ id: 'item-1' }],
         route_verification: {
+          route_contract_version: 2,
           route_fingerprint: 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
           provider: 'alibaba', endpoint: 'business.aliyuncs.com', service: 'bssopenapi',
           action: 'QueryPrice', version: '2017-12-14', region: 'ap-southeast-1',
@@ -434,13 +436,14 @@ test('official evidence cannot cross cloud providers', async (t) => {
   );
 });
 
-test('provider pricing semantics cannot reuse AWS reserved rules for Azure', async (t) => {
+test('provider commitment labels and basis are supplied by GPT instead of hardcoded by provider', async (t) => {
   const { workflow, directory } = fixture();
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const batch = await priceBatch(workflow);
   const input = quoteInput(batch.price_batch_id);
   input.pricing_scenarios = [{
-    scenario_key: 'one_year_commitment', monthly_total: '12.34', upfront_total: '148.08',
+    scenario_key: 'one_year_commitment', label: '1 年官方承诺方案',
+    monthly_total: '12.34', upfront_total: '148.08',
   }];
   input.services[0].scenario_costs = [{
     scenario_key: 'one_year_commitment', pricing_basis: 'reserved',
@@ -448,11 +451,8 @@ test('provider pricing semantics cannot reuse AWS reserved rules for Azure', asy
     price_evidence: [{ query_id: 'price-1', official_item_ids: ['item-1'] }],
   }];
 
-  await assert.rejects(
-    workflow.buildEstimate(input),
-    (error) => error.code === 'provider_pricing_scenario_invalid'
-      && error.details.violations.some((item) => item.includes('provider_commitment_basis_invalid')),
-  );
+  const result = await workflow.buildEstimate(input);
+  assert.equal(result.status, 'displayed_on_page');
 });
 
 test('a signed cloud quote must bind the positive official commercial rate selected by GPT', async (t) => {
@@ -479,6 +479,7 @@ test('a signed cloud quote must bind the positive official commercial rate selec
 
   const input = quoteInput(batch.price_batch_id, {
     provider: 'tencent',
+    currency: 'CNY',
     evidence: [{
       query_id: 'price-1',
       official_item_ids: ['item-1'],
@@ -489,7 +490,27 @@ test('a signed cloud quote must bind the positive official commercial rate selec
   assert.equal(result.status, 'displayed_on_page');
 });
 
-test('OCI public catalog cannot be presented as a one-year public commitment price', async (t) => {
+test('the quote currency must match the selected official commercial rate', async (t) => {
+  const positiveRate = {
+    rate_id: 'tencent:item-1:paid', official_item_id: 'item-1',
+    unit_price: '0.25', currency: 'CNY', unit: 'hour', is_zero_rate: false,
+  };
+  const { workflow, directory } = fixture({ provider: 'tencent', rateCandidates: [positiveRate] });
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const batch = await priceBatch(workflow, 'tencent');
+  await assert.rejects(
+    workflow.buildEstimate(quoteInput(batch.price_batch_id, {
+      provider: 'tencent', currency: 'USD', evidence: [{
+        query_id: 'price-1', official_item_ids: ['item-1'],
+        official_rate_ids: [positiveRate.rate_id],
+      }],
+    })),
+    (error) => error.code === 'official_price_evidence_invalid'
+      && error.details.violations.some((item) => item.includes('price_currency_mismatch')),
+  );
+});
+
+test('MCP accepts a GPT-evidenced provider scenario without a provider-specific denylist', async (t) => {
   const { workflow, directory } = fixture({ provider: 'oci' });
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const batch = await priceBatch(workflow, 'oci');
@@ -503,11 +524,8 @@ test('OCI public catalog cannot be presented as a one-year public commitment pri
     price_evidence: [{ query_id: 'price-1', official_item_ids: ['item-1'] }],
   }];
 
-  await assert.rejects(
-    workflow.buildEstimate(input),
-    (error) => error.code === 'provider_pricing_scenario_invalid'
-      && error.details.violations.some((item) => item.includes('scenario_not_available_for_provider')),
-  );
+  const result = await workflow.buildEstimate(input);
+  assert.equal(result.status, 'displayed_on_page');
 });
 
 test('a component without a commitment discount keeps its on-demand monthly cost', async (t) => {
@@ -579,6 +597,53 @@ test('a structured zero-cost fact cannot be smuggled into a priced component', a
     (error) => error.code === 'official_api_fact_mapping_invalid'
       && error.details.violations.some((item) => item.includes('zero_cost_fact_in_priced_service')),
   );
+});
+
+test('a rejected pricing request is checkpointed as correctable instead of terminal', async (t) => {
+  const { workflow, backend, directory } = fixture();
+  const relayDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-relay-rejected-'));
+  const jobsDirectory = path.join(relayDirectory, 'jobs');
+  fs.mkdirSync(jobsDirectory);
+  const relayJobId = `gpt-${'b'.repeat(32)}`;
+  fs.writeFileSync(path.join(jobsDirectory, `${relayJobId}.json`), JSON.stringify({
+    job_id: relayJobId,
+    submission_code: '4',
+    status: 'processing',
+    quote_options: { cloud_provider: 'baidu', pricing_scenarios: ['on_demand'] },
+  }));
+  const previous = process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+  process.env.ASTRAQUOTE_GPT_RELAY_DIR = relayDirectory;
+  backend.getPrices = async () => {
+    const error = new Error('Correct the request fields.');
+    error.code = 'request_schema_invalid';
+    error.details = {
+      violations: [{ path: 'body.queries.0.region_parameter', message: 'Invalid value' }],
+    };
+    error.retryable = true;
+    throw error;
+  };
+  t.after(() => {
+    if (previous === undefined) delete process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+    else process.env.ASTRAQUOTE_GPT_RELAY_DIR = previous;
+    fs.rmSync(directory, { recursive: true, force: true });
+    fs.rmSync(relayDirectory, { recursive: true, force: true });
+  });
+
+  await assert.rejects(workflow.getPrices({
+    relay_job_id: relayJobId,
+    submission_code: '4',
+    queries: [{ provider: 'baidu', query_id: 'bcc-price', endpoint: 'bcc.sin.baidubce.com' }],
+  }), (error) => error.code === 'request_schema_invalid');
+
+  const status = workflow.getQuoteJobStatus({
+    relay_job_id: relayJobId, submission_code: '4',
+  });
+  assert.equal(status.stage, 'pricing_request_rejected');
+  assert.equal(status.error.retryable, true);
+  assert.equal(status.error.details.violations[0].path, 'body.queries.0.region_parameter');
+  assert.match(workflow.resumeQuoteJob({
+    relay_job_id: relayJobId, submission_code: '4',
+  }).next_action, /Correct the rejected request/);
 });
 
 test('completed relay jobs replay before the processing guard and expose stage-level resume', async (t) => {

@@ -74,7 +74,7 @@ class AzurePriceQuery(StrictModel):
     provider: Literal["azure"] = "azure"
     query_id: str = Field(min_length=1, max_length=100)
     filter: str | None = Field(default=None, max_length=4000)
-    currency_code: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
+    currency_code: str = Field(pattern=r"^[A-Z]{3}$")
     api_version: Literal["2021-10-01", "2023-01-01-preview"] = "2023-01-01-preview"
     next_page_url: str | None = Field(default=None, max_length=8000)
 
@@ -91,7 +91,7 @@ class OciPriceQuery(StrictModel):
     provider: Literal["oci"] = "oci"
     query_id: str = Field(min_length=1, max_length=100)
     part_number: str | None = Field(default=None, min_length=1, max_length=120)
-    currency_code: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
+    currency_code: str = Field(pattern=r"^[A-Z]{3}$")
     response_filters: dict[str, str] = Field(default_factory=dict, max_length=12)
 
     @model_validator(mode="after")
@@ -112,7 +112,7 @@ class GcpPriceQuery(StrictModel):
     )
     page_size: int = Field(default=5000, ge=1, le=5000)
     page_token: str | None = Field(default=None, max_length=4000)
-    currency_code: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
+    currency_code: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
     response_filters: dict[str, str] = Field(default_factory=dict, max_length=12)
     max_pages: int = Field(default=8, ge=1, le=20)
 
@@ -120,6 +120,8 @@ class GcpPriceQuery(StrictModel):
     def validate_operation(self) -> GcpPriceQuery:
         if self.operation == "list_skus" and not self.service_id:
             raise ValueError("list_skus requires service_id")
+        if self.operation == "list_skus" and not self.currency_code:
+            raise ValueError("list_skus requires currency_code")
         if self.operation == "list_services" and self.service_id:
             raise ValueError("list_services does not accept service_id")
         _validate_objective_response_filters(self.response_filters)
@@ -135,7 +137,7 @@ class CommercialRateField(StrictModel):
 
     unit_price_path: str = Field(min_length=1, max_length=360)
     item_id_path: str | None = Field(default=None, min_length=1, max_length=360)
-    currency_code: str = Field(default="CNY", pattern=r"^[A-Z]{3}$")
+    currency_code: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
     currency_path: str | None = Field(default=None, min_length=1, max_length=360)
     unit: str | None = Field(default=None, min_length=1, max_length=120)
     unit_path: str | None = Field(default=None, min_length=1, max_length=360)
@@ -146,6 +148,10 @@ class CommercialRateField(StrictModel):
 
     @model_validator(mode="after")
     def validate_paths(self) -> CommercialRateField:
+        if not self.currency_code and not self.currency_path:
+            raise ValueError(
+                "rate fields require currency_path or an official documented currency_code"
+            )
         for value in (
             self.unit_price_path,
             self.item_id_path,
@@ -170,7 +176,10 @@ class AuthenticatedCatalogQuery(StrictModel):
     region: str = Field(min_length=2, max_length=80)
     method: Literal["GET", "POST"] = "POST"
     path: str = Field(default="/", min_length=1, max_length=1000)
-    region_parameter: Literal["RegionId", "Region", "none"] | None = None
+    region_parameter: str | None = Field(
+        default=None,
+        pattern=r"^(?:none|[A-Za-z][A-Za-z0-9_.-]{0,119})$",
+    )
     query_parameters: dict[str, Any] = Field(default_factory=dict, max_length=100)
     body: dict[str, Any] = Field(default_factory=dict, max_length=200)
     response_items_path: str | None = Field(default=None, min_length=1, max_length=360)
@@ -312,13 +321,15 @@ _SAFE_REST_PATH = re.compile(
     re.IGNORECASE,
 )
 _MUTATING_ACTION = re.compile(
-    r"^(?:create|run|start|stop|restart|reboot|update|modify|delete|remove|"
+    r"^(?:batch)?(?:create|run|launch|start|stop|restart|reboot|execute|invoke|"
+    r"apply|submit|change|update|modify|delete|remove|"
     r"terminate|purchase|buy|pay|renew|resize|upgrade|downgrade|allocate|"
     r"release|bind|unbind|attach|detach|enable|disable|reset|set)",
     re.IGNORECASE,
 )
 _MUTATING_REST_PATH = re.compile(
-    r"/(?:create|run|start|stop|restart|reboot|update|modify|delete|remove|"
+    r"/(?:batch[-_]?)?(?:create|run|launch|start|stop|restart|reboot|"
+    r"execute|invoke|apply|submit|change|update|modify|delete|remove|"
     r"terminate|purchase|buy|pay|renew|resize|upgrade|downgrade|allocate|"
     r"release|bind|unbind|attach|detach|enable|disable|reset|set)(?:/|-|$)",
     re.IGNORECASE,
@@ -347,6 +358,15 @@ def _credentials_available(credentials: dict[str, str]) -> bool:
 
 
 def _validate_response_path(path: str) -> None:
+    if path.startswith("/"):
+        parts = path.split("/")[1:]
+        invalid_escape = any(re.search(r"~(?:[^01]|$)", part) for part in parts)
+        invalid_control = any(any(ord(character) < 32 for character in part) for part in parts)
+        if len(parts) > 20 or invalid_escape or invalid_control:
+            raise ValueError(
+                "official response paths must be dotted fields or RFC 6901 JSON Pointers"
+            )
+        return
     parts = path.split(".")
     if (
         not parts
@@ -358,7 +378,9 @@ def _validate_response_path(path: str) -> None:
             for part in parts
         )
     ):
-        raise ValueError("official response paths must be dotted JSON field paths")
+        raise ValueError(
+            "official response paths must be dotted fields or RFC 6901 JSON Pointers"
+        )
 
 
 def _validate_authenticated_catalog_query(query: AuthenticatedCatalogQuery) -> None:
@@ -380,11 +402,6 @@ def _validate_authenticated_catalog_query(query: AuthenticatedCatalogQuery) -> N
         or "//" in query.path
     ):
         raise ValueError("official API path is invalid")
-    if query.provider in {"tencent", "alibaba", "volcengine"}:
-        if not query.action or not query.version:
-            raise ValueError(f"{query.provider} queries require action and version")
-    if query.region_parameter is not None and query.provider != "alibaba":
-        raise ValueError("region_parameter is only supported for Alibaba RPC APIs")
     if (
         (query.action and _MUTATING_ACTION.match(query.action))
         or _MUTATING_REST_PATH.search(query.path)
@@ -393,6 +410,7 @@ def _validate_authenticated_catalog_query(query: AuthenticatedCatalogQuery) -> N
     if not (
         (query.action and _SAFE_ACTION.match(query.action))
         or _SAFE_REST_PATH.search(query.path)
+        or query.official_source_url
     ):
         raise ValueError("only official read-only discovery or price operations are allowed")
     for key in (*query.query_parameters.keys(), *query.body.keys()):
@@ -947,6 +965,7 @@ def _route_verification(
     )
     return {
         **_route_identity(query),
+        "route_contract_version": 2,
         "route_fingerprint": _route_fingerprint(query),
         "response_schema_hash": _schema_hash(payload),
         "response_items_path": query.response_items_path,
@@ -1047,16 +1066,7 @@ def _identity_status(count: int) -> str:
 
 def _validate_objective_response_filters(filters: dict[str, str]) -> None:
     for field, value in filters.items():
-        parts = field.split(".")
-        if (
-            not parts
-            or any(
-                not part or len(part) > 120 or not part.replace("_", "").isalnum()
-                for part in parts
-            )
-            or len(field) > 360
-        ):
-            raise ValueError("response_filters keys must be dotted official JSON field paths")
+        _validate_response_path(field)
         if not isinstance(value, str) or not value.strip() or len(value) > 500:
             raise ValueError("response_filters values must be non-empty strings")
 
@@ -1065,7 +1075,12 @@ def _candidate_field(candidate: Any, field: str | None) -> Any:
     if not field:
         return None
     current: Any = candidate
-    for part in field.split("."):
+    parts = (
+        [part.replace("~1", "/").replace("~0", "~") for part in field.split("/")[1:]]
+        if field.startswith("/")
+        else field.split(".")
+    )
+    for part in parts:
         if isinstance(current, dict) and part in current:
             current = current[part]
             continue
@@ -1346,7 +1361,7 @@ def _official_rate_candidates(
                 provider,
                 item_id,
                 unit_price=item.get("retailPrice", item.get("unitPrice")),
-                currency=str(item.get("currencyCode") or result.get("currency") or "USD"),
+                currency=str(item.get("currencyCode") or result.get("currency") or ""),
                 unit=item.get("unitOfMeasure"),
                 pricing_model=item.get("type"),
                 description=item.get("meterName") or item.get("productName"),
@@ -1363,13 +1378,13 @@ def _official_rate_candidates(
             localizations = item.get("currencyCodeLocalizations")
             if not isinstance(localizations, list):
                 localizations = [{
-                    "currencyCode": result.get("currency") or "USD",
+                    "currencyCode": result.get("currency") or "",
                     "prices": item.get("prices") or [],
                 }]
             for localization in localizations:
                 if not isinstance(localization, dict):
                     continue
-                currency = str(localization.get("currencyCode") or result.get("currency") or "USD")
+                currency = str(localization.get("currencyCode") or result.get("currency") or "")
                 for index, price in enumerate(localization.get("prices") or []):
                     if not isinstance(price, dict):
                         continue
@@ -1419,7 +1434,7 @@ def _official_rate_candidates(
                         currency=str(
                             unit_price.get("currencyCode")
                             or result.get("currency")
-                            or "USD"
+                            or ""
                         ),
                         unit=expression.get("usageUnit"),
                         description=(

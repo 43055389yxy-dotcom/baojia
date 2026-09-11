@@ -76,6 +76,26 @@ def test_alibaba_rpc_request_flattens_repeated_fields_and_omits_empty_values() -
     assert "ModuleList" not in params
 
 
+def test_alibaba_rpc_request_never_invents_a_region_parameter() -> None:
+    recorder = _RequestRecorder(_Response({"Success": True}))
+    client = OfficialCloudApiClient(_credentials("alibaba"), request=recorder)
+    query = AlibabaPriceQuery(
+        query_id="bss-global",
+        endpoint="business.aliyuncs.com",
+        service="bssopenapi",
+        action="QueryPrice",
+        version="2017-12-14",
+        region="ap-southeast-1",
+        query_parameters={"ProductCode": "ecs"},
+    )
+
+    client.execute(query)
+
+    params = recorder.calls[0][2]["params"]
+    assert "RegionId" not in params
+    assert "Region" not in params
+
+
 def test_official_error_is_structured_before_http_raise_and_never_leaks_signed_url() -> None:
     recorder = _RequestRecorder(
         _Response(

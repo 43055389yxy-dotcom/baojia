@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 import app.aws_main as aws_main
 from app.services.mcp_v2_pricing import (
+    BaiduPriceQuery,
     GetPricesRequest,
     OfficialPricingService,
     PriceQuery,
@@ -403,3 +404,42 @@ def test_v2_api_returns_complete_batch_from_official_pricing_service(monkeypatch
 
     assert response.status_code == 200
     assert response.json()["results"][0]["status"] == "exact"
+
+
+def test_baidu_query_accepts_provider_documented_region_parameter_name() -> None:
+    query = BaiduPriceQuery(
+        query_id="baidu-bcc-singapore",
+        endpoint="bcc.sin.baidubce.com",
+        service="bcc",
+        action="getPrice",
+        region="cn-sin-a",
+        region_parameter="none",
+        method="POST",
+        path="/v1/instance/price",
+        official_source_url="https://cloud.baidu.com/doc/BCC/s/Sk3ip1zrl",
+    )
+    assert query.region_parameter == "none"
+
+
+def test_v2_schema_error_returns_field_details_and_is_retryable(monkeypatch) -> None:
+    monkeypatch.setattr(aws_main.settings, "astraquote_mcp_internal_token", "test-token")
+    response = TestClient(aws_main.app).post(
+        "/api/mcp/v2/prices",
+        json={
+            "queries": [{
+                "provider": "azure",
+                "query_id": "azure-without-currency",
+                "filter": "serviceName eq 'Virtual Machines'",
+            }]
+        },
+        headers={"X-AstraQuote-MCP-Token": "test-token"},
+    )
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload["code"] == "request_schema_invalid"
+    assert payload["retryable"] is True
+    assert any(
+        item["path"].endswith("currency_code")
+        for item in payload["details"]["violations"]
+    )

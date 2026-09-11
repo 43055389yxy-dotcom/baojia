@@ -249,11 +249,16 @@ class OfficialCloudApiClient:
             **query.query_parameters,
             **query.body,
         })
-        region_parameter = getattr(query, "region_parameter", None) or "RegionId"
+        region_parameter = getattr(query, "region_parameter", None)
         has_region = any(
             key.casefold() in {"region", "regionid"} for key in parameters
         )
-        if query.region and region_parameter != "none" and not has_region:
+        if (
+            query.region
+            and region_parameter
+            and region_parameter != "none"
+            and not has_region
+        ):
             parameters[region_parameter] = query.region
         canonical = _encoded_query(parameters)
         string_to_sign = (

@@ -16,6 +16,8 @@ from typing import Any, Literal
 from urllib.parse import quote
 
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
@@ -122,6 +124,29 @@ async def quote_error_handler(request: Request, exc: QuoteError) -> JSONResponse
     return JSONResponse(status_code=exc.http_status, content=payload.model_dump(mode="json"))
 
 
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(request: Request, exc: RequestValidationError):
+    if not request.url.path.startswith("/api/mcp/v2/"):
+        return await request_validation_exception_handler(request, exc)
+    violations = [
+        {
+            "path": ".".join(str(part) for part in error.get("loc", ())),
+            "message": str(error.get("msg") or "Invalid request field."),
+            "type": str(error.get("type") or "validation_error"),
+        }
+        for error in exc.errors()
+    ]
+    return JSONResponse(
+        status_code=422,
+        content={
+            "code": "request_schema_invalid",
+            "message": "AstraQuote 请求字段与官方查价契约不一致，请按字段错误修正后重试。",
+            "details": {"violations": violations},
+            "retryable": True,
+        },
+    )
+
+
 @app.exception_handler(Exception)
 async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResponse:
     logger.exception("Unexpected AstraQuote V2 API failure", exc_info=exc)
@@ -194,7 +219,7 @@ async def mcp_v2_health(request: Request) -> dict[str, Any]:
     _require_mcp_internal_token(request)
     return {
         "status": "ready",
-        "workflow_version": "3.6.0",
+        "workflow_version": "3.7.0",
         "internal_ai_enabled": False,
         "role": "official cloud catalog client",
         "price_sources": [
