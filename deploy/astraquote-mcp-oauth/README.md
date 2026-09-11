@@ -4,14 +4,17 @@ The gateway is packaged inside the single AstraQuote production container. It
 publishes `https://pricing-mcp.tontiancloud.com/mcp` and proxies authenticated
 requests to the loopback-only AstraQuote MCP process.
 
-The public MCP exposes exactly four tools:
+The public MCP exposes exactly seven tools:
 
 1. `describe_service`
 2. `get_attribute_values`
 3. `get_prices`
-4. `build_estimate`
+4. `get_price_results`
+5. `get_quote_job_status`
+6. `resume_quote_job`
+7. `build_estimate`
 
-The first three tools require `pricing:read`; `build_estimate` requires
+The first six tools require `pricing:read`; `build_estimate` requires
 `pricing:write`. Unknown future tools fail closed as writes.
 
 The runtime does not contain a cloud calculator or a browser. `get_prices`
@@ -25,6 +28,14 @@ Production configuration is read from:
 - `/home/ec2-user/astraquote/config/backend.env`
 - `/home/ec2-user/astraquote/config/mcp.env`
 - `/home/ec2-user/astraquote/config/oauth.env`
+
+OAuth client registrations and refresh tokens live in
+`/home/ec2-user/astraquote/data/oauth/oauth.db`, mounted as
+`/data/oauth/oauth.db` inside the container. Jenkins takes a transactionally
+consistent pre-deploy snapshot and refuses to report deployment success if the
+registered-client count decreases after replacement. Readiness also checks the
+complete OAuth schema and SQLite integrity instead of accepting an empty or
+partial database.
 
 Google Cloud catalog access additionally requires `GCP_BILLING_API_KEY` in the
 backend environment. AWS uses the existing signed AWS credentials; Azure Retail

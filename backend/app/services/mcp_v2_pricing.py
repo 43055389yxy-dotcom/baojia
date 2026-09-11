@@ -5,7 +5,7 @@ import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, Literal
 from urllib.parse import quote, urlparse
@@ -847,8 +847,9 @@ class OfficialPricingService:
                 code=f"{query.provider}_credentials_not_configured",
             )
         payload = self._authenticated_request(query)
+        missing = object()
         extracted: Any = (
-            _candidate_field(payload, query.response_items_path)
+            _candidate_field(payload, query.response_items_path, default=missing)
             if query.response_items_path
             else payload
         )
@@ -869,7 +870,56 @@ class OfficialPricingService:
             if query.next_page_path
             else None
         )
+        diagnostics: dict[str, Any] = {
+            "raw_item_count": len(raw_items),
+            "filtered_item_count": len(items),
+        }
+        invalid_shape = (
+            not isinstance(extracted, (dict, list))
+            or any(not isinstance(item, dict) for item in raw_items)
+        )
+        if invalid_shape or not item_ids:
+            reason = (
+                "response_items_path_missing" if extracted is missing else
+                "response_items_type_invalid" if invalid_shape else
+                "response_filters_no_match" if raw_items else
+                "official_empty_result"
+            )
+            diagnostics.update({
+                "not_found_reason": reason,
+                "terminal": False,
+                "retryable": True,
+                "raw_response": payload,
+                "refinement_fields": _objective_refinement_fields(
+                    [item for item in raw_items if isinstance(item, dict)], excluded=set(),
+                ),
+                "recovery": {
+                    "next_action": (
+                        "revalidate_official_response_schema" if invalid_shape else
+                        "review_response_filters_and_pagination" if raw_items else
+                        "review_official_parameters_and_alternate_route"
+                    ),
+                    "reason": reason,
+                    "field": query.response_items_path,
+                },
+            })
+            if invalid_shape:
+                return {
+                    **diagnostics,
+                    "status": "query_failed",
+                    "code": "official_response_schema_invalid",
+                    "error_category": "response_schema",
+                    "message": (
+                        "The requested response path is missing or is not a list of objects. "
+                        "Correct the response contract."
+                    ),
+                    "route_fingerprint": _route_fingerprint(query),
+                    "official_item_ids": [],
+                    "items": [],
+                    "filtered_item_count": 0,
+                }
         return {
+            **diagnostics,
             "status": _identity_status(len(item_ids)),
             "operation": query.action or query.path,
             "official_item_ids": item_ids,
@@ -983,8 +1033,6 @@ def _route_verification(
         "last_verified_at": verified_at.isoformat(),
         "failure_count": 0,
         "confidence": 0.65,
-        "revalidate_after": (verified_at + timedelta(days=7)).isoformat(),
-        "expires_at": (verified_at + timedelta(days=30)).isoformat(),
         "official_source_url": source_url,
     }
 
@@ -1077,9 +1125,9 @@ def _validate_objective_response_filters(filters: dict[str, str]) -> None:
             raise ValueError("response_filters values must be non-empty strings")
 
 
-def _candidate_field(candidate: Any, field: str | None) -> Any:
+def _candidate_field(candidate: Any, field: str | None, *, default: Any = None) -> Any:
     if not field:
-        return None
+        return default
     current: Any = candidate
     parts = (
         [part.replace("~1", "/").replace("~0", "~") for part in field.split("/")[1:]]
@@ -1093,11 +1141,11 @@ def _candidate_field(candidate: Any, field: str | None) -> Any:
         if isinstance(current, list) and part.isdigit():
             index = int(part)
             if index >= len(current):
-                return None
+                return default
             current = current[index]
             continue
         else:
-            return None
+            return default
     return current
 
 

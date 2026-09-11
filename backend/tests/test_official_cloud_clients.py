@@ -133,6 +133,39 @@ def test_official_error_is_structured_before_http_raise_and_never_leaks_signed_u
     assert "Signature" not in str(error)
 
 
+def test_alibaba_unsupported_disk_value_is_a_correctable_parameter_error() -> None:
+    recorder = _RequestRecorder(
+        _Response(
+            {
+                "Code": "InvalidSystemDiskCategory.ValueNotSupported",
+                "Message": "The specified system disk category is not supported.",
+                "RequestId": "request-disk-123",
+            },
+            status_code=400,
+        )
+    )
+    client = OfficialCloudApiClient(_credentials("alibaba"), request=recorder)
+    query = AlibabaPriceQuery(
+        query_id="ecs-price",
+        endpoint="ecs.cn-hangzhou.aliyuncs.com",
+        service="ecs",
+        action="DescribePrice",
+        version="2014-05-26",
+        region="cn-hangzhou",
+    )
+
+    with pytest.raises(OfficialCloudClientError) as captured:
+        client.execute(query)
+
+    error = captured.value
+    assert error.code == "alibaba_invalid_system_disk_category_value_not_supported"
+    assert error.category == "invalid_request"
+    assert error.retryable is True
+    assert error.details["provider_code"] == (
+        "InvalidSystemDiskCategory.ValueNotSupported"
+    )
+
+
 def test_baidu_known_official_hostname_mismatch_uses_chain_verified_tls_only() -> None:
     recorder = _RequestRecorder(_Response({"result": {"items": []}}))
     client = OfficialCloudApiClient(_credentials("baidu"), request=recorder)

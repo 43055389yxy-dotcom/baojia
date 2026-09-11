@@ -171,6 +171,22 @@ def test_readiness_does_not_create_a_missing_database(tmp_path, monkeypatch):
     assert not database_path.exists()
 
 
+def test_readiness_requires_the_complete_oauth_schema(tmp_path, monkeypatch):
+    gateway = load_gateway(tmp_path, monkeypatch)
+    gateway.init_db()
+    with sqlite3.connect(gateway.DB_PATH) as connection:
+        connection.execute('DROP TABLE clients')
+
+    assert gateway.database_ready() is False
+
+
+def test_readiness_rejects_a_corrupt_oauth_database(tmp_path, monkeypatch):
+    gateway = load_gateway(tmp_path, monkeypatch)
+    Path(gateway.DB_PATH).write_bytes(b'not a sqlite database')
+
+    assert gateway.database_ready() is False
+
+
 def test_scope_classification_is_fail_closed(tmp_path, monkeypatch):
     gateway = load_gateway(tmp_path, monkeypatch)
 
@@ -183,6 +199,14 @@ def test_scope_classification_is_fail_closed(tmp_path, monkeypatch):
             "id": 2,
             "method": "tools/call",
             "params": {"name": "get_prices", "arguments": {}},
+        }
+    ).encode()
+    resume = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {"name": "resume_quote_job", "arguments": {}},
         }
     ).encode()
     build = json.dumps(
@@ -212,6 +236,7 @@ def test_scope_classification_is_fail_closed(tmp_path, monkeypatch):
 
     assert gateway.required_scopes_for_payload(initialize) == {"pricing:read"}
     assert gateway.required_scopes_for_payload(prices) == {"pricing:read"}
+    assert gateway.required_scopes_for_payload(resume) == {"pricing:read"}
     assert gateway.required_scopes_for_payload(build) == {"pricing:write"}
     assert gateway.required_scopes_for_payload(removed_tool) == {"pricing:write"}
     assert gateway.required_scopes_for_payload(unknown) == {"pricing:write"}

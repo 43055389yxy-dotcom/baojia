@@ -14,17 +14,33 @@ MCP 只做这些机械动作：调用官方价目 API、保存并返回候选和
 
 ## 查价与选择
 
-`get_prices` 支持一次批量提交多个查询。`queries` 必须是非空数组；每个查询必须带 `provider` 和唯一 `query_id`，其他必填参数由 GPT 在每次调用前读取当前工具 schema，并根据已清洗的标准化组件配置和官方资料自行生成。阶段为 `created` 表示尚未保存价格查询批次：必须先形成结构化查询计划，不得直接空参调用。收到 `created` 后必须在当前回复中立即执行查询，不得只汇报状态、复述计划、列出待办或等待下一轮。工具入参校验返回 `-32602`、`Required at ...` 或其他必填字段错误时，表示 GPT 本次调用遗漏了参数，不表示 AstraQuote 缺少参数定义或官方查价能力。这是可修正的非终态错误：重新读取 schema，补齐参数并重试，不得以此停止报价。恢复已有批次时，工具只返回本次实际新查的增量结果；完整官方原始结果继续保存在后端。需要读取历史结果时使用 `get_price_results` 并明确给出最多 10 个 `query_id`，禁止为了恢复任务反复搬运整个历史批次。
+`get_prices` 支持一次批量提交多个查询。`queries` 必须是非空数组；每个查询必须带 `provider` 和唯一 `query_id`，其他必填参数由 GPT 在每次调用前读取当前工具 schema，并根据已清洗的标准化组件配置和官方资料自行生成。阶段为 `created` 表示尚未保存价格查询批次：必须先形成结构化查询计划，不得直接空参调用。收到 `created` 后必须在当前回复中立即执行查询，不得只汇报状态、复述计划、列出待办或等待下一轮。工具入参校验返回 `-32602`、`Required at ...` 或其他必填字段错误时，表示 GPT 本次调用遗漏了参数，不表示 AstraQuote 缺少参数定义或官方查价能力。这是可修正的非终态错误：重新读取 schema，补齐参数并重试，不得以此停止报价。
+
+长报价必须由 GPT 根据当前查询的宽窄、官方分页规模、候选数量和预计响应体积动态拆成小批，不使用“每批固定 20 个”之类的业务规则。每一批只查询当前组件正式报价真正需要的价格身份，不为试错一次展开全产品、全规格、全地域目录；宽查询先收窄，再继续下一批。所有批次始终属于同一个报价任务、同一个 `price_batch_id`，后台会自动合并，不创建新对话框、不重新提交任务，也不在批次之间暂停等待销售回复。每次调用都沿用工具返回的 `price_batch_id`，已经成功的 `query_id` 会直接复用，只补尚未完成的查询。
+
+恢复已有批次时，工具只返回本次实际新查的增量结果；完整官方原始结果继续保存在后端。若返回 `response_compacted=true`，表示原始结果已安全保存、当前响应为防断流摘要，不是查价失败。GPT 只对确实需要核验或选型的 `detail_query_ids` 调用 `get_price_results`，每次明确给出最多 10 个 `query_id`；不读取不需要的详情，也禁止为了恢复任务反复搬运整个历史批次。完成当前小批后必须继续下一批或构建报价，不得把“已压缩”“分批中”或仍有可执行步骤当成终止原因。
+
+通过 `query_contexts` 告诉 MCP 每条查询的用途和归属：产品目录、规格列表、文档路线验证标记为 `purpose=discovery`；真正用于计价的查询标记为 `purpose=pricing` 并绑定 `component_key`、由 GPT 决定的稳定 `billing_key`，查询某个购买方案时再绑定对应 `scenario_key`。例如同一组件的算力和磁盘是不同计费项，按需与包年是不同方案。它们只是本单工作流元数据，不是官方 API 参数，也不进入道路缓存。不得按 query_id 的名字推测组件，不得把其他产品的查询改个 ID 当成当前产品成功。
+
+换接口、补参数或收窄条件后可使用新的 `query_id`，但同一计费项保持上述归属不变。新查询实际返回可用官方费率后，系统自动把同一归属下更早的未完成尝试标记为 `superseded`，原始记录仍可读取；新查询仍失败或只拿到目录而没有费率时不能关闭原计费项。旧批次没有归属时，GPT 可通过 `query_contexts` 为已保存的查询补充用途/归属，并由新查询的 `supersedes_query_ids` 明确关联旧尝试；不必重查已成功的查询。已绑定的组件、计费项和方案不能串改，也不能把正式计费项改为 discovery 来隐藏缺价。
+
+`incomplete_query_ids` 表示查询尝试的状态，不等于客户尚缺多少组件。`pricing_partial` 也不是禁止调用 `build_estimate` 的门槛。只要 GPT 已逐项确认所有客户组件及所选方案的正式价格证据齐全，就直接用选中的查询和费率构建报价；不再修复已被替代或已不用的探索。目录搜索没有匹配或返回过宽不应阻止其他组件收口。旧客户端不能传 query_contexts 时，也直接提交完整的已选价格证据；最终仍由事实消费、组件归属、官方费率和金额校验决定是否交付。
+
+`not_found` 只说明当前请求没有提取到匹配项，不能据此宣称产品不存在或接口永久不可用。读取 `not_found_reason`、`raw_item_count`、`filtered_item_count` 和 `recovery`：`response_filters_no_match` 表示官方有返回但被筛选掉，结合 `refinement_fields` 检查字段、值和分页；`official_empty_result` 表示这组请求条件返回空列表，检查本次产品代码、站点、区域、购买方式和必填参数，必要时由 GPT 找另一条官方路线。字段路径不存在或返回类型不符会明确返回可修正的 `query_failed / response_schema`；按保存的 `raw_response` 核对真实结构，不可当成无 SKU。只有当前计费项的官方价格证据确实无法取得且已无可执行恢复步骤，才考虑终止。所有选型、参数修正及替代路线继续由 GPT 判断。
+
+探索过程中已经取得真实费率时，GPT 可把该查询从 discovery 补充为带归属的 pricing 并直接复用，避免重复请求。尚未分类的旧失败查询不能自动证明整单永久阻塞，应先由 GPT 核对它是否仍是必要计费项。
 
 - AWS：GPT 提供 `service_code`、区域、Filters 和 OnDemand/Reserved 条款；不调用账号级 Reserved Offering 或 Savings Plans API。
 - Azure：GPT 提供 Retail Prices API 的 OData `filter`、本次官方请求币种和官方分页链接。
 - OCI：GPT 可按官方 `part_number` 和本次官方请求币种查询；不知道 part number 时可提供 `response_filters`，按官方 JSON 字段做精确匹配。
 - GCP：GPT 先列服务，再按 `service_id` 列 SKU；可提供本次官方请求币种、`response_filters` 和 `max_pages`，让 MCP 跨官方分页执行 GPT 指定的精确字段过滤。
-- 腾讯云、阿里云、华为云、百度智能云、火山引擎、天翼云：GPT 根据该厂商官方 API 文档提供精确 `endpoint`、服务、只读查询/询价动作、版本、区域、请求参数、候选列表路径、官方身份路径和费率字段路径。密钥由服务器环境管理，GPT 不得传入或看到。MCP 只校验官方域名和只读动作、签名并发送原请求、机械读取 GPT 指定的官方返回字段；不得补业务参数、替 GPT 选型号或计算金额。
+- 腾讯云、阿里云、华为云、百度智能云、火山引擎、天翼云：GPT 先用云厂商、服务和区域查找已验证道路。只有尚无可用道路时，才根据该厂商官方 API 文档提供精确 `endpoint`、只读查询/询价动作、版本、请求参数、候选列表路径、官方身份路径和费率字段路径。密钥由服务器环境管理，GPT 不得传入或看到。MCP 只校验官方域名和只读动作、签名并发送原请求、机械读取 GPT 指定的官方返回字段；不得补业务参数、替 GPT 选型号或计算金额。
 
-这些厂商的查价道路不得按产品永久写死。接口动作名、区域字段名、币种、计价单位、请求字段、响应字段路径和产品术语都由 GPT 根据本次官方资料与实际官方响应决定，MCP 不设置 USD/CNY、`RegionId`、固定 JSON 路径或固定单位等业务默认值。响应路径既可使用兼容的点路径，也可使用 RFC 6901 JSON Pointer，以便机械读取包含数组下标、斜杠或特殊字符的官方 JSON 字段。未知道路或已失效道路由 GPT 只在官方文档、官方 SDK、官方 OpenAPI、官方价格计算器和该厂商官方域名内查找；第三方网页最多用于发现官方入口，绝不能作为价格证据。GPT 提交新道路时应同时提供 `official_source_url` 和可获得的 `sdk_version`。MCP 会执行只读探测，并在成功返回真实官方身份后保存道路的认证方式、请求/响应 schema 指纹、SDK 版本、验证时间、失败次数、置信度、复验/过期时间和官方来源。报价请求参数和客户 SKU 值不会写入道路库。
+这些厂商的查价道路不得按产品永久写死。接口动作名、区域字段名、币种、计价单位、请求字段、响应字段路径和产品术语都由 GPT 根据本次官方资料与实际官方响应决定，MCP 不设置 USD/CNY、`RegionId`、固定 JSON 路径或固定单位等业务默认值。响应路径既可使用兼容的点路径，也可使用 RFC 6901 JSON Pointer，以便机械读取包含数组下标、斜杠或特殊字符的官方 JSON 字段。未知道路或已失效道路由 GPT 只在官方文档、官方 SDK、官方 OpenAPI、官方价格计算器和该厂商官方域名内查找；第三方网页最多用于发现官方入口，绝不能作为价格证据。GPT 提交新道路时应同时提供 `official_source_url` 和可获得的 `sdk_version`。MCP 会执行只读探测，并在成功返回真实官方身份后把道路和参数字段形状保存到服务器持久化知识库。报价请求参数值、客户 SKU、价格和凭据不会写入道路库。
 
-后续相同云、账号站点、服务和区域优先复用 MCP 初始化说明中列出的 `route_id`，只重新提交本次报价参数。道路记录必须绑定 `market_profile` 与 `credential_scope`，不得跨云、跨账号站点、跨区域复用。道路过期、schema 变化或连续失败时自动降置信度并隔离当前版本，保留旧版本记录供回溯；GPT 随后重新从官方来源查找并只读验证新版本。`get_prices` 返回 `query_failed` 时必须读取 `error_category`、`retryable` 和 `recovery.next_action`：参数缺失就按官方 schema 修正，404 就找官方替代入口，响应结构变化就重新核对官方响应，限流/临时连接故障则安全重试。若工具返回 `request_schema_invalid` 或 `backend_request_schema_invalid`，这是可修正的非终态；必须读取 `details.violations` 的字段路径和原因，修正请求后重试，不能用笼统的 422 报错停止。只要 `terminal=false`，不得向销售报失败或停止任务。
+后续相同云、账号站点、服务和区域先按需检索服务器知识库：在 `get_prices` 中提供 `provider`、`service`、`region` 和本单参数并省略 `endpoint`。唯一匹配时 MCP 机械复用已验证道路；存在多条不同道路时返回候选 `route_id`，由 GPT 选择；没有匹配时 GPT 才重新查询官方资料。道路记录必须绑定 `market_profile` 与 `credential_scope`，不得跨云、跨账号站点、跨区域复用。成功道路不按天数或月份自动删除；只有接口不存在或官方响应结构失效等道路级错误连续出现 3 次才隔离当前版本，旧版本继续保留供回溯，GPT 随后重新从官方来源查找并只读验证新版本。缺少参数、参数格式错误、参数值不支持属于本单参数错误，只记录参数经验并由 GPT 修正，绝不能累计为道路失效。
+
+`get_prices` 返回 `query_failed` 时必须读取 `error_category`、`retryable`、`provider_code`、`pricing_knowledge`、`pricing_route_health` 和 `recovery.next_action`：参数缺失、格式不符或值不支持时，只重新核对被拒绝的字段及其官方允许值，然后使用同一价格批次重新查询；不得因此重新搜索整套产品，更不得把它宣布为不可恢复错误。已缓存道路遇到 404 或响应结构变化时，按 `pricing_route_health.remaining_attempts` 继续重试当前道路；只有第 3 次道路级失败后 `status=quarantined` 才重新查询官方资料寻找新道路。限流、临时连接故障只安全重试，不累计道路失败。若工具返回 `request_schema_invalid` 或 `backend_request_schema_invalid`，这是可修正的非终态；必须读取 `details.violations` 的字段路径和原因，修正请求后重试，不能用笼统的 422 报错停止。只要 `quote_terminal=false`、`terminal=false` 或 `must_continue=true`，不得向销售报失败或停止任务。
 
 所有动态道路仍受同一安全闸门约束：仅允许查询、描述、列举、询价等只读动作；创建、购买、支付、续费、开通、修改、绑定、释放或删除资源的 API 一律拒绝。任何探索都不得关闭整个平台的 TLS 校验。仅百度智能云已确认存在证书主机名问题的官方新加坡 BCC 域名允许受控兼容，并继续校验证书链、禁止跳转、只允许只读请求。
 
@@ -56,7 +72,7 @@ MCP 返回原始官方候选、`official_item_ids`，并把候选中的官方费
 
 所有报价验证通过后都由 `build_estimate` 生成一次 Excel、上传私有 S3、生成 AstraQuote 稳定下载地址，并同时返回结构化 `page_result`，最终状态为 `displayed_on_page`。不存在另一个交付工具，不需要 GPT 记住继续下一步。
 
-中断恢复时先调用 `get_quote_job_status`。`pricing_partial` 只补缺失 `query_id`，`pricing_completed` 复用原 `price_batch_id`，`estimate_validated` 只继续文件和页面交付，`delivery_completed` 直接返回保存结果。相同 `relay_job_id` 或 `idempotency_key` 必须先命中历史成功结果；不得重新查价、重复生成 Excel 或重复交付。
+中断恢复时先调用 `get_quote_job_status`。`pricing_partial` 只补真正缺失的组件价格；旧失败已被新证据覆盖时直接构建报价，不要求历史查询全部成功。`pricing_completed` 复用原 `price_batch_id`，`estimate_validated` 只继续文件和页面交付，`delivery_completed` 直接返回保存结果。相同 `relay_job_id` 或 `idempotency_key` 必须先命中历史成功结果；不得重新查价、重复生成 Excel 或重复交付。
 
 `submission_code` 和 `relay_job_id` 只用于系统内部任务绑定、恢复和撤回保护，不在销售页面展示，也不参与选型或计价。撤回后禁止交付。
 

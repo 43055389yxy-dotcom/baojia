@@ -32,6 +32,9 @@ def test_jenkins_health_checks_explain_the_failure_stage() -> None:
     assert "Restarting the desktop relay through the Docker host systemd" in script
     assert "systemctl --no-pager --full status astraquote-gpt-relay.service" in script
     assert "journalctl --no-pager -u astraquote-gpt-relay.service -n 120" in script
+    assert "snapshot_oauth_database" in script
+    assert "verify_oauth_database_continuity" in script
+    assert "OAuth client registry lost entries during deployment" in script
 
     unit = (root / "deploy/desktop/astraquote-gpt-relay.service").read_text(
         encoding="utf-8"

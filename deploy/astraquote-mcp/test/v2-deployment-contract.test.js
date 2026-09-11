@@ -13,6 +13,9 @@ test('production runs one container and no calculator browser process', () => {
   assert.deepEqual(serviceNames, ['astraquote']);
   assert.match(compose, /ASTRAQUOTE_MCP_PORT:\s*"8200"/);
   assert.match(compose, /OAUTH_PORT:\s*"8001"/);
+  assert.match(compose, /ASTRAQUOTE_MCP_RESULT_MAX_BYTES:\s*"131072"/);
+  assert.match(compose, /DB_PATH:\s*\/data\/oauth\/oauth\.db/);
+  assert.match(compose, /\/home\/ec2-user\/astraquote\/data:\/data/);
   assert.doesNotMatch(compose, /CALCULATOR|generate_calculator_link/i);
 
   const start = fs.readFileSync(path.resolve(__dirname, '..', '..', 'start-production.sh'), 'utf8');

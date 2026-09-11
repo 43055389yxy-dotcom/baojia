@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.8.2';
+const VERSION = '3.10.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -150,7 +150,7 @@ const authenticatedCloudPriceQueryShape = {
     'Previously verified official read-only route. Supply current quote parameters; saved quote-specific values are never reused.',
   ),
   endpoint: z.string().min(4).max(255).optional().describe(
-    'Official provider API hostname only. Protocol, path, credentials and authorization are forbidden.',
+    'Official provider API hostname only. Omit it to look up a previously verified route by provider, service and region. Protocol, path, credentials and authorization are forbidden.',
   ),
   service: z.string().regex(/^[A-Za-z0-9._-]{1,80}$/).optional(),
   action: z.string().regex(/^[A-Za-z0-9._-]{0,160}$/).optional(),
@@ -204,8 +204,28 @@ const priceQuery = z.discriminatedUnion('provider', [
   ctyunPriceQuery,
 ]);
 
+const queryContext = z.object({
+  query_id: z.string().min(1).max(100),
+  purpose: z.enum(['discovery', 'pricing']).describe(
+    'GPT labels catalog exploration as discovery. Pricing attempts belong to a component and billing item.',
+  ),
+  component_key: componentKey.optional(),
+  billing_key: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/).optional().describe(
+    'Stable billing item chosen by GPT, such as compute or storage. Different costs must use different keys.',
+  ),
+  scenario_key: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/).optional(),
+  supersedes_query_ids: z.array(z.string().min(1).max(100)).max(100).optional().describe(
+    'Explicit legacy attempts for the same billing item. They retire only after a replacement returns usable official rates.',
+  ),
+}).strict();
+
 const getPricesInputSchema = z.object({
-  queries: z.array(priceQuery).min(1).max(50),
+  queries: z.array(priceQuery).min(1).max(50).describe(
+    'Current incremental query group. For a long quote, GPT chooses a suitably small group from response complexity and continues the same price_batch_id; this is a transport ceiling, not a required batch size.',
+  ),
+  query_contexts: z.array(queryContext).max(500).optional().describe(
+    'Task bookkeeping only, never sent to a cloud API. May annotate queries in this call or the saved batch. Same component/billing/scenario scope shares a requirement; successful replacement rates retire old failures without deleting history. Omit for legacy clients.',
+  ),
   relay_job_id: z.string().regex(/^gpt-[a-f0-9]{32}$/).optional(),
   submission_code: z.string().regex(/^[1-9]$/).optional(),
   price_batch_id: z.string().regex(/^aqpb_[a-f0-9-]{36}$/).optional().describe(
@@ -224,7 +244,7 @@ const getPricesInput = getPricesInputSchema.superRefine((value, context) => {
     }
     if (['tencent', 'alibaba', 'huawei', 'baidu', 'volcengine', 'ctyun'].includes(query.provider)
       && !query.route_id) {
-      for (const field of ['endpoint', 'service', 'region']) {
+      for (const field of ['service', 'region']) {
         if (!query[field]) {
           context.addIssue({
             code: z.ZodIssueCode.custom,
@@ -410,15 +430,53 @@ function ok(payload) {
   for (const key of [
     'status', 'code', 'price_batch_id', 'quote_id', 'next_action',
     'result_count', 'batch_result_count', 'relay_job_id', 'stage',
-    'terminal', 'must_continue',
+    'terminal', 'quote_terminal', 'must_continue', 'response_compacted',
+    'response_bytes', 'response_bytes_before_compaction', 'response_byte_budget', 'batch_query_count',
+    'completed_query_count', 'incomplete_query_count',
+    'progress_guidance', 'discovery_query_count', 'superseded_query_ids',
   ]) {
     if (payload?.[key] !== undefined) summary[key] = payload[key];
   }
   if (Array.isArray(payload?.results)) {
-    summary.results = payload.results.map((item) => ({
-      query_id: item?.query_id,
-      status: item?.status,
-    }));
+    summary.results = payload.results.map((item) => {
+      const result = {
+        query_id: item?.query_id,
+        status: item?.status,
+      };
+      for (const key of [
+        'terminal', 'retryable', 'error_category', 'code', 'reused_route_id',
+        'not_found_reason', 'raw_item_count', 'filtered_item_count',
+      ]) {
+        if (item?.[key] !== undefined) result[key] = item[key];
+      }
+      if (item?.details?.provider_code) {
+        result.provider_code = item.details.provider_code;
+      }
+      if (item?.recovery) {
+        result.recovery = {
+          next_action: item.recovery.next_action,
+          field: item.recovery.field,
+          parameter: item.recovery.parameter,
+        };
+      }
+      if (Array.isArray(item?.pricing_knowledge)) {
+        result.pricing_knowledge_count = item.pricing_knowledge.length;
+      }
+      if (item?.pricing_route_health) {
+        result.pricing_route_health = item.pricing_route_health;
+      }
+      return result;
+    });
+  }
+  if (Array.isArray(payload?.detail_query_ids)) {
+    summary.detail_query_ids = payload.detail_query_ids;
+  }
+  if (payload?.result_access) summary.result_access = payload.result_access;
+  if (Array.isArray(payload?.learned_routes)) {
+    summary.learned_route_count = payload.learned_routes.length;
+    summary.learned_route_ids = payload.learned_routes
+      .map((route) => route?.route_id)
+      .filter(Boolean);
   }
   return {
     content: [{ type: 'text', text: JSON.stringify(summary) }],
@@ -504,7 +562,7 @@ function buildServer(workflow) {
 
   server.registerTool('get_prices', {
     title: 'Batch query official cloud prices',
-    description: 'Requires a non-empty queries array. Before calling, GPT must read the current input schema and independently provide every required provider-specific field from the normalized quote configuration and official documentation. Dispatches those caller-supplied parameters to the selected cloud provider official catalog API and returns raw candidates. Input validation failures are correctable caller-input errors: fill the omitted fields and retry. needs_refinement is non-terminal: GPT must refine unfinished queries and continue. GPT alone chooses the product and calculates the quote.',
+    description: 'Requires a non-empty incremental queries array. For a long quote, GPT chooses a suitably small current group based on query breadth and expected response size, then continues the same price_batch_id; do not launch speculative catalog scans. Full official results are persisted. If response_compacted=true, read only required details with get_price_results. For an authenticated cloud, first provide provider, service and region while omitting endpoint so AstraQuote can reuse a verified route from its persistent knowledge store. Provide a new official endpoint and response contract only when no cached route matches. Invalid or unsupported parameter values are correctable: use the returned recovery and parameter knowledge, repair only the rejected fields, and retry. needs_refinement and retryable query failures are non-terminal. GPT alone chooses products, parameter values, batch grouping and quote totals.',
     // Keep the JSON Schema visible to MCP clients. ZodEffects produced by
     // superRefine serializes as an empty object in the MCP SDK, so cross-field
     // checks run inside the guarded handler instead.
@@ -535,7 +593,7 @@ function buildServer(workflow) {
 
   server.registerTool('build_estimate', {
     title: 'Validate and deliver an official API quote',
-    description: 'Checks selected official catalog evidence, fact coverage and GPT-calculated totals, then creates one Excel link and returns it with the quote to the sales page.',
+    description: 'Checks selected official catalog evidence, fact coverage and GPT-calculated totals, then creates one Excel link and returns it with the quote to the sales page. A pricing_partial batch is allowed when every required component has usable selected evidence; unused discovery and replaced attempts need not succeed.',
     inputSchema: buildEstimateInput,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, guarded((args) => workflow.buildEstimate(normalizeBuildEstimateInput(args))));

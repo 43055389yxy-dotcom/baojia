@@ -5,6 +5,72 @@ APP_DIR="${WORKSPACE:?Jenkins workspace is unavailable}"
 RELAY_HOST_ROOT="/home/ec2-user/astraquote"
 RELAY_STAGE_NAME=".relay-stage-${GIT_COMMIT:-manual}"
 RELAY_WORKER_COMMAND="/home/ec2-user/astraquote/gpt-relay-venv/bin/python /home/ec2-user/astraquote/source/tools/gpt_quote_relay_worker.py"
+OAUTH_CLIENT_COUNT_BEFORE=""
+
+oauth_client_count() {
+  docker exec astraquote python -c '
+import sqlite3
+connection = sqlite3.connect("file:/data/oauth/oauth.db?mode=ro", uri=True)
+try:
+    print(connection.execute("SELECT count(*) FROM clients").fetchone()[0])
+finally:
+    connection.close()
+'
+}
+
+snapshot_oauth_database() {
+  if ! docker inspect astraquote >/dev/null 2>&1 \
+    || ! docker exec astraquote test -f /data/oauth/oauth.db; then
+    echo "No running OAuth database to snapshot before this deployment"
+    return 0
+  fi
+
+  OAUTH_CLIENT_COUNT_BEFORE="$(oauth_client_count)"
+  case "$OAUTH_CLIENT_COUNT_BEFORE" in
+    ''|*[!0-9]*)
+      echo "Could not verify the existing OAuth client registry" >&2
+      return 1
+      ;;
+  esac
+
+  oauth_backup_path="/data/oauth/backups/oauth-predeploy-$(date -u +%Y%m%dT%H%M%SZ).db"
+  docker exec \
+    -e OAUTH_BACKUP_PATH="$oauth_backup_path" \
+    astraquote python -c '
+import os
+import sqlite3
+from pathlib import Path
+
+source = sqlite3.connect("file:/data/oauth/oauth.db?mode=ro", uri=True)
+target_path = Path(os.environ["OAUTH_BACKUP_PATH"])
+target_path.parent.mkdir(parents=True, exist_ok=True)
+target = sqlite3.connect(target_path)
+try:
+    source.backup(target)
+finally:
+    target.close()
+    source.close()
+target_path.chmod(0o600)
+'
+  echo "OAuth registry snapshot saved before container replacement"
+}
+
+verify_oauth_database_continuity() {
+  if test -z "$OAUTH_CLIENT_COUNT_BEFORE"; then
+    return 0
+  fi
+  oauth_client_count_after="$(oauth_client_count)"
+  case "$oauth_client_count_after" in
+    ''|*[!0-9]*)
+      echo "The deployed OAuth client registry could not be verified" >&2
+      return 1
+      ;;
+  esac
+  if (( oauth_client_count_after < OAUTH_CLIENT_COUNT_BEFORE )); then
+    echo "OAuth client registry lost entries during deployment; refusing to report success" >&2
+    return 1
+  fi
+}
 
 stage_host_browser_relay() {
   echo "Staging the desktop relay source on the Docker host"
@@ -176,6 +242,8 @@ for config_file in \
 done
 test -d /home/ec2-user/astraquote/data
 
+snapshot_oauth_database
+
 # Jenkins 已通过“源码管理”检出代码。将工作区打包送入 Docker，
 # 避免容器内工作区路径与宿主机路径不同导致构建失败。
 tar -C "$APP_DIR" \
@@ -205,6 +273,7 @@ for attempt in {1..24}; do
     && docker exec astraquote curl -fsS http://127.0.0.1:8200/readyz >/dev/null 2>&1 \
     && docker exec astraquote curl -fsS http://127.0.0.1:8001/readyz >/dev/null 2>&1; then
     echo "AstraQuote container endpoints are ready"
+    verify_oauth_database_continuity
     # The logged-in ChatGPT browser worker is a host systemd service, not a
     # container. Keep its source and policy on exactly the same revision as
     # the frontend/backend/MCP before declaring the deployment successful.

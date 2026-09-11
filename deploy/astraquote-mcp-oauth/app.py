@@ -68,6 +68,9 @@ else:
     PASSWORD_SALT = bytes.fromhex(os.environ["PASSWORD_SALT"])
     PASSWORD_DIGEST = bytes.fromhex(os.environ["PASSWORD_DIGEST"])
 DB_PATH = os.environ.get("DB_PATH", "/data/oauth.db")
+OAUTH_REQUIRED_TABLES = frozenset(
+    {"clients", "auth_requests", "auth_codes", "auth_responses", "tokens"}
+)
 ACCESS_TOKEN_TTL = positive_int_env("ACCESS_TOKEN_TTL_SECONDS", 3600)
 REFRESH_TOKEN_TTL = positive_int_env("REFRESH_TOKEN_TTL_SECONDS", 30 * 24 * 3600)
 CODE_TTL = positive_int_env("AUTHORIZATION_CODE_TTL_SECONDS", 300)
@@ -100,6 +103,9 @@ READ_ONLY_TOOLS = {
     "describe_service",
     "get_attribute_values",
     "get_prices",
+    "get_price_results",
+    "get_quote_job_status",
+    "resume_quote_job",
 }
 WRITE_TOOLS = {
     "build_estimate",
@@ -466,10 +472,13 @@ def database_ready() -> bool:
         connection = sqlite3.connect(f"file:{DB_PATH}?mode=ro", timeout=2, uri=True)
         try:
             connection.execute("PRAGMA query_only = ON")
-            row = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tokens'"
-            ).fetchone()
-            return row is not None
+            quick_check = connection.execute("PRAGMA quick_check").fetchone()
+            if quick_check is None or quick_check[0] != "ok":
+                return False
+            rows = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+            return OAUTH_REQUIRED_TABLES.issubset({row[0] for row in rows})
         finally:
             connection.close()
     except sqlite3.Error:

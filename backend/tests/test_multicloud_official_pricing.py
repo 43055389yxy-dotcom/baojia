@@ -57,6 +57,47 @@ class _AuthenticatedRecorder:
         return next(self.payloads)
 
 
+@pytest.mark.parametrize(
+    ("payload", "filters", "status", "reason", "raw_count"),
+    [
+        ({"result": {"items": []}}, {}, "not_found", "official_empty_result", 0),
+        ({"result": {"items": [{"sku": "available", "family": "a"}]}},
+         {"family": "b"}, "not_found", "response_filters_no_match", 1),
+        ({"result": {"prices": [{"sku": "available"}]}}, {},
+         "query_failed", "response_items_path_missing", 0),
+        ({"result": {"items": "invalid"}}, {},
+         "query_failed", "response_items_type_invalid", 0),
+        ({"result": {"items": ["invalid"]}}, {},
+         "query_failed", "response_items_type_invalid", 1),
+    ],
+)
+def test_empty_authenticated_matches_explain_the_actual_failure_without_claiming_no_product(
+    payload: dict[str, Any], filters: dict[str, str], status: str, reason: str, raw_count: int,
+) -> None:
+    service = OfficialPricingService(
+        _UnusedAwsExecutor(), authenticated_request=_AuthenticatedRecorder([payload]),
+        provider_credentials={
+            "alibaba": {"access_key_id": "configured", "secret_access_key": "configured"}
+        },
+    )
+    result = service.get_prices(GetPricesRequest(queries=[AlibabaPriceQuery(
+        query_id="price-attempt", endpoint="business.aliyuncs.com", service="BssOpenApi",
+        action="QuerySkuPriceList", version="2017-12-14", region="cn-hangzhou",
+        response_items_path="result.items", response_filters=filters, item_id_paths=["sku"],
+    )]))["results"][0]
+    assert result["status"] == status
+    assert result["not_found_reason"] == reason
+    assert result["raw_item_count"] == raw_count
+    assert result["filtered_item_count"] == 0
+    assert result["terminal"] is False
+    assert result["retryable"] is True
+    assert result["raw_response"] == payload
+    assert result["recovery"]["next_action"]
+    if reason == "response_filters_no_match":
+        assert any(f["field"] == "family" and "a" in f["candidate_values"]
+                   for f in result["refinement_fields"])
+
+
 def test_azure_and_oci_are_raw_official_catalog_queries() -> None:
     http = _HttpRecorder(
         [
@@ -612,7 +653,8 @@ def test_successful_authenticated_route_returns_verifiable_learning_metadata() -
     assert route["sdk_version"] == "astraquote-direct-signer/1"
     assert route["failure_count"] == 0
     assert route["confidence"] > 0
-    assert route["expires_at"] > route["last_verified_at"]
+    assert "revalidate_after" not in route
+    assert "expires_at" not in route
 
 
 def test_transient_official_transport_failure_is_retried_without_changing_query() -> None:

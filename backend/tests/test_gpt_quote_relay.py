@@ -544,6 +544,9 @@ def test_browser_worker_accepts_the_current_page_delivery_marker() -> None:
     assert 'status in {"displayed_on_page", "delivered"}' in worker
     assert 'if outcome == "continue":' in worker
     assert "browser.continue_quote(active, continuation_prompt)" in worker
+    assert "quote.deadline = quote.stable_since + QUOTE_TIMEOUT_SECONDS" in worker
+    assert "except TimeoutError:" in worker
+    assert "报价等待超时，已在原对话从保存阶段自动继续" in worker
     assert "delivered_without_calculator_link" not in worker
 
 

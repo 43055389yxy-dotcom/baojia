@@ -9,6 +9,9 @@ const { V2QuoteStore } = require('./v2-quote-store');
 const { QuoteDeliveryService } = require('./quote-delivery');
 const { PricingRouteStore } = require('./pricing-route-store');
 const { canFinalizeRelayJob } = require('./relay-job-state');
+const {
+  PROGRESS_GUIDANCE, mergeQueryContexts, queryProgress, assertQueryIdentity, contextEvidenceViolations,
+} = require('./query-lifecycle');
 
 function uniqueComponentKeys(entries) {
   const seen = new Set();
@@ -97,11 +100,147 @@ const SCENARIO_KEYS = Object.freeze([
 ]);
 
 const CREATED_PRICE_NEXT_ACTION = [
-  'Execute now: derive a non-empty queries array from the normalized component configuration',
-  'and current get_prices schema, then call get_prices immediately.',
+  'Execute now: derive a non-empty queries array for the smallest useful current group',
+  'from the normalized component configuration and current get_prices schema, then call get_prices immediately.',
+  'For a long quote, choose groups dynamically from query breadth and expected response size,',
+  'and merge every group into the same returned price_batch_id.',
   'Do not describe or list the remaining steps and do not wait for another turn.',
   'Correct any caller-input validation error and retry in this response.',
 ].join(' ');
+
+const DEFAULT_RESULT_BYTE_BUDGET = 128 * 1024;
+
+function resultByteBudget(value) {
+  const configured = value ?? process.env.ASTRAQUOTE_MCP_RESULT_MAX_BYTES;
+  if (configured === undefined || configured === null || configured === '') {
+    return DEFAULT_RESULT_BYTE_BUDGET;
+  }
+  const parsed = Number(configured);
+  if (!Number.isSafeInteger(parsed) || parsed < 1_024) {
+    throw new Error('ASTRAQUOTE_MCP_RESULT_MAX_BYTES must be an integer of at least 1024.');
+  }
+  return parsed;
+}
+
+function jsonBytes(value) {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8');
+}
+
+function compactRecovery(recovery) {
+  if (!recovery || typeof recovery !== 'object') return undefined;
+  const compact = {};
+  for (const key of ['next_action', 'field', 'parameter', 'reason']) {
+    if (recovery[key] !== undefined) compact[key] = recovery[key];
+  }
+  if (Array.isArray(recovery.candidate_values)) {
+    compact.candidate_values = recovery.candidate_values.slice(0, 10);
+    compact.candidate_value_count = recovery.candidate_values.length;
+  }
+  return Object.keys(compact).length > 0 ? compact : undefined;
+}
+
+function compactRefinementFields(fields) {
+  if (!Array.isArray(fields)) return undefined;
+  return fields.slice(0, 12).map((field) => {
+    if (!field || typeof field !== 'object') return field;
+    const compact = {};
+    for (const key of ['field', 'name', 'path', 'reason', 'description']) {
+      if (field[key] !== undefined) compact[key] = field[key];
+    }
+    if (Array.isArray(field.candidate_values)) {
+      compact.candidate_values = field.candidate_values.slice(0, 10);
+      compact.candidate_value_count = field.candidate_values.length;
+    }
+    return compact;
+  });
+}
+
+function compactPriceResult(item) {
+  const compact = {
+    query_id: item?.query_id,
+    provider: item?.provider,
+    status: item?.status,
+    details_available: true,
+  };
+  for (const key of [
+    'terminal', 'retryable', 'error_category', 'code', 'reused_route_id', 'matched_count',
+    'not_found_reason', 'raw_item_count', 'filtered_item_count',
+  ]) {
+    if (item?.[key] !== undefined) compact[key] = item[key];
+  }
+  if (item?.details?.provider_code !== undefined) {
+    compact.provider_code = item.details.provider_code;
+  }
+  const officialItemIds = Array.isArray(item?.official_item_ids) ? item.official_item_ids : [];
+  if (officialItemIds.length > 0) {
+    compact.official_item_ids = officialItemIds.slice(0, 10);
+    compact.official_item_id_count = officialItemIds.length;
+  }
+  if (Array.isArray(item?.official_rate_candidates)) {
+    compact.official_rate_candidate_count = item.official_rate_candidates.length;
+  }
+  if (Array.isArray(item?.items)) compact.official_item_count = item.items.length;
+  const refinementFields = compactRefinementFields(item?.refinement_fields);
+  if (refinementFields) compact.refinement_fields = refinementFields;
+  const recovery = compactRecovery(item?.recovery);
+  if (recovery) compact.recovery = recovery;
+  if (Array.isArray(item?.pricing_knowledge)) {
+    compact.pricing_knowledge = item.pricing_knowledge.slice(0, 3).map((knowledge) => ({
+      error_category: knowledge?.error_category,
+      provider_code: knowledge?.provider_code,
+      next_action: knowledge?.next_action,
+    }));
+  }
+  if (item?.pricing_route_health) {
+    compact.pricing_route_health = {
+      route_id: item.pricing_route_health.route_id,
+      status: item.pricing_route_health.status,
+      failure_count: item.pricing_route_health.failure_count,
+      remaining_attempts: item.pricing_route_health.remaining_attempts,
+    };
+  }
+  return compact;
+}
+
+function compactLearnedRoute(route) {
+  if (!route || typeof route !== 'object') return route;
+  const compact = {};
+  for (const key of ['route_id', 'query_id', 'provider', 'service', 'status']) {
+    if (route[key] !== undefined) compact[key] = route[key];
+  }
+  return compact;
+}
+
+function compactIncrementalPriceResponse(payload, byteBudget) {
+  const before = jsonBytes(payload);
+  if (before <= byteBudget) {
+    return {
+      ...payload,
+      response_compacted: false,
+      response_bytes: before,
+      response_byte_budget: byteBudget,
+    };
+  }
+  const detailQueryIds = (payload.results || [])
+    .map((item) => item?.query_id)
+    .filter(Boolean);
+  const compacted = {
+    ...payload,
+    results: (payload.results || []).map(compactPriceResult),
+    learned_routes: (payload.learned_routes || []).map(compactLearnedRoute),
+    response_compacted: true,
+    response_bytes_before_compaction: before,
+    response_byte_budget: byteBudget,
+    detail_query_ids: detailQueryIds,
+    result_access: {
+      tool: 'get_price_results',
+      max_query_ids_per_call: 10,
+      instruction: 'Read only the query_ids whose full official evidence is needed.',
+    },
+  };
+  compacted.response_bytes = jsonBytes(compacted);
+  return compacted;
+}
 
 const FREE_ALLOWANCE_REFERENCE = /(?:free\s*tier|always\s*free|free\s*trial|trial\s*credit|promotional\s*credit|account\s*credit|免费额度|免费试用|赠送额度|账户(?:信用|赠送)|零价区间)/i;
 
@@ -458,6 +597,7 @@ class AstraQuoteV2Workflow {
     store = new V2QuoteStore(),
     deliverer = new QuoteDeliveryService(),
     routeStore,
+    resultByteBudget: configuredResultByteBudget,
   }) {
     this.backend = backend;
     this.store = store;
@@ -465,6 +605,7 @@ class AstraQuoteV2Workflow {
     this.routeStore = routeStore || new PricingRouteStore({
       directory: path.join(this.store.directory, 'pricing-routes'),
     });
+    this.resultByteBudget = resultByteBudget(configuredResultByteBudget);
   }
 
   routeInstructions() {
@@ -505,13 +646,20 @@ class AstraQuoteV2Workflow {
       result_count: input.query_ids.length,
       batch_result_count: byId.size,
       results: input.query_ids.map((queryId) => byId.get(queryId)),
+      query_lifecycle: (priceBatch.query_lifecycle || [])
+        .filter((item) => input.query_ids.includes(item.query_id)),
+      progress_guidance: PROGRESS_GUIDANCE,
     };
   }
 
   async getPrices(input) {
     const relayJobId = input.relay_job_id || null;
     if (relayJobId) assertRelayIdentity(input);
-    const materializedQueries = input.queries.map((query) => this.routeStore.materialize(query));
+    const resolvedQueries = input.queries.map((query) => this.routeStore.resolve(query));
+    const materializedQueries = resolvedQueries.map((resolved) => resolved.query);
+    const resolvedByQueryId = new Map(
+      resolvedQueries.map((resolved) => [resolved.query.query_id, resolved]),
+    );
     const queryIds = materializedQueries.map((query) => query.query_id);
     if (new Set(queryIds).size !== queryIds.length) {
       const error = new Error('Every official price query must have a unique query_id.');
@@ -532,6 +680,12 @@ class AstraQuoteV2Workflow {
     );
     const existingQueries = new Map(
       (existing?.request?.queries || []).map((item) => [item.query_id, item]),
+    );
+    assertQueryIdentity(existingQueries, materializedQueries);
+    const mergedQueries = new Map(existingQueries);
+    for (const query of materializedQueries) mergedQueries.set(query.query_id, query);
+    const queryContexts = mergeQueryContexts(
+      existing?.query_contexts, input.query_contexts, mergedQueries,
     );
     const pendingQueries = [];
     for (const query of materializedQueries) {
@@ -569,21 +723,42 @@ class AstraQuoteV2Workflow {
       }
       throw error;
     }
+    result = {
+      ...result,
+      results: (result.results || []).map((item) => {
+        const resolved = resolvedByQueryId.get(item.query_id);
+        return resolved?.route
+          ? { ...item, reused_route_id: resolved.route.route_id }
+          : item;
+      }),
+    };
     const learnedRoutes = this.routeStore.recordBatch(pendingQueries, result.results || []);
+    result = {
+      ...result,
+      results: (result.results || []).map((item) => {
+        const resolved = resolvedByQueryId.get(item.query_id);
+        const query = resolved?.query;
+        const pricingKnowledge = query ? this.routeStore.knowledgeForQuery(query) : [];
+        const routeHealth = resolved?.route
+          ? this.routeStore.healthForRoute(resolved.route.route_id)
+          : null;
+        return {
+          ...item,
+          ...(pricingKnowledge.length > 0 ? { pricing_knowledge: pricingKnowledge } : {}),
+          ...(routeHealth ? { pricing_route_health: routeHealth } : {}),
+        };
+      }),
+    };
     const priceBatchId = existing?.price_batch_id || `aqpb_${randomUUID()}`;
     const mergedResults = new Map(existingResults);
     for (const item of result.results || []) mergedResults.set(item.query_id, item);
-    const mergedQueries = new Map(existingQueries);
-    for (const query of materializedQueries) mergedQueries.set(query.query_id, query);
-    const incompleteQueryIds = [...mergedQueries.keys()].filter((queryId) => {
-      const item = mergedResults.get(queryId);
-      return !item || !['exact', 'ambiguous'].includes(item.status);
-    });
-    const completed = incompleteQueryIds.length === 0;
+    const progress = queryProgress([...mergedQueries.values()], [...mergedResults.values()], queryContexts);
+    const incompleteQueryIds = progress.incomplete_query_ids;
+    const completed = progress.status === 'completed';
     const mergedResult = {
-      status: completed ? 'completed' : 'needs_refinement',
-      terminal: completed,
-      next_action: completed ? 'build_estimate' : 'refine_incomplete_queries',
+      status: progress.status,
+      terminal: progress.terminal,
+      next_action: progress.next_action,
       result_count: mergedResults.size,
       results: [...mergedResults.values()],
     };
@@ -594,6 +769,8 @@ class AstraQuoteV2Workflow {
       updated_at: new Date().toISOString(),
       relay_job_id: relayJobId,
       request: { queries: [...mergedQueries.values()] },
+      query_contexts: queryContexts,
+      query_lifecycle: progress.query_lifecycle,
       result: mergedResult,
     });
     if (relayJobId) {
@@ -601,16 +778,30 @@ class AstraQuoteV2Workflow {
         stage: completed ? 'pricing_completed' : 'pricing_partial',
         price_batch_id: priceBatchId,
         incomplete_query_ids: incompleteQueryIds,
+        batch_query_count: mergedQueries.size,
+        completed_query_count: progress.completed_query_count,
+        incomplete_query_count: incompleteQueryIds.length,
+        superseded_query_ids: progress.superseded_query_ids,
+        discovery_query_count: progress.discovery_query_count,
+        progress_guidance: PROGRESS_GUIDANCE,
       });
     }
-    return {
+    return compactIncrementalPriceResponse({
       status: mergedResult.status,
       terminal: mergedResult.terminal,
+      quote_terminal: progress.quote_terminal,
+      must_continue: !progress.quote_terminal,
       next_action: mergedResult.next_action,
       result_count: (result.results || []).length,
       batch_result_count: mergedResults.size,
       results: result.results || [],
       incomplete_query_ids: incompleteQueryIds,
+      superseded_query_ids: progress.superseded_query_ids,
+      discovery_query_count: progress.discovery_query_count,
+      progress_guidance: PROGRESS_GUIDANCE,
+      query_lifecycle: progress.query_lifecycle.filter((item) => (
+        queryIds.includes(item.query_id) || item.state === 'superseded'
+      )),
       price_batch_id: priceBatchId,
       learned_routes: learnedRoutes,
       resumed_batch: Boolean(existing),
@@ -618,7 +809,7 @@ class AstraQuoteV2Workflow {
         .filter((query) => !pendingQueries.includes(query))
         .map((query) => query.query_id),
       queried_query_ids: pendingQueries.map((query) => query.query_id),
-    };
+    }, this.resultByteBudget);
   }
 
   getQuoteJobStatus(input) {
@@ -640,6 +831,12 @@ class AstraQuoteV2Workflow {
       stage: checkpoint.stage,
       price_batch_id: checkpoint.price_batch_id || null,
       incomplete_query_ids: checkpoint.incomplete_query_ids || [],
+      batch_query_count: checkpoint.batch_query_count,
+      completed_query_count: checkpoint.completed_query_count,
+      incomplete_query_count: checkpoint.incomplete_query_count,
+      superseded_query_ids: checkpoint.superseded_query_ids || [],
+      discovery_query_count: checkpoint.discovery_query_count,
+      progress_guidance: PROGRESS_GUIDANCE,
       quote_id: checkpoint.quote_id || null,
       failed_stage: checkpoint.failed_stage || null,
       error: checkpoint.error || undefined,
@@ -652,7 +849,7 @@ class AstraQuoteV2Workflow {
     const nextActions = {
       created: CREATED_PRICE_NEXT_ACTION,
       pricing_request_rejected: 'Correct the rejected request using the saved field-level details, then retry get_prices.',
-      pricing_partial: 'Query only incomplete_query_ids; keep the saved price batch.',
+      pricing_partial: `Continue the next missing component price in the same price_batch_id. ${PROGRESS_GUIDANCE}`,
       pricing_completed: 'Reuse price_batch_id and continue with build_estimate.',
       estimate_validated: 'Resume artifact generation and sales-page delivery only.',
       artifacts_generated: 'Reuse the existing Excel artifact and finish the completion receipt.',
@@ -677,7 +874,7 @@ class AstraQuoteV2Workflow {
     const priceResults = new Map(
       (priceBatch.result.results || []).map((result) => [result.query_id, result]),
     );
-    const violations = [];
+    const violations = contextEvidenceViolations(input, priceBatch, evidenceReferences);
     for (const component of input.services) {
       const refs = [
         ...evidenceReferences(component),
@@ -824,7 +1021,8 @@ class AstraQuoteV2Workflow {
     if (violations.length > 0) {
       const error = new Error('Official price evidence is missing or ambiguous.');
       error.code = 'official_price_evidence_invalid';
-      error.details = { violations };
+      error.retryable = true;
+      error.details = { violations, next_action: 'repair_selected_component_price_evidence' };
       throw error;
     }
   }
@@ -984,6 +1182,12 @@ class AstraQuoteV2Workflow {
     this.validatePriceEvidence(normalizedInput, priceBatch);
     this.validateZeroCostEvidence(normalizedInput, priceBatch);
     const compiled = prepareOfficialApiSubmission(normalizedInput);
+    const selectedQueryIds = new Set([
+      ...(normalizedInput.services || []), ...(normalizedInput.zero_cost_services || []),
+    ].flatMap((component) => [
+      ...evidenceReferences(component),
+      ...(component.scenario_costs || []).flatMap(evidenceReferences),
+    ]).map((ref) => ref.query_id));
     const quoteId = `aqv2_${randomUUID()}`;
     const record = {
       schema_version: 'astraquote-v3-quote/1',
@@ -1007,7 +1211,7 @@ class AstraQuoteV2Workflow {
       resource_ir: normalizedInput.services,
       zero_cost_ir: normalizedInput.zero_cost_services || [],
       billing_usage_ir: compiled.billing_usage_ir,
-      price_ir: priceBatch.result.results,
+      price_ir: priceBatch.result.results.filter((result) => selectedQueryIds.has(result.query_id)),
       expected_monthly_total: normalizedInput.expected_monthly_total,
       pricing_scenarios: normalizedInput.pricing_scenarios || [],
       assumptions: normalizedInput.assumptions || [],

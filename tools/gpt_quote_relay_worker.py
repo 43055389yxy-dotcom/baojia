@@ -745,6 +745,7 @@ class ChatGptBrowser:
         quote.minimum_assistant_messages = assistant_count + 1
         quote.last_text = ""
         quote.stable_since = time.monotonic()
+        quote.deadline = quote.stable_since + QUOTE_TIMEOUT_SECONDS
         quote.saw_assistant = False
         quote.retry_visible_since = None
         quote.retry_clicked = False
@@ -879,6 +880,34 @@ def fail_continuation_limit(store: GptQuoteRelayStore, job_id: str) -> None:
     )
 
 
+def continue_from_saved_stage(
+    store: GptQuoteRelayStore,
+    browser: ChatGptBrowser,
+    active: ActiveQuote,
+    *,
+    message: str,
+) -> bool:
+    """Resume one unfinished quote in the same conversation without source text."""
+
+    latest = store.get(active.job_id)
+    attempts = int(latest.get("continuation_attempts") or 0)
+    if attempts >= MAX_CONTINUATION_ATTEMPTS:
+        fail_continuation_limit(store, active.job_id)
+        return False
+    continuation_prompt = build_quote_continuation_prompt(
+        relay_job_id=active.job_id,
+        submission_code=str(latest.get("submission_code") or ""),
+    )
+    browser.continue_quote(active, continuation_prompt)
+    store.update_if_not_cancelled(
+        active.job_id,
+        {"continuation_attempts": attempts + 1},
+        stage="continuing",
+        message=message,
+    )
+    return True
+
+
 def fail_job(store: GptQuoteRelayStore, job_id: str, exc: Exception) -> None:
     current = store.get(job_id)
     if current.get("status") == "cancelled":
@@ -977,27 +1006,31 @@ def main() -> int:
                         continue
                     outcome = complete_job(store, job_id, response)
                     if outcome == "continue":
-                        latest = store.get(job_id)
-                        attempts = int(latest.get("continuation_attempts") or 0)
-                        if attempts >= MAX_CONTINUATION_ATTEMPTS:
-                            fail_continuation_limit(store, job_id)
+                        if not continue_from_saved_stage(
+                            store,
+                            browser,
+                            active,
+                            message="报价尚未完成，已在原对话从保存阶段自动继续",
+                        ):
                             browser.close_quote(active)
                             active_quotes.pop(job_id, None)
-                            continue
-                        continuation_prompt = build_quote_continuation_prompt(
-                            relay_job_id=job_id,
-                            submission_code=str(latest.get("submission_code") or ""),
-                        )
-                        browser.continue_quote(active, continuation_prompt)
-                        store.update_if_not_cancelled(
-                            job_id,
-                            {"continuation_attempts": attempts + 1},
-                            stage="continuing",
-                            message="报价尚未完成，已在原对话从保存阶段自动继续",
-                        )
                         continue
                     browser.close_quote(active)
                     active_quotes.pop(job_id, None)
+                except TimeoutError:
+                    current = store.reconcile_delivery_receipt(job_id)
+                    if current.get("status") == "completed":
+                        browser.close_quote(active)
+                        active_quotes.pop(job_id, None)
+                        continue
+                    if not continue_from_saved_stage(
+                        store,
+                        browser,
+                        active,
+                        message="报价等待超时，已在原对话从保存阶段自动继续",
+                    ):
+                        browser.close_quote(active)
+                        active_quotes.pop(job_id, None)
                 except Exception as exc:
                     if is_transient_browser_poll_exception(exc):
                         # ChatGPT replaces live DOM nodes while generating. The

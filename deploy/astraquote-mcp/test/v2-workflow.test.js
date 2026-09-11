@@ -11,6 +11,7 @@ const { V2QuoteStore } = require('../lib/v2-quote-store');
 
 function fixture({
   status = 'exact', provider = 'azure', itemIds = ['item-1'], rateCandidates = [],
+  resultByteBudget,
 } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-api-workflow-'));
   const delivered = [];
@@ -50,6 +51,7 @@ function fixture({
       backend,
       store: new V2QuoteStore({ directory }),
       deliverer,
+      resultByteBudget,
     }),
   };
 }
@@ -119,6 +121,25 @@ test('get_prices stores raw official evidence without choosing or calculating', 
   assert.equal(result.monthly_total, undefined);
 });
 
+test('a legacy partial batch can deliver with selected complete evidence and keeps unused attempts only in the batch', async (t) => {
+  const { workflow, backend, directory, displayed } = fixture();
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const batch = await priceBatch(workflow);
+  backend.getPrices = async () => ({ results: [{
+    query_id: 'unused-discovery', provider: 'azure', status: 'not_found', official_item_ids: [],
+  }] });
+  const partial = await workflow.getPrices({
+    price_batch_id: batch.price_batch_id,
+    queries: [{ query_id: 'unused-discovery', provider: 'azure', filter: 'missing' }],
+  });
+  assert.equal(partial.status, 'needs_refinement');
+  const result = await workflow.buildEstimate(quoteInput(batch.price_batch_id));
+  assert.equal(result.status, 'displayed_on_page');
+  assert.equal(displayed.length, 1);
+  assert.deepEqual(workflow.store.get(result.quote_id).price_ir.map((r) => r.query_id), ['price-1']);
+  assert.equal(workflow.store.getPriceBatch(batch.price_batch_id).result.results.length, 2);
+});
+
 test('resuming a price batch queries only unfinished ids and reuses successful results', async (t) => {
   const { workflow, directory, backend } = fixture({ status: 'needs_refinement', itemIds: [] });
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -184,6 +205,53 @@ test('resumed get_prices returns only this call delta instead of the whole store
 
   assert.deepEqual(resumed.results.map((item) => item.query_id), ['new']);
   assert.equal(resumed.batch_result_count, 2);
+  assert.equal(resumed.response_compacted, false);
+});
+
+test('large get_prices deltas are compacted while complete official evidence stays retrievable', async (t) => {
+  const { workflow, directory, backend } = fixture({ resultByteBudget: 1_400 });
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  backend.getPrices = async (input) => ({
+    status: 'completed',
+    result_count: input.queries.length,
+    results: input.queries.map((query, index) => ({
+      query_id: query.query_id,
+      provider: 'azure',
+      status: 'exact',
+      official_item_ids: [`item-${index}`],
+      official_rate_candidates: [{
+        rate_id: `rate-${index}`,
+        official_item_id: `item-${index}`,
+        unit_price: '1.23',
+        currency: 'USD',
+      }],
+      items: [{
+        id: `item-${index}`,
+        official_payload: 'x'.repeat(4_000),
+      }],
+    })),
+  });
+
+  const result = await workflow.getPrices({
+    queries: [
+      { provider: 'azure', query_id: 'large-1', filter: 'first' },
+      { provider: 'azure', query_id: 'large-2', filter: 'second' },
+    ],
+  });
+
+  assert.equal(result.response_compacted, true);
+  assert.ok(result.response_bytes_before_compaction > result.response_byte_budget);
+  assert.deepEqual(result.detail_query_ids, ['large-1', 'large-2']);
+  assert.equal(result.results[0].details_available, true);
+  assert.equal(result.results[0].items, undefined);
+  assert.equal(result.results[0].official_rate_candidates, undefined);
+
+  const saved = workflow.getPriceResults({
+    price_batch_id: result.price_batch_id,
+    query_ids: ['large-1'],
+  });
+  assert.equal(saved.results[0].items[0].official_payload.length, 4_000);
+  assert.equal(saved.results[0].official_rate_candidates[0].rate_id, 'rate-0');
 });
 
 test('get_prices persists learned official routes and can reuse a route id', async (t) => {
@@ -208,8 +276,7 @@ test('get_prices persists learned official routes and can reuse a route id', asy
           response_schema_hash: 'sha256:res', sdk_version: 'astraquote-direct-signer/1',
           official_source_url: 'https://help.aliyun.com/document_detail/87913.html',
           last_verified_at: '2026-09-11T00:00:00.000Z',
-          revalidate_after: '2026-09-18T00:00:00.000Z',
-          expires_at: '2026-10-11T00:00:00.000Z', confidence: 0.75, failure_count: 0,
+          confidence: 0.75, failure_count: 0,
         },
       }],
     };
@@ -233,6 +300,15 @@ test('get_prices persists learned official routes and can reuse a route id', asy
   assert.equal(received.endpoint, 'business.aliyuncs.com');
   assert.equal(received.action, 'QueryPrice');
   assert.deepEqual(received.query_parameters, { ProductCode: 'rds' });
+
+  await workflow.getPrices({ queries: [{
+    provider: 'alibaba', query_id: 'route-auto-reused', service: 'bssopenapi',
+    region: 'ap-southeast-1', query_parameters: { ProductCode: 'oss' },
+    body: {}, response_filters: {},
+  }] });
+  assert.equal(received.endpoint, 'business.aliyuncs.com');
+  assert.equal(received.action, 'QueryPrice');
+  assert.deepEqual(received.query_parameters, { ProductCode: 'oss' });
 });
 
 test('build validates selected official evidence then delivers', async (t) => {
