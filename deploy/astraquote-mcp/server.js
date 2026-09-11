@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.8.0';
+const VERSION = '3.8.1';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -204,14 +204,16 @@ const priceQuery = z.discriminatedUnion('provider', [
   ctyunPriceQuery,
 ]);
 
-const getPricesInput = z.object({
+const getPricesInputSchema = z.object({
   queries: z.array(priceQuery).min(1).max(50),
   relay_job_id: z.string().regex(/^gpt-[a-f0-9]{32}$/).optional(),
   submission_code: z.string().regex(/^[1-9]$/).optional(),
   price_batch_id: z.string().regex(/^aqpb_[a-f0-9-]{36}$/).optional().describe(
     'Saved batch to extend during resume. Existing successful query_ids are reused.',
   ),
-}).strict().superRefine((value, context) => {
+}).strict();
+
+const getPricesInput = getPricesInputSchema.superRefine((value, context) => {
   value.queries.forEach((query, index) => {
     if (query.provider === 'gcp' && query.operation === 'list_skus' && !query.currency_code) {
       context.addIssue({
@@ -234,6 +236,21 @@ const getPricesInput = z.object({
     }
   });
 });
+
+function parseGetPricesInput(args) {
+  const parsed = getPricesInput.safeParse(args);
+  if (parsed.success) return parsed.data;
+  const error = new Error('Correct the get_prices input fields and retry.');
+  error.code = 'request_schema_invalid';
+  error.retryable = true;
+  error.details = {
+    violations: parsed.error.issues.map((issue) => ({
+      path: issue.path.join('.'),
+      message: issue.message,
+    })),
+  };
+  throw error;
+}
 
 const getPriceResultsInput = z.object({
   price_batch_id: z.string().regex(/^aqpb_[a-f0-9-]{36}$/),
@@ -486,10 +503,13 @@ function buildServer(workflow) {
 
   server.registerTool('get_prices', {
     title: 'Batch query official cloud prices',
-    description: 'Dispatches caller-supplied parameters to the selected cloud provider official catalog API and returns raw candidates. needs_refinement is non-terminal: GPT must refine unfinished queries and continue. GPT alone chooses the product and calculates the quote.',
-    inputSchema: getPricesInput,
+    description: 'Requires a non-empty queries array. Before calling, GPT must read the current input schema and independently provide every required provider-specific field from the normalized quote configuration and official documentation. Dispatches those caller-supplied parameters to the selected cloud provider official catalog API and returns raw candidates. Input validation failures are correctable caller-input errors: fill the omitted fields and retry. needs_refinement is non-terminal: GPT must refine unfinished queries and continue. GPT alone chooses the product and calculates the quote.',
+    // Keep the JSON Schema visible to MCP clients. ZodEffects produced by
+    // superRefine serializes as an empty object in the MCP SDK, so cross-field
+    // checks run inside the guarded handler instead.
+    inputSchema: getPricesInputSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, guarded((args) => workflow.getPrices(args)));
+  }, guarded((args) => workflow.getPrices(parseGetPricesInput(args))));
 
   server.registerTool('get_price_results', {
     title: 'Read selected saved official price results',
@@ -595,6 +615,7 @@ module.exports = {
   describeServiceInput,
   fail,
   getPricesInput,
+  getPricesInputSchema,
   getPriceResultsInput,
   guarded,
   normalizeBuildEstimateInput,

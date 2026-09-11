@@ -673,6 +673,40 @@ test('a rejected pricing request is checkpointed as correctable instead of termi
   }).next_action, /Correct the rejected request/);
 });
 
+test('a created relay job tells GPT to build non-empty queries before price lookup', (t) => {
+  const { workflow, directory } = fixture();
+  const relayDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-relay-created-'));
+  const jobsDirectory = path.join(relayDirectory, 'jobs');
+  fs.mkdirSync(jobsDirectory);
+  const relayJobId = `gpt-${'d'.repeat(32)}`;
+  fs.writeFileSync(path.join(jobsDirectory, `${relayJobId}.json`), JSON.stringify({
+    job_id: relayJobId,
+    submission_code: '9',
+    status: 'processing',
+    quote_options: { cloud_provider: 'alibaba', pricing_scenarios: ['on_demand'] },
+  }));
+  const previous = process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+  process.env.ASTRAQUOTE_GPT_RELAY_DIR = relayDirectory;
+  t.after(() => {
+    if (previous === undefined) delete process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+    else process.env.ASTRAQUOTE_GPT_RELAY_DIR = previous;
+    fs.rmSync(directory, { recursive: true, force: true });
+    fs.rmSync(relayDirectory, { recursive: true, force: true });
+  });
+
+  const status = workflow.getQuoteJobStatus({
+    relay_job_id: relayJobId, submission_code: '9',
+  });
+  const resumed = workflow.resumeQuoteJob({
+    relay_job_id: relayJobId, submission_code: '9',
+  });
+
+  assert.equal(status.stage, 'created');
+  assert.match(status.next_action, /non-empty queries array/);
+  assert.match(resumed.next_action, /non-empty queries array/);
+  assert.match(resumed.next_action, /correctable caller-input error/);
+});
+
 test('completed relay jobs replay before the processing guard and expose stage-level resume', async (t) => {
   const { workflow, directory, displayed } = fixture();
   const relayDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-relay-resume-'));

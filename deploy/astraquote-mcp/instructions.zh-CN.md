@@ -14,7 +14,7 @@ MCP 只做这些机械动作：调用官方价目 API、保存并返回候选和
 
 ## 查价与选择
 
-`get_prices` 支持一次批量提交多个查询。每个查询必须带 `provider` 和唯一 `query_id`，其他参数全部由 GPT 根据当前官方返回继续缩小或分页。恢复已有批次时，工具只返回本次实际新查的增量结果；完整官方原始结果继续保存在后端。需要读取历史结果时使用 `get_price_results` 并明确给出最多 10 个 `query_id`，禁止为了恢复任务反复搬运整个历史批次。
+`get_prices` 支持一次批量提交多个查询。`queries` 必须是非空数组；每个查询必须带 `provider` 和唯一 `query_id`，其他必填参数由 GPT 在每次调用前读取当前工具 schema，并根据已清洗的标准化组件配置和官方资料自行生成。阶段为 `created` 表示尚未保存价格查询批次：必须先形成结构化查询计划，不得直接空参调用。工具入参校验返回 `-32602`、`Required at ...` 或其他必填字段错误时，表示 GPT 本次调用遗漏了参数，不表示 AstraQuote 缺少参数定义或官方查价能力。这是可修正的非终态错误：重新读取 schema，补齐参数并重试，不得以此停止报价。恢复已有批次时，工具只返回本次实际新查的增量结果；完整官方原始结果继续保存在后端。需要读取历史结果时使用 `get_price_results` 并明确给出最多 10 个 `query_id`，禁止为了恢复任务反复搬运整个历史批次。
 
 - AWS：GPT 提供 `service_code`、区域、Filters 和 OnDemand/Reserved 条款；不调用账号级 Reserved Offering 或 Savings Plans API。
 - Azure：GPT 提供 Retail Prices API 的 OData `filter`、本次官方请求币种和官方分页链接。

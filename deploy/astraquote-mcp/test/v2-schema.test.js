@@ -44,11 +44,18 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
     'resume_quote_job',
     'build_estimate',
   ]);
+  const getPrices = listed.tools.find((tool) => tool.name === 'get_prices');
+  assert.ok(getPrices.inputSchema.required.includes('queries'));
+  assert.equal(getPrices.inputSchema.properties.queries.type, 'array');
+  assert.match(JSON.stringify(getPrices.inputSchema.properties.queries), /provider/);
+  assert.match(JSON.stringify(getPrices.inputSchema.properties.queries), /query_id/);
   assert.match(INSTRUCTIONS, /GPT.*理解.*选择.*计算/s);
   assert.match(INSTRUCTIONS, /AWS.*Azure.*Oracle.*Google.*腾讯云.*阿里云.*华为云.*百度智能云.*火山引擎.*天翼云/s);
   assert.match(INSTRUCTIONS, /官方文档.*官方 SDK/s);
   assert.match(INSTRUCTIONS, /route_id.*连续失败.*隔离/s);
   assert.match(INSTRUCTIONS, /第三方网页.*绝不能作为价格证据/s);
+  assert.match(INSTRUCTIONS, /工具入参校验.*可修正.*重试/s);
+  assert.match(INSTRUCTIONS, /queries.*非空/s);
   assert.doesNotMatch(INSTRUCTIONS, /Calculator|import_estimate|模板映射/i);
 });
 
@@ -140,6 +147,28 @@ test('get_prices accepts a learned route id without repeating transport details'
 
   assert.equal(result.isError, undefined);
   assert.equal(result.structuredContent.input.queries[0].route_id, 'aqr_aaaaaaaaaaaaaaaaaaaaaaaa');
+});
+
+test('get_prices returns cross-field omissions as a retryable tool result', async (t) => {
+  const { client, server } = await connectedClient();
+  t.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const result = await client.callTool({
+    name: 'get_prices',
+    arguments: {
+      queries: [{ provider: 'alibaba', query_id: 'alibaba-missing-route-fields' }],
+    },
+  });
+  const payload = JSON.parse(result.content[0].text);
+
+  assert.equal(result.isError, true);
+  assert.equal(payload.code, 'request_schema_invalid');
+  assert.equal(payload.retryable, true);
+  assert.equal(payload.terminal, false);
+  assert.ok(payload.details.violations.some((item) => item.path === 'queries.0.endpoint'));
 });
 
 test('build_estimate carries provider, official item evidence and no calculator fields', async (t) => {

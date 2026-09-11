@@ -96,6 +96,15 @@ const SCENARIO_KEYS = Object.freeze([
   'three_year_commitment',
 ]);
 
+const CREATED_PRICE_NEXT_ACTION = [
+  'No saved price query batch exists yet.',
+  'First derive a non-empty queries array from the current normalized component configuration',
+  'and the current get_prices input schema, including every required provider-specific field.',
+  'Then call get_prices.',
+  'An input validation error such as "Required at queries" is a correctable caller-input error:',
+  'fill the omitted fields and retry instead of reporting a terminal blocker.',
+].join(' ');
+
 const FREE_ALLOWANCE_REFERENCE = /(?:free\s*tier|always\s*free|free\s*trial|trial\s*credit|promotional\s*credit|account\s*credit|免费额度|免费试用|赠送额度|账户(?:信用|赠送)|零价区间)/i;
 
 function relayScenarioKeys(options) {
@@ -622,7 +631,7 @@ class AstraQuoteV2Workflow {
         relay_job_id: input.relay_job_id,
         relay_status: job.status,
         stage: 'created',
-        next_action: 'Continue official price queries with get_prices.',
+        next_action: CREATED_PRICE_NEXT_ACTION,
       };
     }
     return {
@@ -641,7 +650,7 @@ class AstraQuoteV2Workflow {
   resumeQuoteJob(input) {
     const status = this.getQuoteJobStatus(input);
     const nextActions = {
-      created: 'Continue official price queries with get_prices.',
+      created: CREATED_PRICE_NEXT_ACTION,
       pricing_request_rejected: 'Correct the rejected request using the saved field-level details, then retry get_prices.',
       pricing_partial: 'Query only incomplete_query_ids; keep the saved price batch.',
       pricing_completed: 'Reuse price_batch_id and continue with build_estimate.',
