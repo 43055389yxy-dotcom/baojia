@@ -10,6 +10,7 @@ from app.services.gpt_browser_navigation import (
     active_quote_poll_order,
     bounded_continuation_attempts,
     canonical_url_path,
+    is_interrupted_response,
     is_new_project_chat,
     is_persistent_permission_action,
     is_project_landing_url,
@@ -592,6 +593,78 @@ def test_stale_dom_reference_is_retryable_without_failing_the_quote() -> None:
     assert is_transient_browser_poll_exception(stale_error)
     assert is_transient_browser_poll_exception(transport_timeout)
     assert not is_transient_browser_poll_exception(permanent_error)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "连接已中断。正在等待完整回复",
+        "Connection interrupted. Waiting for the full response.",
+    ],
+)
+def test_interrupted_chat_response_is_resumed_in_the_same_quote(text: str) -> None:
+    assert is_interrupted_response(text)
+
+
+def test_normal_stage_progress_is_not_mislabeled_as_an_interruption() -> None:
+    assert not is_interrupted_response("正在调用官方价格接口，报价仍在继续。")
+
+
+def test_failed_job_exposes_only_the_generic_sales_failure_code(tmp_path: Path) -> None:
+    store = GptQuoteRelayStore(tmp_path)
+    public = store.create("东京 EC2 两台，按需。", {"preferred_region": "ap-northeast-1"})
+    store.update(
+        public["job_id"],
+        {
+            "status": "failed",
+            "error": {"code": "internal_sensitive_detail", "message": "technical detail"},
+        },
+    )
+
+    sales = store.public_get(public["job_id"])
+
+    assert sales["failure_code"] == "AQ-QUOTE-FAILED"
+    assert sales["preferred_region"] == "ap-northeast-1"
+    assert "error" not in sales
+
+
+def test_abandoned_processing_job_stops_instead_of_waiting_forever(tmp_path: Path) -> None:
+    store = GptQuoteRelayStore(tmp_path)
+    public = store.create("东京 EC2 两台，按需。", {})
+    store.claim_next("worker-a")
+    record = store.get(public["job_id"])
+    record["updated_at"] = "2000-01-01T00:00:00+00:00"
+    store._write_atomic(store._path(public["job_id"]), record)
+    store._write_atomic(
+        store.heartbeat_path,
+        {"updated_at": "2000-01-01T00:00:00+00:00", "logged_in": False},
+    )
+
+    sales = store.public_get(public["job_id"])
+
+    assert sales["status"] == "failed"
+    assert sales["failure_code"] == "AQ-QUOTE-FAILED"
+
+
+def test_active_worker_heartbeat_prevents_false_quote_failure(tmp_path: Path) -> None:
+    store = GptQuoteRelayStore(tmp_path)
+    public = store.create("东京 EC2 两台，按需。", {})
+    store.claim_next("worker-a")
+    record = store.get(public["job_id"])
+    record["updated_at"] = "2000-01-01T00:00:00+00:00"
+    store._write_atomic(store._path(public["job_id"]), record)
+    store._write_atomic(
+        store.heartbeat_path,
+        {"updated_at": store.get(public["job_id"])["created_at"], "logged_in": True},
+    )
+    heartbeat = store._read(store.heartbeat_path)
+    heartbeat["updated_at"] = store._event("heartbeat", "alive")["time"]
+    store._write_atomic(store.heartbeat_path, heartbeat)
+
+    sales = store.public_get(public["job_id"])
+
+    assert sales["status"] == "processing"
+    assert sales["failure_code"] is None
 
 
 def test_visible_generation_or_retry_control_extends_quote_deadline() -> None:

@@ -158,6 +158,32 @@ test('resuming a price batch queries only unfinished ids and reuses successful r
   assert.equal(calls, 2);
   assert.deepEqual(replayed.reused_query_ids, ['price-1']);
   assert.deepEqual(replayed.queried_query_ids, []);
+  assert.deepEqual(replayed.results, []);
+  const saved = workflow.getPriceResults({
+    price_batch_id: first.price_batch_id,
+    query_ids: ['price-1'],
+  });
+  assert.equal(saved.results[0].status, 'exact');
+});
+
+test('resumed get_prices returns only this call delta instead of the whole stored batch', async (t) => {
+  const { workflow, directory, backend } = fixture();
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const first = await workflow.getPrices({
+    queries: [{ provider: 'azure', query_id: 'old', filter: 'old' }],
+  });
+  backend.getPrices = async () => ({
+    status: 'completed', result_count: 1,
+    results: [{ query_id: 'new', provider: 'azure', status: 'exact', official_item_ids: ['new-1'] }],
+  });
+
+  const resumed = await workflow.getPrices({
+    price_batch_id: first.price_batch_id,
+    queries: [{ provider: 'azure', query_id: 'new', filter: 'new' }],
+  });
+
+  assert.deepEqual(resumed.results.map((item) => item.query_id), ['new']);
+  assert.equal(resumed.batch_result_count, 2);
 });
 
 test('get_prices persists learned official routes and can reuse a route id', async (t) => {
@@ -171,9 +197,10 @@ test('get_prices persists learned official routes and can reuse a route id', asy
         query_id: received.query_id, provider: 'alibaba', status: 'exact',
         official_item_ids: ['item-1'], items: [{ id: 'item-1' }],
         route_verification: {
-          route_contract_version: 2,
+          route_contract_version: 3,
           route_fingerprint: 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
           provider: 'alibaba', endpoint: 'business.aliyuncs.com', service: 'bssopenapi',
+          market_profile: 'alibaba-cn', credential_scope: 'alibaba-cn',
           action: 'QueryPrice', version: '2017-12-14', region: 'ap-southeast-1',
           region_parameter: 'Region', method: 'POST', path: '/',
           response_items_path: 'Data.Items', item_id_paths: ['Id'], rate_fields: [],

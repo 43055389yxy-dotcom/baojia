@@ -17,9 +17,11 @@ function verifiedResult(overrides = {}) {
     official_item_ids: ['ecs.g8i.xlarge'],
     official_rate_candidates: [{ unit_price: '1.25', is_zero_rate: false }],
     route_verification: {
-      route_contract_version: 2,
+      route_contract_version: 3,
       route_fingerprint: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       provider: 'alibaba',
+      market_profile: 'alibaba-cn',
+      credential_scope: 'alibaba-cn',
       endpoint: 'business.aliyuncs.com',
       service: 'bssopenapi',
       action: 'QueryPrice',

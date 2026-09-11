@@ -850,6 +850,67 @@ body {
 .sales-result-price em { display: block; margin-top: 3px; color: #6e8ba1; font-size: 9px; font-style: normal; }
 .sales-result-empty { color: #99adbc; }
 
+.sales-region-section {
+  margin: 0 0 22px;
+  padding: 18px 20px;
+  border: 1px solid rgba(100, 164, 210, .22);
+  border-radius: 18px;
+  background: rgba(244, 251, 255, .58);
+  box-shadow: inset 0 1px rgba(255, 255, 255, .92);
+}
+.sales-region-section .sales-section-heading { min-height: 0; margin-bottom: 11px; }
+.sales-region-select-wrap { position: relative; }
+.sales-region-select-wrap input {
+  width: 100%;
+  min-height: 50px;
+  padding: 0 46px 0 15px;
+  appearance: none;
+  border: 1px solid rgba(82, 153, 204, .3);
+  border-radius: 12px;
+  outline: none;
+  background: rgba(255, 255, 255, .82);
+  color: #19486d;
+  cursor: pointer;
+  transition: border-color .2s ease, box-shadow .2s ease, transform .2s ease;
+}
+.sales-region-select-wrap input:focus {
+  border-color: rgba(36, 151, 226, .62);
+  box-shadow: 0 0 0 4px rgba(40, 153, 225, .09), 0 13px 30px rgba(77, 131, 170, .09);
+  transform: translateY(-1px);
+}
+.sales-region-select-wrap input:disabled { cursor: wait; opacity: .62; }
+.sales-region-select-wrap > i {
+  position: absolute;
+  top: 50%;
+  right: 17px;
+  color: #3a8fbe;
+  font-style: normal;
+  pointer-events: none;
+  transform: translateY(-54%);
+}
+.sales-failure-reference {
+  display: inline-flex;
+  width: fit-content;
+  margin-top: 13px;
+  padding: 8px 11px;
+  border: 1px solid rgba(213, 92, 97, .24);
+  border-radius: 9px;
+  background: rgba(255, 237, 239, .76);
+  color: #a9474c;
+  font: 700 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.sales-result-region-note {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(55, 150, 211, .18);
+  border-radius: 10px;
+  background: rgba(226, 244, 255, .68);
+  color: #567d98;
+  font-size: 10px;
+  line-height: 1.55;
+}
+
 @media (max-width: 1040px) {
   .sales-result-summary { grid-template-columns: auto minmax(0, 1fr); }
   .sales-result-file { grid-column: 1 / -1; }

@@ -33,14 +33,18 @@ def test_sales_api_preserves_the_provider_and_exact_selected_scenarios(
 ) -> None:
     store = GptQuoteRelayStore(tmp_path / provider)
     monkeypatch.setattr(aws_main, "gpt_quote_relay", store)
+    client = TestClient(aws_main.app)
+    catalog = client.get(f"/api/quote-relay/providers/{provider}/regions").json()
+    preferred_region = catalog["regions"][0]["code"]
 
-    response = TestClient(aws_main.app).post(
+    response = client.post(
         "/api/quote-relay/jobs",
         json={
             "customer_request": "2 核 4 GiB，一台，爱尔兰区域。",
             "cloud_provider": provider,
             "pricing_scenarios": scenarios,
             "utilization_percent": 100,
+            "preferred_region": preferred_region,
             "client_request_id": "123e4567-e89b-42d3-a456-426614174000",
         },
     )
@@ -51,6 +55,40 @@ def test_sales_api_preserves_the_provider_and_exact_selected_scenarios(
     assert internal["cloud_provider"] == provider
     assert internal["quote_options"]["cloud_provider"] == provider
     assert internal["quote_options"]["pricing_scenarios"] == scenarios
+    assert internal["quote_options"]["preferred_region"] == preferred_region
+
+
+def test_sales_region_catalog_is_scoped_to_the_configured_provider_site() -> None:
+    response = TestClient(aws_main.app).get("/api/quote-relay/providers/alibaba/regions")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["provider"] == "alibaba"
+    assert payload["market_profile"] == "alibaba-cn"
+    assert payload["regions"]
+    assert all(item["code"] and item["label"] for item in payload["regions"])
+
+
+def test_sales_accepts_a_new_region_name_without_a_hardcoded_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = GptQuoteRelayStore(tmp_path / "new-region")
+    monkeypatch.setattr(aws_main, "gpt_quote_relay", store)
+    response = TestClient(aws_main.app).post(
+        "/api/quote-relay/jobs",
+        json={
+            "customer_request": "ECS 2 核 4 GiB，一台。",
+            "cloud_provider": "alibaba",
+            "preferred_region": "not-a-real-region",
+            "pricing_scenarios": ["on_demand"],
+            "utilization_percent": 100,
+            "client_request_id": "123e4567-e89b-42d3-a456-426614174000",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["preferred_region"] == "not-a-real-region"
 
 
 def test_public_health_marks_only_unconfigured_gcp_catalog_as_pending(

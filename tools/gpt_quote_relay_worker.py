@@ -18,18 +18,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.firefox.options import Options
-from selenium.webdriver.remote.webelement import WebElement
-from selenium.webdriver.support.ui import WebDriverWait
-
 from app.services.gpt_browser_navigation import (
     active_quote_poll_order,
     bounded_continuation_attempts,
     canonical_url_path,
+    is_interrupted_response,
     is_new_project_chat,
     is_persistent_permission_action,
     is_project_landing_url,
@@ -45,6 +38,13 @@ from app.services.gpt_quote_prompt import (
     parse_final_response,
 )
 from app.services.gpt_quote_relay import GptQuoteRelayStore, utc_now
+from selenium import webdriver
+from selenium.common.exceptions import WebDriverException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.remote.webelement import WebElement
+from selenium.webdriver.support.ui import WebDriverWait
 
 CHATGPT_URL = os.environ.get("ASTRAQUOTE_CHATGPT_URL", "https://chatgpt.com/projects")
 PROJECT_NAME = os.environ.get("ASTRAQUOTE_CHATGPT_PROJECT", "baojia")
@@ -643,6 +643,8 @@ class ChatGptBrowser:
                 quote.last_text = current
                 quote.stable_since = now
                 quote.deadline = now + QUOTE_TIMEOUT_SECONDS
+        if current and not stop_buttons and is_interrupted_response(current):
+            return current
         if quote.saw_assistant and not stop_buttons and now - quote.stable_since >= 8:
             return quote.last_text
         if should_extend_quote_deadline(
@@ -963,6 +965,7 @@ def main() -> int:
                         active_quotes.pop(job_id, None)
                     continue
                 try:
+                    store.renew_lease(job_id, WORKER_ID, lease_minutes=35)
                     response = browser.poll_quote(
                         active,
                         completion_check=lambda job_id=job_id: (

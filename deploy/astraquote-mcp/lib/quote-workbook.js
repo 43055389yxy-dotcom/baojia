@@ -351,6 +351,26 @@ async function buildQuoteWorkbook(record) {
   }
 
   const lastColumn = 8 + priceColumnCount;
+  if (record.preferred_region
+    && record.preferred_region !== record.default_region
+    && record.region_adjustment_reason) {
+    const regionRow = sheet.addRow([
+      '地域调整',
+      `${friendlyRegion(record.preferred_region)} → ${friendlyRegion(record.default_region)}：${simplifyCustomerText(record.region_adjustment_reason)}`,
+    ]);
+    sheet.mergeCells(
+      `B${regionRow.number}:${sheet.getColumn(lastColumn).letter}${regionRow.number}`,
+    );
+    regionRow.height = 30;
+    regionRow.eachCell({ includeEmpty: true }, (cell) => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ALT_FILL } };
+      cell.font = { color: { argb: TEXT }, name: 'Arial', size: 10 };
+      cell.alignment = { vertical: 'middle', wrapText: true };
+      applyBorder(cell);
+    });
+    regionRow.getCell(1).font = { bold: true, color: { argb: TEXT }, name: 'Arial' };
+    lastPrintableRow = regionRow.number;
+  }
   sheet.autoFilter = { from: { row: 1, column: 1 }, to: { row: lastDataRow || 1, column: lastColumn } };
   sheet.pageSetup.printArea = `A1:${sheet.getColumn(lastColumn).letter}${lastPrintableRow}`;
   return workbook.xlsx.writeBuffer().then((buffer) => Buffer.from(buffer));

@@ -132,6 +132,8 @@ function buildPageResult(record) {
     schema_version: 'astraquote-page-result/1',
     currency: record.currency,
     region: record.default_region || '',
+    preferred_region: record.preferred_region || record.default_region || '',
+    region_adjustment_reason: record.region_adjustment_reason || '',
     components,
     scenarios,
   };

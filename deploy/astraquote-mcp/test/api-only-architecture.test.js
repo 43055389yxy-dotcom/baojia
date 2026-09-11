@@ -14,6 +14,7 @@ test('public MCP is an official ten-cloud catalog API-only workflow', async (t) 
     describeService: async (input) => ({ status: 'ok', input }),
     getAttributeValues: async (input) => ({ status: 'ok', input }),
     getPrices: async (input) => ({ status: 'ok', input }),
+    getPriceResults: async (input) => ({ status: 'ok', input }),
     getQuoteJobStatus: async (input) => ({ status: 'created', input }),
     resumeQuoteJob: async (input) => ({ status: 'created', input }),
     buildEstimate: async (input) => ({ status: 'delivered', input }),
@@ -31,7 +32,7 @@ test('public MCP is an official ten-cloud catalog API-only workflow', async (t) 
   const listed = await client.listTools();
   assert.deepEqual(
     listed.tools.map((tool) => tool.name),
-    ['describe_service', 'get_attribute_values', 'get_prices', 'get_quote_job_status', 'resume_quote_job', 'build_estimate'],
+    ['describe_service', 'get_attribute_values', 'get_prices', 'get_price_results', 'get_quote_job_status', 'resume_quote_job', 'build_estimate'],
   );
   assert.doesNotMatch(INSTRUCTIONS, /Calculator|官方报价链接|模板指纹|模板搜索/i);
   assert.match(INSTRUCTIONS, /AWS Price List API/);
@@ -44,7 +45,7 @@ test('public MCP is an official ten-cloud catalog API-only workflow', async (t) 
   assert.match(INSTRUCTIONS, /百度智能云/);
   assert.match(INSTRUCTIONS, /火山引擎/);
   assert.match(INSTRUCTIONS, /天翼云/);
-  assert.match(INSTRUCTIONS, /ASTRAQUOTE_STOP_CODE: AQ-QUOTE-BLOCKED/);
+  assert.match(INSTRUCTIONS, /ASTRAQUOTE_STOP_CODE: AQ-QUOTE-FAILED/);
   assert.match(INSTRUCTIONS, /不得.*needs_refinement.*终止码/s);
 });
 

@@ -178,9 +178,22 @@ function bindRelayJobContext(input) {
     };
     throw error;
   }
+  const preferredRegion = String(job.quote_options?.preferred_region || '');
+  if (preferredRegion && input.default_region !== preferredRegion
+    && !String(input.region_adjustment_reason || '').trim()) {
+    const error = new Error('A changed quote region requires a customer-facing reason.');
+    error.code = 'relay_region_adjustment_required';
+    error.details = {
+      relay_job_id: relayJobId,
+      preferred_region: preferredRegion,
+      actual_region: input.default_region,
+    };
+    throw error;
+  }
   return {
     ...input,
     submission_code: submissionCode,
+    preferred_region: preferredRegion || input.default_region,
     display_result_on_page: true,
   };
 }
@@ -458,6 +471,35 @@ class AstraQuoteV2Workflow {
     return this.backend.getAttributeValues(input);
   }
 
+  getPriceResults(input) {
+    const priceBatch = this.store.getPriceBatch(input.price_batch_id);
+    if (priceBatch.relay_job_id) {
+      const relayJob = assertRelayIdentity(input);
+      if (relayJob.job_id !== priceBatch.relay_job_id) {
+        const error = new Error('The saved price batch belongs to a different sales quote task.');
+        error.code = 'price_batch_relay_context_mismatch';
+        throw error;
+      }
+    }
+    const byId = new Map(
+      (priceBatch.result?.results || []).map((item) => [item.query_id, item]),
+    );
+    const missing = input.query_ids.filter((queryId) => !byId.has(queryId));
+    if (missing.length > 0) {
+      const error = new Error('One or more price query results were not found in the batch.');
+      error.code = 'price_query_result_not_found';
+      error.details = { query_ids: missing };
+      throw error;
+    }
+    return {
+      status: priceBatch.result?.status || 'needs_refinement',
+      price_batch_id: priceBatch.price_batch_id,
+      result_count: input.query_ids.length,
+      batch_result_count: byId.size,
+      results: input.query_ids.map((queryId) => byId.get(queryId)),
+    };
+  }
+
   async getPrices(input) {
     const relayJobId = input.relay_job_id || null;
     if (relayJobId) assertRelayIdentity(input);
@@ -554,7 +596,13 @@ class AstraQuoteV2Workflow {
       });
     }
     return {
-      ...mergedResult,
+      status: mergedResult.status,
+      terminal: mergedResult.terminal,
+      next_action: mergedResult.next_action,
+      result_count: (result.results || []).length,
+      batch_result_count: mergedResults.size,
+      results: result.results || [],
+      incomplete_query_ids: incompleteQueryIds,
       price_batch_id: priceBatchId,
       learned_routes: learnedRoutes,
       resumed_batch: Boolean(existing),
@@ -929,6 +977,8 @@ class AstraQuoteV2Workflow {
       relay_job_id: normalizedInput.relay_job_id || null,
       price_batch_id: normalizedInput.price_batch_id,
       default_region: normalizedInput.default_region,
+      preferred_region: normalizedInput.preferred_region || normalizedInput.default_region,
+      region_adjustment_reason: normalizedInput.region_adjustment_reason || '',
       cloud_provider: normalizedInput.cloud_provider,
       currency: normalizedInput.currency,
       display_result_on_page: true,

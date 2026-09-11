@@ -34,7 +34,7 @@
 - 缓存复用必须重新执行当前清洗后证据校验；不完整就重新调用逐组件 AI，不能恢复原文补齐。
 - 旧草稿没有当前 `official-only-v4` 和 `cleaned-only-v1` 标记，或仍含原文时，禁止进入新报价链路并要求从首页重新识别。历史记录不批量删除，但不得作为新流程输入。
 
-## 网页版 ChatGPT 统一官方价格 MCP 路径（2026-09-10）
+## 网页版 ChatGPT 统一官方价格 MCP 路径（2026-09-11）
 
 网页版 ChatGPT 是这条路径中唯一的自然语言推理和价格计算层。AstraQuote 不调用内部 AI 补充、改写或重算 GPT 的业务决定；MCP 只调用销售选定云厂商的官方价目 API，保存官方返回证据，并执行 schema、事实归属、金额加总一致性和交付状态等机械校验。AWS Pricing Calculator 不再参与查价、验证或交付。
 
@@ -49,12 +49,13 @@ MCP = 手：云厂商官方价目 API 客户端、原始结果保存、schema/�
 
 该销售选型政策必须保存在独立的声明式策略文件中，并注入每一张销售报价任务。不得只依赖 MCP 初始化说明，因为客户端可能缓存旧说明；官方价目查询结果只返回官网原始数据，不夹带业务选择规则。程序不得据此替 GPT 选择型号，但必须确保 GPT 在作出选择时收到当前策略版本。
 
-公共 MCP 只能暴露六个工具：
+公共 MCP 只能暴露七个工具：
 
 ```text
 describe_service
 get_attribute_values
 get_prices
+get_price_results
 get_quote_job_status
 resume_quote_job
 build_estimate
@@ -76,7 +77,9 @@ build_estimate
 
 `describe_service`、`get_attribute_values` 只在服务代码或属性值不明确时使用。`get_prices` 命中不超过 10 条时返回完整候选；命中超过 10 条或仍有下一页时不得截断后冒充完整结果，而要返回 `needs_refinement`、当前查询、命中数/下界及客观可筛选字段和值，由 GPT 决定如何继续收窄。禁止再维护一套重复的公共产品搜索路径。
 
-`get_prices` 必须支持批量查询。AWS 使用 Price List API 中的 `OnDemand` 和 `Reserved` terms；Azure 使用 Retail Prices API 的即用即付与 Reservation；Oracle Cloud 公共目录只使用 `PAY_AS_YOU_GO`，没有公共合同价证据时不得虚构 1/3 年方案；Google Cloud 使用 Billing Catalog API 的按需与对应产品的 1/3 年承诺使用价格。四个云只共用查询、证据和恢复协议，不共享产品、SKU、区域、币种或优惠语义，任何云都不得替代 AWS 或复用 AWS 预留实例规则。每个查询必须有稳定 `query_id`并保留官方原始候选、SKU/产品身份、价格维度、币种和分页信息。程序只能做结果数量、字段和证据身份校验，不得挑选单价、估算折扣、换算用量或替换相近 SKU。
+`get_prices` 必须支持批量查询。AWS 使用 Price List API 中的 `OnDemand` 和 `Reserved` terms；Azure 使用 Retail Prices API 的即用即付与 Reservation；Oracle Cloud 公共目录只使用 `PAY_AS_YOU_GO`，没有公共合同价证据时不得虚构 1/3 年方案；Google Cloud 使用 Billing Catalog API 的按需与对应产品的 1/3 年承诺使用价格。各云只共用查询、证据和恢复协议，不共享产品、SKU、区域、币种或优惠语义，任何云都不得替代其他云或复用其他云的优惠规则。每个查询必须有稳定 `query_id`并保留官方原始候选、SKU/产品身份、价格维度、币种和分页信息。程序只能做结果数量、字段和证据身份校验，不得挑选单价、估算折扣、换算用量或替换相近 SKU。
+
+`get_prices` 的持久化层保存完整批次，但每次工具响应只返回本次新执行查询的增量和批次级计数，不得反复把历史完整规格树发送给 ChatGPT。GPT 需要复查旧结果时，只能通过 `get_price_results` 按明确 `query_id` 小批读取；工具文本摘要不得重复承载 `structuredContent` 的全部原始结果。该边界用于避免大响应挤占上下文或造成页面流式连接中断，不改变官方原始证据的完整保存。
 
 并非所有客户组件都必须找到收费 SKU。GPT 根据官方依据确认不产生额外费用的资源可进入结构化 `zero_cost_services`，其事实必须标记 `disposition=zero_cost`，并绑定官方文档或官方价目证据。Free Tier、Always Free、试用、促销赠送和账户信用额度不属于“不产生额外费用”。价目证据必须绑定具体零费率；若同一 SKU 还存在正常商业费率，编译器必须拒绝其进入零元通道。程序只机械校验组件归属、唯一消费和官方零元身份，不得自动找相近收费产品。
 
@@ -108,11 +111,11 @@ XLSX 的表格、列宽、费用汇总、冻结窗格和样式完全由程序生
 
 队列中的 `customer_request` 不进入公开任务响应。浏览器确认消息已经提交后，工作进程必须立即从队列文件删除原始输入并写入 `source_purged_at`；后续 MCP 工具参数只能来自 ChatGPT 首轮形成的标准化组件和 Fact Ledger。登录失效时任务保持 `needs_login`，不得丢弃尚未提交的原始输入；管理员重新登录后任务自动回到队列。
 
-销售任务的完成状态必须来自可验证的机器结果，禁止仅凭页面出现一段文字就向销售伪报成功。`build_estimate` 在私有 XLSX、稳定下载地址和页面结构化结果都成功后，必须写入绑定 `relay_job_id + submission_code + quote_id` 的原子 `page_result_ready` 回执。后端以该回执作为完成状态的第一依据，并允许它纠正浏览器先前因缺少文字标记造成的假失败，但 `cancelled` 永远不可恢复。收到相同 `client_request_id` 必须返回原销售任务；收到相同 `relay_job_id` 或 `idempotency_key` 必须先返回历史成功结果，再检查任务是否仍为 processing，不得重复查价、生成 XLSX 或写完成回执。`get_quote_job_status` 和 `resume_quote_job` 只暴露 `created / pricing_partial / pricing_completed / estimate_validated / artifacts_generated / delivery_completed / failed` 阶段及下一缺失动作；恢复时复用 `price_batch_id`，只补缺失查询或步骤。没有交付回执且没有最终状态标记的阶段性回复必须视为“尚未完成”，浏览器中继应在同一标签页发送不含客户原话的最小续跑消息，并保持任务为 `processing`；不得把“下一步继续”“仍需收窄”等进度说明直接记为失败。不可恢复的终止状态必须由最终答复末尾的固定机器码 `ASTRAQUOTE_STOP_CODE: AQ-QUOTE-BLOCKED` 明确声明并附一行 `ASTRAQUOTE_SUMMARY`；自然语言中的“失败”“无法报价”或“停止”不得触发终态。`needs_refinement`、`terminal=false`、临时错误和仍有恢复步骤的阶段均禁止输出终止码。只有该终止码（旧会话的 `ASTRAQUOTE_STATUS: blocked` 继续兼容）、总时限或续跑上限耗尽、标签页关闭、项目不存在等真实终止条件才记为失败。浏览器中继不属于 Docker 应用进程：它必须在 VNC 桌面宿主机运行；报价前端、后端、AstraQuote MCP 与 OAuth 保持在同一个 AstraQuote 容器。
+销售任务的完成状态必须来自可验证的机器结果，禁止仅凭页面出现一段文字就向销售伪报成功。`build_estimate` 在私有 XLSX、稳定下载地址和页面结构化结果都成功后，必须写入绑定 `relay_job_id + submission_code + quote_id` 的原子 `page_result_ready` 回执。后端以该回执作为完成状态的第一依据，并允许它纠正浏览器先前因缺少文字标记造成的假失败，但 `cancelled` 永远不可恢复。收到相同 `client_request_id` 必须返回原销售任务；收到相同 `relay_job_id` 或 `idempotency_key` 必须先返回历史成功结果，再检查任务是否仍为 processing，不得重复查价、生成 XLSX 或写完成回执。`get_quote_job_status` 和 `resume_quote_job` 只暴露 `created / pricing_partial / pricing_completed / estimate_validated / artifacts_generated / delivery_completed / failed` 阶段及下一缺失动作；恢复时复用 `price_batch_id`，只补缺失查询或步骤。没有交付回执且没有最终状态标记的阶段性回复必须视为“尚未完成”，浏览器中继应在同一标签页发送不含客户原话的最小续跑消息，并保持任务为 `processing`；不得把“下一步继续”“仍需收窄”等进度说明直接记为失败。不可恢复的终止状态必须由最终答复末尾的固定机器码 `ASTRAQUOTE_STOP_CODE: AQ-QUOTE-FAILED` 明确声明并附一行 `ASTRAQUOTE_SUMMARY`；自然语言中的“失败”“无法报价”或“停止”不得触发终态。`needs_refinement`、`terminal=false`、临时错误和仍有恢复步骤的阶段均禁止输出终止码。只有该终止码（旧会话的 `AQ-QUOTE-BLOCKED` 与 `ASTRAQUOTE_STATUS: blocked` 继续兼容）、总时限或续跑上限耗尽、标签页关闭、项目不存在等真实终止条件才记为失败。工作进程保持新鲜心跳时，页面短暂无输出不得误判失败；工作进程和任务均停止更新超过宽限期时，后端必须把任务原子改为失败，禁止销售页面无限显示报价中。ChatGPT 页面出现“连接已中断/等待完整回复”时，浏览器中继在原标签、原对话和原保存批次中自动续跑，不得另建报价；超过有界续跑次数才进入失败终态。浏览器中继不属于 Docker 应用进程：它必须在 VNC 桌面宿主机运行；报价前端、后端、AstraQuote MCP 与 OAuth 保持在同一个 AstraQuote 容器。
 
-报价流程、安全边界、批量调用要求、降级条件和最终状态标记全部属于 AstraQuote MCP 的固定服务说明，禁止由浏览器中继在每张报价的 ChatGPT 消息里重复拼接。每张新对话只能发送四类本单数据：一句使用 AstraQuote 的报价请求、服务端生成的提交码与撤回保护任务编号、本次计价选项和客户需求；不得出现工具调用步骤、Fact Ledger 教程、内部字段说明或完成标记模板。这样规则只在插件中维护一份，销售输入保持正常、简短，且插件升级不会要求销售更换提示词。
+报价流程、安全边界、批量调用要求、降级条件和最终状态标记全部属于 AstraQuote MCP 的固定服务说明，禁止由浏览器中继在每张报价的 ChatGPT 消息里重复拼接。每张新对话只能发送本单业务数据：一句使用 AstraQuote 的报价请求、服务端生成的提交码与撤回保护任务编号、销售选择的云厂商/账号站点/首选地域、本次计价选项和客户需求；不得出现工具调用步骤、Fact Ledger 教程、内部字段说明或完成标记模板。这样规则只在插件中维护一份，销售输入保持正常、简短，且插件升级不会要求销售更换提示词。
 
-销售页面和公开任务 API 只显示业务状态，不得暴露 ChatGPT、插件、项目、对话、客户原文清理、Fact Ledger、运行日志或内部错误。首页只保留云厂商、需求、该云厂商自己的购买方式和提交操作；购买方式默认只选按需/即用即付，1 年和 3 年方案由销售主动勾选。服务端为每张新任务随机分配 1～9 的一位提交码，但销售页面不得展示该内部校验码。排队、等待登录和处理中必须分别显示对应业务状态，不能把排队任务伪装成正在运行；处理中显示预计时间和近似进度条。所有报价均由公开 API 返回已验证的客户可读服务名称、精简配置、方案金额及 AstraQuote Excel 稳定下载地址；结果页按一组件一行紧凑展示各方案折合月费，页面自动弹出并提供“复制报价、复制下载链接、下载 Excel”，不发送群消息。Excel 文件名必须使用云厂商短名加报价短标识，禁止拼接完整报价名称和完整 UUID。
+销售页面和公开任务 API 只显示业务状态，不得暴露 ChatGPT、插件、项目、对话、客户原文清理、Fact Ledger、运行日志或内部错误。首页只保留云厂商、账号站点对应的可编辑地域建议、需求、该云厂商自己的购买方式和提交操作；购买方式默认只选按需/即用即付，1 年和 3 年方案由销售主动勾选。地域建议来自配置中账号站点的目录，不得根据账号现有资源反推，也不得混入另一站点；它只帮助销售填写，不是程序用于拒绝新地域的固定白名单，最终可用性由 GPT 依据当次官方资料和官方响应判断。销售地域是整单首选；整套产品不能全部部署时，GPT 只能在同一云厂商、同一账号站点内根据官方产品地域目录选择支持整套产品的相邻地域，并在页面和 Excel 明示“首选地域 → 实际地域”及原因。服务端为每张新任务随机分配 1～9 的一位提交码，但销售页面不得展示该内部校验码。排队、等待登录和处理中必须分别显示对应业务状态，不能把排队任务伪装成正在运行；处理中显示预计时间和近似进度条。失败页只显示统一错误码 `AQ-QUOTE-FAILED` 和“请联系管理员”，详细异常仅留在后端。所有报价均由公开 API 返回已验证的客户可读服务名称、精简配置、方案金额及 AstraQuote Excel 稳定下载地址；结果页按一组件一行紧凑展示各方案折合月费，页面自动弹出并提供“复制报价、复制下载链接、下载 Excel”，不发送群消息。Excel 文件名必须使用云厂商短名加报价短标识，禁止拼接完整报价名称和完整 UUID。
 
 ## 旧路径物理删除（2026-09-07）
 
@@ -253,9 +256,9 @@ AWS Price List 在不同区域可能省略 `group`、`productFamily` 等说明�
 
 需要签名访问的云厂商不得把每个产品的接口路径、动作和返回结构永久写死在报价逻辑中。GPT 可以在官方文档、官方 SDK、官方 OpenAPI、官方价格计算器及云厂商官方域名内提出新的只读查价道路；程序只负责安全校验、签名、探测、结构验证和持久化。第三方页面最多用于定位官方资料，不得成为正式价格证据。
 
-只有实际成功返回官方产品身份的只读道路才可写入道路库。记录至少包含 `auth_scheme`、`request_schema_hash`、`response_schema_hash`、`sdk_version`、`last_verified_at`、`failure_count`、`confidence`、`revalidate_after`、`expires_at` 和 `official_source_url`，并保存道路版本历史。请求中的客户型号、数量、区域以外的业务值和其他报价专属参数不得写入道路库；客户原话、Fact Ledger 和凭据绝对不得进入道路记录。
+只有实际成功返回官方产品身份的只读道路才可写入道路库。记录至少包含 `auth_scheme`、`market_profile`、`credential_scope`、`request_schema_hash`、`response_schema_hash`、`sdk_version`、`last_verified_at`、`failure_count`、`confidence`、`revalidate_after`、`expires_at` 和 `official_source_url`，并保存道路版本历史。请求中的客户型号、数量、区域以外的业务值和其他报价专属参数不得写入道路库；客户原话、Fact Ledger 和凭据绝对不得进入道路记录。文档 URL 只是可选元数据：它失效或属于另一站点时应丢弃，并以实际通过验证的官方 API URL 作为证据，不能因此拒绝同批全部有效查询；官方 endpoint、站点、只读动作或响应证据不合法时仍必须拒绝。
 
-后续报价可以按 `route_id` 复用已验证的传输及响应契约，但必须重新提交本单业务参数，并由程序校验云厂商和区域作用域。过期道路必须复验；连续三次 schema、路径或调用失败的当前版本自动隔离并降低置信度，旧版本只用于追溯，不得静默回退后直接发布。一次 400、404、限流、临时网络错误或响应结构变化只产生结构化 `error_category` 与 `recovery.next_action`，可恢复错误保持报价任务为 `pricing_partial`，不得直接向销售宣告失败。
+后续报价可以按 `route_id` 复用已验证的传输及响应契约，但必须重新提交本单业务参数，并由程序校验云厂商、账号站点和区域作用域。过期道路必须复验；连续三次 schema、路径或调用失败的当前版本自动隔离并降低置信度，旧版本只用于追溯，不得静默回退后直接发布。一次 400、404、限流、临时网络错误或响应结构变化只产生结构化 `error_category` 与 `recovery.next_action`，可恢复错误保持报价任务为 `pricing_partial`，不得直接向销售宣告失败。
 
 动态道路仍必须经过原有四层 IR 和发布闸门。共享 API 边界只允许查询、描述、列举和询价；创建、购买、支付、续费、修改、绑定、释放或删除资源的动作一律拒绝。TLS 例外只能绑定已确认的单个官方主机，继续验证证书链、禁止重定向并仅用于只读调用，禁止关闭全局证书验证。
 
@@ -318,7 +321,7 @@ AI 不可以做：
 - [ ] 官方目录匹配没有把 `group`、`productFamily` 等可选标签当成唯一依据。
 - [ ] 编译器校验已执行，失败时不会生成客户链接。
 - [ ] 页面只在全部必须组件通过后进入客户可见状态。
-- [ ] 公共 MCP 只暴露四工具；`build_estimate` 只做官方价格证据、事实和金额机械校验及交付，没有重新引入内部 AI。
+- [ ] 公共 MCP 只暴露七个正式工具；`build_estimate` 只做官方价格证据、事实和金额机械校验及交付，没有重新引入内部 AI。
 - [ ] `get_prices` 在小结果集返回完整官方候选、terms、offerings 和 price dimensions；大结果集返回 `needs_refinement` 且没有截断冒充完整；非唯一结果没有被自动选择。
 - [ ] 仓库生产运行路径中没有 Calculator 客户端、浏览器、模板、回读器或手写服务转换器。
 - [ ] `build_estimate` 只接收 GPT 决定的 ResourceIR、事实归属、官方 PriceIR 证据和 GPT 计算金额。

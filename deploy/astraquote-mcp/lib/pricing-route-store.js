@@ -20,8 +20,14 @@ const ROUTE_FIELDS = Object.freeze([
   'region_parameter', 'method', 'path', 'response_items_path', 'item_id_paths',
   'rate_fields', 'next_page_path', 'official_source_url', 'sdk_version',
 ]);
-const ROUTE_SCHEMA_VERSION = 'astraquote-pricing-route/2';
-const ROUTE_STORE_SCHEMA_VERSION = 'astraquote-pricing-routes/2';
+const ROUTE_SCHEMA_VERSION = 'astraquote-pricing-route/3';
+const ROUTE_STORE_SCHEMA_VERSION = 'astraquote-pricing-routes/3';
+const MARKET_PROFILE_CATALOG_CANDIDATES = [
+  process.env.ASTRAQUOTE_MARKET_PROFILE_CATALOG_PATH,
+  path.resolve(__dirname, '../policies/cloud-market-profiles.json'),
+  path.resolve(__dirname, '../../policies/cloud-market-profiles.json'),
+  path.resolve(__dirname, '../../../policies/cloud-market-profiles.json'),
+].filter(Boolean);
 
 
 function routeId(fingerprint) {
@@ -38,6 +44,7 @@ function cleanRouteVerification(verification) {
   }
   for (const field of [
     'route_contract_version', 'route_fingerprint', 'auth_scheme',
+    'market_profile', 'credential_scope',
     'request_schema_hash', 'response_schema_hash',
     'last_verified_at', 'revalidate_after', 'expires_at',
   ]) {
@@ -46,6 +53,21 @@ function cleanRouteVerification(verification) {
     }
   }
   return clean;
+}
+
+
+function configuredMarketProfile(provider) {
+  const environmentKey = `ASTRAQUOTE_${String(provider).toUpperCase()}_MARKET_PROFILE`;
+  if (process.env[environmentKey]) return process.env[environmentKey];
+  for (const catalogPath of MARKET_PROFILE_CATALOG_CANDIDATES) {
+    try {
+      const catalog = JSON.parse(fs.readFileSync(catalogPath, 'utf8'));
+      return catalog?.providers?.[provider]?.default_profile || null;
+    } catch {
+      // Try the next known packaging layout. No business decision is made here.
+    }
+  }
+  return null;
 }
 
 
@@ -119,6 +141,13 @@ class PricingRouteStore {
         },
       });
     }
+    const activeProfile = configuredMarketProfile(route.provider);
+    if (activeProfile && route.market_profile !== activeProfile) {
+      throw new PricingRouteStoreError('Verified pricing route belongs to a different account site.', {
+        code: 'pricing_route_revalidation_required',
+        details: { route_id: route.route_id, reason: 'market_profile_changed' },
+      });
+    }
     if (query.provider !== route.provider || (query.region && query.region !== route.region)) {
       throw new PricingRouteStoreError('Verified pricing route has a different provider or region.', {
         code: 'pricing_route_scope_mismatch',
@@ -165,7 +194,7 @@ class PricingRouteStore {
     const learned = [];
     for (const result of results || []) {
       if (result?.route_verification
-        && Number(result.route_verification.route_contract_version) === 2
+        && Number(result.route_verification.route_contract_version) === 3
         && ['exact', 'ambiguous'].includes(result.status)
         && Array.isArray(result.official_item_ids)
         && result.official_item_ids.length > 0) {
@@ -254,11 +283,12 @@ class PricingRouteStore {
         confidence: route.confidence,
         revalidate_after: route.revalidate_after,
         official_source_url: route.official_source_url,
+        market_profile: route.market_profile,
       }));
     if (routes.length === 0) return '';
     return [
       '## 已验证的动态查价道路',
-      '以下道路来自历史成功的官方只读调用。相同云、服务和区域可在 get_prices 中只传 route_id 与本次业务参数复用；不得跨区域或跨云复用。到期或隔离道路必须重新查官方资料验证。',
+      '以下道路来自历史成功的官方只读调用。相同云、账号站点、服务和区域可在 get_prices 中只传 route_id 与本次业务参数复用；不得跨账号站点、跨区域或跨云复用。到期或隔离道路必须重新查官方资料验证。',
       JSON.stringify(routes),
     ].join('\n\n');
   }

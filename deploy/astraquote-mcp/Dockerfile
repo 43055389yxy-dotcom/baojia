@@ -11,6 +11,7 @@ RUN npm ci --omit=dev --ignore-scripts \
 COPY deploy/astraquote-mcp/server.js ./server.js
 COPY deploy/astraquote-mcp/instructions.zh-CN.md ./instructions.zh-CN.md
 COPY deploy/astraquote-mcp/lib ./lib
+COPY policies ./policies
 
 USER node
 EXPOSE 8000

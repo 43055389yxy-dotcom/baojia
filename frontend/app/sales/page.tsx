@@ -24,6 +24,8 @@ type QuickQuoteResult = {
   schema_version: "astraquote-page-result/1";
   currency: string;
   region: string;
+  preferred_region?: string;
+  region_adjustment_reason?: string;
   components: Array<{
     service_name: string;
     model_or_plan?: string;
@@ -41,10 +43,19 @@ type RelayJob = {
   created_at?: string;
   updated_at?: string;
   cloud_provider?: CloudProvider;
+  preferred_region?: string;
+  failure_code?: string | null;
   display_result_on_page?: boolean;
   quick_quote_result?: QuickQuoteResult | null;
   quote_download_url?: string | null;
   quote_download_filename?: string | null;
+};
+
+type RegionCatalog = {
+  provider: CloudProvider;
+  market_profile: string;
+  site_label: string;
+  regions: Array<{ code: string; label: string }>;
 };
 
 type RelayHealth = {
@@ -61,7 +72,7 @@ const statusCopy: Record<RelayJob["status"], { title: string; detail?: string }>
   processing: { title: "报价申请已提交" },
   needs_login: { title: "报价等待登录", detail: "报价服务正在等待管理员恢复登录。" },
   completed: { title: "报价已完成", detail: "报价结果和 Excel 已生成。" },
-  failed: { title: "报价未完成", detail: "请联系管理员处理。" },
+  failed: { title: "报价失败", detail: "报价已经停止，请联系管理员处理。" },
   cancelled: { title: "报价已撤回", detail: "本次报价已停止处理。" },
 };
 
@@ -195,6 +206,9 @@ export default function SalesQuotePage() {
   );
   const [utilization, setUtilization] = useState(100);
   const [cloudProvider, setCloudProvider] = useState<CloudProvider>("aws");
+  const [regionCatalog, setRegionCatalog] = useState<RegionCatalog | null>(null);
+  const [preferredRegion, setPreferredRegion] = useState("");
+  const [regionLoading, setRegionLoading] = useState(true);
   const [health, setHealth] = useState<RelayHealth | null>(null);
   const [job, setJob] = useState<RelayJob | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -238,6 +252,32 @@ export default function SalesQuotePage() {
       window.clearInterval(timer);
     };
   }, []);
+
+  useEffect(() => {
+    let stopped = false;
+    setRegionLoading(true);
+    setPreferredRegion("");
+    async function loadRegions() {
+      try {
+        const response = await fetch(
+          `${API_BASE}/api/quote-relay/providers/${cloudProvider}/regions`,
+          { cache: "no-store" },
+        );
+        if (!response.ok) throw new Error();
+        const payload = await response.json() as RegionCatalog;
+        if (!stopped) setRegionCatalog(payload);
+      } catch {
+        if (!stopped) {
+          setRegionCatalog(null);
+          setPageError("暂时无法读取所选云厂商的地域目录，请稍后重试。");
+        }
+      } finally {
+        if (!stopped) setRegionLoading(false);
+      }
+    }
+    void loadRegions();
+    return () => { stopped = true; };
+  }, [cloudProvider]);
 
   useEffect(() => {
     const savedJobId = window.sessionStorage.getItem(ACTIVE_JOB_KEY);
@@ -311,6 +351,7 @@ export default function SalesQuotePage() {
           .map((scenario) => scenario.key)
           .filter((scenario) => selectedScenarios.has(scenario)),
         utilization_percent: utilization,
+        preferred_region: preferredRegion,
       };
       const fingerprint = await submissionFingerprint(requestDetails);
       let pending: { fingerprint?: string; client_request_id?: string } = {};
@@ -451,7 +492,7 @@ export default function SalesQuotePage() {
             <fieldset className="sales-pricing-mode sales-provider-section">
               <div className="sales-section-heading">
                 <legend>选择云厂商</legend>
-                <span>01 / 03</span>
+                <span>01 / 04</span>
               </div>
               <div className="sales-choice-row sales-provider-row">
                 {PROVIDER_ORDER.map((value) => {
@@ -482,11 +523,38 @@ export default function SalesQuotePage() {
               </p>
             )}
 
+            <section className="sales-region-section">
+              <div className="sales-section-heading">
+                <div>
+                  <label htmlFor="sales-region">选择首选地域</label>
+                  <p>{regionCatalog?.site_label ?? "正在读取账号站点"} · 整套产品不支持时，GPT 会选择同站点最近可用地域并说明</p>
+                </div>
+                <span>02 / 04</span>
+              </div>
+              <div className="sales-region-select-wrap">
+                <input
+                  id="sales-region"
+                  list="sales-region-options"
+                  value={preferredRegion}
+                  onChange={(event) => setPreferredRegion(event.target.value)}
+                  disabled={regionLoading}
+                  placeholder={regionLoading ? "正在加载地域建议…" : "选择或输入官方地域"}
+                  required
+                />
+                <datalist id="sales-region-options">
+                  {regionCatalog?.regions.map((item) => (
+                    <option value={item.code} key={item.code}>{item.label} · {item.code}</option>
+                  ))}
+                </datalist>
+                <i aria-hidden="true">⌄</i>
+              </div>
+            </section>
+
             <div className="sales-form-grid">
               <section className="sales-requirement-panel">
                 <div className="sales-section-heading">
-                  <div><label htmlFor="sales-requirement">填写客户需求</label><p>区域、规格、数量、存储及流量</p></div>
-                  <span>02 / 03</span>
+                  <div><label htmlFor="sales-requirement">填写客户需求</label><p>规格、数量、存储及流量</p></div>
+                  <span>03 / 04</span>
                 </div>
                 <div className="sales-textarea-shell">
                   <textarea
@@ -494,7 +562,7 @@ export default function SalesQuotePage() {
                     value={requirement}
                     maxLength={12000}
                     onChange={(event) => setRequirement(event.target.value)}
-                    placeholder="例如：爱尔兰区域，Linux 云服务器 1 台，2 核 4GB，每月运行 730 小时……"
+                    placeholder="例如：Linux 云服务器 1 台，2 核 4GB，每月运行 730 小时……"
                   />
                   <div className="sales-field-foot">
                     <span>支持自然语言描述</span>
@@ -506,7 +574,7 @@ export default function SalesQuotePage() {
               <aside className="sales-options-panel">
                 <div className="sales-section-heading">
                   <div><strong>设置报价方案</strong><p>采用所选云厂商的计价方式</p></div>
-                  <span>03 / 03</span>
+                  <span>04 / 04</span>
                 </div>
                 <fieldset className="sales-pricing-mode sales-scenario-list">
                   <legend className="sales-visually-hidden">报价方案</legend>
@@ -545,7 +613,7 @@ export default function SalesQuotePage() {
             {pageError && <p className="sales-form-error" role="alert">{pageError}</p>}
             <div className="sales-form-submit-row">
               <span><i aria-hidden="true" /> 数据来自所选云厂商官方价格目录</span>
-              <button className="sales-button sales-button-primary sales-submit" type="submit" disabled={submitting || selectedScenarios.size < 1 || requirement.trim().length < 3 || health?.status === "offline" || selectedCatalogUnavailable}>
+              <button className="sales-button sales-button-primary sales-submit" type="submit" disabled={submitting || regionLoading || !preferredRegion || selectedScenarios.size < 1 || requirement.trim().length < 3 || health?.status === "offline" || selectedCatalogUnavailable}>
                 {submitting ? "正在提交…" : "提交报价"}
                 <i aria-hidden="true">→</i>
               </button>
@@ -569,6 +637,11 @@ export default function SalesQuotePage() {
             <span>{job.status === "completed" && job.quick_quote_result
               ? "报价结果和 Excel 已生成，可查看、复制或下载。"
               : statusCopy[job.status].detail ?? `预计 ${estimateWindow()}完成，结果将在当前页面显示。`}</span>
+            {job.status === "failed" && (
+              <small className="sales-failure-reference">
+                错误码 {job.failure_code || "AQ-QUOTE-FAILED"}
+              </small>
+            )}
           </div>
 
           {active && (
@@ -625,6 +698,12 @@ export default function SalesQuotePage() {
                 </div>
                 <div className="sales-result-file"><i aria-hidden="true">X</i><span><strong>Excel 报价文件</strong><small>{job.quote_download_filename || "正式报价单.xlsx"}</small></span><b aria-hidden="true">✓</b></div>
                 <p className="sales-result-commercial"><i aria-hidden="true" /> 正常商业价格，不抵扣免费或试用额度</p>
+                {job.quick_quote_result.preferred_region && job.quick_quote_result.preferred_region !== job.quick_quote_result.region && (
+                  <p className="sales-result-region-note">
+                    首选地域 {job.quick_quote_result.preferred_region} → 实际地域 {job.quick_quote_result.region}<br />
+                    {job.quick_quote_result.region_adjustment_reason || "首选地域不能承载整套产品，已选择同站点最近可用地域。"}
+                  </p>
+                )}
               </section>
               <div className="sales-result-body">
                 <div className="sales-result-section-label"><span>服务明细</span><b>{job.quick_quote_result.components.length} 项</b></div>

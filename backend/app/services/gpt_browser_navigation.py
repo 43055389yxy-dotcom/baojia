@@ -58,6 +58,18 @@ def is_transient_browser_poll_exception(exc: BaseException) -> bool:
     return "httpconnectionpool" in message and "read timed out" in message
 
 
+def is_interrupted_response(text: str) -> bool:
+    """Recognize ChatGPT's recoverable stream interruption banner."""
+
+    normalized = " ".join(str(text or "").split()).casefold()
+    return (
+        "连接已中断" in normalized
+        or "正在等待完整回复" in normalized
+        or "connection interrupted" in normalized
+        or "waiting for the full response" in normalized
+    )
+
+
 def canonical_url_path(url: str) -> str:
     """Compare ChatGPT locations without transient query parameters."""
 

@@ -33,6 +33,7 @@ from app.core.errors import QuoteError
 from app.domain.models import ErrorResponse
 from app.integrations.aws import AwsClients
 from app.services.aws_query_executor import ReadOnlyAwsQueryExecutor
+from app.services.cloud_quote_profiles import provider_region_catalog
 from app.services.gpt_quote_relay import GptQuoteRelayStore, GptRelayError
 from app.services.mcp_v2_pricing import (
     AttributeValuesRequest,
@@ -219,7 +220,7 @@ async def mcp_v2_health(request: Request) -> dict[str, Any]:
     _require_mcp_internal_token(request)
     return {
         "status": "ready",
-        "workflow_version": "3.7.0",
+        "workflow_version": "3.8.0",
         "internal_ai_enabled": False,
         "role": "official cloud catalog client",
         "price_sources": [
@@ -292,6 +293,7 @@ class GptRelayQuoteRequest(BaseModel):
         Literal["on_demand", "one_year_commitment", "three_year_commitment"]
     ] = Field(default_factory=lambda: ["on_demand"], min_length=1, max_length=3)
     utilization_percent: int = Field(default=100, ge=1, le=100)
+    preferred_region: str = Field(min_length=2, max_length=80)
     client_request_id: str = Field(
         pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
     )
@@ -303,6 +305,9 @@ class GptRelayQuoteRequest(BaseModel):
             raise ValueError("pricing_scenarios must be unique")
         if self.cloud_provider == "oci" and scenarios != ["on_demand"]:
             raise ValueError("OCI public catalog currently supports on_demand only")
+        self.preferred_region = self.preferred_region.strip()
+        if not self.preferred_region:
+            raise ValueError("preferred_region must not be blank")
         self.pricing_scenarios = scenarios
         return self
 
@@ -324,6 +329,7 @@ async def create_gpt_relay_job(request: GptRelayQuoteRequest) -> dict[str, Any] 
                 "cloud_provider": request.cloud_provider,
                 "pricing_scenarios": request.pricing_scenarios,
                 "utilization_percent": request.utilization_percent,
+                "preferred_region": request.preferred_region,
                 "display_result_on_page": True,
                 "client_request_id": request.client_request_id,
             },
@@ -354,6 +360,17 @@ async def gpt_relay_health() -> dict[str, Any]:
         **gpt_quote_relay.health(),
         "provider_catalogs": mcp_v2_pricing.catalog_availability(),
     }
+
+
+@app.get("/api/quote-relay/providers/{provider}/regions", response_model=None)
+async def gpt_relay_provider_regions(provider: str) -> dict[str, Any] | JSONResponse:
+    try:
+        return provider_region_catalog(provider)
+    except (ValueError, RuntimeError):
+        return JSONResponse(
+            status_code=404,
+            content={"code": "provider_region_catalog_not_found", "message": "地域目录不存在。"},
+        )
 
 
 @app.get("/api/quote-artifacts/{token}", response_model=None)

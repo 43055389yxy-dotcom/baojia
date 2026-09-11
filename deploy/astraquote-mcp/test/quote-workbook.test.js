@@ -139,6 +139,17 @@ test('renders CNY quotes with an explicit CNY header and RMB number format', asy
   assert.equal(sheet.getCell('G3').numFmt, '"¥"#,##0.00');
 });
 
+test('discloses a provider-site region adjustment in the Excel file', async () => {
+  const record = verifiedRecord();
+  record.preferred_region = 'ap-southeast-1';
+  record.region_adjustment_reason = '首选地域不能承载整套产品，改用同站点最近可用地域。';
+
+  const { sheet } = await readWorkbook(record);
+  assert.equal(sheet.getCell('A4').value, '地域调整');
+  assert.match(sheet.getCell('B4').value, /新加坡 → 东京/);
+  assert.match(sheet.getCell('B4').value, /同站点最近可用地域/);
+});
+
 test('refuses to render an unverified quote', async () => {
   const record = verifiedRecord();
   record.verification.status = 'pending';

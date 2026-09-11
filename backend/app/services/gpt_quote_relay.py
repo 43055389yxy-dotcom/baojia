@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-UTC = timezone.utc
+UTC = timezone.utc  # noqa: UP017 - the host-side worker still supports Python 3.9
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 DELIVERY_RECEIPT_STATUSES = {
@@ -35,6 +35,8 @@ PUBLIC_FIELDS = {
     "updated_at",
     "submission_code",
     "cloud_provider",
+    "preferred_region",
+    "failure_code",
     "display_result_on_page",
     "quick_quote_result",
     "quote_download_url",
@@ -185,6 +187,7 @@ class GptQuoteRelayStore:
                 "job_id": job_id,
                 "submission_code": submission_code,
                 "cloud_provider": str(options.get("cloud_provider") or "aws"),
+                "preferred_region": str(options.get("preferred_region") or ""),
                 "display_result_on_page": True,
                 "status": "queued",
                 "created_at": now,
@@ -213,10 +216,43 @@ class GptQuoteRelayStore:
         return self._read(path)
 
     def public(self, record: dict[str, Any]) -> dict[str, Any]:
-        return {key: record.get(key) for key in PUBLIC_FIELDS}
+        payload = {key: record.get(key) for key in PUBLIC_FIELDS}
+        payload["failure_code"] = (
+            "AQ-QUOTE-FAILED" if record.get("status") == "failed" else None
+        )
+        return payload
 
     def public_get(self, job_id: str) -> dict[str, Any]:
-        return self.public(self.reconcile_delivery_receipt(job_id))
+        record = self.reconcile_delivery_receipt(job_id)
+        if record.get("status") == "processing" and self._worker_is_stale(record):
+            record = self.update_if_not_cancelled(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": {
+                        "code": "gpt_quote_worker_stale",
+                        "message": "报价执行器已停止更新任务。",
+                    },
+                    "lease_expires_at": None,
+                },
+                stage="failed",
+                message="报价执行器停止响应，任务已结束",
+            )
+        return self.public(record)
+
+    def _worker_is_stale(self, record: dict[str, Any], *, seconds: int = 120) -> bool:
+        try:
+            job_updated = datetime.fromisoformat(str(record.get("updated_at") or ""))
+        except ValueError:
+            return False
+        if datetime.now(UTC) - job_updated < timedelta(seconds=seconds):
+            return False
+        try:
+            heartbeat = self._read(self.heartbeat_path)
+            heartbeat_updated = datetime.fromisoformat(str(heartbeat.get("updated_at") or ""))
+        except (OSError, ValueError, TypeError):
+            return True
+        return datetime.now(UTC) - heartbeat_updated >= timedelta(seconds=seconds)
 
     def reconcile_delivery_receipt(self, job_id: str) -> dict[str, Any]:
         """Prefer a verified MCP delivery receipt over brittle chat prose.
@@ -371,6 +407,10 @@ class GptQuoteRelayStore:
             "schema_version": "astraquote-page-result/1",
             "currency": currency,
             "region": str(value.get("region") or "")[:32],
+            "preferred_region": str(value.get("preferred_region") or "")[:80],
+            "region_adjustment_reason": str(
+                value.get("region_adjustment_reason") or ""
+            )[:500],
             "components": public_components,
             "scenarios": public_scenarios,
         }
@@ -476,6 +516,28 @@ class GptQuoteRelayStore:
                     ][-100:],
                 }
             )
+            self._write_atomic(path, record)
+            return record
+
+    def renew_lease(
+        self, job_id: str, worker_id: str, *, lease_minutes: int = 35
+    ) -> dict[str, Any]:
+        """Keep a genuinely active browser tab from being reclaimed as abandoned."""
+
+        with self._lock():
+            path = self._path(job_id)
+            record = self._read(path)
+            if record.get("status") != "processing" or record.get("worker_id") != worker_id:
+                return record
+            now = datetime.now(UTC)
+            try:
+                expires = datetime.fromisoformat(str(record.get("lease_expires_at") or ""))
+            except ValueError:
+                expires = now
+            if expires - now > timedelta(minutes=max(1, lease_minutes // 2)):
+                return record
+            record["lease_expires_at"] = (now + timedelta(minutes=lease_minutes)).isoformat()
+            record["updated_at"] = utc_now()
             self._write_atomic(path, record)
             return record
 

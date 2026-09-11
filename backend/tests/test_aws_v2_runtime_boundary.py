@@ -17,6 +17,7 @@ def test_aws_runtime_exposes_only_v2_pricing_and_sales_relay_routes() -> None:
         "/api/quote-relay/jobs/{job_id}",
         "/api/quote-relay/jobs/{job_id}/cancel",
         "/api/quote-relay/health",
+        "/api/quote-relay/providers/{provider}/regions",
     } <= paths
 
     for legacy_path in {

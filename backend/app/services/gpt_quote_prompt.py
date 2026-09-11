@@ -6,12 +6,14 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from app.services.cloud_quote_profiles import active_market_profile
+
 FINAL_STATUS_PATTERN = re.compile(
     r"ASTRAQUOTE_STATUS\s*[:：]\s*(displayed_on_page|delivered|blocked)",
     re.IGNORECASE,
 )
 FINAL_STOP_CODE_PATTERN = re.compile(
-    r"ASTRAQUOTE_STOP_CODE\s*[:：]\s*AQ-QUOTE-BLOCKED",
+    r"ASTRAQUOTE_STOP_CODE\s*[:：]\s*(?:AQ-QUOTE-FAILED|AQ-QUOTE-BLOCKED)",
     re.IGNORECASE,
 )
 FINAL_SUMMARY_PATTERN = re.compile(
@@ -125,10 +127,19 @@ def build_quote_prompt(
         "ctyun": "天翼云",
     }.get(provider, provider)
     delivery_method = "生成 Excel，并在销售报价页提供报价与下载链接；不发送企业微信群"
+    market_profile = active_market_profile(provider)
+    preferred_region = str(options.get("preferred_region") or "").strip()
     return (
         f"请使用 AstraQuote 完成正式 {provider_label} 报价并交付。\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n\n"
         f"云厂商：{provider_label}（销售已选定，不得改换）。\n\n"
+        f"账号站点：{market_profile['site_label']}（凭证范围 "
+        f"{market_profile['credential_scope']}，不得与其他站点的文档、域名或价格混用）。\n\n"
+        f"销售首选地域：{preferred_region}（销售输入的偏好，不是程序白名单结论）。"
+        "请由 GPT 根据本次官方资料和实际官方响应核对整套产品的可购性；"
+        "若并非全部组件都支持，只能在同一账号站点和同一云厂商内，由 GPT 根据官方地域与产品目录"
+        "选择支持整套产品的最近地域，并在报价页和 Excel 中说明首选地域、实际地域和调整原因。"
+        "不得因为首选地域不可用而改换云厂商或混用其他站点账号。\n\n"
         f"计价选项：{_pricing_summary(options)}。\n\n"
         "报价币种：由 GPT 根据本次所选云厂商、区域和官方价格接口实际支持并返回的币种决定；"
         "中国站可使用 CNY，国际站可使用 USD 或官方实际币种。不得强制统一为 USD，"

@@ -497,6 +497,20 @@ def test_authenticated_cloud_queries_reject_batch_mutating_actions() -> None:
         )
 
 
+def test_mismatched_document_url_does_not_block_a_verified_official_api_endpoint() -> None:
+    query = AlibabaPriceQuery(
+        query_id="domestic-ecs",
+        endpoint="ecs.cn-hangzhou.aliyuncs.com",
+        service="ecs",
+        action="DescribePrice",
+        version="2014-05-26",
+        region="cn-hangzhou",
+        official_source_url="https://www.alibabacloud.com/help/en/ecs/",
+    )
+
+    assert query.official_source_url is None
+
+
 def test_authenticated_query_failure_returns_machine_recovery_plan() -> None:
     def fail(_: Any) -> dict[str, Any]:
         raise OfficialCloudClientError(
@@ -589,7 +603,8 @@ def test_successful_authenticated_route_returns_verifiable_learning_metadata() -
     )["results"][0]
 
     route = result["route_verification"]
-    assert route["route_contract_version"] == 2
+    assert route["route_contract_version"] == 3
+    assert route["market_profile"] == "alibaba-cn"
     assert route["auth_scheme"] == "alibaba_rpc_hmac_sha1"
     assert route["official_source_url"].startswith("https://help.aliyun.com/")
     assert route["request_schema_hash"].startswith("sha256:")

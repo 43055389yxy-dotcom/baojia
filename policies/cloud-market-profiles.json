@@ -1,0 +1,169 @@
+{
+  "schema_version": "astraquote-cloud-market-profiles/1",
+  "providers": {
+    "aws": {
+      "default_profile": "aws-global",
+      "profiles": {
+        "aws-global": {
+          "site_label": "AWS 全球站",
+          "market_scope": "global",
+          "credential_scope": "global",
+          "currency_policy": "official_response",
+          "official_source_url": "https://docs.aws.amazon.com/global-infrastructure/latest/regions/aws-regions.html",
+          "regions": []
+        }
+      }
+    },
+    "azure": {
+      "default_profile": "azure-global",
+      "profiles": {
+        "azure-global": {
+          "site_label": "Microsoft Azure 全球站",
+          "market_scope": "global",
+          "credential_scope": "global",
+          "currency_policy": "official_response",
+          "official_source_url": "https://azure.microsoft.com/explore/global-infrastructure/geographies/",
+          "regions": [
+            ["australiaeast", "澳大利亚东部"], ["australiasoutheast", "澳大利亚东南部"],
+            ["brazilsouth", "巴西南部"], ["canadacentral", "加拿大中部"], ["canadaeast", "加拿大东部"],
+            ["centralindia", "印度中部"], ["centralus", "美国中部"], ["eastasia", "东亚（香港）"],
+            ["eastus", "美国东部"], ["eastus2", "美国东部 2"], ["francecentral", "法国中部"],
+            ["germanywestcentral", "德国中西部"], ["japaneast", "日本东部"], ["japanwest", "日本西部"],
+            ["koreacentral", "韩国中部"], ["northcentralus", "美国中北部"], ["northeurope", "北欧（爱尔兰）"],
+            ["norwayeast", "挪威东部"], ["qatarcentral", "卡塔尔中部"], ["southafricanorth", "南非北部"],
+            ["southcentralus", "美国中南部"], ["southeastasia", "东南亚（新加坡）"], ["southindia", "印度南部"],
+            ["swedencentral", "瑞典中部"], ["switzerlandnorth", "瑞士北部"], ["uaenorth", "阿联酋北部"],
+            ["uksouth", "英国南部"], ["ukwest", "英国西部"], ["westcentralus", "美国中西部"],
+            ["westeurope", "西欧（荷兰）"], ["westus", "美国西部"], ["westus2", "美国西部 2"],
+            ["westus3", "美国西部 3"]
+          ]
+        }
+      }
+    },
+    "oci": {
+      "default_profile": "oci-global",
+      "profiles": {
+        "oci-global": {
+          "site_label": "Oracle Cloud 全球站",
+          "market_scope": "global",
+          "credential_scope": "global",
+          "currency_policy": "official_response",
+          "official_source_url": "https://docs.oracle.com/en-us/iaas/Content/General/Concepts/regions.htm",
+          "regions": [
+            ["ap-chuncheon-1", "韩国春川"], ["ap-hyderabad-1", "印度海得拉巴"], ["ap-melbourne-1", "澳大利亚墨尔本"],
+            ["ap-mumbai-1", "印度孟买"], ["ap-osaka-1", "日本大阪"], ["ap-seoul-1", "韩国首尔"],
+            ["ap-singapore-1", "新加坡"], ["ap-sydney-1", "澳大利亚悉尼"], ["ap-tokyo-1", "日本东京"],
+            ["ca-montreal-1", "加拿大蒙特利尔"], ["ca-toronto-1", "加拿大多伦多"], ["eu-amsterdam-1", "荷兰阿姆斯特丹"],
+            ["eu-frankfurt-1", "德国法兰克福"], ["eu-madrid-1", "西班牙马德里"], ["eu-marseille-1", "法国马赛"],
+            ["eu-milan-1", "意大利米兰"], ["eu-paris-1", "法国巴黎"], ["eu-stockholm-1", "瑞典斯德哥尔摩"],
+            ["eu-zurich-1", "瑞士苏黎世"], ["me-dubai-1", "阿联酋迪拜"], ["me-jeddah-1", "沙特吉达"],
+            ["sa-bogota-1", "哥伦比亚波哥大"], ["sa-santiago-1", "智利圣地亚哥"], ["sa-saopaulo-1", "巴西圣保罗"],
+            ["uk-cardiff-1", "英国卡迪夫"], ["uk-london-1", "英国伦敦"], ["us-ashburn-1", "美国阿什本"],
+            ["us-chicago-1", "美国芝加哥"], ["us-phoenix-1", "美国凤凰城"], ["us-sanjose-1", "美国圣何塞"],
+            ["eu-dublin-1", "爱尔兰都柏林"]
+          ]
+        }
+      }
+    },
+    "gcp": {
+      "default_profile": "gcp-global",
+      "profiles": {
+        "gcp-global": {
+          "site_label": "Google Cloud 全球站",
+          "market_scope": "global",
+          "credential_scope": "global",
+          "currency_policy": "official_response",
+          "official_source_url": "https://cloud.google.com/about/locations",
+          "regions": [
+            ["asia-east1", "台湾彰化"], ["asia-east2", "香港"], ["asia-northeast1", "日本东京"],
+            ["asia-northeast2", "日本大阪"], ["asia-northeast3", "韩国首尔"], ["asia-south1", "印度孟买"],
+            ["asia-southeast1", "新加坡"], ["asia-southeast2", "印度尼西亚雅加达"], ["australia-southeast1", "澳大利亚悉尼"],
+            ["europe-north1", "芬兰"], ["europe-west1", "比利时"], ["europe-west2", "英国伦敦"],
+            ["europe-west3", "德国法兰克福"], ["europe-west4", "荷兰"], ["europe-west6", "瑞士苏黎世"],
+            ["me-central1", "卡塔尔多哈"], ["northamerica-northeast1", "加拿大蒙特利尔"], ["southamerica-east1", "巴西圣保罗"],
+            ["us-central1", "美国爱荷华"], ["us-east1", "美国南卡罗来纳"], ["us-east4", "美国北弗吉尼亚"],
+            ["us-west1", "美国俄勒冈"], ["us-west2", "美国洛杉矶"], ["us-west3", "美国盐湖城"], ["us-west4", "美国拉斯维加斯"]
+          ]
+        }
+      }
+    },
+    "tencent": {
+      "default_profile": "tencent-cn",
+      "profiles": {
+        "tencent-cn": {
+          "site_label": "腾讯云中国站",
+          "market_scope": "china_site",
+          "credential_scope": "tencent-cn",
+          "currency_policy": "official_response",
+          "official_source_url": "https://cloud.tencent.com/document/product/213/6091",
+          "regions": [["ap-beijing", "北京"], ["ap-chengdu", "成都"], ["ap-chongqing", "重庆"], ["ap-guangzhou", "广州"], ["ap-nanjing", "南京"], ["ap-shanghai", "上海"], ["ap-hongkong", "中国香港"], ["ap-tokyo", "日本东京"], ["ap-seoul", "韩国首尔"], ["ap-singapore", "新加坡"], ["ap-bangkok", "泰国曼谷"], ["ap-jakarta", "印度尼西亚雅加达"], ["na-siliconvalley", "美国硅谷"], ["na-ashburn", "美国弗吉尼亚"], ["eu-frankfurt", "德国法兰克福"], ["sa-saopaulo", "巴西圣保罗"]]
+        }
+      }
+    },
+    "alibaba": {
+      "default_profile": "alibaba-cn",
+      "profiles": {
+        "alibaba-cn": {
+          "site_label": "阿里云中国站",
+          "market_scope": "china_site",
+          "credential_scope": "alibaba-cn",
+          "currency_policy": "official_response",
+          "official_source_url": "https://help.aliyun.com/zh/ecs/user-guide/regions-and-zones",
+          "regions": [["cn-beijing", "北京"], ["cn-hangzhou", "杭州"], ["cn-shanghai", "上海"], ["cn-shenzhen", "深圳"], ["cn-heyuan", "河源"], ["cn-guangzhou", "广州"], ["cn-chengdu", "成都"], ["cn-zhangjiakou", "张家口"], ["cn-hongkong", "中国香港"], ["ap-southeast-1", "新加坡"], ["ap-southeast-2", "澳大利亚悉尼"], ["ap-southeast-3", "马来西亚吉隆坡"], ["ap-southeast-5", "印度尼西亚雅加达"], ["ap-northeast-1", "日本东京"], ["ap-northeast-2", "韩国首尔"], ["eu-central-1", "德国法兰克福"], ["eu-west-1", "英国伦敦"], ["us-east-1", "美国弗吉尼亚"], ["us-west-1", "美国硅谷"], ["me-east-1", "阿联酋迪拜"]]
+        }
+      }
+    },
+    "huawei": {
+      "default_profile": "huawei-cn",
+      "profiles": {
+        "huawei-cn": {
+          "site_label": "华为云中国站",
+          "market_scope": "china_site",
+          "credential_scope": "huawei-cn",
+          "currency_policy": "official_response",
+          "official_source_url": "https://support.huaweicloud.com/intl/zh-cn/productdesc-region/zh-cn_topic_0182205862.html",
+          "regions": [["cn-north-1", "华北-北京一"], ["cn-north-4", "华北-北京四"], ["cn-east-2", "华东-上海二"], ["cn-east-3", "华东-上海一"], ["cn-south-1", "华南-广州"], ["cn-southwest-2", "西南-贵阳一"], ["ap-southeast-1", "中国香港"], ["ap-southeast-3", "新加坡"], ["ap-southeast-2", "泰国曼谷"], ["ap-southeast-4", "印度尼西亚雅加达"], ["ap-northeast-1", "日本东京"], ["la-south-2", "智利圣地亚哥"], ["sa-brazil-1", "巴西圣保罗"], ["af-south-1", "南非约翰内斯堡"], ["tr-west-1", "土耳其伊斯坦布尔"]]
+        }
+      }
+    },
+    "baidu": {
+      "default_profile": "baidu-cn",
+      "profiles": {
+        "baidu-cn": {
+          "site_label": "百度智能云中国站",
+          "market_scope": "china_site",
+          "credential_scope": "baidu-cn",
+          "currency_policy": "official_response",
+          "official_source_url": "https://cloud.baidu.com/doc/BCC/s/2k3sbu6ne",
+          "regions": [["bj", "北京"], ["gz", "广州"], ["su", "苏州"], ["hkg", "中国香港"], ["fwh", "武汉"], ["bd", "保定"]]
+        }
+      }
+    },
+    "volcengine": {
+      "default_profile": "volcengine-cn",
+      "profiles": {
+        "volcengine-cn": {
+          "site_label": "火山引擎中国站",
+          "market_scope": "china_site",
+          "credential_scope": "volcengine-cn",
+          "currency_policy": "official_response",
+          "official_source_url": "https://www.volcengine.com/docs/6396/107714",
+          "regions": [["cn-beijing", "华北 2（北京）"], ["cn-shanghai", "华东 2（上海）"], ["cn-guangzhou", "华南 1（广州）"], ["cn-hongkong", "中国香港"], ["ap-southeast-1", "新加坡"]]
+        }
+      }
+    },
+    "ctyun": {
+      "default_profile": "ctyun-cn",
+      "profiles": {
+        "ctyun-cn": {
+          "site_label": "天翼云中国站",
+          "market_scope": "china_site",
+          "credential_scope": "ctyun-cn",
+          "currency_policy": "official_response",
+          "official_source_url": "https://www.ctyun.cn/document/10026730/10028822",
+          "regions": [["cn-beijing5", "北京 5"], ["cn-shanghai4", "上海 4"], ["cn-guangzhou4", "广州 4"], ["cn-chengdu", "成都"], ["cn-wuhan", "武汉"], ["cn-hongkong", "中国香港"]]
+        }
+      }
+    }
+  }
+}

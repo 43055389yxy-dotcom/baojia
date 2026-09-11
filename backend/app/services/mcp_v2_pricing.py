@@ -14,6 +14,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.services.aws_query_executor import ReadOnlyAwsQueryExecutor
+from app.services.cloud_quote_profiles import active_market_profile
 from app.services.official_cloud_clients import (
     OfficialCloudApiClient,
     OfficialCloudClientError,
@@ -439,9 +440,11 @@ def _validate_authenticated_catalog_query(query: AuthenticatedCatalogQuery) -> N
                 for suffix in _PROVIDER_OFFICIAL_SOURCE_SUFFIXES[query.provider]
             )
         ):
-            raise ValueError(
-                f"{query.provider} official_source_url must use an official HTTPS domain"
-            )
+            # The official endpoint and read-only operation are independently
+            # verified. A stale or cross-site documentation link is optional
+            # metadata, so discard it and use the verified API URL as evidence
+            # instead of rejecting every valid query in the batch.
+            query.official_source_url = None
 
 
 class OfficialPricingService:
@@ -927,6 +930,7 @@ def _schema_hash(value: Any) -> str:
 
 
 def _route_identity(query: AuthenticatedCatalogQuery) -> dict[str, Any]:
+    market_profile = active_market_profile(query.provider)
     return {
         "provider": query.provider,
         "endpoint": query.endpoint,
@@ -934,6 +938,8 @@ def _route_identity(query: AuthenticatedCatalogQuery) -> dict[str, Any]:
         "action": query.action,
         "version": query.version,
         "region": query.region,
+        "market_profile": market_profile["market_profile"],
+        "credential_scope": market_profile["credential_scope"],
         "region_parameter": query.region_parameter,
         "method": query.method,
         "path": query.path,
@@ -965,7 +971,7 @@ def _route_verification(
     )
     return {
         **_route_identity(query),
-        "route_contract_version": 2,
+        "route_contract_version": 3,
         "route_fingerprint": _route_fingerprint(query),
         "response_schema_hash": _schema_hash(payload),
         "response_items_path": query.response_items_path,

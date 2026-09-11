@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.7.0';
+const VERSION = '3.8.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -235,6 +235,13 @@ const getPricesInput = z.object({
   });
 });
 
+const getPriceResultsInput = z.object({
+  price_batch_id: z.string().regex(/^aqpb_[a-f0-9-]{36}$/),
+  query_ids: z.array(z.string().min(1).max(100)).min(1).max(10),
+  relay_job_id: z.string().regex(/^gpt-[a-f0-9]{32}$/).optional(),
+  submission_code: z.string().regex(/^[1-9]$/).optional(),
+}).strict();
+
 const fact = z.object({
   fact_id: factId,
   component_key: componentKey,
@@ -352,6 +359,9 @@ const buildEstimateInput = z.object({
   cloud_provider: cloudProvider,
   relay_job_id: z.string().regex(/^gpt-[a-f0-9]{32}$/).optional().describe('销售前端提供的内部任务编号，用于撤回后的交付保护。'),
   default_region: region,
+  region_adjustment_reason: z.string().min(1).max(500).optional().describe(
+    '仅当实际报价地域不同于销售首选地域时填写，说明该地域不能承载整套产品以及 GPT 选择的同站点相邻地域。',
+  ),
   currency: z.string().regex(/^[A-Z]{3}$/).describe(
     '整张报价使用的官方币种，必须与所选官方费率证据一致；不得静默换汇。',
   ),
@@ -379,8 +389,21 @@ const quoteJobInput = z.object({
 }).strict();
 
 function ok(payload) {
+  const summary = {};
+  for (const key of [
+    'status', 'code', 'price_batch_id', 'quote_id', 'next_action',
+    'result_count', 'batch_result_count', 'relay_job_id', 'stage',
+  ]) {
+    if (payload?.[key] !== undefined) summary[key] = payload[key];
+  }
+  if (Array.isArray(payload?.results)) {
+    summary.results = payload.results.map((item) => ({
+      query_id: item?.query_id,
+      status: item?.status,
+    }));
+  }
   return {
-    content: [{ type: 'text', text: JSON.stringify(payload) }],
+    content: [{ type: 'text', text: JSON.stringify(summary) }],
     structuredContent: payload,
   };
 }
@@ -468,16 +491,23 @@ function buildServer(workflow) {
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, guarded((args) => workflow.getPrices(args)));
 
+  server.registerTool('get_price_results', {
+    title: 'Read selected saved official price results',
+    description: 'Reads only explicitly requested query IDs from a saved batch. Use it instead of replaying the whole historical batch.',
+    inputSchema: getPriceResultsInput,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, guarded((args) => workflow.getPriceResults(args)));
+
   server.registerTool('get_quote_job_status', {
     title: 'Read a resumable quote job checkpoint',
-    description: 'Returns only persisted stage, price batch and delivery state. It never reruns a completed step. If the saved state proves the job is permanently unrecoverable, follow the server final-state protocol and emit AQ-QUOTE-BLOCKED.',
+    description: 'Returns only persisted stage, price batch and delivery state. It never reruns a completed step. If the saved state proves the job is permanently unrecoverable, follow the server final-state protocol and emit AQ-QUOTE-FAILED.',
     inputSchema: quoteJobInput,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, guarded((args) => workflow.getQuoteJobStatus(args)));
 
   server.registerTool('resume_quote_job', {
     title: 'Resume a quote job from its saved stage',
-    description: 'Returns the next missing action and saved identifiers. It does not restart price queries, files or delivery. If recovery is definitively impossible, follow the server final-state protocol and emit AQ-QUOTE-BLOCKED.',
+    description: 'Returns the next missing action and saved identifiers. It does not restart price queries, files or delivery. If recovery is definitively impossible, follow the server final-state protocol and emit AQ-QUOTE-FAILED.',
     inputSchema: quoteJobInput,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, guarded((args) => workflow.resumeQuoteJob(args)));
@@ -565,6 +595,7 @@ module.exports = {
   describeServiceInput,
   fail,
   getPricesInput,
+  getPriceResultsInput,
   guarded,
   normalizeBuildEstimateInput,
   ok,
