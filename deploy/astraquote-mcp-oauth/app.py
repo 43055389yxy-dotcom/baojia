@@ -5,6 +5,7 @@ import html
 import json
 import math
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -12,7 +13,7 @@ from collections import defaultdict, deque
 from collections.abc import Iterable
 from contextlib import asynccontextmanager, contextmanager
 from threading import Lock
-from urllib.parse import urlencode, urlparse
+from urllib.parse import unquote, urlencode, urlparse
 
 import httpx
 from fastapi import FastAPI, Form, Request
@@ -401,19 +402,39 @@ def valid_redirect_uri(uri: str) -> bool:
         parsed = urlparse(uri)
     except ValueError:
         return False
-    if (
-        parsed.scheme != "https"
-        or parsed.username
-        or parsed.password
-        or parsed.fragment
-    ):
+    if parsed.username or parsed.password or parsed.fragment:
         return False
-    if parsed.hostname not in {"chatgpt.com", "www.chatgpt.com"}:
-        return False
-    return (
-        parsed.path == "/connector_platform_oauth_redirect"
-        or parsed.path.startswith("/connector/oauth/")
-    )
+
+    if parsed.scheme == "https" and parsed.hostname in {
+        "chatgpt.com",
+        "www.chatgpt.com",
+    }:
+        return (
+            parsed.path == "/connector_platform_oauth_redirect"
+            or parsed.path.startswith("/connector/oauth/")
+        )
+
+    if parsed.scheme == "workbuddy" and parsed.hostname == "workbuddy":
+        if parsed.params or parsed.query:
+            return False
+        callback_path = unquote(parsed.path)
+        return (
+            re.fullmatch(
+                r"/mcp/connector:[a-z0-9]+(?:-[a-z0-9]+)*/oauth/callback",
+                callback_path,
+            )
+            is not None
+        )
+
+    if parsed.scheme == "http" and parsed.hostname == "127.0.0.1":
+        if parsed.params or parsed.query or parsed.path != "/oauth/callback":
+            return False
+        try:
+            return parsed.port is not None
+        except ValueError:
+            return False
+
+    return False
 
 
 def oauth_metadata() -> dict:
@@ -541,16 +562,17 @@ async def register(request: Request) -> JSONResponse:
         isinstance(uri, str) and valid_redirect_uri(uri) for uri in redirect_uris
     ):
         return json_error(
-            "invalid_redirect_uri", "Only ChatGPT HTTPS callbacks are allowed"
+            "invalid_redirect_uri",
+            "Only approved ChatGPT or WorkBuddy callbacks are allowed",
         )
     method = body.get("token_endpoint_auth_method", "none")
     if method not in {"none", "client_secret_basic", "client_secret_post"}:
         return json_error(
             "invalid_client_metadata", "Unsupported token authentication method"
         )
-    client_id = f"chatgpt_{secrets.token_urlsafe(24)}"
+    client_id = f"mcp_{secrets.token_urlsafe(24)}"
     client_secret = secrets.token_urlsafe(48) if method != "none" else None
-    client_name = str(body.get("client_name", "ChatGPT"))[:200]
+    client_name = str(body.get("client_name", "MCP Client"))[:200]
     with db() as connection:
         cleanup_expired(connection)
         connection.execute(

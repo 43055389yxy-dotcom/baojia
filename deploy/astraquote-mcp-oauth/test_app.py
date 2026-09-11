@@ -140,6 +140,70 @@ def request_from(address: str) -> Request:
     )
 
 
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [
+        "https://chatgpt.com/connector_platform_oauth_redirect",
+        "https://www.chatgpt.com/connector/oauth/callback",
+        "workbuddy://workbuddy/mcp/connector%3Aastraquote/oauth/callback",
+        "http://127.0.0.1:49152/oauth/callback",
+    ],
+)
+def test_supported_mcp_clients_have_valid_redirect_uris(
+    tmp_path, monkeypatch, redirect_uri
+):
+    gateway = load_gateway(tmp_path, monkeypatch)
+
+    assert gateway.valid_redirect_uri(redirect_uri) is True
+
+
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [
+        "workbuddy://attacker/mcp/connector%3Aastraquote/oauth/callback",
+        "workbuddy://workbuddy/mcp/connector%3A../oauth/callback",
+        "workbuddy://workbuddy/mcp/connector%3Aastraquote/oauth/callback?next=evil",
+        "http://localhost:49152/oauth/callback",
+        "http://127.0.0.1.evil.example:49152/oauth/callback",
+        "http://127.0.0.1/oauth/callback",
+    ],
+)
+def test_untrusted_workbuddy_redirect_uris_are_rejected(
+    tmp_path, monkeypatch, redirect_uri
+):
+    gateway = load_gateway(tmp_path, monkeypatch)
+
+    assert gateway.valid_redirect_uri(redirect_uri) is False
+
+
+@pytest.mark.asyncio
+async def test_dynamic_registration_accepts_workbuddy_public_client(
+    tmp_path, monkeypatch
+):
+    gateway = load_gateway(tmp_path, monkeypatch)
+    gateway.init_db()
+    transport = httpx.ASGITransport(app=gateway.app)
+    redirect_uri = (
+        "workbuddy://workbuddy/mcp/connector%3Aastraquote/oauth/callback"
+    )
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://pricing-mcp.tontiancloud.com"
+    ) as client:
+        response = await client.post(
+            "/oauth/register",
+            json={
+                "client_name": "WorkBuddy",
+                "redirect_uris": [redirect_uri],
+                "token_endpoint_auth_method": "none",
+            },
+        )
+
+    assert response.status_code == 201
+    assert response.json()["redirect_uris"] == [redirect_uri]
+    assert response.json()["token_endpoint_auth_method"] == "none"
+
+
 def test_existing_database_rows_survive_initialization(tmp_path, monkeypatch):
     gateway = load_gateway(tmp_path, monkeypatch)
     gateway.init_db()
