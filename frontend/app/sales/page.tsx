@@ -211,6 +211,7 @@ export default function SalesQuotePage() {
   const [preferredRegion, setPreferredRegion] = useState("");
   const [regionLoading, setRegionLoading] = useState(true);
   const [regionOpen, setRegionOpen] = useState(false);
+  const providerPickerRef = useRef<HTMLDivElement>(null);
   const regionPickerRef = useRef<HTMLDivElement>(null);
   const [health, setHealth] = useState<RelayHealth | null>(null);
   const [job, setJob] = useState<RelayJob | null>(null);
@@ -284,11 +285,12 @@ export default function SalesQuotePage() {
   }, [cloudProvider]);
 
   useEffect(() => {
-    function closeRegionPicker(event: PointerEvent) {
+    function closePickers(event: PointerEvent) {
+      if (!providerPickerRef.current?.contains(event.target as Node)) setProviderOpen(false);
       if (!regionPickerRef.current?.contains(event.target as Node)) setRegionOpen(false);
     }
-    document.addEventListener("pointerdown", closeRegionPicker);
-    return () => document.removeEventListener("pointerdown", closeRegionPicker);
+    document.addEventListener("pointerdown", closePickers);
+    return () => document.removeEventListener("pointerdown", closePickers);
   }, []);
 
   useEffect(() => {
@@ -501,56 +503,55 @@ export default function SalesQuotePage() {
       {!job ? (
         <section className="sales-quote-workspace">
           <form className="sales-quote-form" onSubmit={submit}>
-            <fieldset
-              className="sales-pricing-mode sales-provider-section"
-              onPointerEnter={(event) => {
-                if (event.pointerType === "mouse") setProviderOpen(true);
-              }}
-              onPointerLeave={(event) => {
-                if (event.pointerType === "mouse") setProviderOpen(false);
-              }}
-            >
+            <fieldset className="sales-pricing-mode sales-provider-section">
               <div className="sales-provider-heading">
-                <div>
-                  <legend>选择云厂商</legend>
-                  <span className="sales-provider-summary">
-                    <b className="sales-provider-mark" aria-hidden="true">{PROVIDER_META[cloudProvider].mark}</b>
-                    <span><strong>{PROVIDER_META[cloudProvider].label}</strong><small>{PROVIDER_META[cloudProvider].detail}</small></span>
-                  </span>
-                </div>
+                <legend>选择云厂商</legend>
+                <span>01 / 04</span>
+              </div>
+              <div
+                className="sales-provider-select-wrap"
+                ref={providerPickerRef}
+                onMouseLeave={() => setProviderOpen(false)}
+              >
                 <button
+                  className="sales-provider-trigger"
                   type="button"
                   aria-controls="sales-provider-options"
                   aria-expanded={providerOpen}
                   aria-label={providerOpen ? "收起云厂商" : "展开云厂商"}
-                  onClick={(event) => {
-                    if ((event.nativeEvent as PointerEvent).pointerType !== "mouse") {
-                      setProviderOpen((current) => !current);
-                    }
-                  }}
-                ><i aria-hidden="true">⌄</i></button>
+                  onClick={() => setProviderOpen((current) => !current)}
+                >
+                  <b className="sales-provider-mark" aria-hidden="true">{PROVIDER_META[cloudProvider].mark}</b>
+                  <span><strong>{PROVIDER_META[cloudProvider].label}</strong><small>{PROVIDER_META[cloudProvider].detail}</small></span>
+                  <i aria-hidden="true">⌄</i>
+                </button>
+                {providerOpen && <div className="sales-choice-row sales-provider-row" id="sales-provider-options" role="listbox">
+                  {PROVIDER_ORDER.map((value) => {
+                    const catalog = health?.provider_catalogs?.[value];
+                    const provider = PROVIDER_META[value];
+                    return (
+                      <label
+                        className={`${cloudProvider === value ? "selected" : ""} ${catalog?.available === false ? "unavailable" : ""}`}
+                        key={value}
+                        role="option"
+                        aria-selected={cloudProvider === value}
+                      >
+                        <input
+                          type="radio"
+                          name="cloud-provider"
+                          value={value}
+                          checked={cloudProvider === value}
+                          onChange={() => chooseProvider(value)}
+                        />
+                        <b className="sales-provider-mark" aria-hidden="true">{provider.mark}</b>
+                        <span><strong>{provider.label}</strong><small>{provider.detail}</small></span>
+                        <i className="sales-choice-indicator" aria-hidden="true" />
+                        {catalog?.available === false && <em>待配置</em>}
+                      </label>
+                    );
+                  })}
+                </div>}
               </div>
-              {providerOpen && <div className="sales-choice-row sales-provider-row" id="sales-provider-options">
-                {PROVIDER_ORDER.map((value) => {
-                  const catalog = health?.provider_catalogs?.[value];
-                  const provider = PROVIDER_META[value];
-                  return (
-                    <label className={`${cloudProvider === value ? "selected" : ""} ${catalog?.available === false ? "unavailable" : ""}`} key={value}>
-                      <input
-                        type="radio"
-                        name="cloud-provider"
-                        value={value}
-                        checked={cloudProvider === value}
-                        onChange={() => chooseProvider(value)}
-                      />
-                      <b className="sales-provider-mark" aria-hidden="true">{provider.mark}</b>
-                      <span><strong>{provider.label}</strong><small>{provider.detail}</small></span>
-                      <i className="sales-choice-indicator" aria-hidden="true" />
-                      {catalog?.available === false && <em>待配置</em>}
-                    </label>
-                  );
-                })}
-              </div>}
             </fieldset>
 
             {selectedCatalogUnavailable && (

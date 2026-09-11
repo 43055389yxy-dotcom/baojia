@@ -87,9 +87,10 @@ test("sales portal uses a structured workspace and grouped result actions", asyn
   assert.match(page, /sales-result-actions/);
   assert.match(page, /sales-provider-mark/);
   assert.match(page, /providerOpen/);
-  assert.match(page, /onPointerEnter=\{\(event\) => \{/);
-  assert.match(page, /event\.pointerType === "mouse"/);
-  assert.match(page, /onPointerLeave=\{\(event\) => \{/);
+  assert.match(page, /sales-provider-trigger/);
+  assert.match(page, /onMouseLeave=\{\(\) => setProviderOpen\(false\)\}/);
+  assert.match(page, /onClick=\{\(\) => setProviderOpen\(\(current\) => !current\)\}/);
+  assert.doesNotMatch(page, /onPointerEnter/);
   assert.match(page, /aria-label=\{providerOpen \? "收起云厂商" : "展开云厂商"\}/);
   assert.doesNotMatch(page, /更换云厂商/);
   assert.match(page, /setProviderOpen\(false\)/);
@@ -114,6 +115,7 @@ test("sales portal uses a pale-blue glass theme and distinguishes queued work", 
   assert.match(page, /sales-region-options-panel/);
   assert.doesNotMatch(page, /<datalist/);
   assert.match(css, /grid-template-columns:\s*repeat\(4, minmax\(0, 1fr\)\)/);
+  assert.match(css, /\.sales-provider-row\s*\{[^}]*grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\)/s);
   assert.match(css, /background:\s*rgba\(239, 249, 255, \.985\)/);
   assert.match(css, /\.sales-region-options-panel\s*\{[^}]*position:\s*relative/s);
 });
