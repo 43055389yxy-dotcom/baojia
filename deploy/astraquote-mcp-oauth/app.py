@@ -420,7 +420,10 @@ def valid_redirect_uri(uri: str) -> bool:
         callback_path = unquote(parsed.path)
         return (
             re.fullmatch(
-                r"/mcp/connector:[a-z0-9]+(?:-[a-z0-9]+)*/oauth/callback",
+                r"/mcp/(?:"
+                r"connector:[a-z0-9]+(?:-[a-z0-9]+)*"
+                r"|custom-mcp:[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+                r")/oauth/callback",
                 callback_path,
             )
             is not None

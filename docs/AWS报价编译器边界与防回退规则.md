@@ -61,7 +61,7 @@ resume_quote_job
 build_estimate
 ```
 
-对授权智能体客户端暴露的稳定 HTTPS 地址是 `/mcp`；OAuth 网关完成认证后再转发到容器内部的 `/v2/mcp`。网关允许 ChatGPT 官方 HTTPS 回调、WorkBuddy 官方自定义协议回调，以及 WorkBuddy 使用 `127.0.0.1` 动态端口的回退回调；不得放宽到任意域名、任意自定义协议或非回环 HTTP 地址。禁止把内部版本路径直接交给销售配置，以免连接地址与 OAuth resource 不一致。
+对授权智能体客户端暴露的稳定 HTTPS 地址是 `/mcp`；OAuth 网关完成认证后再转发到容器内部的 `/v2/mcp`。网关允许 ChatGPT 官方 HTTPS 回调、WorkBuddy 打包连接器和自定义 MCP 的官方自定义协议回调，以及 WorkBuddy 使用 `127.0.0.1` 动态端口的回退回调；不得放宽到任意域名、任意自定义协议或非回环 HTTP 地址。禁止把内部版本路径直接交给销售配置，以免连接地址与 OAuth resource 不一致。
 
 正常路径只有价目查询与核验交付两个主要阶段：
 

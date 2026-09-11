@@ -146,6 +146,7 @@ def request_from(address: str) -> Request:
         "https://chatgpt.com/connector_platform_oauth_redirect",
         "https://www.chatgpt.com/connector/oauth/callback",
         "workbuddy://workbuddy/mcp/connector%3Aastraquote/oauth/callback",
+        "workbuddy://workbuddy/mcp/custom-mcp%3AAstraQuote/oauth/callback",
         "http://127.0.0.1:49152/oauth/callback",
     ],
 )
@@ -162,6 +163,8 @@ def test_supported_mcp_clients_have_valid_redirect_uris(
     [
         "workbuddy://attacker/mcp/connector%3Aastraquote/oauth/callback",
         "workbuddy://workbuddy/mcp/connector%3A../oauth/callback",
+        "workbuddy://workbuddy/mcp/custom-mcp%3A../oauth/callback",
+        "workbuddy://workbuddy/mcp/custom-mcp%3AAstraQuote%2Fevil/oauth/callback",
         "workbuddy://workbuddy/mcp/connector%3Aastraquote/oauth/callback?next=evil",
         "http://localhost:49152/oauth/callback",
         "http://127.0.0.1.evil.example:49152/oauth/callback",
@@ -184,7 +187,7 @@ async def test_dynamic_registration_accepts_workbuddy_public_client(
     gateway.init_db()
     transport = httpx.ASGITransport(app=gateway.app)
     redirect_uri = (
-        "workbuddy://workbuddy/mcp/connector%3Aastraquote/oauth/callback"
+        "workbuddy://workbuddy/mcp/custom-mcp%3AAstraQuote/oauth/callback"
     )
 
     async with httpx.AsyncClient(

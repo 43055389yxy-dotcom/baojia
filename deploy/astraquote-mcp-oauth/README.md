@@ -5,8 +5,10 @@ publishes `https://pricing-mcp.tontiancloud.com/mcp` and proxies authenticated
 requests to the loopback-only AstraQuote MCP process.
 
 The OAuth dynamic-registration boundary accepts the approved ChatGPT HTTPS
-callbacks and WorkBuddy's documented `workbuddy://workbuddy/.../oauth/callback`
-callback. It also accepts WorkBuddy's documented fallback callback only on
+callbacks, WorkBuddy packaged-connector callbacks, and WorkBuddy custom-MCP
+callbacks such as
+`workbuddy://workbuddy/mcp/custom-mcp%3AAstraQuote/oauth/callback`. It also
+accepts WorkBuddy's fallback callback only on
 `http://127.0.0.1:<dynamic-port>/oauth/callback`; non-loopback HTTP callbacks
 remain rejected. Both clients use OAuth 2.1 authorization code flow with PKCE.
 
