@@ -9,6 +9,7 @@ baojia.tontiancloud.com {
     }
 
     handle {
+        import tool_auth automated_quote
         reverse_proxy astraquote:3000
     }
 }
