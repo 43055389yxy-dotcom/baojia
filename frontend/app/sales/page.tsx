@@ -206,7 +206,7 @@ export default function SalesQuotePage() {
   );
   const [utilization, setUtilization] = useState(100);
   const [cloudProvider, setCloudProvider] = useState<CloudProvider>("aws");
-  const [providerOpen, setProviderOpen] = useState(true);
+  const [providerOpen, setProviderOpen] = useState(false);
   const [regionCatalog, setRegionCatalog] = useState<RegionCatalog | null>(null);
   const [preferredRegion, setPreferredRegion] = useState("");
   const [regionLoading, setRegionLoading] = useState(true);
@@ -501,23 +501,34 @@ export default function SalesQuotePage() {
       {!job ? (
         <section className="sales-quote-workspace">
           <form className="sales-quote-form" onSubmit={submit}>
-            <fieldset className="sales-pricing-mode sales-provider-section">
+            <fieldset
+              className="sales-pricing-mode sales-provider-section"
+              onPointerEnter={(event) => {
+                if (event.pointerType === "mouse") setProviderOpen(true);
+              }}
+              onPointerLeave={(event) => {
+                if (event.pointerType === "mouse") setProviderOpen(false);
+              }}
+            >
               <div className="sales-provider-heading">
                 <div>
                   <legend>选择云厂商</legend>
-                  {!providerOpen && (
-                    <span className="sales-provider-summary">
-                      <b className="sales-provider-mark" aria-hidden="true">{PROVIDER_META[cloudProvider].mark}</b>
-                      <span><strong>{PROVIDER_META[cloudProvider].label}</strong><small>{PROVIDER_META[cloudProvider].detail}</small></span>
-                    </span>
-                  )}
+                  <span className="sales-provider-summary">
+                    <b className="sales-provider-mark" aria-hidden="true">{PROVIDER_META[cloudProvider].mark}</b>
+                    <span><strong>{PROVIDER_META[cloudProvider].label}</strong><small>{PROVIDER_META[cloudProvider].detail}</small></span>
+                  </span>
                 </div>
                 <button
                   type="button"
                   aria-controls="sales-provider-options"
                   aria-expanded={providerOpen}
-                  onClick={() => setProviderOpen((current) => !current)}
-                >{providerOpen ? "收起" : "更换云厂商"}<i aria-hidden="true">⌄</i></button>
+                  aria-label={providerOpen ? "收起云厂商" : "展开云厂商"}
+                  onClick={(event) => {
+                    if ((event.nativeEvent as PointerEvent).pointerType !== "mouse") {
+                      setProviderOpen((current) => !current);
+                    }
+                  }}
+                ><i aria-hidden="true">⌄</i></button>
               </div>
               {providerOpen && <div className="sales-choice-row sales-provider-row" id="sales-provider-options">
                 {PROVIDER_ORDER.map((value) => {

@@ -87,7 +87,11 @@ test("sales portal uses a structured workspace and grouped result actions", asyn
   assert.match(page, /sales-result-actions/);
   assert.match(page, /sales-provider-mark/);
   assert.match(page, /providerOpen/);
-  assert.match(page, /更换云厂商/);
+  assert.match(page, /onPointerEnter=\{\(event\) => \{/);
+  assert.match(page, /event\.pointerType === "mouse"/);
+  assert.match(page, /onPointerLeave=\{\(event\) => \{/);
+  assert.match(page, /aria-label=\{providerOpen \? "收起云厂商" : "展开云厂商"\}/);
+  assert.doesNotMatch(page, /更换云厂商/);
   assert.match(page, /setProviderOpen\(false\)/);
   assert.doesNotMatch(page, /创建云成本报价/);
   assert.match(css, /prefers-reduced-motion/);

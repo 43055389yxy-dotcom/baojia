@@ -159,10 +159,12 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .sales-provider-heading legend { color: #dcefff; font-size: 14px; font-weight: 800; }
 .sales-provider-heading > button {
   display: inline-flex;
+  width: 34px;
   min-height: 34px;
+  justify-content: center;
   align-items: center;
   gap: 8px;
-  padding: 0 12px;
+  padding: 0;
   border: 1px solid rgba(107, 196, 235, .2);
   border-radius: 10px;
   background: rgba(20, 65, 92, .5);
