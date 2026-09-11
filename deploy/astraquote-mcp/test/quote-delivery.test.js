@@ -180,7 +180,7 @@ test('a cancelled relay job cannot upload or expose a result', async () => {
   );
 });
 
-test('the default delivery guard permits only an actively processing relay job', async () => {
+test('the default delivery guard permits active and legacy stale-worker relay jobs', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-delivery-guard-'));
   const jobsDirectory = path.join(directory, 'jobs');
   fs.mkdirSync(jobsDirectory);
@@ -191,6 +191,18 @@ test('the default delivery guard permits only an actively processing relay job',
   try {
     fs.writeFileSync(jobPath, JSON.stringify({ job_id: relayJobId, status: 'processing' }));
     assert.equal(await defaultDeliveryGuard({ relay_job_id: relayJobId }), true);
+    fs.writeFileSync(jobPath, JSON.stringify({
+      job_id: relayJobId,
+      status: 'failed',
+      error: { code: 'gpt_quote_worker_stale' },
+    }));
+    assert.equal(await defaultDeliveryGuard({ relay_job_id: relayJobId }), true);
+    fs.writeFileSync(jobPath, JSON.stringify({
+      job_id: relayJobId,
+      status: 'failed',
+      error: { code: 'gpt_quote_blocked' },
+    }));
+    assert.equal(await defaultDeliveryGuard({ relay_job_id: relayJobId }), false);
     fs.writeFileSync(jobPath, JSON.stringify({ job_id: relayJobId, status: 'cancelled' }));
     assert.equal(await defaultDeliveryGuard({ relay_job_id: relayJobId }), false);
   } finally {

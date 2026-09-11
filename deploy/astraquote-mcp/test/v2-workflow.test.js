@@ -730,3 +730,89 @@ test('completed relay jobs replay before the processing guard and expose stage-l
   assert.equal(resumed.stage, 'delivery_completed');
   assert.match(resumed.next_action, /do not query, generate or deliver again/);
 });
+
+test('a legacy stale-worker failure can finish from its saved complete price batch', async (t) => {
+  const { workflow, directory, displayed } = fixture();
+  const relayDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-relay-stale-'));
+  const jobsDirectory = path.join(relayDirectory, 'jobs');
+  fs.mkdirSync(jobsDirectory);
+  const relayJobId = `gpt-${'c'.repeat(32)}`;
+  const relayPath = path.join(jobsDirectory, `${relayJobId}.json`);
+  const relay = {
+    job_id: relayJobId,
+    submission_code: '7',
+    status: 'processing',
+    quote_options: {
+      cloud_provider: 'azure',
+      pricing_scenarios: ['on_demand'],
+    },
+  };
+  fs.writeFileSync(relayPath, JSON.stringify(relay));
+  const previous = process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+  process.env.ASTRAQUOTE_GPT_RELAY_DIR = relayDirectory;
+  t.after(() => {
+    if (previous === undefined) delete process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+    else process.env.ASTRAQUOTE_GPT_RELAY_DIR = previous;
+    fs.rmSync(directory, { recursive: true, force: true });
+    fs.rmSync(relayDirectory, { recursive: true, force: true });
+  });
+
+  const batch = await workflow.getPrices({
+    relay_job_id: relayJobId,
+    submission_code: '7',
+    queries: [{ provider: 'azure', query_id: 'price-1', filter: 'caller supplied query' }],
+  });
+  relay.status = 'failed';
+  relay.error = { code: 'gpt_quote_worker_stale', message: 'legacy false failure' };
+  fs.writeFileSync(relayPath, JSON.stringify(relay));
+
+  const input = quoteInput(batch.price_batch_id);
+  input.relay_job_id = relayJobId;
+  input.pricing_scenarios = [{
+    scenario_key: 'on_demand', monthly_total: '12.34', upfront_total: '0',
+  }];
+  input.services[0].scenario_costs = [{
+    scenario_key: 'on_demand', pricing_basis: 'on_demand',
+    monthly_cost: '12.34', upfront_cost: '0',
+    price_evidence: [{ query_id: 'price-1', official_item_ids: ['item-1'] }],
+  }];
+
+  const result = await workflow.buildEstimate(input);
+
+  assert.equal(result.status, 'displayed_on_page');
+  assert.equal(displayed.length, 1);
+});
+
+test('an explicit quote stop remains terminal and cannot be revived', async (t) => {
+  const { workflow, directory } = fixture();
+  const relayDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-relay-blocked-'));
+  const jobsDirectory = path.join(relayDirectory, 'jobs');
+  fs.mkdirSync(jobsDirectory);
+  const relayJobId = `gpt-${'d'.repeat(32)}`;
+  fs.writeFileSync(path.join(jobsDirectory, `${relayJobId}.json`), JSON.stringify({
+    job_id: relayJobId,
+    submission_code: '8',
+    status: 'failed',
+    error: { code: 'gpt_quote_blocked' },
+    quote_options: { cloud_provider: 'azure', pricing_scenarios: ['on_demand'] },
+  }));
+  const previous = process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+  process.env.ASTRAQUOTE_GPT_RELAY_DIR = relayDirectory;
+  t.after(() => {
+    if (previous === undefined) delete process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+    else process.env.ASTRAQUOTE_GPT_RELAY_DIR = previous;
+    fs.rmSync(directory, { recursive: true, force: true });
+    fs.rmSync(relayDirectory, { recursive: true, force: true });
+  });
+
+  await assert.rejects(
+    workflow.buildEstimate({
+      ...quoteInput('aqpb-not-needed'),
+      relay_job_id: relayJobId,
+      pricing_scenarios: [{
+        scenario_key: 'on_demand', monthly_total: '12.34', upfront_total: '0',
+      }],
+    }),
+    (error) => error.code === 'relay_job_not_processing',
+  );
+});

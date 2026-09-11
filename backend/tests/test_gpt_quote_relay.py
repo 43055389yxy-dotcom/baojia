@@ -628,7 +628,7 @@ def test_failed_job_exposes_only_the_generic_sales_failure_code(tmp_path: Path) 
     assert "error" not in sales
 
 
-def test_abandoned_processing_job_stops_instead_of_waiting_forever(tmp_path: Path) -> None:
+def test_stale_worker_does_not_terminally_fail_submitted_quote(tmp_path: Path) -> None:
     store = GptQuoteRelayStore(tmp_path)
     public = store.create("东京 EC2 两台，按需。", {})
     store.claim_next("worker-a")
@@ -642,8 +642,9 @@ def test_abandoned_processing_job_stops_instead_of_waiting_forever(tmp_path: Pat
 
     sales = store.public_get(public["job_id"])
 
-    assert sales["status"] == "failed"
-    assert sales["failure_code"] == "AQ-QUOTE-FAILED"
+    assert sales["status"] == "processing"
+    assert sales["failure_code"] is None
+    assert store.get(public["job_id"])["status"] == "processing"
 
 
 def test_active_worker_heartbeat_prevents_false_quote_failure(tmp_path: Path) -> None:

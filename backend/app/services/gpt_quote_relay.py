@@ -223,36 +223,11 @@ class GptQuoteRelayStore:
         return payload
 
     def public_get(self, job_id: str) -> dict[str, Any]:
+        # A browser-worker heartbeat is transport health, not quote outcome.
+        # Keeping the job non-terminal lets a restarted worker reattach to the
+        # saved ChatGPT conversation and continue from its persisted checkpoint.
         record = self.reconcile_delivery_receipt(job_id)
-        if record.get("status") == "processing" and self._worker_is_stale(record):
-            record = self.update_if_not_cancelled(
-                job_id,
-                {
-                    "status": "failed",
-                    "error": {
-                        "code": "gpt_quote_worker_stale",
-                        "message": "报价执行器已停止更新任务。",
-                    },
-                    "lease_expires_at": None,
-                },
-                stage="failed",
-                message="报价执行器停止响应，任务已结束",
-            )
         return self.public(record)
-
-    def _worker_is_stale(self, record: dict[str, Any], *, seconds: int = 120) -> bool:
-        try:
-            job_updated = datetime.fromisoformat(str(record.get("updated_at") or ""))
-        except ValueError:
-            return False
-        if datetime.now(UTC) - job_updated < timedelta(seconds=seconds):
-            return False
-        try:
-            heartbeat = self._read(self.heartbeat_path)
-            heartbeat_updated = datetime.fromisoformat(str(heartbeat.get("updated_at") or ""))
-        except (OSError, ValueError, TypeError):
-            return True
-        return datetime.now(UTC) - heartbeat_updated >= timedelta(seconds=seconds)
 
     def reconcile_delivery_receipt(self, job_id: str) -> dict[str, Any]:
         """Prefer a verified MCP delivery receipt over brittle chat prose.

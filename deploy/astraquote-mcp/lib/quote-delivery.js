@@ -10,6 +10,7 @@ const {
 } = require('@aws-sdk/client-s3');
 
 const { buildQuoteWorkbook, simplifyCustomerText } = require('./quote-workbook');
+const { canFinalizeRelayJob } = require('./relay-job-state');
 
 const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 
@@ -196,7 +197,7 @@ async function defaultDeliveryGuard(record) {
   const jobPath = path.join(relayDirectory, 'jobs', `${relayJobId}.json`);
   try {
     const job = JSON.parse(await fs.readFile(jobPath, 'utf8'));
-    return job.job_id === relayJobId && job.status === 'processing';
+    return job.job_id === relayJobId && canFinalizeRelayJob(job);
   } catch {
     return false;
   }

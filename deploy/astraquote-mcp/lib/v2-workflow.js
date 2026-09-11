@@ -8,6 +8,7 @@ const { isDeepStrictEqual } = require('node:util');
 const { V2QuoteStore } = require('./v2-quote-store');
 const { QuoteDeliveryService } = require('./quote-delivery');
 const { PricingRouteStore } = require('./pricing-route-store');
+const { canFinalizeRelayJob } = require('./relay-job-state');
 
 function uniqueComponentKeys(entries) {
   const seen = new Set();
@@ -143,7 +144,7 @@ function bindRelayJobContext(input) {
   const relayJobId = String(input.relay_job_id || '');
   if (!relayJobId) return input;
   const job = readRelayJob(relayJobId);
-  if (job.status !== 'processing') {
+  if (!canFinalizeRelayJob(job)) {
     const error = new Error('The sales quote task is no longer active.');
     error.code = 'relay_job_not_processing';
     error.details = { relay_job_id: relayJobId, status: job.status || null };
