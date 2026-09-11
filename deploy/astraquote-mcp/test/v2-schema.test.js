@@ -56,6 +56,7 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   assert.match(INSTRUCTIONS, /第三方网页.*绝不能作为价格证据/s);
   assert.match(INSTRUCTIONS, /工具入参校验.*可修正.*重试/s);
   assert.match(INSTRUCTIONS, /queries.*非空/s);
+  assert.match(INSTRUCTIONS, /created.*立即执行.*不得只汇报/s);
   assert.doesNotMatch(INSTRUCTIONS, /Calculator|import_estimate|模板映射/i);
 });
 

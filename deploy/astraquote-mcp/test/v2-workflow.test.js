@@ -704,7 +704,12 @@ test('a created relay job tells GPT to build non-empty queries before price look
   assert.equal(status.stage, 'created');
   assert.match(status.next_action, /non-empty queries array/);
   assert.match(resumed.next_action, /non-empty queries array/);
-  assert.match(resumed.next_action, /correctable caller-input error/);
+  assert.match(resumed.next_action, /Execute now/);
+  assert.match(resumed.next_action, /Do not describe or list the remaining steps/);
+  assert.equal(status.terminal, false);
+  assert.equal(status.must_continue, true);
+  assert.equal(resumed.terminal, false);
+  assert.equal(resumed.must_continue, true);
 });
 
 test('completed relay jobs replay before the processing guard and expose stage-level resume', async (t) => {

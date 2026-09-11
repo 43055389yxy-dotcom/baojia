@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.8.1';
+const VERSION = '3.8.2';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -410,6 +410,7 @@ function ok(payload) {
   for (const key of [
     'status', 'code', 'price_batch_id', 'quote_id', 'next_action',
     'result_count', 'batch_result_count', 'relay_job_id', 'stage',
+    'terminal', 'must_continue',
   ]) {
     if (payload?.[key] !== undefined) summary[key] = payload[key];
   }

@@ -529,6 +529,8 @@ def test_continuation_prompt_reuses_identity_without_restoring_customer_text() -
     assert "gpt-dddddddddddddddddddddddddddddddd" in prompt
     assert "提交码 6" in prompt
     assert "从已保存阶段继续" in prompt
+    assert "立即继续实际执行" in prompt
+    assert "只输出状态、计划或待办清单" in prompt
     assert "客户需求" not in prompt
     assert "get_prices" not in prompt
     assert "build_estimate" not in prompt

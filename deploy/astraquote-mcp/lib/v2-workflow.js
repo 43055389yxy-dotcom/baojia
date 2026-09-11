@@ -97,12 +97,10 @@ const SCENARIO_KEYS = Object.freeze([
 ]);
 
 const CREATED_PRICE_NEXT_ACTION = [
-  'No saved price query batch exists yet.',
-  'First derive a non-empty queries array from the current normalized component configuration',
-  'and the current get_prices input schema, including every required provider-specific field.',
-  'Then call get_prices.',
-  'An input validation error such as "Required at queries" is a correctable caller-input error:',
-  'fill the omitted fields and retry instead of reporting a terminal blocker.',
+  'Execute now: derive a non-empty queries array from the normalized component configuration',
+  'and current get_prices schema, then call get_prices immediately.',
+  'Do not describe or list the remaining steps and do not wait for another turn.',
+  'Correct any caller-input validation error and retry in this response.',
 ].join(' ');
 
 const FREE_ALLOWANCE_REFERENCE = /(?:free\s*tier|always\s*free|free\s*trial|trial\s*credit|promotional\s*credit|account\s*credit|免费额度|免费试用|赠送额度|账户(?:信用|赠送)|零价区间)/i;
@@ -632,6 +630,8 @@ class AstraQuoteV2Workflow {
         relay_status: job.status,
         stage: 'created',
         next_action: CREATED_PRICE_NEXT_ACTION,
+        terminal: false,
+        must_continue: true,
       };
     }
     return {
@@ -659,7 +659,15 @@ class AstraQuoteV2Workflow {
       delivery_completed: 'Return result exactly as saved; do not query, generate or deliver again.',
       failed: 'Inspect the saved failure and retry only its missing stage.',
     };
-    return { ...status, resumed_from: status.stage, next_action: nextActions[status.stage] };
+    const terminal = status.stage === 'delivery_completed'
+      || (status.stage === 'failed' && status.error?.retryable !== true);
+    return {
+      ...status,
+      resumed_from: status.stage,
+      next_action: nextActions[status.stage],
+      terminal,
+      must_continue: !terminal,
+    };
   }
 
   validatePriceEvidence(input, priceBatch) {

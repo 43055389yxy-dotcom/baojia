@@ -1,6 +1,6 @@
 {
   "name": "astraquote-mcp",
-  "version": "3.8.1",
+  "version": "3.8.2",
   "private": true,
   "description": "AstraQuote: official multi-cloud catalog queries and mechanically verified delivery",
   "main": "server.js",
