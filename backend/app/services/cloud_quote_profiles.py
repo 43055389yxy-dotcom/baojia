@@ -6,8 +6,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from app.integrations.aws_regions import commercial_aws_region_options
-
 
 @lru_cache(maxsize=1)
 def _catalog() -> dict[str, Any]:
@@ -29,8 +27,6 @@ def active_market_profile(provider: str) -> dict[str, Any]:
     if not isinstance(profile, dict):
         raise RuntimeError(f"Configured market profile does not exist: {profile_id}")
     regions = profile.get("regions") or []
-    if provider_key == "aws":
-        regions = commercial_aws_region_options()
     normalized_regions = [
         {"code": str(code), "label": str(label)}
         for code, label in regions
@@ -50,8 +46,20 @@ def active_market_profile(provider: str) -> dict[str, Any]:
 
 def provider_region_catalog(provider: str) -> dict[str, Any]:
     profile = active_market_profile(provider)
+    regions = profile["regions"]
+    if profile["provider"] == "aws":
+        # Only the backend region-catalog endpoint needs botocore's current AWS
+        # directory. The desktop GPT relay only needs the market profile and
+        # must remain able to start in its intentionally small host venv.
+        from app.integrations.aws_regions import commercial_aws_region_options
+
+        regions = [
+            {"code": str(code), "label": str(label)}
+            for code, label in commercial_aws_region_options()
+        ]
     return {
         **profile,
-        "region_count": len(profile["regions"]),
+        "regions": regions,
+        "region_count": len(regions),
         "catalog_role": "editable_sales_suggestions_only",
     }

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 
@@ -28,6 +30,8 @@ def test_jenkins_health_checks_explain_the_failure_stage() -> None:
     assert "Activating the staged desktop relay source" in script
     assert "Installing the versioned desktop relay systemd unit" in script
     assert "Restarting the desktop relay through the Docker host systemd" in script
+    assert "systemctl --no-pager --full status astraquote-gpt-relay.service" in script
+    assert "journalctl --no-pager -u astraquote-gpt-relay.service -n 120" in script
 
     unit = (root / "deploy/desktop/astraquote-gpt-relay.service").read_text(
         encoding="utf-8"
@@ -40,3 +44,33 @@ def test_runtime_image_contains_the_host_namespace_helper() -> None:
     dockerfile = (root / "deploy/Dockerfile").read_text(encoding="utf-8")
 
     assert "util-linux" in dockerfile
+
+
+def test_desktop_relay_prompt_import_does_not_require_botocore() -> None:
+    root = Path(__file__).resolve().parents[2]
+    script = """
+import builtins
+
+original_import = builtins.__import__
+
+def without_botocore(name, *args, **kwargs):
+    if name == "botocore" or name.startswith("botocore."):
+        raise ModuleNotFoundError("botocore intentionally unavailable")
+    return original_import(name, *args, **kwargs)
+
+builtins.__import__ = without_botocore
+from app.services.gpt_quote_prompt import build_quote_prompt
+
+prompt = build_quote_prompt(
+    relay_job_id="gpt-0123456789abcdef0123456789abcdef",
+    submission_code="1",
+    customer_request="云服务器 1 台",
+    options={"cloud_provider": "alibaba", "preferred_region": "cn-shanghai"},
+)
+assert "阿里云中国站" in prompt
+"""
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=root / "backend",
+        check=True,
+    )

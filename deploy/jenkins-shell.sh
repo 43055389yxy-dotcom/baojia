@@ -102,6 +102,25 @@ restart_host_browser_relay() {
     /usr/bin/systemctl restart astraquote-gpt-relay.service
 }
 
+diagnose_host_browser_relay() {
+  echo "Desktop relay service diagnostics"
+  docker run --rm --privileged --pid=host \
+    --entrypoint /usr/bin/nsenter \
+    astraquote:production \
+    --target 1 \
+    --mount \
+    --uts \
+    --ipc \
+    --net \
+    --pid \
+    --root=/proc/1/root \
+    --wd=/ \
+    /bin/sh -ceu '
+      systemctl --no-pager --full status astraquote-gpt-relay.service || true
+      journalctl --no-pager -u astraquote-gpt-relay.service -n 120 || true
+    '
+}
+
 wait_for_host_browser_relay() {
   echo "Waiting for the restarted desktop relay worker to remain stable"
   docker run --rm --pid=host \
@@ -143,7 +162,10 @@ update_host_browser_relay() {
   activate_host_browser_relay
   install_host_browser_relay_service
   restart_host_browser_relay
-  wait_for_host_browser_relay
+  if ! wait_for_host_browser_relay; then
+    diagnose_host_browser_relay
+    return 1
+  fi
 }
 
 for config_file in \
