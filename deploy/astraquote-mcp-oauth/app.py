@@ -616,17 +616,17 @@ def authorize_error(redirect_uri: str, state: str, error: str, description: str)
 def login_page(request_id: str, error: str = "") -> HTMLResponse:
     error_html = f"<div class='error'>{html.escape(error)}</div>" if error else ""
     if PASSWORDLESS_AUTH:
-        introduction = "确认后，ChatGPT 可以调用 AstraQuote 报价工具。"
+        introduction = "确认后，当前 AI 客户端可以调用 AstraQuote 报价工具。"
         credential_fields = ""
         button_label = "确认授权"
-        footer = "无需用户名和密码，仅授权 AWS 报价工具。"
+        footer = "无需用户名和密码，仅授权 AstraQuote 多云报价工具。"
     else:
-        introduction = "登录后，ChatGPT 可以调用 AstraQuote 报价工具。"
+        introduction = "登录后，当前 AI 客户端可以调用 AstraQuote 报价工具。"
         credential_fields = """
       <label for='username'>用户名</label><input id='username' name='username' required autocomplete='username'>
       <label for='password'>密码</label><input id='password' name='password' type='password' required autocomplete='current-password'>"""
         button_label = "登录并授权"
-        footer = "仅授权 AWS 报价工具，不会登录其他网站。"
+        footer = "仅授权 AstraQuote 多云报价工具，不会登录其他网站。"
     page = f"""<!doctype html><html lang='zh-CN'><meta charset='utf-8'>
     <meta name='viewport' content='width=device-width,initial-scale=1'>
     <title>授权 AstraQuote MCP</title><style>
@@ -652,7 +652,12 @@ def login_page(request_id: str, error: str = "") -> HTMLResponse:
             "X-Frame-Options": "DENY",
             "X-Content-Type-Options": "nosniff",
             "Referrer-Policy": "no-referrer",
-            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https://chatgpt.com https://www.chatgpt.com; base-uri 'none'; frame-ancestors 'none'",
+            "Content-Security-Policy": (
+                "default-src 'none'; style-src 'unsafe-inline'; "
+                "form-action 'self' https://chatgpt.com https://www.chatgpt.com "
+                "workbuddy: http://127.0.0.1:*; "
+                "base-uri 'none'; frame-ancestors 'none'"
+            ),
         },
     )
 

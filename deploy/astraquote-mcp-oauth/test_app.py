@@ -91,11 +91,27 @@ def test_passwordless_authorization_page_has_only_a_confirmation_button(
 ):
     gateway = load_gateway(tmp_path, monkeypatch, passwordless_auth=True)
 
-    body = gateway.login_page("request-id").body.decode()
+    response = gateway.login_page("request-id")
+    body = response.body.decode()
 
     assert "确认授权" in body
     assert "name='username'" not in body
     assert "name='password'" not in body
+
+
+def test_authorization_page_allows_supported_mcp_callback_schemes(
+    tmp_path, monkeypatch
+):
+    gateway = load_gateway(tmp_path, monkeypatch, passwordless_auth=True)
+
+    response = gateway.login_page("request-id")
+    policy = response.headers["content-security-policy"]
+
+    assert "form-action 'self'" in policy
+    assert "https://chatgpt.com" in policy
+    assert "https://www.chatgpt.com" in policy
+    assert "workbuddy:" in policy
+    assert "http://127.0.0.1:*" in policy
 
 
 def test_passwordless_authorization_issues_code_without_credentials(
