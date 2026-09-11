@@ -107,6 +107,12 @@ test("sales portal uses a pale-blue glass theme and distinguishes queued work", 
 
   assert.match(page, /queued:\s*\{ title: "报价正在排队"/);
   assert.match(page, /job\.status === "queued" \? "等待启动"/);
+  assert.match(page, /active_quote_count\?: number/);
+  assert.match(page, /queued_ahead_count\?: number/);
+  assert.match(page, /estimated_wait_minutes\?: number/);
+  assert.match(page, /个任务正在报价/);
+  assert.match(page, /个任务排在您前面/);
+  assert.match(page, /预计等待约/);
   assert.match(css, /color-scheme:\s*light/);
   assert.match(css, /--page:\s*#eef8ff/);
   assert.match(css, /backdrop-filter:\s*blur\(28px\) saturate\(145%\)/);

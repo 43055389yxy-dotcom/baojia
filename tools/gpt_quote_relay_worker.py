@@ -2,8 +2,8 @@
 """Drive the server's logged-in browser for isolated sales quote jobs.
 
 One visible Firefox process owns the administrator session. Each active quote
-uses its own tab and conversation. Every queued quote receives an independent
-work tab; there is no application-level concurrency cap.
+uses its own tab and conversation. The shared relay queue limits new active
+work tabs to four and keeps later submissions queued until a slot is free.
 """
 
 from __future__ import annotations

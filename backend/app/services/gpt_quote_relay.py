@@ -9,10 +9,13 @@ first-pass cleaning prompt.
 from __future__ import annotations
 
 import fcntl
+import heapq
 import json
+import math
 import os
 import re
 import secrets
+import statistics
 import tempfile
 import uuid
 from collections.abc import Iterator
@@ -43,6 +46,9 @@ PUBLIC_FIELDS = {
     "quote_download_filename",
 }
 
+DEFAULT_MAX_CONCURRENT_QUOTES = 4
+DEFAULT_QUOTE_SECONDS = 600
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
@@ -56,7 +62,17 @@ class GptRelayError(RuntimeError):
 
 
 class GptQuoteRelayStore:
-    def __init__(self, directory: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        directory: Path | str | None = None,
+        *,
+        max_concurrent_quotes: int | None = None,
+        default_quote_seconds: int | None = None,
+    ) -> None:
+        configured_limit = max_concurrent_quotes or DEFAULT_MAX_CONCURRENT_QUOTES
+        configured_duration = default_quote_seconds or DEFAULT_QUOTE_SECONDS
+        self.max_concurrent_quotes = max(1, configured_limit)
+        self.default_quote_seconds = max(60, configured_duration)
         owner_uid = os.environ.get("ASTRAQUOTE_GPT_RELAY_UID")
         owner_gid = os.environ.get("ASTRAQUOTE_GPT_RELAY_GID")
         self.owner_uid = int(owner_uid) if owner_uid and owner_uid.isdigit() else None
@@ -220,7 +236,92 @@ class GptQuoteRelayStore:
         payload["failure_code"] = (
             "AQ-QUOTE-FAILED" if record.get("status") == "failed" else None
         )
+        if record.get("status") in {"queued", "needs_login"}:
+            payload.update(self._queue_metadata(record))
         return payload
+
+    @staticmethod
+    def _timestamp(value: Any) -> datetime | None:
+        try:
+            return datetime.fromisoformat(str(value or ""))
+        except ValueError:
+            return None
+
+    def _queue_metadata(self, target: dict[str, Any]) -> dict[str, int]:
+        records: list[dict[str, Any]] = []
+        for path in self.jobs_directory.glob("gpt-*.json"):
+            try:
+                records.append(self._read(path))
+            except (OSError, ValueError):
+                continue
+
+        durations: list[tuple[datetime, float]] = []
+        for record in records:
+            if record.get("status") != "completed":
+                continue
+            started_at = self._timestamp(record.get("processing_started_at"))
+            completed_at = self._timestamp(record.get("updated_at"))
+            if started_at and completed_at and completed_at > started_at:
+                durations.append(
+                    (completed_at, (completed_at - started_at).total_seconds())
+                )
+        recent_durations = [
+            seconds for _completed_at, seconds in sorted(durations, reverse=True)[:20]
+        ]
+        typical_seconds = (
+            max(60, int(statistics.median(recent_durations)))
+            if recent_durations
+            else self.default_quote_seconds
+        )
+
+        now = datetime.now(UTC)
+        active = [record for record in records if record.get("status") == "processing"]
+        waiting = sorted(
+            (
+                record
+                for record in records
+                if record.get("status") in {"queued", "needs_login"}
+            ),
+            key=lambda record: (
+                str(record.get("created_at") or ""),
+                str(record.get("job_id") or ""),
+            ),
+        )
+        target_id = str(target.get("job_id") or "")
+        target_index = next(
+            (
+                index
+                for index, record in enumerate(waiting)
+                if str(record.get("job_id") or "") == target_id
+            ),
+            0,
+        )
+
+        slot_availability: list[float] = []
+        for record in active:
+            started_at = self._timestamp(record.get("processing_started_at"))
+            elapsed = max(0.0, (now - started_at).total_seconds()) if started_at else 0.0
+            slot_availability.append(max(60.0, typical_seconds - elapsed))
+        while len(slot_availability) < self.max_concurrent_quotes:
+            slot_availability.append(0.0)
+        heapq.heapify(slot_availability)
+
+        target_wait_seconds = 0.0
+        for index, _record in enumerate(waiting):
+            starts_after = heapq.heappop(slot_availability)
+            if index == target_index:
+                target_wait_seconds = starts_after
+                break
+            heapq.heappush(slot_availability, starts_after + typical_seconds)
+
+        return {
+            "max_concurrent_quotes": self.max_concurrent_quotes,
+            "active_quote_count": len(active),
+            "queue_position": target_index + 1,
+            "queued_ahead_count": target_index,
+            "jobs_ahead_count": len(active) + target_index,
+            "estimated_wait_minutes": math.ceil(target_wait_seconds / 60),
+        }
 
     def public_get(self, job_id: str) -> dict[str, Any]:
         # A browser-worker heartbeat is transport health, not quote outcome.
@@ -461,6 +562,7 @@ class GptQuoteRelayStore:
         with self._lock():
             now = datetime.now(UTC)
             candidates: list[tuple[str, Path, dict[str, Any]]] = []
+            active_count = 0
             for path in self.jobs_directory.glob("gpt-*.json"):
                 try:
                     record = self._read(path)
@@ -474,15 +576,18 @@ class GptQuoteRelayStore:
                         expired = datetime.fromisoformat(lease_text) <= now
                     except ValueError:
                         expired = True
+                if status == "processing" and not expired:
+                    active_count += 1
                 if status == "queued" or expired:
                     candidates.append((str(record.get("created_at") or ""), path, record))
-            if not candidates:
+            if active_count >= self.max_concurrent_quotes or not candidates:
                 return None
             _, path, record = min(candidates, key=lambda item: item[0])
             record.update(
                 {
                     "status": "processing",
                     "worker_id": worker_id,
+                    "processing_started_at": record.get("processing_started_at") or utc_now(),
                     "lease_expires_at": (now + timedelta(minutes=lease_minutes)).isoformat(),
                     "updated_at": utc_now(),
                     "events": [

@@ -49,6 +49,12 @@ type RelayJob = {
   quick_quote_result?: QuickQuoteResult | null;
   quote_download_url?: string | null;
   quote_download_filename?: string | null;
+  max_concurrent_quotes?: number;
+  active_quote_count?: number;
+  queue_position?: number;
+  queued_ahead_count?: number;
+  jobs_ahead_count?: number;
+  estimated_wait_minutes?: number;
 };
 
 type RegionCatalog = {
@@ -145,6 +151,18 @@ const PROVIDER_ORDER: CloudProvider[] = [
 
 function estimateWindow() {
   return "5～10 分钟";
+}
+
+function queuedStatusDetail(job: RelayJob) {
+  const activeCount = job.active_quote_count ?? 0;
+  const queuedAhead = job.queued_ahead_count ?? 0;
+  const waitMinutes = job.estimated_wait_minutes ?? 0;
+  const parts = [];
+  if (activeCount > 0) parts.push(`${activeCount} 个任务正在报价`);
+  if (queuedAhead > 0) parts.push(`${queuedAhead} 个任务排在您前面`);
+  if (parts.length === 0) parts.push("正在等待报价引擎启动");
+  const wait = waitMinutes > 0 ? `预计等待约 ${waitMinutes} 分钟` : "即将开始";
+  return `${parts.join("，")}，${wait}。`;
 }
 
 function providerLabel(provider: CloudProvider | undefined) {
@@ -708,6 +726,8 @@ export default function SalesQuotePage() {
             <h1>{statusCopy[job.status].title}</h1>
             <span>{job.status === "completed" && job.quick_quote_result
               ? "报价结果和 Excel 已生成，可查看、复制或下载。"
+              : job.status === "queued"
+                ? queuedStatusDetail(job)
               : statusCopy[job.status].detail ?? `预计 ${estimateWindow()}完成，结果将在当前页面显示。`}</span>
             {job.status === "failed" && (
               <small className="sales-failure-reference">
@@ -720,7 +740,7 @@ export default function SalesQuotePage() {
             <div className="sales-job-progress" aria-label="报价引擎处理中">
               <div><span>{job.status === "queued" ? "等待启动" : "报价引擎处理中"}</span><b><i /> {job.status === "queued" ? "排队中" : "正在运行"}</b></div>
               <i><span /></i>
-              <small>{job.status === "queued" ? "正在创建独立报价标签，即将开始处理" : `正在读取官网价格并生成报价，预计 ${estimateWindow()}`}</small>
+              <small>{job.status === "queued" ? queuedStatusDetail(job) : `正在读取官网价格并生成报价，预计 ${estimateWindow()}`}</small>
             </div>
           )}
 

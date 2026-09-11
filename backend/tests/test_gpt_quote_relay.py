@@ -97,6 +97,41 @@ def test_worker_claims_one_job_and_purges_source_after_submission(tmp_path: Path
     assert purged["source_purged_at"]
 
 
+def test_relay_runs_at_most_four_quotes_and_reports_the_waiting_queue(tmp_path: Path) -> None:
+    store = GptQuoteRelayStore(
+        tmp_path,
+        max_concurrent_quotes=4,
+        default_quote_seconds=600,
+    )
+    jobs = [store.create(f"报价需求 {index}，两台云服务器。", {}) for index in range(6)]
+
+    claimed = [store.claim_next("worker-1") for _ in range(4)]
+
+    assert [record["job_id"] for record in claimed if record] == [
+        job["job_id"] for job in jobs[:4]
+    ]
+    assert store.claim_next("worker-1") is None
+
+    fifth = store.public_get(jobs[4]["job_id"])
+    sixth = store.public_get(jobs[5]["job_id"])
+    assert fifth["status"] == "queued"
+    assert fifth["max_concurrent_quotes"] == 4
+    assert fifth["active_quote_count"] == 4
+    assert fifth["queue_position"] == 1
+    assert fifth["queued_ahead_count"] == 0
+    assert fifth["jobs_ahead_count"] == 4
+    assert fifth["estimated_wait_minutes"] == 10
+    assert sixth["queue_position"] == 2
+    assert sixth["queued_ahead_count"] == 1
+    assert sixth["jobs_ahead_count"] == 5
+    assert sixth["estimated_wait_minutes"] == 10
+
+    store.update(jobs[0]["job_id"], {"status": "completed"})
+    next_job = store.claim_next("worker-1")
+    assert next_job is not None
+    assert next_job["job_id"] == jobs[4]["job_id"]
+
+
 def test_cancelled_job_is_purged_and_never_claimed_again(tmp_path: Path) -> None:
     store = GptQuoteRelayStore(tmp_path)
     job = store.create("东京 EC2 两台，按需。", {})
@@ -716,20 +751,21 @@ def test_submitted_processing_job_can_be_reattached_after_worker_restart(
     assert resumed[0]["worker_id"] == "worker-new"
 
 
-def test_all_submitted_jobs_are_reattached_when_parallel_work_is_unlimited(
+def test_existing_submitted_jobs_are_reattached_after_the_new_limit_is_enabled(
     tmp_path: Path,
 ) -> None:
-    store = GptQuoteRelayStore(tmp_path)
-    jobs = [store.create(f"报价需求 {index}", {}) for index in range(6)]
+    legacy_store = GptQuoteRelayStore(tmp_path, max_concurrent_quotes=6)
+    jobs = [legacy_store.create(f"报价需求 {index}", {}) for index in range(6)]
     for job in jobs:
-        claimed = store.claim_next("worker-old")
+        claimed = legacy_store.claim_next("worker-old")
         assert claimed is not None
-        store.update(
+        legacy_store.update(
             job["job_id"],
             {"chat_url": f"https://chatgpt.com/g/g-p-abc123/c/quote-{job['job_id']}"},
         )
-        store.purge_source(job["job_id"])
+        legacy_store.purge_source(job["job_id"])
 
+    store = GptQuoteRelayStore(tmp_path, max_concurrent_quotes=4)
     resumed = store.claim_submitted_for_monitoring(
         "worker-new",
         limit=None,
