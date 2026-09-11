@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "/api/backend";
 const ACTIVE_JOB_KEY = "astraquote.sales.active-job.v1";
@@ -206,9 +206,12 @@ export default function SalesQuotePage() {
   );
   const [utilization, setUtilization] = useState(100);
   const [cloudProvider, setCloudProvider] = useState<CloudProvider>("aws");
+  const [providerOpen, setProviderOpen] = useState(true);
   const [regionCatalog, setRegionCatalog] = useState<RegionCatalog | null>(null);
   const [preferredRegion, setPreferredRegion] = useState("");
   const [regionLoading, setRegionLoading] = useState(true);
+  const [regionOpen, setRegionOpen] = useState(false);
+  const regionPickerRef = useRef<HTMLDivElement>(null);
   const [health, setHealth] = useState<RelayHealth | null>(null);
   const [job, setJob] = useState<RelayJob | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -257,6 +260,7 @@ export default function SalesQuotePage() {
     let stopped = false;
     setRegionLoading(true);
     setPreferredRegion("");
+    setRegionOpen(false);
     async function loadRegions() {
       try {
         const response = await fetch(
@@ -278,6 +282,14 @@ export default function SalesQuotePage() {
     void loadRegions();
     return () => { stopped = true; };
   }, [cloudProvider]);
+
+  useEffect(() => {
+    function closeRegionPicker(event: PointerEvent) {
+      if (!regionPickerRef.current?.contains(event.target as Node)) setRegionOpen(false);
+    }
+    document.addEventListener("pointerdown", closeRegionPicker);
+    return () => document.removeEventListener("pointerdown", closeRegionPicker);
+  }, []);
 
   useEffect(() => {
     const savedJobId = window.sessionStorage.getItem(ACTIVE_JOB_KEY);
@@ -322,6 +334,14 @@ export default function SalesQuotePage() {
     () => `已选 ${selectedScenarios.size} 种报价方案`,
     [selectedScenarios],
   );
+  const filteredRegions = useMemo(() => {
+    const query = preferredRegion.trim().toLocaleLowerCase();
+    const regions = regionCatalog?.regions ?? [];
+    if (!query || regions.some((region) => region.code.toLocaleLowerCase() === query)) {
+      return regions;
+    }
+    return regions.filter((region) => `${region.label} ${region.code}`.toLocaleLowerCase().includes(query));
+  }, [preferredRegion, regionCatalog]);
 
   function toggleScenario(scenario: ScenarioKey) {
     setSelectedScenarios((current) => {
@@ -334,6 +354,7 @@ export default function SalesQuotePage() {
 
   function chooseProvider(provider: CloudProvider) {
     setCloudProvider(provider);
+    setProviderOpen(false);
     setSelectedScenarios(new Set<ScenarioKey>(["on_demand"]));
     setPageError("");
   }
@@ -480,21 +501,25 @@ export default function SalesQuotePage() {
       {!job ? (
         <section className="sales-quote-workspace">
           <form className="sales-quote-form" onSubmit={submit}>
-            <div className="sales-form-heading">
-              <div>
-                <p>OFFICIAL CLOUD PRICING</p>
-                <h1>创建云成本报价</h1>
-                <span>选择云厂商并填写客户需求，结果将在当前页面生成。</span>
-              </div>
-              <div className="sales-form-chip"><i aria-hidden="true" /> 官方价格目录</div>
-            </div>
-
             <fieldset className="sales-pricing-mode sales-provider-section">
-              <div className="sales-section-heading">
-                <legend>选择云厂商</legend>
-                <span>01 / 04</span>
+              <div className="sales-provider-heading">
+                <div>
+                  <legend>选择云厂商</legend>
+                  {!providerOpen && (
+                    <span className="sales-provider-summary">
+                      <b className="sales-provider-mark" aria-hidden="true">{PROVIDER_META[cloudProvider].mark}</b>
+                      <span><strong>{PROVIDER_META[cloudProvider].label}</strong><small>{PROVIDER_META[cloudProvider].detail}</small></span>
+                    </span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  aria-controls="sales-provider-options"
+                  aria-expanded={providerOpen}
+                  onClick={() => setProviderOpen((current) => !current)}
+                >{providerOpen ? "收起" : "更换云厂商"}<i aria-hidden="true">⌄</i></button>
               </div>
-              <div className="sales-choice-row sales-provider-row">
+              {providerOpen && <div className="sales-choice-row sales-provider-row" id="sales-provider-options">
                 {PROVIDER_ORDER.map((value) => {
                   const catalog = health?.provider_catalogs?.[value];
                   const provider = PROVIDER_META[value];
@@ -514,7 +539,7 @@ export default function SalesQuotePage() {
                     </label>
                   );
                 })}
-              </div>
+              </div>}
             </fieldset>
 
             {selectedCatalogUnavailable && (
@@ -531,22 +556,57 @@ export default function SalesQuotePage() {
                 </div>
                 <span>02 / 04</span>
               </div>
-              <div className="sales-region-select-wrap">
+              <div className="sales-region-select-wrap" ref={regionPickerRef}>
                 <input
                   id="sales-region"
-                  list="sales-region-options"
                   value={preferredRegion}
-                  onChange={(event) => setPreferredRegion(event.target.value)}
+                  onChange={(event) => {
+                    setPreferredRegion(event.target.value);
+                    setRegionOpen(true);
+                  }}
+                  onFocus={() => setRegionOpen(true)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") setRegionOpen(false);
+                    if (event.key === "ArrowDown") setRegionOpen(true);
+                  }}
                   disabled={regionLoading}
                   placeholder={regionLoading ? "正在加载地域建议…" : "选择或输入官方地域"}
+                  role="combobox"
+                  aria-autocomplete="list"
+                  aria-expanded={regionOpen}
+                  aria-controls="sales-region-options"
                   required
                 />
-                <datalist id="sales-region-options">
-                  {regionCatalog?.regions.map((item) => (
-                    <option value={item.code} key={item.code}>{item.label} · {item.code}</option>
-                  ))}
-                </datalist>
-                <i aria-hidden="true">⌄</i>
+                <button
+                  className="sales-region-toggle"
+                  type="button"
+                  aria-label={regionOpen ? "收起地域" : "展开地域"}
+                  aria-expanded={regionOpen}
+                  onClick={() => setRegionOpen((current) => !current)}
+                  disabled={regionLoading}
+                >⌄</button>
+                {regionOpen && !regionLoading && (
+                  <div className="sales-region-options-panel" id="sales-region-options" role="listbox">
+                    {filteredRegions.length > 0 ? filteredRegions.map((item) => (
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={preferredRegion === item.code}
+                        className={preferredRegion === item.code ? "selected" : ""}
+                        key={item.code}
+                        onClick={() => {
+                          setPreferredRegion(item.code);
+                          setRegionOpen(false);
+                        }}
+                      >
+                        <strong>{item.label}</strong>
+                        <small>{item.code}</small>
+                      </button>
+                    )) : (
+                      <p>没有匹配的建议地域，可保留当前输入，由 GPT 根据官方目录核对。</p>
+                    )}
+                  </div>
+                )}
               </div>
             </section>
 

@@ -46,6 +46,15 @@ def test_runtime_image_contains_the_host_namespace_helper() -> None:
     assert "util-linux" in dockerfile
 
 
+def test_public_proxy_keeps_oauth_and_mcp_outside_the_sales_site() -> None:
+    root = Path(__file__).resolve().parents[2]
+    caddyfile = (root / "deploy/caddy-astraquote.caddy").read_text(encoding="utf-8")
+
+    assert "path /mcp /oauth/* /.well-known/oauth-authorization-server" in caddyfile
+    assert "reverse_proxy astraquote:8001" in caddyfile
+    assert "reverse_proxy astraquote:3000" in caddyfile
+
+
 def test_desktop_relay_prompt_import_does_not_require_botocore() -> None:
     root = Path(__file__).resolve().parents[2]
     script = """

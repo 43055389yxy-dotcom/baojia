@@ -1,4 +1,14 @@
 baojia.tontiancloud.com {
     encode zstd gzip
-    reverse_proxy astraquote:3000
+
+    @astraquote_oauth {
+        path /mcp /oauth/* /.well-known/oauth-authorization-server /.well-known/openid-configuration /.well-known/oauth-protected-resource*
+    }
+    handle @astraquote_oauth {
+        reverse_proxy astraquote:8001
+    }
+
+    handle {
+        reverse_proxy astraquote:3000
+    }
 }
