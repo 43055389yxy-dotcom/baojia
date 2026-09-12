@@ -10,6 +10,13 @@ PROMPT_LABEL_PATTERN = re.compile(
     r"为\s*Gemini\s*输入提示|Enter a prompt|Ask Gemini|描述任务|Describe a task|接下来要做些什么",
     re.IGNORECASE,
 )
+SEND_LABEL_PATTERN = re.compile(r"^(发送|Send(?: message)?)$", re.IGNORECASE)
+
+
+def is_gemini_send_label(label: str) -> bool:
+    """Return whether a control is Gemini's semantic send action."""
+
+    return bool(SEND_LABEL_PATTERN.fullmatch(str(label or "").strip()))
 
 
 def choose_composer_candidate(

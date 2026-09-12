@@ -25,7 +25,10 @@ from app.services.gemini_chat_references import (
     is_authenticated_gemini_workspace_url,
     task_id_from_gemini_reference,
 )
-from app.services.gemini_composer_selection import choose_composer_candidate
+from app.services.gemini_composer_selection import (
+    choose_composer_candidate,
+    is_gemini_send_label,
+)
 from app.services.gpt_browser_navigation import (
     is_interrupted_response,
     should_extend_quote_deadline,
@@ -277,7 +280,30 @@ class GeminiChatBrowser:
             composer = self._wait_until(self._current_composer, timeout=45)
         self._write_multiline(composer, "")
         self._bind_astraquote_mention(composer, prompt)
-        composer.send_keys(Keys.ENTER)
+        self._submit_composer(composer)
+
+    def _submit_composer(self, composer: Any) -> None:
+        container = composer
+        for _ in range(10):
+            for button in container.find_elements(
+                By.CSS_SELECTOR,
+                "button,[role='button']",
+            ):
+                with suppress(Exception):
+                    label = (
+                        button.get_attribute("aria-label") or button.text or ""
+                    ).strip()
+                    if (
+                        is_gemini_send_label(label)
+                        and button.is_displayed()
+                        and button.is_enabled()
+                    ):
+                        button.click()
+                        return
+            if str(container.tag_name or "").lower() in {"html", "body"}:
+                break
+            container = container.find_element(By.XPATH, "..")
+        raise RuntimeError("Gemini 输入框旁没有可用的发送按钮。")
 
     def _page_contains_marker(self, marker: str) -> bool:
         return bool(

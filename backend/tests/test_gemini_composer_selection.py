@@ -1,4 +1,7 @@
-from app.services.gemini_composer_selection import choose_composer_candidate
+from app.services.gemini_composer_selection import (
+    choose_composer_candidate,
+    is_gemini_send_label,
+)
 
 
 def test_new_task_uses_upper_left_prompt_box() -> None:
@@ -115,3 +118,11 @@ def test_hidden_quill_clipboards_are_ignored() -> None:
         )["element"]
         == "new-task"
     )
+
+
+def test_only_the_semantic_send_button_is_accepted() -> None:
+    assert is_gemini_send_label("发送")
+    assert is_gemini_send_label("Send")
+    assert is_gemini_send_label("Send message")
+    assert not is_gemini_send_label("语音输入 (^⇧D)")
+    assert not is_gemini_send_label("上传和工具")
