@@ -11,7 +11,7 @@ const { OfficialPriceCache } = require('./official-price-cache');
 const {
   officialPricingPageUrlAllowed, providerRegionMismatch,
 } = require('./cloud-market-profiles');
-const { PricingRouteStore } = require('./pricing-route-store');
+const { PricingRouteStore, PricingRouteStoreError } = require('./pricing-route-store');
 const { canFinalizeRelayJob } = require('./relay-job-state');
 const {
   PROGRESS_GUIDANCE, mergeQueryContexts, queryProgress, componentProgress,
@@ -262,6 +262,13 @@ const CREATED_PRICE_NEXT_ACTION = [
 ].join(' ');
 
 const DEFAULT_RESULT_BYTE_BUDGET = 128 * 1024;
+
+function routeResolutionErrorCategory(code) {
+  if (['pricing_route_identity_conflict', 'pricing_route_scope_mismatch',
+    'pricing_route_id_invalid'].includes(code)) return 'invalid_request';
+  if (code === 'pricing_route_revalidation_required') return 'response_schema';
+  return 'route_not_found';
+}
 
 function resultByteBudget(value) {
   const configured = value ?? process.env.ASTRAQUOTE_MCP_RESULT_MAX_BYTES;
@@ -1077,7 +1084,35 @@ class AstraQuoteV2Workflow {
       queries: input.queries,
       queryContexts: preliminaryContexts,
     });
-    const resolvedQueries = input.queries.map((query) => this.routeStore.resolve(query));
+    const routeResolutionFailures = [];
+    const resolvedQueries = input.queries.map((query) => {
+      try {
+        return this.routeStore.resolve(query);
+      } catch (error) {
+        if (!(error instanceof PricingRouteStoreError)) throw error;
+        const errorCategory = routeResolutionErrorCategory(error.code);
+        routeResolutionFailures.push({
+          query_id: query.query_id,
+          provider: query.provider,
+          status: 'query_failed',
+          terminal: error.retryable !== true,
+          retryable: error.retryable === true,
+          error_category: errorCategory,
+          code: error.code || 'pricing_route_resolution_failed',
+          message: error.message,
+          details: error.details || {},
+          recovery: {
+            retryable: error.retryable === true,
+            next_action: error.details?.next_action
+              || (errorCategory === 'invalid_request'
+                ? 'correct_pricing_route_input'
+                : 'discover_and_verify_official_read_only_route'),
+          },
+          official_item_ids: [],
+        });
+        return { query: { ...query }, route: null };
+      }
+    });
     const materializedQueries = resolvedQueries.map((resolved) => resolved.query);
     const resolvedByQueryId = new Map(
       resolvedQueries.map((resolved) => [resolved.query.query_id, resolved]),
@@ -1103,10 +1138,14 @@ class AstraQuoteV2Workflow {
     const pendingQueries = [];
     const freshCacheResults = [];
     const capabilityPreflightResults = [];
+    const routeResolutionFailureById = new Map(
+      routeResolutionFailures.map((item) => [item.query_id, item]),
+    );
     const contextById = new Map(queryContexts.map((context) => [context.query_id, context]));
     const forceCapabilityRecheck = input.force_capability_recheck === true
       || Number(relayJob?.partial_retry_generation || 0) > 0;
     for (const query of materializedQueries) {
+      if (routeResolutionFailureById.has(query.query_id)) continue;
       const priorResult = existingResults.get(query.query_id);
       if (reusableQueryResult(priorResult, contextById.get(query.query_id))) {
         if (!isDeepStrictEqual(existingQueries.get(query.query_id), query)) {
@@ -1208,6 +1247,7 @@ class AstraQuoteV2Workflow {
     const responseResults = new Map([
       ...freshCacheResults,
       ...capabilityPreflightResults,
+      ...routeResolutionFailures,
       ...completedLiveResults,
     ].map((item) => [item.query_id, item]));
     result = {

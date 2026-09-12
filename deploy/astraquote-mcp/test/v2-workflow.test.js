@@ -822,6 +822,76 @@ test('get_prices persists learned official routes and can reuse a route id', asy
   assert.deepEqual(received.query_parameters, { ProductCode: 'oss' });
 });
 
+test('one missing cached route does not block other queries in the same batch', async (t) => {
+  const { workflow, directory, backend } = fixture({ provider: 'alibaba' });
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  backend.getPrices = async (input) => ({
+    status: 'completed',
+    result_count: input.queries.length,
+    results: input.queries.map((query) => ({
+      query_id: query.query_id,
+      provider: query.provider,
+      status: 'exact',
+      official_item_ids: [`item-${query.query_id}`],
+      official_rate_candidates: [],
+      items: [{ id: `item-${query.query_id}` }],
+      ...(query.query_id === 'learn-known-route' ? {
+        route_verification: {
+          route_contract_version: 3,
+          route_fingerprint: 'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+          provider: 'alibaba', endpoint: 'business.aliyuncs.com', service: 'known-service',
+          market_profile: 'alibaba-cn', credential_scope: 'alibaba-cn',
+          action: 'QueryPrice', version: '2017-12-14', region: 'cn-hangzhou',
+          region_parameter: 'Region', method: 'POST', path: '/',
+          response_items_path: 'Data.Items', item_id_paths: ['Id'], rate_fields: [],
+          auth_scheme: 'alibaba_rpc_hmac_sha1', request_schema_hash: 'sha256:req',
+          response_schema_hash: 'sha256:res', sdk_version: 'astraquote-direct-signer/1',
+          official_source_url: 'https://help.aliyun.com/document_detail/87913.html',
+          last_verified_at: '2026-09-12T00:00:00.000Z', confidence: 0.75, failure_count: 0,
+        },
+      } : {}),
+    })),
+  });
+
+  await workflow.getPrices({ queries: [{
+    provider: 'alibaba', query_id: 'learn-known-route', endpoint: 'business.aliyuncs.com',
+    service: 'known-service', action: 'QueryPrice', version: '2017-12-14',
+    region: 'cn-hangzhou', region_parameter: 'Region', method: 'POST', path: '/',
+    query_parameters: { ProductCode: 'ecs' }, body: {}, response_filters: {},
+  }] });
+
+  let receivedQueryIds = [];
+  backend.getPrices = async (input) => {
+    receivedQueryIds = input.queries.map((query) => query.query_id);
+    return {
+      status: 'completed', result_count: input.queries.length,
+      results: input.queries.map((query) => ({
+        query_id: query.query_id, provider: query.provider, status: 'exact',
+        official_item_ids: [`item-${query.query_id}`], items: [{ id: `item-${query.query_id}` }],
+      })),
+    };
+  };
+  const batch = await workflow.getPrices({ queries: [
+    {
+      provider: 'alibaba', query_id: 'known-query', service: 'known-service',
+      region: 'cn-hangzhou', query_parameters: { ProductCode: 'rds' },
+      body: {}, response_filters: {},
+    },
+    {
+      provider: 'alibaba', query_id: 'missing-query', service: 'missing-service',
+      region: 'cn-hangzhou', query_parameters: { ProductCode: 'mq' },
+      body: {}, response_filters: {},
+    },
+  ] });
+
+  assert.deepEqual(receivedQueryIds, ['known-query']);
+  assert.equal(batch.results.find((item) => item.query_id === 'known-query').status, 'exact');
+  const missing = batch.results.find((item) => item.query_id === 'missing-query');
+  assert.equal(missing.status, 'query_failed');
+  assert.equal(missing.code, 'pricing_route_discovery_required');
+  assert.equal(missing.recovery.next_action, 'discover_and_verify_official_read_only_route');
+});
+
 test('build validates selected official evidence then delivers', async (t) => {
   const { workflow, directory, delivered } = fixture();
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
