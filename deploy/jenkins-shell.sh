@@ -298,7 +298,10 @@ restart_host_browser_relay() {
     --pid \
     --root=/proc/1/root \
     --wd=/ \
-    /usr/bin/systemctl enable --now astraquote-gpt-relay.service
+    /bin/sh -ceu '
+      /usr/bin/systemctl enable astraquote-gpt-relay.service
+      /usr/bin/systemctl restart astraquote-gpt-relay.service
+    '
 }
 
 diagnose_host_browser_relay() {
