@@ -495,6 +495,18 @@ class GeminiChatBrowser:
             )
         )
 
+    def _scroll_to_latest(self) -> None:
+        self._execute(
+            """
+            const root = document.querySelector('main,[role="main"]') || document.body;
+            const scrollables = [root, ...root.querySelectorAll('*')].filter(node =>
+              node.scrollHeight > node.clientHeight + 24
+            );
+            for (const node of scrollables) node.scrollTop = node.scrollHeight;
+            window.scrollTo({top: document.documentElement.scrollHeight, behavior: 'instant'});
+            """
+        )
+
     def _approve_tool_if_needed(self) -> bool:
         buttons = self.driver.find_elements(By.CSS_SELECTOR, "button,[role='button']")
         for button in buttons:
@@ -528,6 +540,7 @@ class GeminiChatBrowser:
         completion_check: Callable[[], bool] | None = None,
     ) -> str | None:
         self._switch_to_quote(quote)
+        self._scroll_to_latest()
         now = time.monotonic()
         if self._approve_tool_if_needed():
             quote.stable_since = now

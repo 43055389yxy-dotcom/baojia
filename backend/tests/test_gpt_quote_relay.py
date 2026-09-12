@@ -995,6 +995,8 @@ def test_quote_prompt_uses_provider_profile_subscription_terms() -> None:
 
     assert "按量计费；包月；包年（1 年）" in prompt
     assert "3 年包年" not in prompt
+    assert "销售已选中的全部计价方式，任何一种都不得遗漏" in prompt
+    assert "查价、汇总、报价页和 Excel" in prompt
 
 
 def test_every_quote_prompt_requires_excel_and_sales_page_delivery_only() -> None:

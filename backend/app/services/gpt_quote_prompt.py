@@ -89,7 +89,10 @@ def build_quote_context_prompt(options: dict[str, Any]) -> str:
         f"账号站点：{market_profile['site_label']}（凭证范围 "
         f"{market_profile['credential_scope']}，不得与其他站点的文档、域名或价格混用）。\n\n"
         f"{preferred_region_instruction}\n\n"
-        f"计价选项：{_pricing_summary(options)}。"
+        f"计价选项：{_pricing_summary(options)}。\n"
+        "以上是销售已选中的全部计价方式，任何一种都不得遗漏；"
+        "查价、汇总、报价页和 Excel 必须逐项保留，"
+        "不得自行替换成其他期限或计价方式。"
     )
 
 
