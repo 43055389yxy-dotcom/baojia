@@ -82,6 +82,95 @@ function sealedComponentPlan(existing, supplied) {
   return incoming;
 }
 
+function assertFormalQuotePricingPlan({ relayJobId, quoteComponents, queries, queryContexts }) {
+  const formalQuote = Boolean(relayJobId) || quoteComponents.length > 0;
+  if (!formalQuote) return;
+  if (quoteComponents.length === 0) {
+    const error = new Error('Register the complete cleaned component plan before querying a sales quote.');
+    error.code = 'formal_quote_component_plan_required';
+    error.retryable = true;
+    error.details = {
+      next_action: 'retry_get_prices_with_complete_quote_components_and_query_contexts',
+    };
+    throw error;
+  }
+
+  const contextById = new Map(queryContexts.map((item) => [item.query_id, item]));
+  const missingContextIds = queries
+    .map((query) => query.query_id)
+    .filter((queryId) => !contextById.has(queryId));
+  if (missingContextIds.length > 0) {
+    const error = new Error('Every formal quote query must declare whether it is discovery or owned pricing work.');
+    error.code = 'formal_quote_query_context_required';
+    error.retryable = true;
+    error.details = {
+      query_ids: missingContextIds,
+      next_action: 'retry_get_prices_with_query_contexts_for_every_query',
+    };
+    throw error;
+  }
+
+  const plannedScopes = new Set(quoteComponents.flatMap((component) => (
+    (component.billing_scopes || []).map((billing) => pricingScopeKey(
+      component.component_key, billing.billing_key, billing.scenario_key || null,
+    ))
+  )));
+  const unknownScopes = queries.flatMap((query) => {
+    const context = contextById.get(query.query_id);
+    if (context?.purpose !== 'pricing') return [];
+    const contextScope = pricingScopeKey(
+      context.component_key, context.billing_key, context.scenario_key || null,
+    );
+    return plannedScopes.has(contextScope) ? [] : [{
+      query_id: query.query_id,
+      component_key: context.component_key,
+      billing_key: context.billing_key,
+      scenario_key: context.scenario_key || null,
+    }];
+  });
+  if (unknownScopes.length > 0) {
+    const error = new Error('Formal quote pricing queries must belong to a declared component billing scope.');
+    error.code = 'formal_quote_query_scope_unknown';
+    error.retryable = true;
+    error.details = {
+      query_scopes: unknownScopes,
+      next_action: 'correct_query_context_or_quote_component_plan',
+    };
+    throw error;
+  }
+}
+
+function priceWorkflowGuard({ relayJobId, quoteComponents, componentLifecycle = [] }) {
+  const formalQuote = Boolean(relayJobId) || quoteComponents.length > 0;
+  return {
+    mode: formalQuote ? 'formal_quote' : 'price_lookup',
+    quote_plan_registered: quoteComponents.length > 0,
+    quote_coverage_known: quoteComponents.length > 0,
+    formal_quote_final_response_allowed: false,
+    ...(formalQuote ? {
+      required_delivery_tool: 'build_estimate',
+      instruction: 'Do not end with a prose-only failure. Continue to official page fallback or deliver a verified partial/complete quote with build_estimate.',
+      completed_component_keys: componentLifecycle
+        .filter((item) => item.state === 'completed').map((item) => item.component_key),
+      failed_component_keys: componentLifecycle
+        .filter((item) => item.state === 'failed').map((item) => item.component_key),
+      pending_component_keys: componentLifecycle
+        .filter((item) => item.state === 'pending').map((item) => item.component_key),
+    } : {
+      price_lookup_answer_allowed: true,
+      formal_quote_required_action: 'Register the complete quote_components plan and query_contexts before treating this batch as a formal quote.',
+      instruction: 'This batch is only a price lookup. If the user requested a formal quote or Excel, do not give a final quote answer because component coverage is unknown.',
+    }),
+    official_page_fallback: {
+      supported: true,
+      api_attempts_required: 3,
+      same_component_billing_scenario_scope_required: true,
+      disallowed_for: ['credentials', 'authorization'],
+      build_estimate_field: 'official_page_price_evidence',
+    },
+  };
+}
+
 function validateCustomerDocumentMetadata(input) {
   const componentKeys = new Set([
     ...(input.services || []).map((entry) => entry.component_key),
@@ -911,6 +1000,11 @@ class AstraQuoteV2Workflow {
       };
       return paged;
     });
+    const componentStatus = componentProgress(
+      priceBatch.quote_components || [],
+      priceBatch.query_lifecycle || [],
+      priceBatch.result?.results || [],
+    );
     return {
       status: priceBatch.result?.status || 'needs_refinement',
       price_batch_id: priceBatch.price_batch_id,
@@ -924,23 +1018,17 @@ class AstraQuoteV2Workflow {
       query_lifecycle: (priceBatch.query_lifecycle || [])
         .filter((item) => input.query_ids.includes(item.query_id)),
       progress_guidance: PROGRESS_GUIDANCE,
+      workflow_guard: priceWorkflowGuard({
+        relayJobId: priceBatch.relay_job_id || null,
+        quoteComponents: priceBatch.quote_components || [],
+        componentLifecycle: componentStatus.component_lifecycle,
+      }),
     };
   }
 
   async getPrices(input) {
     const relayJobId = input.relay_job_id || null;
     const relayJob = relayJobId ? assertRelayIdentity(input) : null;
-    const resolvedQueries = input.queries.map((query) => this.routeStore.resolve(query));
-    const materializedQueries = resolvedQueries.map((resolved) => resolved.query);
-    const resolvedByQueryId = new Map(
-      resolvedQueries.map((resolved) => [resolved.query.query_id, resolved]),
-    );
-    const queryIds = materializedQueries.map((query) => query.query_id);
-    if (new Set(queryIds).size !== queryIds.length) {
-      const error = new Error('Every official price query must have a unique query_id.');
-      error.code = 'duplicate_price_query_id';
-      throw error;
-    }
     const existing = input.price_batch_id
       ? this.store.getPriceBatch(input.price_batch_id)
       : null;
@@ -953,7 +1041,31 @@ class AstraQuoteV2Workflow {
       existing?.quote_components,
       input.quote_components,
     );
-
+    const preliminaryQueries = new Map(
+      (existing?.request?.queries || []).map((item) => [item.query_id, item]),
+    );
+    assertQueryIdentity(preliminaryQueries, input.queries);
+    for (const query of input.queries) preliminaryQueries.set(query.query_id, query);
+    const preliminaryContexts = mergeQueryContexts(
+      existing?.query_contexts, input.query_contexts, preliminaryQueries,
+    );
+    assertFormalQuotePricingPlan({
+      relayJobId,
+      quoteComponents,
+      queries: input.queries,
+      queryContexts: preliminaryContexts,
+    });
+    const resolvedQueries = input.queries.map((query) => this.routeStore.resolve(query));
+    const materializedQueries = resolvedQueries.map((resolved) => resolved.query);
+    const resolvedByQueryId = new Map(
+      resolvedQueries.map((resolved) => [resolved.query.query_id, resolved]),
+    );
+    const queryIds = materializedQueries.map((query) => query.query_id);
+    if (new Set(queryIds).size !== queryIds.length) {
+      const error = new Error('Every official price query must have a unique query_id.');
+      error.code = 'duplicate_price_query_id';
+      throw error;
+    }
     const existingResults = new Map(
       (existing?.result?.results || []).map((item) => [item.query_id, item]),
     );
@@ -1239,6 +1351,11 @@ class AstraQuoteV2Workflow {
       completed_component_count: componentStatus.completed_component_count,
       failed_component_count: componentStatus.failed_component_count,
       pending_component_count: componentStatus.pending_component_count,
+      workflow_guard: priceWorkflowGuard({
+        relayJobId,
+        quoteComponents: finalQuoteComponents,
+        componentLifecycle: componentStatus.component_lifecycle,
+      }),
     }, this.resultByteBudget);
   }
 

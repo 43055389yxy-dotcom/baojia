@@ -160,6 +160,10 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   assert.match(INSTRUCTIONS, /response_compacted.*get_price_results/s);
   assert.match(INSTRUCTIONS, /同一个.*price_batch_id.*合并/s);
   assert.match(INSTRUCTIONS, /created.*立即执行.*不得只汇报/s);
+  assert.match(getPrices.description, /formal quote.*quote_components.*query_contexts/is);
+  assert.match(getPrices.description, /must_continue.*final answer/is);
+  assert.match(getPrices.description, /three.*official API.*official pricing page/is);
+  assert.match(buildEstimate.description, /official_page_price_evidence/i);
   assert.doesNotMatch(INSTRUCTIONS, /Calculator|import_estimate|模板映射/i);
 });
 

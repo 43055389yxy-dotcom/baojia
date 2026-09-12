@@ -240,12 +240,12 @@ const getPricesInputSchema = z.object({
     'Current incremental query group. For a long quote, GPT chooses a suitably small group from response complexity and continues the same price_batch_id; this is a transport ceiling, not a required batch size.',
   ),
   query_contexts: z.array(queryContext).max(500).optional().describe(
-    'Task bookkeeping only, never sent to a cloud API. May annotate queries in this call or the saved batch. Same component/billing/scenario scope shares a requirement; successful replacement rates retire old failures without deleting history. Omit for legacy clients.',
+    'Task bookkeeping only, never sent to a cloud API. For a formal quote, provide one context for every query: discovery is explicit; pricing must bind component_key, billing_key and any scenario_key. Same scope shares a requirement, and successful replacement rates retire old failures without deleting history. Omit only for a one-off legacy price lookup.',
   ),
   relay_job_id: z.string().regex(/^gpt-[a-f0-9]{32}$/).optional(),
   submission_code: z.string().regex(/^[1-9]$/).optional(),
   quote_components: z.array(quoteComponentPlan).min(1).max(200).optional().describe(
-    '整单清洗完成后一次性提交并封存的组件计划。后续批次只复用，不得修改。用于按每 20 个组件分配对话名额、显示真实组件进度和部分交付。',
+    '正式报价第一次调用 get_prices 时必须一次性提交并封存完整清洗组件计划；后续批次只复用，不得修改。用于按每 20 个组件分配对话名额、显示真实组件进度和部分交付。单项查价可以省略。',
   ),
   price_batch_id: z.string().regex(/^aqpb_[a-f0-9-]{36}$/).optional().describe(
     'Saved batch to extend during resume. Existing successful query_ids are reused.',
@@ -691,7 +691,7 @@ function buildServer(workflow) {
 
   server.registerTool('get_prices', {
     title: 'Batch query official cloud prices',
-    description: 'Requires a non-empty incremental queries array. For a long quote, GPT chooses a suitably small current group based on query breadth and expected response size, then continues the same price_batch_id; do not launch speculative catalog scans. Full official results are persisted. If response_compacted=true, read only required details with get_price_results. For an authenticated cloud, first provide provider, service and region while omitting endpoint so AstraQuote can reuse a verified route from its persistent knowledge store. Provide a new official endpoint and response contract only when no cached route matches. Invalid or unsupported parameter values are correctable: use the returned recovery and parameter knowledge, repair only the rejected fields, and retry. needs_refinement and retryable query failures are non-terminal. GPT alone chooses products, parameter values, batch grouping and quote totals.',
+    description: 'Requires a non-empty incremental queries array. For a formal quote, the first call MUST include the complete quote_components plan and every query MUST have a query_contexts entry; a sales relay call is rejected before provider access when either is missing. For a long quote, GPT chooses a suitably small current group based on query breadth and expected response size, then continues the same price_batch_id; do not launch speculative catalog scans. Full official results are persisted. If response_compacted=true, read only required details with get_price_results. For an authenticated cloud, first provide provider, service and region while omitting endpoint so AstraQuote can reuse a verified route from its persistent knowledge store. Provide a new official endpoint and response contract only when no cached route matches. Invalid or unsupported parameter values are correctable: use the returned recovery and parameter knowledge, repair only the rejected fields, and retry. needs_refinement, terminal=false, or must_continue=true means do not give the user a final answer. After three qualifying official API failures for the same component/billing/scenario scope, use that provider and account-site official pricing page through build_estimate. GPT alone chooses products, parameter values, batch grouping and quote totals.',
     // Keep the JSON Schema visible to MCP clients. ZodEffects produced by
     // superRefine serializes as an empty object in the MCP SDK, so cross-field
     // checks run inside the guarded handler instead.
@@ -721,8 +721,8 @@ function buildServer(workflow) {
   }, guarded((args) => workflow.resumeQuoteJob(args)));
 
   server.registerTool('build_estimate', {
-    title: 'Validate and deliver an official API quote',
-    description: 'Checks selected official catalog evidence, fact coverage and GPT-calculated totals, then creates one Excel link and returns it with the quote to the sales page. A pricing_partial batch is allowed when every required component has usable selected evidence; unused discovery and replaced attempts need not succeed.',
+    title: 'Validate and deliver an official quote',
+    description: 'Checks selected official catalog evidence, fact coverage and GPT-calculated totals, then creates one Excel link and returns it with the quote to the sales page. After three qualifying official API failures in one declared scope, official_page_price_evidence is accepted from the same provider and account site. If a component still cannot be priced, submit it through the verified partial-quote contract instead of ending with prose only. Unused discovery and replaced attempts need not succeed.',
     inputSchema: buildEstimateInput,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, guarded((args) => workflow.buildEstimate(normalizeBuildEstimateInput(args))));

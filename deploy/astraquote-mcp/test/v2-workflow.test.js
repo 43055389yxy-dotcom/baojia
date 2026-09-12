@@ -1301,6 +1301,14 @@ test('a rejected pricing request is checkpointed as correctable instead of termi
     relay_job_id: relayJobId,
     submission_code: '4',
     queries: [{ provider: 'baidu', query_id: 'bcc-price', endpoint: 'bcc.sin.baidubce.com' }],
+    query_contexts: [{
+      query_id: 'bcc-price', purpose: 'pricing',
+      component_key: 'cmp_compute_0001', billing_key: 'compute',
+    }],
+    quote_components: [{
+      component_key: 'cmp_compute_0001', customer_owned_source: '云服务器 1 台。',
+      billing_scopes: [{ billing_key: 'compute' }],
+    }],
   }), (error) => error.code === 'request_schema_invalid');
 
   const status = workflow.getQuoteJobStatus({
@@ -1312,6 +1320,68 @@ test('a rejected pricing request is checkpointed as correctable instead of termi
   assert.match(workflow.resumeQuoteJob({
     relay_job_id: relayJobId, submission_code: '4',
   }).next_action, /Correct the rejected request/);
+});
+
+test('a sales relay quote must register its complete component plan before any official call', async (t) => {
+  const { workflow, backend, directory } = fixture();
+  const relayDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-relay-plan-required-'));
+  fs.mkdirSync(path.join(relayDirectory, 'jobs'));
+  const relayJobId = `gpt-${'e'.repeat(32)}`;
+  fs.writeFileSync(path.join(relayDirectory, 'jobs', `${relayJobId}.json`), JSON.stringify({
+    job_id: relayJobId, submission_code: '5', status: 'processing',
+    quote_options: { cloud_provider: 'tencent', pricing_scenarios: ['on_demand'] },
+  }));
+  const previous = process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+  process.env.ASTRAQUOTE_GPT_RELAY_DIR = relayDirectory;
+  let officialCalls = 0;
+  backend.getPrices = async () => { officialCalls += 1; return { results: [] }; };
+  t.after(() => {
+    if (previous === undefined) delete process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+    else process.env.ASTRAQUOTE_GPT_RELAY_DIR = previous;
+    fs.rmSync(directory, { recursive: true, force: true });
+    fs.rmSync(relayDirectory, { recursive: true, force: true });
+  });
+
+  await assert.rejects(workflow.getPrices({
+    relay_job_id: relayJobId, submission_code: '5',
+    queries: [{ provider: 'tencent', query_id: 'redis-price', route_id: 'aqr_aaaaaaaaaaaaaaaaaaaaaaaa' }],
+  }), (error) => error.code === 'formal_quote_component_plan_required'
+    && error.retryable === true);
+  assert.equal(officialCalls, 0);
+});
+
+test('a formal quote rejects unowned price queries before calling a provider', async (t) => {
+  const { workflow, backend, directory } = fixture();
+  let officialCalls = 0;
+  backend.getPrices = async () => { officialCalls += 1; return { results: [] }; };
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+
+  await assert.rejects(workflow.getPrices({
+    queries: [{ provider: 'tencent', query_id: 'redis-price', route_id: 'aqr_aaaaaaaaaaaaaaaaaaaaaaaa' }],
+    quote_components: [{
+      component_key: 'cmp_redis_0001', customer_owned_source: 'Redis 16 GB。',
+      billing_scopes: [{ billing_key: 'instance' }],
+    }],
+  }), (error) => error.code === 'formal_quote_query_context_required'
+    && error.details.query_ids.includes('redis-price'));
+  assert.equal(officialCalls, 0);
+});
+
+test('price lookup responses tell weaker clients that quote coverage is unknown and page fallback exists', async (t) => {
+  const { workflow, directory } = fixture();
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+
+  const result = await workflow.getPrices({
+    queries: [{ provider: 'azure', query_id: 'one-price', filter: 'caller supplied query' }],
+  });
+
+  assert.equal(result.workflow_guard.mode, 'price_lookup');
+  assert.equal(result.workflow_guard.quote_plan_registered, false);
+  assert.equal(result.workflow_guard.quote_coverage_known, false);
+  assert.equal(result.workflow_guard.formal_quote_final_response_allowed, false);
+  assert.match(result.workflow_guard.formal_quote_required_action, /quote_components/);
+  assert.equal(result.workflow_guard.official_page_fallback.supported, true);
+  assert.equal(result.workflow_guard.official_page_fallback.api_attempts_required, 3);
 });
 
 test('a created relay job tells GPT to build non-empty queries before price lookup', (t) => {
@@ -1354,7 +1424,9 @@ test('a created relay job tells GPT to build non-empty queries before price look
 });
 
 test('completed relay jobs replay before the processing guard and expose stage-level resume', async (t) => {
-  const { workflow, directory, displayed } = fixture();
+  const { workflow, directory, displayed } = fixture({ rateCandidates: [{
+    rate_id: 'rate-1', official_item_id: 'item-1', unit_price: '12.34', currency: 'USD',
+  }] });
   const relayDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-relay-resume-'));
   const jobsDirectory = path.join(relayDirectory, 'jobs');
   fs.mkdirSync(jobsDirectory);
@@ -1383,6 +1455,14 @@ test('completed relay jobs replay before the processing guard and expose stage-l
     relay_job_id: relayJobId,
     submission_code: '6',
     queries: [{ provider: 'azure', query_id: 'price-1', filter: 'caller supplied query' }],
+    query_contexts: [{
+      query_id: 'price-1', purpose: 'pricing',
+      component_key: 'cmp_compute_0001', billing_key: 'compute',
+    }],
+    quote_components: [{
+      component_key: 'cmp_compute_0001', customer_owned_source: '云服务器数量：1。',
+      billing_scopes: [{ billing_key: 'compute' }],
+    }],
   });
   assert.equal(workflow.getQuoteJobStatus({
     relay_job_id: relayJobId, submission_code: '6',
@@ -1412,7 +1492,9 @@ test('completed relay jobs replay before the processing guard and expose stage-l
 });
 
 test('a legacy stale-worker failure can finish from its saved complete price batch', async (t) => {
-  const { workflow, directory, displayed } = fixture();
+  const { workflow, directory, displayed } = fixture({ rateCandidates: [{
+    rate_id: 'rate-1', official_item_id: 'item-1', unit_price: '12.34', currency: 'USD',
+  }] });
   const relayDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-relay-stale-'));
   const jobsDirectory = path.join(relayDirectory, 'jobs');
   fs.mkdirSync(jobsDirectory);
@@ -1441,6 +1523,14 @@ test('a legacy stale-worker failure can finish from its saved complete price bat
     relay_job_id: relayJobId,
     submission_code: '7',
     queries: [{ provider: 'azure', query_id: 'price-1', filter: 'caller supplied query' }],
+    query_contexts: [{
+      query_id: 'price-1', purpose: 'pricing',
+      component_key: 'cmp_compute_0001', billing_key: 'compute',
+    }],
+    quote_components: [{
+      component_key: 'cmp_compute_0001', customer_owned_source: '云服务器数量：1。',
+      billing_scopes: [{ billing_key: 'compute' }],
+    }],
   });
   relay.status = 'failed';
   relay.error = { code: 'gpt_quote_worker_stale', message: 'legacy false failure' };
