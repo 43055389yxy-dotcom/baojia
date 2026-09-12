@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import html
 import json
+import logging
 import math
 import os
 import re
@@ -23,6 +24,8 @@ from fastapi.responses import (
     RedirectResponse,
     StreamingResponse,
 )
+
+LOGGER = logging.getLogger("astraquote.oauth")
 
 
 def positive_int_env(name: str, default: int) -> int:
@@ -589,19 +592,31 @@ async def register(request: Request) -> JSONResponse:
     try:
         body = await request.json()
     except (json.JSONDecodeError, UnicodeDecodeError):
+        LOGGER.warning("OAuth registration rejected: request body is not JSON")
         return json_error("invalid_client_metadata", "JSON body is required")
     redirect_uris = body.get("redirect_uris")
     if not isinstance(redirect_uris, list) or not redirect_uris:
+        LOGGER.warning(
+            "OAuth registration rejected: redirect_uris has type %s",
+            type(redirect_uris).__name__,
+        )
         return json_error("invalid_redirect_uri", "redirect_uris is required")
     if not all(
         isinstance(uri, str) and valid_redirect_uri(uri) for uri in redirect_uris
     ):
+        LOGGER.warning(
+            "OAuth registration rejected: unapproved redirect_uris=%r", redirect_uris
+        )
         return json_error(
             "invalid_redirect_uri",
             "Only approved ChatGPT, Gemini or WorkBuddy callbacks are allowed",
         )
     method = body.get("token_endpoint_auth_method", "none")
     if method not in {"none", "client_secret_basic", "client_secret_post"}:
+        LOGGER.warning(
+            "OAuth registration rejected: unsupported token authentication method=%r",
+            method,
+        )
         return json_error(
             "invalid_client_metadata", "Unsupported token authentication method"
         )
