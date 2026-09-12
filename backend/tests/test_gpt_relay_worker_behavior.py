@@ -17,6 +17,10 @@ def codex_chat(index: int) -> str:
     return f"codex-chat://conversations/00000000-0000-4000-8000-{index:012d}"
 
 
+def local_codex_chat(index: int) -> str:
+    return f"codex-chat://conversations/local-chatgpt:00000000-0000-4000-8000-{index:012d}"
+
+
 @pytest.fixture
 def worker(monkeypatch):
     """Load the real worker without needing a browser driver in backend tests."""
@@ -314,6 +318,42 @@ def test_numbered_intake_is_sent_as_three_isolated_chats_before_ai_cleanup(
     internal = store.get(job["job_id"])
     assert internal["source_purged_at"]
     assert all(not batch["source_lines"] for batch in internal["intake_batches"])
+
+
+def test_local_codex_conversation_ids_do_not_serialize_component_chat_creation(
+    worker,
+    tmp_path: Path,
+) -> None:
+    store = GptQuoteRelayStore(tmp_path / "relay", max_concurrent_quotes=4)
+    text = "\n".join(f"{index}. 组件 {index}：配置。" for index in range(1, 45))
+    job = store.create(
+        text,
+        {"cloud_provider": "alibaba", "preferred_region": "cn-hangzhou"},
+        numbered_components=parse_numbered_component_lines(text),
+    )
+    record = store.claim_next("test-worker")
+    assert record is not None
+    browser = Mock()
+    browser.logged_in.return_value = True
+    browser.start_quote.return_value = worker.ActiveQuote(
+        job["job_id"], local_codex_chat(0), 100,
+    )
+    browser.start_component_batch.side_effect = lambda job_id, _prompt, **kwargs: (
+        worker.ActiveQuote(
+            job_id,
+            local_codex_chat(kwargs["batch_index"]),
+            100,
+            **kwargs,
+        )
+    )
+
+    first = worker.submit_job(store, browser, record)
+    assert first is not None
+    active = {first.session_key: first}
+    worker.create_missing_component_chats(store, browser, active, job["job_id"])
+
+    assert set(active) == {f"{job['job_id']}:{index}" for index in range(3)}
+    assert browser.start_component_batch.call_count == 2
 
 
 def test_terminal_cleanup_keeps_slot_when_stop_is_uncertain(worker):

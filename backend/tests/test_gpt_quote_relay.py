@@ -174,6 +174,8 @@ def test_component_batch_prompt_contains_only_that_batches_cleaned_sources() -> 
     assert "对象存储" not in prompt
     assert "客户原话" not in prompt
     assert "第 2/2 批" in prompt
+    assert "relay_batch_index：1" in prompt
+    assert "relay_batch_count：2" in prompt
     assert "不要生成最终整单" in prompt
     assert "AWS 全球站" in prompt
     assert "ap-southeast-1" in prompt
@@ -1009,6 +1011,8 @@ def test_every_automated_followup_explicitly_mentions_astraquote() -> None:
     ]
 
     assert all(prompt.startswith("@AstraQuote ") for prompt in prompts)
+    assert "relay_batch_index：1" in prompts[-1]
+    assert "relay_batch_count：2" in prompts[-1]
 
 
 def test_codex_worker_keeps_continuation_and_receipt_integration() -> None:
@@ -1183,6 +1187,31 @@ def test_pending_codex_chat_reference_can_be_atomically_promoted(tmp_path: Path)
     assert record["chat_url"] == stable
     assert record["chat_sessions"][0]["chat_url"] == stable
     assert record["chat_sessions"][0]["previous_conversation_ids"] == []
+
+
+def test_local_codex_chat_reference_can_be_saved_and_remapped(tmp_path: Path) -> None:
+    store = GptQuoteRelayStore(tmp_path)
+    public = store.create("东京 EC2 两台，按需。", {})
+    job_id = public["job_id"]
+    store.claim_next("worker-a")
+    local_id = "local-chatgpt:2995f22c-1bfa-414c-8f65-cebe43aa23cf"
+    local = f"codex-chat://conversations/{local_id}"
+    stable = "codex-chat://conversations/6aa52a28-5510-83ee-b69a-42c10c9f1ddb"
+
+    store.record_chat_session(
+        job_id,
+        batch_index=0,
+        batch_count=1,
+        chat_url=local,
+        role="coordinator",
+        component_keys=[],
+        previous_conversation_ids=[local_id],
+    )
+    store.promote_chat_session_reference(job_id, 0, local, stable)
+
+    record = store.get(job_id)
+    assert record["chat_url"] == stable
+    assert record["chat_sessions"][0]["chat_url"] == stable
 
 
 def test_pending_codex_reference_must_match_its_relay_job(tmp_path: Path) -> None:

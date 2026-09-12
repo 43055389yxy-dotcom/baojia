@@ -21,6 +21,10 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
+from app.services.codex_chat_references import (
+    CODEX_CHAT_REFERENCE_PREFIX,
+    is_codex_conversation_id,
+)
 from app.services.gpt_browser_navigation import (
     is_interrupted_response,
     should_extend_quote_deadline,
@@ -39,7 +43,6 @@ CODEX_STATE_PATH = Path(
     )
 )
 CODEX_NEW_CHAT_LINK = "codex://threads/new?mode=chat"
-CODEX_CHAT_REFERENCE_PREFIX = "codex-chat://conversations/"
 CODEX_PENDING_REFERENCE_PREFIX = "codex-chat://pending/"
 COMPOSER_SELECTOR = (
     '[contenteditable="true"][aria-label="给 ChatGPT 发消息"],'
@@ -50,10 +53,6 @@ RICH_MENTION_SELECTOR = '[plugin-mention-display-name="AstraQuote"]'
 ASSISTANT_SELECTOR = '[data-content-search-unit-key$=":assistant"]'
 USER_SELECTOR = '[data-content-search-unit-key$=":user"]'
 SIDEBAR_REFERENCE_ATTRIBUTE = "data-sidebar-chatgpt-conversation-key"
-THREAD_ID_PATTERN = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-    re.IGNORECASE,
-)
 RELAY_JOB_ID_PATTERN = re.compile(r"^gpt-[0-9a-f]{32}$", re.IGNORECASE)
 
 
@@ -75,7 +74,7 @@ def split_astraquote_prompt(prompt: str) -> str:
 
 def codex_chat_reference(thread_id: str) -> str:
     normalized = str(thread_id).strip()
-    if not THREAD_ID_PATTERN.fullmatch(normalized):
+    if not is_codex_conversation_id(normalized):
         raise ValueError("Codex Chat conversation id is invalid")
     return f"{CODEX_CHAT_REFERENCE_PREFIX}{normalized}"
 
@@ -357,7 +356,7 @@ class CodexChatDesktop:
               .map(x => x.replace('chatgpt:conversation:', ''))
             """
         )
-        return [value for value in (values or []) if THREAD_ID_PATTERN.fullmatch(value)]
+        return [value for value in (values or []) if is_codex_conversation_id(value)]
 
     def _open_new_chat(self) -> list[str]:
         previous = self._sidebar_ids()
@@ -588,12 +587,30 @@ class CodexChatDesktop:
         return active
 
     def _switch_to_quote(self, quote: Any) -> None:
+        batch_index = int(getattr(quote, "batch_index", 0) or 0)
+        batch_count = int(getattr(quote, "batch_count", 1) or 1)
+        role = str(getattr(quote, "role", "coordinator") or "coordinator")
+        batch_markers = []
+        if batch_count > 1 and role != "merge":
+            batch_markers = [
+                f"relay_batch_index：{batch_index}",
+                f"relay_batch_index: {batch_index}",
+                f"当前为第 {batch_index + 1}/{batch_count} 批",
+                f"第 {batch_index + 1}/{batch_count} 个组件批次",
+            ]
+
         def current_quote_visible() -> bool:
             return bool(
                 self._evaluate(
                     f"""
-                    [...document.querySelectorAll({json.dumps(USER_SELECTOR)})]
-                      .some(x => x.innerText.includes({json.dumps(quote.job_id)}))
+                    (() => {{
+                      const jobId = {json.dumps(quote.job_id)};
+                      const batchMarkers = {json.dumps(batch_markers, ensure_ascii=False)};
+                      return [...document.querySelectorAll({json.dumps(USER_SELECTOR)})]
+                        .some(x => x.innerText.includes(jobId)
+                          && (!batchMarkers.length
+                            || batchMarkers.some(marker => x.innerText.includes(marker))));
+                    }})()
                     """
                 )
             )
@@ -622,6 +639,39 @@ class CodexChatDesktop:
             """
         )
         if not clicked:
+            # Codex may replace an immediate local-chatgpt id with a server id
+            # after synchronization. Recover by checking recent opaque chat
+            # handles against the job and exact batch markers.
+            for candidate_id in self._sidebar_ids():
+                candidate_clicked = self._evaluate(
+                    f"""
+                    (() => {{
+                      const row = document.querySelector(
+                        '[{SIDEBAR_REFERENCE_ATTRIBUTE}="chatgpt:conversation:{candidate_id}"]'
+                      );
+                      if (!row) return false;
+                      (row.querySelector('[role="button"]') || row).click();
+                      return true;
+                    }})()
+                    """
+                )
+                if not candidate_clicked:
+                    continue
+                try:
+                    self._wait_until(current_quote_visible, timeout=2)
+                except TimeoutError:
+                    continue
+                quote.chat_url = codex_chat_reference(candidate_id)
+                quote.previous_conversation_ids = ()
+                _atomic_json(
+                    CODEX_STATE_PATH,
+                    {
+                        "surface": "Codex Chat",
+                        "last_chat_reference": quote.chat_url,
+                        "updated_at": time.time(),
+                    },
+                )
+                return
             raise RuntimeError("Codex 最近对话中找不到本报价会话。")
         self._wait_until(current_quote_visible, timeout=45)
 

@@ -24,6 +24,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from app.services.codex_chat_references import (
+    is_codex_chat_reference,
+    is_codex_conversation_id,
+)
 from app.services.gpt_quote_batches import split_component_plan, split_numbered_intake
 
 UTC = timezone.utc  # noqa: UP017 - the host-side worker still supports Python 3.9
@@ -458,22 +462,13 @@ class GptQuoteRelayStore:
             raise GptRelayError("无效的报价对话角色。", code="gpt_relay_chat_role_invalid")
         if not 0 <= batch_index < batch_count <= 200:
             raise GptRelayError("无效的报价对话批次。", code="gpt_relay_chat_batch_invalid")
-        stable_reference = re.fullmatch(
-            r"codex-chat://conversations/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
-            r"[0-9a-f]{4}-[0-9a-f]{12}",
-            str(chat_url),
-            flags=re.IGNORECASE,
-        )
+        stable_reference = is_codex_chat_reference(chat_url)
         pending_reference = str(chat_url) == f"codex-chat://pending/{job_id}"
         if not stable_reference and not pending_reference:
             raise GptRelayError("无效的报价对话地址。", code="gpt_relay_chat_url_invalid")
         previous_ids = list(previous_conversation_ids or [])
         if len(previous_ids) > 200 or any(
-            re.fullmatch(
-                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-                str(value),
-                flags=re.IGNORECASE,
-            ) is None
+            not is_codex_conversation_id(value)
             for value in previous_ids
         ):
             raise GptRelayError(
@@ -514,14 +509,13 @@ class GptQuoteRelayStore:
         previous_reference: str,
         stable_reference: str,
     ) -> dict[str, Any]:
-        """Atomically replace one job-bound pending reference with a stable id."""
+        """Atomically replace a pending or remapped Codex conversation handle."""
 
-        if previous_reference != f"codex-chat://pending/{job_id}" or re.fullmatch(
-            r"codex-chat://conversations/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
-            r"[0-9a-f]{4}-[0-9a-f]{12}",
-            str(stable_reference),
-            flags=re.IGNORECASE,
-        ) is None:
+        previous_is_valid = (
+            previous_reference == f"codex-chat://pending/{job_id}"
+            or is_codex_chat_reference(previous_reference)
+        )
+        if not previous_is_valid or not is_codex_chat_reference(stable_reference):
             raise GptRelayError(
                 "无效的报价对话地址。", code="gpt_relay_chat_url_invalid"
             )

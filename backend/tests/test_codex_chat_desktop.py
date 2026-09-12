@@ -37,6 +37,37 @@ def test_codex_chat_reference_is_stable_and_rejects_web_urls(desktop_module):
         )
 
 
+def test_codex_chat_reference_accepts_strict_local_conversation_id(
+    desktop_module,
+):
+    local_id = "local-chatgpt:2995f22c-1bfa-414c-8f65-cebe43aa23cf"
+
+    reference = desktop_module.codex_chat_reference(local_id)
+
+    assert reference == f"codex-chat://conversations/{local_id}"
+    assert desktop_module.conversation_id_from_reference(reference) == local_id
+    with pytest.raises(ValueError):
+        desktop_module.codex_chat_reference("local-chatgpt:not-a-uuid")
+
+
+def test_sidebar_conversations_include_local_and_server_ids(
+    desktop_module, monkeypatch,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=600,
+    )
+    local_id = "local-chatgpt:2995f22c-1bfa-414c-8f65-cebe43aa23cf"
+    server_id = "6aa52a28-5510-83ee-b69a-42c10c9f1ddb"
+    monkeypatch.setattr(
+        desktop,
+        "_evaluate",
+        lambda _expression: [local_id, server_id, "local-chatgpt:invalid"],
+    )
+
+    assert desktop._sidebar_ids() == [local_id, server_id]
+
+
 def test_pending_reference_is_bound_to_the_relay_job(desktop_module):
     job_id = "gpt-0123456789abcdef0123456789abcdef"
 
@@ -116,6 +147,45 @@ def test_resume_pending_quote_waits_for_sidebar_without_failing(
     )
 
     assert active["chat_url"] == desktop_module.pending_chat_reference(job_id)
+
+
+def test_switching_multi_batch_quote_requires_the_exact_batch_marker(
+    desktop_module, monkeypatch,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=600,
+    )
+    quote = type(
+        "Quote",
+        (),
+        {
+            "job_id": "gpt-0123456789abcdef0123456789abcdef",
+            "chat_url": desktop_module.codex_chat_reference(
+                "6aa52a28-5510-83ee-b69a-42c10c9f1ddb"
+            ),
+            "previous_conversation_ids": (),
+            "batch_index": 1,
+            "batch_count": 3,
+            "role": "component_batch",
+        },
+    )()
+    expressions = []
+
+    def evaluate(expression):
+        expressions.append(expression)
+        if "const jobId" in expression:
+            return True
+        return False
+
+    monkeypatch.setattr(desktop, "_evaluate", evaluate)
+
+    desktop._switch_to_quote(quote)
+
+    identity_expression = next(item for item in expressions if "const jobId" in item)
+    assert quote.job_id in identity_expression
+    assert "relay_batch_index：1" in identity_expression
+    assert "当前为第 2/3 批" in identity_expression
 
 
 def test_rich_mention_selector_requires_plugin_markup(desktop_module):
