@@ -1,8 +1,8 @@
-"""Drive one logged-in Codex Chat window across isolated sales quote chats.
+"""Drive one logged-in quote engine across isolated sales quote conversations.
 
-The worker keeps one stable Codex conversation reference per active quote and
-visits those chats in a round-robin loop; generation continues remotely while
-another chat is shown.  There is no web-browser fallback.
+The worker keeps one stable engine-specific reference per active quote and
+visits those conversations in a round-robin loop; generation continues remotely
+while another conversation is shown. Each worker owns one assigned engine.
 """
 
 from __future__ import annotations
@@ -40,14 +40,26 @@ from app.services.gpt_quote_prompt import (
     parse_final_response,
 )
 from app.services.gpt_quote_relay import GptQuoteRelayStore, utc_now
-from codex_chat_desktop import CodexChatDesktop, is_pending_chat_reference
+
+RELAY_ENGINE = os.environ.get("ASTRAQUOTE_RELAY_ENGINE", "chatgpt").strip().lower()
+if RELAY_ENGINE not in {"chatgpt", "gemini"}:
+    raise RuntimeError("ASTRAQUOTE_RELAY_ENGINE must be chatgpt or gemini")
+if RELAY_ENGINE == "gemini":
+    from gemini_chat_browser import GeminiChatBrowser
+else:
+    from codex_chat_desktop import CodexChatDesktop, is_pending_chat_reference
 
 POLL_SECONDS = float(os.environ.get("ASTRAQUOTE_GPT_RELAY_POLL_SECONDS", "4"))
 QUOTE_TIMEOUT_SECONDS = int(os.environ.get("ASTRAQUOTE_GPT_QUOTE_TIMEOUT", "600"))
 MAX_CONTINUATION_ATTEMPTS = bounded_continuation_attempts(
     os.environ.get("ASTRAQUOTE_GPT_MAX_CONTINUATIONS")
 )
-WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
+WORKER_ID = f"{RELAY_ENGINE}-{socket.gethostname()}-{os.getpid()}"
+
+
+def is_pending_browser_reference(reference: str) -> bool:
+    return RELAY_ENGINE == "chatgpt" and is_pending_chat_reference(reference)
+
 
 def atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -65,10 +77,10 @@ def write_heartbeat(
     *,
     logged_in: bool,
     message: str,
-    browser: str = "Codex Chat",
+    browser: str,
 ) -> None:
     atomic_json(
-        store.heartbeat_path,
+        store.heartbeat_path_for(RELAY_ENGINE),
         {
             "updated_at": utc_now(),
             "worker_id": WORKER_ID,
@@ -107,17 +119,27 @@ class ActiveQuote:
 
 
 def mark_needs_login(store: GptQuoteRelayStore, record: dict[str, Any]) -> None:
+    has_submitted_chat = bool(record.get("chat_url") or record.get("chat_sessions"))
     store.update_if_not_cancelled(
         record["job_id"],
-        {"status": "needs_login", "worker_id": None, "lease_expires_at": None},
+        {
+            "status": "needs_login" if has_submitted_chat else "queued",
+            "assigned_engine": record.get("assigned_engine") if has_submitted_chat else None,
+            "worker_id": None,
+            "lease_expires_at": None,
+        },
         stage="login",
-        message="服务器 Codex Chat 登录已失效，等待管理员在运维桌面重新登录",
+        message=f"{engine_display_name()} 登录已失效，等待管理员在运维桌面重新登录",
     )
+
+
+def engine_display_name() -> str:
+    return "Gemini" if RELAY_ENGINE == "gemini" else "Codex Chat"
 
 
 def submit_job(
     store: GptQuoteRelayStore,
-    browser: CodexChatDesktop,
+    browser: Any,
     record: dict[str, Any],
 ) -> ActiveQuote | None:
     job_id = record["job_id"]
@@ -208,7 +230,7 @@ def submit_job(
     )
     store.update_if_not_cancelled(
         job_id, {"project_name": None}, stage="submitted",
-        message="已在 Codex 独立聊天中创建总控对话并提交需求清洗",
+        message=f"已在 {engine_display_name()} 独立任务中创建总控报价并提交需求清洗",
     )
     store.purge_source(job_id)
     return active
@@ -271,7 +293,7 @@ def refresh_progress_deadline(store: GptQuoteRelayStore, active: ActiveQuote) ->
 
 def continue_component_batch(
     store: GptQuoteRelayStore,
-    browser: CodexChatDesktop,
+    browser: Any,
     active: ActiveQuote,
 ) -> bool:
     """Continue a child batch twice only while its machine state is unchanged."""
@@ -321,7 +343,7 @@ def continue_component_batch(
 
 def create_missing_component_chats(
     store: GptQuoteRelayStore,
-    browser: CodexChatDesktop,
+    browser: Any,
     active_quotes: dict[str, ActiveQuote],
     job_id: str,
 ) -> None:
@@ -369,7 +391,7 @@ def create_missing_component_chats(
             )
             store.purge_intake_batch(job_id, batch_index)
             active_quotes[active.session_key] = active
-            if is_pending_chat_reference(active.chat_url):
+            if is_pending_browser_reference(active.chat_url):
                 break
         return
 
@@ -425,7 +447,7 @@ def create_missing_component_chats(
         )
         active.batch_progress_fingerprint = batch_progress_fingerprint(batch)
         active_quotes[active.session_key] = active
-        if is_pending_chat_reference(active.chat_url):
+        if is_pending_browser_reference(active.chat_url):
             # Do not leave a just-sent conversation before Codex exposes its
             # stable sidebar id; the model continues running in this chat.
             break
@@ -433,7 +455,7 @@ def create_missing_component_chats(
 
 def maybe_start_final_merge(
     store: GptQuoteRelayStore,
-    browser: CodexChatDesktop,
+    browser: Any,
     active_quotes: dict[str, ActiveQuote],
     job_id: str,
 ) -> None:
@@ -525,7 +547,7 @@ def fail_continuation_limit(store: GptQuoteRelayStore, job_id: str) -> None:
         job_id,
         {
             "status": "failed",
-            "result_summary": "ChatGPT 多次只返回阶段进度，未给出最终完成或明确阻塞状态。",
+            "result_summary": "报价引擎多次只返回阶段进度，未给出最终完成或明确阻塞状态。",
             "error": {
                 "code": "gpt_quote_continuation_limit",
                 "message": "报价在限定续跑次数内仍未产生最终状态。",
@@ -539,7 +561,7 @@ def fail_continuation_limit(store: GptQuoteRelayStore, job_id: str) -> None:
 
 def continue_from_saved_stage(
     store: GptQuoteRelayStore,
-    browser: CodexChatDesktop,
+    browser: Any,
     active: ActiveQuote,
     *,
     message: str,
@@ -602,19 +624,19 @@ def fail_job(store: GptQuoteRelayStore, job_id: str, exc: Exception) -> None:
             "status": "failed",
             "customer_request": "",
             "error": {
-                "code": "codex_chat_automation_failed",
+                "code": f"{RELAY_ENGINE}_automation_failed",
                 "message": str(exc)[:1200],
             },
             "lease_expires_at": None,
         },
         stage="failed",
-        message="服务器 Codex Chat 自动化失败，任务已安全停止",
+        message=f"{engine_display_name()} 自动化失败，任务已安全停止",
     )
 
 
 def handle_no_progress_timeout(
     store: GptQuoteRelayStore,
-    browser: CodexChatDesktop,
+    browser: Any,
     active: ActiveQuote,
     active_quotes: dict[str, ActiveQuote],
 ) -> None:
@@ -643,7 +665,7 @@ def handle_no_progress_timeout(
 
 def reattach_job_chats(
     store: GptQuoteRelayStore,
-    browser: CodexChatDesktop,
+    browser: Any,
     record: dict[str, Any],
     active_quotes: dict[str, ActiveQuote],
 ) -> None:
@@ -719,7 +741,7 @@ def reattach_job_chats(
 
 
 def stop_terminal_job_chats(
-    browser: CodexChatDesktop,
+    browser: Any,
     active_quotes: dict[str, ActiveQuote],
     job_id: str,
     *,
@@ -749,7 +771,7 @@ def pending_active_quote(
         (
             quote
             for quote in active_quotes.values()
-            if is_pending_chat_reference(quote.chat_url)
+            if is_pending_browser_reference(quote.chat_url)
         ),
         None,
     )
@@ -760,6 +782,8 @@ def persist_promoted_chat_reference(
     active: ActiveQuote,
     previous_reference: str,
 ) -> None:
+    if RELAY_ENGINE != "chatgpt":
+        return
     if active.chat_url == previous_reference:
         return
     store.promote_chat_session_reference(
@@ -772,19 +796,29 @@ def persist_promoted_chat_reference(
 
 def main() -> int:
     store = GptQuoteRelayStore()
-    browser = CodexChatDesktop(
-        active_quote_factory=ActiveQuote,
-        quote_timeout_seconds=QUOTE_TIMEOUT_SECONDS,
+    browser = (
+        GeminiChatBrowser(
+            active_quote_factory=ActiveQuote,
+            quote_timeout_seconds=QUOTE_TIMEOUT_SECONDS,
+        )
+        if RELAY_ENGINE == "gemini"
+        else CodexChatDesktop(
+            active_quote_factory=ActiveQuote,
+            quote_timeout_seconds=QUOTE_TIMEOUT_SECONDS,
+        )
     )
     active_quotes: dict[str, ActiveQuote] = {}
     while True:
         try:
             if browser.driver is None:
                 browser.start()
+            logged_in = browser.logged_in()
+            if logged_in and not active_quotes:
                 for record in store.claim_submitted_for_monitoring(
                     WORKER_ID,
                     limit=None,
                     lease_minutes=35,
+                    engine=RELAY_ENGINE,
                 ):
                     reattach_job_chats(store, browser, record, active_quotes)
                     create_missing_component_chats(
@@ -793,11 +827,8 @@ def main() -> int:
                     maybe_start_final_merge(
                         store, browser, active_quotes, record["job_id"],
                     )
-            logged_in = browser.logged_in()
             if logged_in:
-                store.resume_login_waiting()
-            elif not active_quotes:
-                store.mark_queued_needs_login()
+                store.resume_login_waiting(RELAY_ENGINE)
             write_heartbeat(
                 store,
                 logged_in=logged_in,
@@ -805,14 +836,22 @@ def main() -> int:
                     f"正在并行处理 {len(active_quotes)} 个报价"
                     if active_quotes
                     else "等待销售报价任务"
-                ) if logged_in else "等待管理员登录 ChatGPT",
+                ) if logged_in else f"等待管理员登录 {engine_display_name()}",
+                browser=engine_display_name(),
             )
+            if not logged_in:
+                for job_id in {quote.job_id for quote in active_quotes.values()}:
+                    mark_needs_login(store, store.get(job_id))
+                active_quotes.clear()
+                time.sleep(POLL_SECONDS)
+                continue
             if logged_in:
                 for record in store.claim_submitted_for_monitoring(
                     WORKER_ID,
                     limit=None,
                     lease_minutes=35,
                     exclude_job_ids={quote.job_id for quote in active_quotes.values()},
+                    engine=RELAY_ENGINE,
                 ):
                     reattach_job_chats(store, browser, record, active_quotes)
                     create_missing_component_chats(
@@ -824,7 +863,11 @@ def main() -> int:
                     if pending_active_quote(active_quotes) is not None:
                         break
             while logged_in and pending_active_quote(active_quotes) is None:
-                record = store.claim_next(WORKER_ID, lease_minutes=35)
+                record = store.claim_next(
+                    WORKER_ID,
+                    lease_minutes=35,
+                    engine=RELAY_ENGINE,
+                )
                 if record is None:
                     break
                 try:
@@ -932,7 +975,7 @@ def main() -> int:
                     handle_no_progress_timeout(store, browser, active, active_quotes)
                 except Exception as exc:  # noqa: BLE001 - classify live renderer failures
                     if is_transient_browser_poll_exception(exc):
-                        # Codex replaces live DOM nodes while generating. The
+                        # Quote clients replace live DOM nodes while generating. The
                         # next polling round must locate fresh elements; the
                         # quote itself is still running and must remain active.
                         active.stable_since = time.monotonic()
@@ -956,10 +999,14 @@ def main() -> int:
             browser.close()
             return 0
         except Exception as exc:  # noqa: BLE001 - keep the supervisor alive
-            write_heartbeat(store, logged_in=False, message=f"Codex Chat 工作进程异常：{str(exc)[:500]}")
-            # Submitted ChatGPT conversations continue server-side if the Codex
-            # desktop renderer restarts. Leave them processing so the next CDP
-            # session can reattach by its saved conversation reference.
+            write_heartbeat(
+                store,
+                logged_in=False,
+                message=f"{engine_display_name()} 工作进程异常：{str(exc)[:500]}",
+                browser=engine_display_name(),
+            )
+            # Submitted conversations continue server-side while the desktop
+            # renderer restarts. Leave them processing for reference reattachment.
             active_quotes.clear()
             browser.close()
             time.sleep(10)

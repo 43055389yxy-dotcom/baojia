@@ -1,8 +1,8 @@
 [Unit]
-Description=AstraQuote Codex Chat desktop quote relay
-After=network-online.target docker.service vncserver@:1.service
+Description=AstraQuote Gemini Spark desktop quote relay
+After=network-online.target vncserver@:1.service
 Wants=network-online.target
-Requires=docker.service vncserver@:1.service
+Requires=vncserver@:1.service
 
 [Service]
 Type=simple
@@ -12,14 +12,14 @@ WorkingDirectory=/home/ec2-user/astraquote/source
 Environment=DISPLAY=:1
 Environment=XAUTHORITY=/home/ec2-user/.Xauthority
 Environment=PYTHONPATH=/home/ec2-user/astraquote/source/backend
+Environment=ASTRAQUOTE_RELAY_ENGINE=gemini
 Environment=ASTRAQUOTE_GPT_RELAY_DIR=/home/ec2-user/astraquote/data/gpt-relay
-Environment=ASTRAQUOTE_RELAY_ENGINE=chatgpt
-Environment=ASTRAQUOTE_GPT_RELAY_STATE=/home/ec2-user/astraquote/data/gpt-relay/browser-state.json
+Environment=ASTRAQUOTE_GPT_RELAY_STATE=/home/ec2-user/astraquote/data/gpt-relay/gemini-state.json
 Environment=ASTRAQUOTE_V2_STATE_DIR=/home/ec2-user/astraquote/data/v2-quotes
-Environment=ASTRAQUOTE_CODEX_CONTAINER=astraquote-chatgpt-desktop
-Environment=ASTRAQUOTE_CODEX_CDP=http://127.0.0.1:9222
-ExecStartPre=/usr/bin/docker inspect astraquote-chatgpt-desktop
-ExecStartPre=/usr/bin/docker start astraquote-chatgpt-desktop
+Environment=ASTRAQUOTE_GEMINI_PROFILE=/home/ec2-user/.mozilla/firefox/astraquote-gemini
+Environment=ASTRAQUOTE_GEMINI_URL=https://gemini.google.com/spark/chat/046174d2550d9f1c
+ExecStartPre=/usr/bin/mkdir -p /home/ec2-user/.mozilla/firefox/astraquote-gemini
+ExecStartPre=-/usr/bin/pkill -u ec2-user -f astraquote-gemini
 ExecStart=/home/ec2-user/astraquote/gpt-relay-venv/bin/python /home/ec2-user/astraquote/source/tools/gpt_quote_relay_worker.py
 Restart=always
 RestartSec=10

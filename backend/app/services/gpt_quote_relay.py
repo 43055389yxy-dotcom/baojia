@@ -1,4 +1,4 @@
-"""File-backed queue shared with the host-side ChatGPT browser worker.
+"""File-backed queue shared with the host-side quote-engine workers.
 
 The backend container only accepts sales requests and exposes progress.  The
 worker on the desktop host owns the logged-in browser.  Raw customer text is
@@ -28,6 +28,7 @@ from app.services.codex_chat_references import (
     is_codex_chat_reference,
     is_codex_conversation_id,
 )
+from app.services.gemini_chat_references import is_gemini_chat_reference
 from app.services.gpt_quote_batches import split_component_plan, split_numbered_intake
 
 UTC = timezone.utc  # noqa: UP017 - the host-side worker still supports Python 3.9
@@ -46,6 +47,8 @@ PUBLIC_FIELDS = {
     "submission_code",
     "cloud_provider",
     "preferred_region",
+    "preferred_engine",
+    "assigned_engine",
     "failure_code",
     "display_result_on_page",
     "quick_quote_result",
@@ -57,6 +60,7 @@ PUBLIC_FIELDS = {
 DEFAULT_MAX_CONCURRENT_QUOTES = 4
 DEFAULT_QUOTE_SECONDS = 600
 COMPONENTS_PER_CHAT = 20
+QUOTE_ENGINES = ("chatgpt", "gemini")
 
 PUBLIC_FAILURE_CATEGORIES = {
     "credentials",
@@ -165,6 +169,17 @@ class GptQuoteRelayStore:
         self._path(job_id)
         return self.completions_directory / f"{job_id}.json"
 
+    def heartbeat_path_for(self, engine: str) -> Path:
+        normalized = self._normalize_engine(engine)
+        if normalized == "chatgpt":
+            return self.heartbeat_path
+        return self.directory / f"worker-heartbeat-{normalized}.json"
+
+    @staticmethod
+    def _normalize_engine(value: object) -> str:
+        normalized = str(value or "chatgpt").strip().lower()
+        return normalized if normalized in QUOTE_ENGINES else "chatgpt"
+
     def _request_path(self, client_request_id: str) -> Path:
         try:
             normalized = str(uuid.UUID(client_request_id))
@@ -263,6 +278,10 @@ class GptQuoteRelayStore:
                 "submission_code": submission_code,
                 "cloud_provider": str(options.get("cloud_provider") or "aws"),
                 "preferred_region": str(options.get("preferred_region") or ""),
+                "preferred_engine": self._normalize_engine(
+                    options.get("preferred_engine")
+                ),
+                "assigned_engine": None,
                 "display_result_on_page": True,
                 "status": "queued",
                 "created_at": now,
@@ -462,7 +481,9 @@ class GptQuoteRelayStore:
             raise GptRelayError("无效的报价对话角色。", code="gpt_relay_chat_role_invalid")
         if not 0 <= batch_index < batch_count <= 200:
             raise GptRelayError("无效的报价对话批次。", code="gpt_relay_chat_batch_invalid")
-        stable_reference = is_codex_chat_reference(chat_url)
+        stable_reference = is_codex_chat_reference(chat_url) or is_gemini_chat_reference(
+            chat_url
+        )
         pending_reference = str(chat_url) == f"codex-chat://pending/{job_id}"
         if not stable_reference and not pending_reference:
             raise GptRelayError("无效的报价对话地址。", code="gpt_relay_chat_url_invalid")
@@ -772,6 +793,50 @@ class GptQuoteRelayStore:
             self._safe_count(checkpoint.get("total_component_count")) or 0
         ) > 0
 
+    def _record_engine(self, record: dict[str, Any]) -> str:
+        return self._normalize_engine(record.get("assigned_engine") or "chatgpt")
+
+    def _active_slots_by_engine(
+        self,
+        records: list[dict[str, Any]],
+        now: datetime,
+    ) -> tuple[dict[str, int], dict[str, bool]]:
+        slots = {engine: 0 for engine in QUOTE_ENGINES}
+        has_unplanned = {engine: False for engine in QUOTE_ENGINES}
+        for record in records:
+            if record.get("status") != "processing":
+                continue
+            lease_text = record.get("lease_expires_at")
+            expired = False
+            if lease_text:
+                try:
+                    expired = datetime.fromisoformat(str(lease_text)) <= now
+                except ValueError:
+                    expired = True
+            if expired:
+                continue
+            engine = self._record_engine(record)
+            slots[engine] += self._slot_count(record)
+            has_unplanned[engine] = (
+                has_unplanned[engine]
+                or not self._has_sealed_component_count(record)
+            )
+        return slots, has_unplanned
+
+    def _engine_heartbeat_ready(self, engine: str) -> bool | None:
+        """Return readiness, or None before an engine has ever reported."""
+
+        path = self.heartbeat_path_for(engine)
+        if not path.exists():
+            return None
+        try:
+            heartbeat = self._read(path)
+            updated = datetime.fromisoformat(str(heartbeat["updated_at"]))
+            fresh = datetime.now(UTC) - updated < timedelta(seconds=45)
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+        return fresh and bool(heartbeat.get("logged_in"))
+
     @staticmethod
     def _timestamp(value: Any) -> datetime | None:
         try:
@@ -782,7 +847,7 @@ class GptQuoteRelayStore:
         except ValueError:
             return None
 
-    def _queue_metadata(self, target: dict[str, Any]) -> dict[str, int]:
+    def _queue_metadata(self, target: dict[str, Any]) -> dict[str, Any]:
         records: list[dict[str, Any]] = []
         for path in self.jobs_directory.glob("gpt-*.json"):
             try:
@@ -810,7 +875,15 @@ class GptQuoteRelayStore:
         )
 
         now = datetime.now(UTC)
-        active = [record for record in records if record.get("status") == "processing"]
+        target_engine = self._normalize_engine(
+            target.get("assigned_engine") or target.get("preferred_engine")
+        )
+        active = [
+            record
+            for record in records
+            if record.get("status") == "processing"
+            and self._record_engine(record) == target_engine
+        ]
         active_slot_count = min(
             self.max_concurrent_quotes,
             sum(self._slot_count(record) for record in active),
@@ -862,12 +935,27 @@ class GptQuoteRelayStore:
             "queued_ahead_count": target_index,
             "jobs_ahead_count": active_slot_count + target_index,
             "estimated_wait_minutes": math.ceil(target_wait_seconds / 60),
+            "engine_capacity": {
+                engine: {
+                    "active_quote_count": min(
+                        self.max_concurrent_quotes,
+                        sum(
+                            self._slot_count(record)
+                            for record in records
+                            if record.get("status") == "processing"
+                            and self._record_engine(record) == engine
+                        ),
+                    ),
+                    "max_concurrent_quotes": self.max_concurrent_quotes,
+                }
+                for engine in QUOTE_ENGINES
+            },
         }
 
     def public_get(self, job_id: str) -> dict[str, Any]:
         # A browser-worker heartbeat is transport health, not quote outcome.
         # Keeping the job non-terminal lets a restarted worker reattach to the
-        # saved ChatGPT conversation and continue from its persisted checkpoint.
+        # saved engine conversation and continue from its persisted checkpoint.
         record = self.reconcile_delivery_receipt(job_id)
         return self.public(record)
 
@@ -1171,17 +1259,24 @@ class GptQuoteRelayStore:
             self._write_atomic(path, record)
             return record
 
-    def claim_next(self, worker_id: str, lease_minutes: int = 30) -> dict[str, Any] | None:
+    def claim_next(
+        self,
+        worker_id: str,
+        lease_minutes: int = 30,
+        *,
+        engine: str = "chatgpt",
+    ) -> dict[str, Any] | None:
+        requesting_engine = self._normalize_engine(engine)
         with self._lock():
             now = datetime.now(UTC)
             candidates: list[tuple[str, Path, dict[str, Any]]] = []
-            active_count = 0
-            active_has_unplanned_intake = False
+            records: list[dict[str, Any]] = []
             for path in self.jobs_directory.glob("gpt-*.json"):
                 try:
                     record = self._read(path)
                 except (OSError, ValueError):
                     continue
+                records.append(record)
                 status = record.get("status")
                 lease_text = record.get("lease_expires_at")
                 expired = False
@@ -1190,32 +1285,61 @@ class GptQuoteRelayStore:
                         expired = datetime.fromisoformat(lease_text) <= now
                     except ValueError:
                         expired = True
-                if status == "processing" and not expired:
-                    active_count += self._slot_count(record)
-                    active_has_unplanned_intake = (
-                        active_has_unplanned_intake
-                        or not self._has_sealed_component_count(record)
-                    )
                 if status == "queued" or expired:
                     candidates.append((str(record.get("created_at") or ""), path, record))
-            if active_count >= self.max_concurrent_quotes or not candidates:
+            if not candidates:
                 return None
-            # The exact slot demand is known only after the first-pass clean
-            # plan is sealed. Admit at most one such intake at a time so four
-            # one-slot placeholders cannot later expand into twelve chats.
-            if active_has_unplanned_intake:
-                return None
-            eligible = [
-                item
-                for item in candidates
-                if active_count + self._slot_count(item[2]) <= self.max_concurrent_quotes
-            ]
+            active_slots, active_has_unplanned = self._active_slots_by_engine(
+                records, now
+            )
+            eligible: list[tuple[str, Path, dict[str, Any]]] = []
+            for item in candidates:
+                record = item[2]
+                required = self._slot_count(record)
+                assigned = record.get("assigned_engine")
+                preferred = self._normalize_engine(record.get("preferred_engine"))
+                alternate = "gemini" if preferred == "chatgpt" else "chatgpt"
+                if assigned:
+                    routed_engine = self._normalize_engine(assigned)
+                else:
+                    preferred_ready = self._engine_heartbeat_ready(preferred)
+                    preferred_can_run = (
+                        not active_has_unplanned[preferred]
+                        and active_slots[preferred] + required
+                        <= self.max_concurrent_quotes
+                        and preferred_ready is not False
+                    )
+                    alternate_can_run = (
+                        not active_has_unplanned[alternate]
+                        and active_slots[alternate] + required
+                        <= self.max_concurrent_quotes
+                        and (
+                            alternate == requesting_engine
+                            or self._engine_heartbeat_ready(alternate) is True
+                        )
+                    )
+                    routed_engine = (
+                        preferred
+                        if preferred_can_run
+                        else alternate if alternate_can_run else ""
+                    )
+                if routed_engine != requesting_engine:
+                    continue
+                if active_has_unplanned[requesting_engine]:
+                    continue
+                if (
+                    active_slots[requesting_engine] + required
+                    > self.max_concurrent_quotes
+                ):
+                    continue
+                eligible.append(item)
             if not eligible:
                 return None
             _, path, record = min(eligible, key=lambda item: item[0])
             record.update(
                 {
                     "status": "processing",
+                    "assigned_engine": requesting_engine,
                     "worker_id": worker_id,
                     "processing_started_at": record.get("processing_started_at") or utc_now(),
                     "lease_expires_at": (now + timedelta(minutes=lease_minutes)).isoformat(),
@@ -1258,6 +1382,7 @@ class GptQuoteRelayStore:
         limit: int | None,
         lease_minutes: int = 30,
         exclude_job_ids: set[str] | None = None,
+        engine: str = "chatgpt",
     ) -> list[dict[str, Any]]:
         """Reattach submitted conversations after the browser worker restarts.
 
@@ -1269,6 +1394,7 @@ class GptQuoteRelayStore:
         if limit is not None and limit < 1:
             return []
         claimed: list[dict[str, Any]] = []
+        requesting_engine = self._normalize_engine(engine)
         excluded = exclude_job_ids or set()
         with self._lock():
             candidates: list[tuple[str, Path, dict[str, Any]]] = []
@@ -1279,6 +1405,7 @@ class GptQuoteRelayStore:
                     continue
                 if (
                     record.get("status") == "processing"
+                    and self._record_engine(record) == requesting_engine
                     and record.get("job_id") not in excluded
                     and (
                         str(record.get("chat_url") or "").strip()
@@ -1445,9 +1572,10 @@ class GptQuoteRelayStore:
             self._write_atomic(path, record)
             return self.public(record)
 
-    def resume_login_waiting(self) -> int:
+    def resume_login_waiting(self, engine: str | None = None) -> int:
         """Return login-blocked jobs to the queue after the browser signs in."""
         resumed = 0
+        normalized_engine = self._normalize_engine(engine) if engine else None
         with self._lock():
             for path in self.jobs_directory.glob("gpt-*.json"):
                 try:
@@ -1456,9 +1584,16 @@ class GptQuoteRelayStore:
                     continue
                 if record.get("status") != "needs_login":
                     continue
+                if normalized_engine and self._normalize_engine(
+                    record.get("assigned_engine") or record.get("preferred_engine")
+                ) != normalized_engine:
+                    continue
+                has_submitted_chat = bool(
+                    record.get("chat_url") or record.get("chat_sessions")
+                )
                 record.update(
                     {
-                        "status": "queued",
+                        "status": "processing" if has_submitted_chat else "queued",
                         "worker_id": None,
                         "lease_expires_at": None,
                         "updated_at": utc_now(),
@@ -1472,9 +1607,10 @@ class GptQuoteRelayStore:
                 resumed += 1
         return resumed
 
-    def mark_queued_needs_login(self) -> int:
+    def mark_queued_needs_login(self, engine: str | None = None) -> int:
         """Expose an expired browser login without dropping queued source text."""
         marked = 0
+        normalized_engine = self._normalize_engine(engine) if engine else None
         with self._lock():
             for path in self.jobs_directory.glob("gpt-*.json"):
                 try:
@@ -1482,6 +1618,10 @@ class GptQuoteRelayStore:
                 except (OSError, ValueError):
                     continue
                 if record.get("status") != "queued":
+                    continue
+                if normalized_engine and self._normalize_engine(
+                    record.get("assigned_engine") or record.get("preferred_engine")
+                ) != normalized_engine:
                     continue
                 record.update(
                     {
@@ -1500,18 +1640,33 @@ class GptQuoteRelayStore:
         return marked
 
     def health(self) -> dict[str, Any]:
-        if not self.heartbeat_path.exists():
-            return {"status": "offline", "message": "报价服务暂时不可用"}
-        try:
-            heartbeat = self._read(self.heartbeat_path)
-            updated = datetime.fromisoformat(str(heartbeat["updated_at"]))
-            fresh = datetime.now(UTC) - updated < timedelta(seconds=45)
-        except (OSError, ValueError, KeyError, TypeError):
-            return {"status": "offline", "message": "报价服务暂时不可用"}
-        logged_in = bool(heartbeat.get("logged_in"))
-        ready = fresh and logged_in
+        engines: dict[str, dict[str, Any]] = {}
+        latest_updated_at: str | None = None
+        for engine in QUOTE_ENGINES:
+            path = self.heartbeat_path_for(engine)
+            heartbeat: dict[str, Any] = {}
+            ready = False
+            if path.exists():
+                try:
+                    heartbeat = self._read(path)
+                    updated = datetime.fromisoformat(str(heartbeat["updated_at"]))
+                    ready = (
+                        datetime.now(UTC) - updated < timedelta(seconds=45)
+                        and bool(heartbeat.get("logged_in"))
+                    )
+                except (OSError, ValueError, KeyError, TypeError):
+                    ready = False
+            updated_text = str(heartbeat.get("updated_at") or "") or None
+            if updated_text and (latest_updated_at is None or updated_text > latest_updated_at):
+                latest_updated_at = updated_text
+            engines[engine] = {
+                "status": "ready" if ready else "offline",
+                "max_concurrent_quotes": self.max_concurrent_quotes,
+            }
+        ready = any(item["status"] == "ready" for item in engines.values())
         return {
             "status": "ready" if ready else "offline",
             "message": "服务正常" if ready else "报价服务暂时不可用",
-            "updated_at": heartbeat.get("updated_at"),
+            "updated_at": latest_updated_at,
+            "engines": engines,
         }

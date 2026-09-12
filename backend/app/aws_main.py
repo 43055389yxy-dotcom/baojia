@@ -304,6 +304,7 @@ class GptRelayQuoteRequest(BaseModel):
     ] = Field(default_factory=lambda: ["on_demand"], min_length=1, max_length=3)
     utilization_percent: int = Field(default=100, ge=1, le=100)
     preferred_region: str = Field(min_length=2, max_length=80)
+    preferred_engine: Literal["chatgpt", "gemini"] = "chatgpt"
     client_request_id: str = Field(
         pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
     )
@@ -350,6 +351,7 @@ async def create_gpt_relay_job(request: GptRelayQuoteRequest) -> dict[str, Any] 
                 "pricing_scenarios": request.pricing_scenarios,
                 "utilization_percent": request.utilization_percent,
                 "preferred_region": request.preferred_region,
+                "preferred_engine": request.preferred_engine,
                 "display_result_on_page": True,
                 "client_request_id": request.client_request_id,
             },

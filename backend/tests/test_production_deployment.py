@@ -17,6 +17,8 @@ def test_jenkins_deploy_updates_and_restarts_the_host_codex_chat_relay() -> None
     assert "--entrypoint /usr/bin/nsenter" in script
     assert "/usr/bin/systemctl enable astraquote-gpt-relay.service" in script
     assert "/usr/bin/systemctl restart astraquote-gpt-relay.service" in script
+    assert "/usr/bin/systemctl enable astraquote-gemini-relay.service" in script
+    assert "/usr/bin/systemctl restart astraquote-gemini-relay.service" in script
     assert "astraquote-chatgpt-desktop" in script
     assert "codex://threads/new?mode=chat" in script
     assert "--shm-size 1g" in script
@@ -68,6 +70,22 @@ def test_jenkins_health_checks_explain_the_failure_stage() -> None:
     assert "ASTRAQUOTE_CHATGPT_PROJECT" not in unit
     assert "chatgpt.com/projects" not in unit
     assert "docker.service" in unit
+
+
+def test_gemini_relay_is_a_separate_visible_persistent_worker() -> None:
+    root = Path(__file__).resolve().parents[2]
+    unit = (root / "deploy/desktop/astraquote-gemini-relay.service").read_text(
+        encoding="utf-8"
+    )
+    requirements = (root / "deploy/desktop/relay-requirements.txt").read_text(
+        encoding="utf-8"
+    )
+
+    assert "ASTRAQUOTE_RELAY_ENGINE=gemini" in unit
+    assert "DISPLAY=:1" in unit
+    assert "ASTRAQUOTE_GEMINI_PROFILE=" in unit
+    assert "Restart=always" in unit
+    assert "selenium==" in requirements
 
 
 def test_runtime_image_contains_the_host_namespace_helper() -> None:

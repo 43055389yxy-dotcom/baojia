@@ -341,6 +341,122 @@ def test_relay_runs_at_most_four_quotes_and_reports_the_waiting_queue(tmp_path: 
     assert next_job["job_id"] == jobs[4]["job_id"]
 
 
+def _numbered_components(count: int) -> list[dict[str, str]]:
+    return [
+        {
+            "component_key": f"cmp_intake_{index:04d}",
+            "source_line": f"{index}. 云资源组件 {index}",
+        }
+        for index in range(1, count + 1)
+    ]
+
+
+def test_quote_engine_defaults_to_chatgpt_and_is_public(tmp_path: Path) -> None:
+    store = GptQuoteRelayStore(tmp_path)
+
+    public = store.create("1. 东京 EC2 两台。", {})
+
+    assert public["preferred_engine"] == "chatgpt"
+    assert public["assigned_engine"] is None
+    assert store.get(public["job_id"])["preferred_engine"] == "chatgpt"
+
+
+def test_each_engine_has_four_independent_slots_and_overflow_falls_back_atomically(
+    tmp_path: Path,
+) -> None:
+    store = GptQuoteRelayStore(tmp_path, max_concurrent_quotes=4)
+    chatgpt_job = store.create(
+        "1. ChatGPT 大型报价。",
+        {"preferred_engine": "chatgpt"},
+        numbered_components=_numbered_components(80),
+    )
+    overflow = store.create(
+        "1. 新报价。",
+        {"preferred_engine": "chatgpt"},
+        numbered_components=_numbered_components(40),
+    )
+
+    claimed_chatgpt = store.claim_next("chatgpt-worker", engine="chatgpt")
+    assert claimed_chatgpt is not None
+    assert claimed_chatgpt["job_id"] == chatgpt_job["job_id"]
+    assert claimed_chatgpt["assigned_engine"] == "chatgpt"
+    assert store.claim_next("chatgpt-worker", engine="chatgpt") is None
+
+    claimed_gemini = store.claim_next("gemini-worker", engine="gemini")
+    assert claimed_gemini is not None
+    assert claimed_gemini["job_id"] == overflow["job_id"]
+    assert claimed_gemini["assigned_engine"] == "gemini"
+    assert store._slot_count(claimed_gemini) == 2
+
+
+def test_gemini_preference_falls_back_to_chatgpt_when_all_gemini_slots_are_used(
+    tmp_path: Path,
+) -> None:
+    store = GptQuoteRelayStore(tmp_path, max_concurrent_quotes=4)
+    gemini_job = store.create(
+        "1. Gemini 大型报价。",
+        {"preferred_engine": "gemini"},
+        numbered_components=_numbered_components(80),
+    )
+    overflow = store.create(
+        "1. Gemini 新报价。",
+        {"preferred_engine": "gemini"},
+        numbered_components=_numbered_components(20),
+    )
+
+    claimed_gemini = store.claim_next("gemini-worker", engine="gemini")
+    assert claimed_gemini is not None
+    assert claimed_gemini["job_id"] == gemini_job["job_id"]
+    claimed = store.claim_next("chatgpt-worker", engine="chatgpt")
+
+    assert claimed is not None
+    assert claimed["job_id"] == overflow["job_id"]
+    assert claimed["assigned_engine"] == "chatgpt"
+
+
+def test_job_waits_when_neither_engine_has_enough_slots(tmp_path: Path) -> None:
+    store = GptQuoteRelayStore(tmp_path, max_concurrent_quotes=4)
+    for engine in ("chatgpt", "gemini"):
+        store.create(
+            f"1. {engine} 满载任务。",
+            {"preferred_engine": engine},
+            numbered_components=_numbered_components(80),
+        )
+        assert store.claim_next(f"{engine}-worker", engine=engine) is not None
+    waiting = store.create(
+        "1. 等待中的报价。",
+        {"preferred_engine": "chatgpt"},
+        numbered_components=_numbered_components(20),
+    )
+
+    assert store.claim_next("chatgpt-worker", engine="chatgpt") is None
+    assert store.claim_next("gemini-worker", engine="gemini") is None
+    assert store.public_get(waiting["job_id"])["status"] == "queued"
+
+
+def test_submitted_quote_is_reattached_only_by_its_assigned_engine(tmp_path: Path) -> None:
+    store = GptQuoteRelayStore(tmp_path)
+    public = store.create(
+        "1. Gemini 报价。",
+        {"preferred_engine": "gemini"},
+        numbered_components=_numbered_components(1),
+    )
+    claimed = store.claim_next("gemini-old", engine="gemini")
+    assert claimed is not None
+    store.update(
+        public["job_id"],
+        {"chat_url": "gemini-chat://tasks/046174d2550d9f1c"},
+    )
+
+    assert store.claim_submitted_for_monitoring(
+        "chatgpt-worker", engine="chatgpt", limit=None,
+    ) == []
+    resumed = store.claim_submitted_for_monitoring(
+        "gemini-worker", engine="gemini", limit=None,
+    )
+    assert [item["job_id"] for item in resumed] == [public["job_id"]]
+
+
 def test_relay_admits_only_one_unplanned_intake_until_its_component_count_is_sealed(
     tmp_path: Path,
 ) -> None:

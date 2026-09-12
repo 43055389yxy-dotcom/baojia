@@ -16,6 +16,12 @@ test("sales portal keeps its internal job identity private and recovers active j
   assert.match(page, /pricing_scenarios/);
   assert.match(page, /regionCatalog\?\.pricing_scenarios/);
   assert.match(page, /cloud_provider: cloudProvider/);
+  assert.match(page, /preferred_engine: preferredEngine/);
+  assert.match(page, /type QuoteEngine = "chatgpt" \| "gemini"/);
+  assert.match(page, /useState<QuoteEngine>\("chatgpt"\)/);
+  assert.match(page, /ChatGPT/);
+  assert.match(page, /Gemini/);
+  assert.match(page, /选择报价引擎/);
   assert.match(page, /Microsoft Azure|微软 Azure/);
   assert.match(page, /Oracle Cloud/);
   assert.match(page, /Google Cloud/);
@@ -78,7 +84,7 @@ test("sales portal exposes only formal progress copy and no internal implementat
   assert.match(page, /sales-job-progress/);
   assert.match(page, /报价结果和 Excel 已生成/);
   assert.doesNotMatch(page, /企业微信群/);
-  assert.doesNotMatch(page, /ChatGPT|对话|清洗|客户原始需求|events\?\.length/);
+  assert.doesNotMatch(page, /管理员查看对话|清洗|客户原始需求|events\?\.length/);
 });
 
 test("sales portal keeps polling after a transient status failure", async () => {

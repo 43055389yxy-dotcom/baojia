@@ -85,6 +85,7 @@ stage_host_browser_relay() {
     --exclude='**/__pycache__' \
     --exclude='**/*.pyc' \
     -cf - backend tools policies deploy/desktop/astraquote-gpt-relay.service \
+      deploy/desktop/astraquote-gemini-relay.service \
       deploy/desktop/relay-requirements.txt \
     | docker run --rm -i \
       -e RELAY_STAGE_NAME="$RELAY_STAGE_NAME" \
@@ -99,6 +100,7 @@ stage_host_browser_relay() {
         test -f "$stage/backend/app/services/gpt_quote_prompt.py"
         test -f "$stage/policies/sales-selection-policy.json"
         test -f "$stage/deploy/desktop/astraquote-gpt-relay.service"
+        test -f "$stage/deploy/desktop/astraquote-gemini-relay.service"
         test -f "$stage/deploy/desktop/relay-requirements.txt"
         chown -R 1000:1000 "$stage"
       '
@@ -128,12 +130,15 @@ activate_host_browser_relay() {
       done
       mv "$stage/deploy/desktop/astraquote-gpt-relay.service" \
         /host/astraquote/astraquote-gpt-relay.service.next
+      mv "$stage/deploy/desktop/astraquote-gemini-relay.service" \
+        /host/astraquote/astraquote-gemini-relay.service.next
       mv "$stage/deploy/desktop/relay-requirements.txt" \
         /host/astraquote/relay-requirements.txt.next
       rmdir "$stage/deploy/desktop" "$stage/deploy"
       rmdir "$stage"
       chown -R 1000:1000 "$target/backend" "$target/tools" "$target/policies" \
         /host/astraquote/astraquote-gpt-relay.service.next \
+        /host/astraquote/astraquote-gemini-relay.service.next \
         /host/astraquote/relay-requirements.txt.next
     '
 }
@@ -283,6 +288,9 @@ install_host_browser_relay_service() {
       install -m 0644 \
         /home/ec2-user/astraquote/astraquote-gpt-relay.service.next \
         /etc/systemd/system/astraquote-gpt-relay.service
+      install -m 0644 \
+        /home/ec2-user/astraquote/astraquote-gemini-relay.service.next \
+        /etc/systemd/system/astraquote-gemini-relay.service
       systemctl daemon-reload
     '
 }
@@ -303,6 +311,8 @@ restart_host_browser_relay() {
     /bin/sh -ceu '
       /usr/bin/systemctl enable astraquote-gpt-relay.service
       /usr/bin/systemctl restart astraquote-gpt-relay.service
+      /usr/bin/systemctl enable astraquote-gemini-relay.service
+      /usr/bin/systemctl restart astraquote-gemini-relay.service
     '
 }
 
@@ -322,6 +332,8 @@ diagnose_host_browser_relay() {
     /bin/sh -ceu '
       systemctl --no-pager --full status astraquote-gpt-relay.service || true
       journalctl --no-pager -u astraquote-gpt-relay.service -n 120 || true
+      systemctl --no-pager --full status astraquote-gemini-relay.service || true
+      journalctl --no-pager -u astraquote-gemini-relay.service -n 120 || true
     '
 }
 
@@ -361,6 +373,35 @@ wait_for_host_browser_relay() {
     '
 }
 
+wait_for_both_quote_engines() {
+  echo "Waiting for both desktop quote engines"
+  docker run --rm --privileged --pid=host \
+    --entrypoint /usr/bin/nsenter \
+    astraquote:production \
+    --target 1 \
+    --mount \
+    --uts \
+    --ipc \
+    --net \
+    --pid \
+    --root=/proc/1/root \
+    --wd=/ \
+    /bin/sh -ceu '
+      for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        if systemctl is-active --quiet astraquote-gpt-relay.service \
+          && systemctl is-active --quiet astraquote-gemini-relay.service; then
+          sleep 5
+          systemctl is-active --quiet astraquote-gpt-relay.service \
+            && systemctl is-active --quiet astraquote-gemini-relay.service \
+            && exit 0
+        fi
+        sleep 5
+      done
+      echo "Both desktop quote engine services did not remain active" >&2
+      exit 1
+    '
+}
+
 update_host_browser_relay() {
   stage_host_browser_relay
   activate_host_browser_relay
@@ -368,7 +409,7 @@ update_host_browser_relay() {
   install_host_relay_dependencies
   install_host_browser_relay_service
   restart_host_browser_relay
-  if ! wait_for_host_browser_relay; then
+  if ! wait_for_host_browser_relay || ! wait_for_both_quote_engines; then
     diagnose_host_browser_relay
     return 1
   fi

@@ -153,6 +153,32 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .sales-form-chip i { width: 6px; height: 6px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 14px var(--cyan); }
 
 .sales-pricing-mode { margin: 0; padding: 0; border: 0; }
+.sales-engine-section { margin-bottom: 22px; }
+.sales-engine-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.sales-engine-options label {
+  position: relative;
+  display: grid;
+  min-height: 64px;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border: 1px solid rgba(120, 185, 219, .14);
+  border-radius: 13px;
+  background: rgba(11, 34, 52, .72);
+  color: #8faabd;
+  cursor: pointer;
+  transition: border-color .2s ease, background .2s ease, transform .2s ease;
+}
+.sales-engine-options label:hover { transform: translateY(-2px); border-color: rgba(67, 220, 255, .3); }
+.sales-engine-options label.selected { border-color: rgba(67, 220, 255, .5); background: rgba(27, 92, 121, .3); }
+.sales-engine-options input { position: absolute; opacity: 0; pointer-events: none; }
+.sales-engine-options label > i { display: grid; width: 42px; height: 42px; place-items: center; border-radius: 12px; background: rgba(65, 156, 225, .18); color: #91e7ff; font-size: 11px; font-style: normal; font-weight: 900; }
+.sales-engine-options label > span { display: grid; gap: 3px; }
+.sales-engine-options strong { color: #dcefff; font-size: 13px; }
+.sales-engine-options small { color: #6f8da2; font-size: 9px; }
+.sales-engine-options em { color: #78a4bd; font-size: 9px; font-style: normal; }
+.sales-engine-note { margin: 9px 2px 0; color: #68889d; font-size: 10px; }
 .sales-provider-section { margin-bottom: 22px; }
 .sales-provider-heading { display: flex; min-height: 35px; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 11px; }
 .sales-provider-heading legend { color: #dcefff; font-size: 14px; font-weight: 800; }
@@ -563,6 +589,17 @@ body {
 .sales-section-heading > span { color: #76a3c2; }
 .sales-provider-heading legend { color: #214d73; }
 .sales-provider-heading > span { color: #76a3c2; }
+.sales-engine-options label {
+  border-color: rgba(70, 151, 207, .24);
+  background: rgba(255, 255, 255, .7);
+  color: #527995;
+  box-shadow: inset 0 1px rgba(255, 255, 255, .94);
+}
+.sales-engine-options label:hover { border-color: rgba(54, 157, 224, .42); background: rgba(247, 252, 255, .95); }
+.sales-engine-options label.selected { border-color: rgba(42, 155, 226, .58); background: linear-gradient(145deg, rgba(224, 245, 255, .94), rgba(232, 241, 255, .88)); }
+.sales-engine-options label > i { background: linear-gradient(145deg, rgba(226, 246, 255, .96), rgba(216, 236, 251, .84)); color: #247eae; }
+.sales-engine-options strong { color: #285b7e; }
+.sales-engine-options small, .sales-engine-options em, .sales-engine-note { color: #7895aa; }
 .sales-provider-trigger {
   border-color: rgba(70, 151, 207, .24);
   background: rgba(255, 255, 255, .82);
@@ -1035,6 +1072,7 @@ body {
   .sales-result-commercial { grid-column: 1 / -1; margin-top: -6px; }
 }
 @media (max-width: 700px) {
+  .sales-engine-options { grid-template-columns: 1fr; }
   .sales-region-options-panel { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .sales-result-dialog > header { min-height: 80px; padding: 14px 16px; }
   .sales-result-summary { display: block; padding: 13px 16px; }

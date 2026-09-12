@@ -58,6 +58,40 @@ def test_sales_api_preserves_the_provider_and_exact_selected_scenarios(
     assert internal["quote_options"]["preferred_region"] == preferred_region
 
 
+def test_sales_api_accepts_an_explicit_quote_engine_and_defaults_to_chatgpt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = GptQuoteRelayStore(tmp_path / "engines")
+    monkeypatch.setattr(aws_main, "gpt_quote_relay", store)
+    client = TestClient(aws_main.app)
+    request = {
+        "customer_request": "1. 新加坡 EC2 一台。",
+        "cloud_provider": "aws",
+        "pricing_scenarios": ["on_demand"],
+        "utilization_percent": 100,
+        "preferred_region": "ap-southeast-1",
+        "client_request_id": "123e4567-e89b-42d3-a456-426614174022",
+    }
+
+    default_response = client.post("/api/quote-relay/jobs", json=request)
+    gemini_response = client.post(
+        "/api/quote-relay/jobs",
+        json={
+            **request,
+            "client_request_id": "123e4567-e89b-42d3-a456-426614174023",
+            "preferred_engine": "gemini",
+        },
+    )
+
+    assert default_response.status_code == 200
+    assert default_response.json()["preferred_engine"] == "chatgpt"
+    assert gemini_response.status_code == 200
+    assert gemini_response.json()["preferred_engine"] == "gemini"
+    internal = store.get(gemini_response.json()["job_id"])
+    assert internal["quote_options"]["preferred_engine"] == "gemini"
+
+
 def test_sales_api_requires_one_consecutively_numbered_component_per_line(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
