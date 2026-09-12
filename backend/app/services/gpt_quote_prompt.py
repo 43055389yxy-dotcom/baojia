@@ -33,6 +33,8 @@ PROVIDER_LABELS = {
     "ctyun": "天翼云",
 }
 
+ASTRAQUOTE_MENTION = "@AstraQuote"
+
 
 @lru_cache(maxsize=1)
 def _selection_policy_prompt() -> str:
@@ -179,7 +181,7 @@ def build_quote_prompt(
     provider_label = PROVIDER_LABELS.get(provider, provider)
     delivery_method = "生成 Excel，并在销售报价页提供报价与下载链接；不发送企业微信群"
     return (
-        f"请使用 AstraQuote 完成正式 {provider_label} 报价并交付。\n\n"
+        f"{ASTRAQUOTE_MENTION} 请使用 AstraQuote 完成正式 {provider_label} 报价并交付。\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n\n"
         f"{build_quote_context_prompt(options)}\n\n"
         f"结果交付方式：{delivery_method}。\n\n"
@@ -204,7 +206,7 @@ def build_quote_continuation_prompt(
     """Continue one submitted quote without restoring or repeating customer text."""
 
     return (
-        "这不是新报价，当前 AstraQuote 报价尚未产生最终结果。"
+        f"{ASTRAQUOTE_MENTION} 这不是新报价，当前 AstraQuote 报价尚未产生最终结果。"
         "请在本对话中从已保存阶段继续完成，不要只汇报剩余待办，"
         "也不要重复已经成功的查价、文件或交付步骤。"
         "收到后立即继续实际执行，禁止再次只输出状态、计划或待办清单。\n\n"
@@ -222,7 +224,8 @@ def build_quote_partial_finalization_prompt(
     """Stop retrying an unchanged stage and publish verified successes."""
 
     return (
-        "后台已确认同一处理阶段连续两次没有真实进展。现在停止重复查价，不要整单报错。"
+        f"{ASTRAQUOTE_MENTION} 后台已确认同一处理阶段连续两次没有真实进展。"
+        "现在停止重复查价，不要整单报错。"
         "请从 AstraQuote 已保存阶段读取成功组件及其官方证据，立即生成部分报价和 Excel；"
         "仍未取得价格的组件全部放入 unpriced_services，并设置 is_partial=true。"
         "未取得价格的组件不得按 0 元、不得计入任何合计，也不得丢失。\n\n"
@@ -239,7 +242,7 @@ def build_quote_failed_components_retry_prompt(
     """Resume a partial quote without repeating successful component work."""
 
     return (
-        "销售已选择重试部分报价中的未完成组件。这不是新报价。"
+        f"{ASTRAQUOTE_MENTION} 销售已选择重试部分报价中的未完成组件。这不是新报价。"
         "请读取 AstraQuote 保存的组件计划、价格批次和部分报价，只处理 unpriced_services；"
         "已经核价成功的组件、官方证据和 Excel 数据必须直接复用，不得重新查询。"
         "完成后重新核对整单：全部成功则交付完整报价；仍有组件失败则再次交付部分报价。\n\n"

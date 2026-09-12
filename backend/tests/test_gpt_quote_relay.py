@@ -21,11 +21,14 @@ from app.services.gpt_browser_navigation import (
     should_extend_quote_deadline,
 )
 from app.services.gpt_quote_batches import (
+    build_component_batch_continuation_prompt,
     build_component_batch_prompt,
+    build_quote_merge_prompt,
     split_component_plan,
 )
 from app.services.gpt_quote_prompt import (
     build_quote_continuation_prompt,
+    build_quote_failed_components_retry_prompt,
     build_quote_partial_finalization_prompt,
     build_quote_prompt,
     parse_final_response,
@@ -113,6 +116,7 @@ def test_component_batch_prompt_contains_only_that_batches_cleaned_sources() -> 
         ),
     )
 
+    assert prompt.startswith("@AstraQuote ")
     assert "云服务器：2 台，4 核 16 GiB。" in prompt
     assert "对象存储" not in prompt
     assert "客户原话" not in prompt
@@ -648,7 +652,7 @@ def test_per_quote_prompt_carries_the_current_nearest_lower_policy() -> None:
         submission_code="7",
     )
 
-    assert "请使用 AstraQuote 完成正式 AWS 报价并交付" in prompt
+    assert prompt.startswith("@AstraQuote 请使用 AstraQuote 完成正式 AWS 报价并交付")
     assert "云厂商：AWS（销售已选定，不得改换）" in prompt
     assert "计价选项：按需付费；使用率 100%" in prompt
     assert "官方报价链接" not in prompt
@@ -821,6 +825,7 @@ def test_continuation_prompt_reuses_identity_without_restoring_customer_text() -
         submission_code="6",
     )
 
+    assert prompt.startswith("@AstraQuote ")
     assert "gpt-dddddddddddddddddddddddddddddddd" in prompt
     assert "提交码 6" in prompt
     assert "从已保存阶段继续" in prompt
@@ -837,11 +842,35 @@ def test_partial_finalization_prompt_returns_saved_successes_without_customer_te
         submission_code="6",
     )
 
+    assert prompt.startswith("@AstraQuote ")
     assert "两次" in prompt
     assert "部分报价" in prompt
     assert "未取得价格的组件不得按 0 元" in prompt
     assert "gpt-dddddddddddddddddddddddddddddddd" in prompt
     assert "客户需求" not in prompt
+
+
+def test_every_automated_followup_explicitly_mentions_astraquote() -> None:
+    identity = {
+        "relay_job_id": "gpt-dddddddddddddddddddddddddddddddd",
+        "submission_code": "6",
+    }
+    prompts = [
+        build_quote_failed_components_retry_prompt(**identity),
+        build_quote_merge_prompt(
+            **identity,
+            price_batch_id="aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        ),
+        build_component_batch_continuation_prompt(
+            **identity,
+            price_batch_id="aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            batch_index=1,
+            batch_count=2,
+            component_keys=["cmp_compute_0001"],
+        ),
+    ]
+
+    assert all(prompt.startswith("@AstraQuote ") for prompt in prompts)
 
 
 def test_browser_worker_keeps_continuation_and_receipt_integration() -> None:

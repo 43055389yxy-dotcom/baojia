@@ -13,6 +13,7 @@ from collections import defaultdict
 from typing import Any
 
 COMPONENTS_PER_CHAT = 20
+ASTRAQUOTE_MENTION = "@AstraQuote"
 
 
 def split_component_plan(
@@ -89,7 +90,7 @@ def build_component_batch_prompt(
         for component in components
     ]
     return (
-        "这是同一张 AstraQuote 报价的组件子批次，不是新报价。"
+        f"{ASTRAQUOTE_MENTION} 这是同一张 AstraQuote 报价的组件子批次，不是新报价。"
         f"当前为第 {batch_index + 1}/{batch_count} 批。只处理下面列出的组件，"
         "不得读取、猜测或修改其他批次。使用已经封存的 price_batch_id，"
         "逐组件查询并保存官方价格证据；已经成功的计费项直接复用，只补未完成项。"
@@ -113,7 +114,8 @@ def build_quote_merge_prompt(
     """Return the coordinator to the saved state for one final merge."""
 
     return (
-        "所有组件子批次已经停止运行。请在总控对话中读取 AstraQuote 后台保存的"
+        f"{ASTRAQUOTE_MENTION} 所有组件子批次已经停止运行。"
+        "请在总控对话中读取 AstraQuote 后台保存的"
         "组件计划、price_batch 和真实组件状态，立即做最终机械合并与编译器校验。"
         "已有官方价格的组件必须全部进入报价；永久失败或两次无进展后仍未完成的组件"
         "进入 unpriced_services，不得按 0 元，不得计入合计。若存在未核价组件，"
@@ -135,7 +137,8 @@ def build_component_batch_continuation_prompt(
     """Continue only one saved child batch without restoring any source text."""
 
     return (
-        "这不是新报价。请继续当前组件子批次，只补本批尚未完成的官方价格，"
+        f"{ASTRAQUOTE_MENTION} 这不是新报价。"
+        "请继续当前组件子批次，只补本批尚未完成的官方价格，"
         "已经成功的查询必须复用，不得处理其他批次，也不要生成最终整单。"
         f"当前为第 {batch_index + 1}/{batch_count} 批；"
         f"允许处理的 component_key：{json.dumps(component_keys, ensure_ascii=False)}。\n\n"
