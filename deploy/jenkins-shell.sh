@@ -161,11 +161,13 @@ ensure_host_codex_chat_desktop() {
     configured_image="$(docker inspect "$CODEX_CONTAINER" --format '{{.Config.Image}}')"
     configured_shm="$(docker inspect "$CODEX_CONTAINER" --format '{{.HostConfig.ShmSize}}')"
     configured_network="$(docker inspect "$CODEX_CONTAINER" --format '{{.HostConfig.NetworkMode}}')"
+    configured_restart="$(docker inspect "$CODEX_CONTAINER" --format '{{.HostConfig.RestartPolicy.Name}}')"
     configured_command="$(docker inspect "$CODEX_CONTAINER" --format '{{json .Config.Cmd}}')"
     configured_binds="$(docker inspect "$CODEX_CONTAINER" --format '{{json .HostConfig.Binds}}')"
     if test "$configured_image" != "$CODEX_IMAGE" \
       || test "$configured_shm" -lt 1073741824 \
       || test "$configured_network" != host \
+      || test "$configured_restart" != always \
       || [[ "$configured_command" != *'codex://threads/new?mode=chat'* ]] \
       || [[ "$configured_command" != *'--remote-debugging-port=9222'* ]] \
       || [[ "$configured_binds" != *'/home/ec2-user/.chatgpt-desktop-home:/home/chatgpt'* ]]; then
@@ -184,7 +186,7 @@ ensure_host_codex_chat_desktop() {
       --user 1000:1000 \
       --network host \
       --shm-size 1g \
-      --restart unless-stopped \
+      --restart always \
       -e DISPLAY=:1 \
       -e HOME=/home/chatgpt \
       -e XAUTHORITY=/home/chatgpt/.Xauthority \

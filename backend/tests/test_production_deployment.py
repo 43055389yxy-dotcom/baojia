@@ -20,6 +20,10 @@ def test_jenkins_deploy_updates_and_restarts_the_host_codex_chat_relay() -> None
     assert "astraquote-chatgpt-desktop" in script
     assert "codex://threads/new?mode=chat" in script
     assert "--shm-size 1g" in script
+    assert "--restart always" in script
+    assert "--restart unless-stopped" not in script
+    assert "configured_restart" in script
+    assert 'configured_restart" != always' in script
     assert "host_codex_cdp_ready" in script
     assert 'docker restart "$CODEX_CONTAINER" >/dev/null' in script
     assert "--network host" in script
@@ -59,6 +63,7 @@ def test_jenkins_health_checks_explain_the_failure_stage() -> None:
     )
     assert "ASTRAQUOTE_CODEX_CONTAINER=astraquote-chatgpt-desktop" in unit
     assert "ASTRAQUOTE_CODEX_CDP=http://127.0.0.1:9222" in unit
+    assert "ExecStartPre=/usr/bin/docker start astraquote-chatgpt-desktop" in unit
     assert "ASTRAQUOTE_FIREFOX_PROFILE" not in unit
     assert "ASTRAQUOTE_CHATGPT_PROJECT" not in unit
     assert "chatgpt.com/projects" not in unit

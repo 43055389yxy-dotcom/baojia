@@ -18,6 +18,7 @@ Environment=ASTRAQUOTE_V2_STATE_DIR=/home/ec2-user/astraquote/data/v2-quotes
 Environment=ASTRAQUOTE_CODEX_CONTAINER=astraquote-chatgpt-desktop
 Environment=ASTRAQUOTE_CODEX_CDP=http://127.0.0.1:9222
 ExecStartPre=/usr/bin/docker inspect astraquote-chatgpt-desktop
+ExecStartPre=/usr/bin/docker start astraquote-chatgpt-desktop
 ExecStart=/home/ec2-user/astraquote/gpt-relay-venv/bin/python /home/ec2-user/astraquote/source/tools/gpt_quote_relay_worker.py
 Restart=always
 RestartSec=10

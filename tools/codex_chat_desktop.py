@@ -138,7 +138,11 @@ class CodexChatDesktop:
         self.driver: Any | None = None
 
     def start(self) -> None:
-        self._connect()
+        try:
+            self._connect()
+        except Exception as exc:  # noqa: BLE001 - the desktop may be closed manually
+            self._recover_desktop(exc)
+            self._connect()
         self.driver = self
         if not self._chat_surface_ready():
             self._open_deep_link(CODEX_NEW_CHAT_LINK)
@@ -160,6 +164,56 @@ class CodexChatDesktop:
         self._websocket = None
         self._connect()
         self.driver = self
+
+    def _cdp_target_available(self) -> bool:
+        """Return whether the visible Codex desktop renderer is controllable."""
+
+        try:
+            targets = json.load(
+                urllib.request.urlopen(f"{self.cdp_base_url}/json/list", timeout=5)
+            )
+        except Exception:  # noqa: BLE001 - a missing renderer is the expected signal
+            return False
+        return any(item.get("url") == "app://-/index.html" for item in targets)
+
+    def _recover_desktop(self, original_error: Exception) -> None:
+        """Start or restart Codex while preserving its mounted login profile."""
+
+        self.close()
+        try:
+            inspection = subprocess.run(
+                [
+                    "docker",
+                    "inspect",
+                    "--format",
+                    "{{.State.Running}}",
+                    self.container_name,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            action = (
+                "restart" if inspection.stdout.strip().lower() == "true" else "start"
+            )
+            subprocess.run(
+                ["docker", action, self.container_name],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=45,
+            )
+            self._wait_until(
+                self._cdp_target_available,
+                timeout=90,
+                interval=2,
+            )
+        except Exception as recovery_error:  # noqa: BLE001 - retain both causes
+            raise RuntimeError(
+                "Codex 桌面已退出，自动重新启动失败："
+                f"{str(recovery_error)[:500]}"
+            ) from original_error
 
     def _connect(self) -> None:
         targets = json.load(

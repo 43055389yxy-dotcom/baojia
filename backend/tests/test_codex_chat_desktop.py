@@ -151,3 +151,62 @@ def test_new_chat_clears_a_stale_unsent_draft(desktop_module, monkeypatch):
         ("a", "KeyA", {"modifiers": 2}),
         ("Backspace", "Backspace", {}),
     ]
+
+
+def test_start_revives_codex_after_the_desktop_window_is_closed(
+    desktop_module, monkeypatch,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=60,
+    )
+    attempts = []
+    recovered = []
+
+    def connect():
+        attempts.append("connect")
+        if len(attempts) == 1:
+            raise RuntimeError("Codex desktop control is unavailable")
+
+    monkeypatch.setattr(desktop, "_connect", connect)
+    monkeypatch.setattr(
+        desktop,
+        "_recover_desktop",
+        lambda _error: recovered.append("restarted"),
+    )
+    monkeypatch.setattr(desktop, "_chat_surface_ready", lambda: True)
+
+    desktop.start()
+
+    assert attempts == ["connect", "connect"]
+    assert recovered == ["restarted"]
+    assert desktop.driver is desktop
+
+
+@pytest.mark.parametrize(
+    ("running", "expected_action"),
+    [("true", "restart"), ("false", "start")],
+)
+def test_desktop_recovery_checks_the_real_container_state(
+    desktop_module, monkeypatch, running, expected_action,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=60,
+    )
+    commands = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        if command[1] == "inspect":
+            return type("Result", (), {"stdout": f"{running}\n"})()
+        return type("Result", (), {"stdout": ""})()
+
+    monkeypatch.setattr(desktop_module.subprocess, "run", run)
+    monkeypatch.setattr(desktop, "_wait_until", lambda check, **_kwargs: check())
+    monkeypatch.setattr(desktop, "_cdp_target_available", lambda: True)
+
+    desktop._recover_desktop(RuntimeError("window closed"))
+
+    assert commands[0][1:3] == ["inspect", "--format"]
+    assert commands[1] == ["docker", expected_action, desktop.container_name]
