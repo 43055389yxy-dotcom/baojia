@@ -121,6 +121,28 @@ def test_authorization_page_allows_supported_mcp_callback_schemes(
     assert "http://127.0.0.1:*" in policy
 
 
+def test_authorization_page_allows_configured_exact_https_redirect_origins(
+    tmp_path, monkeypatch
+):
+    redirect_uris = (
+        "https://oauth-redirect.googleusercontent.com/r/custom-mcp-test,"
+        "https://oauth-redirect-test.googleusercontent.com/a/custom-mcp-test"
+    )
+    gateway = load_gateway(
+        tmp_path,
+        monkeypatch,
+        passwordless_auth=True,
+        exact_https_redirect_uris=redirect_uris,
+    )
+
+    response = gateway.login_page("request-id")
+    policy = response.headers["content-security-policy"]
+
+    assert "https://oauth-redirect.googleusercontent.com" in policy
+    assert "https://oauth-redirect-test.googleusercontent.com" in policy
+    assert "/r/custom-mcp-test" not in policy
+
+
 def test_passwordless_authorization_issues_code_without_credentials(
     tmp_path, monkeypatch
 ):

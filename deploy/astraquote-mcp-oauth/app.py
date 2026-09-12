@@ -110,6 +110,15 @@ ALLOWED_SCOPES = set(DEFAULT_SCOPE.split())
 EXACT_HTTPS_REDIRECT_URIS = exact_https_redirect_uris_env(
     "OAUTH_EXACT_HTTPS_REDIRECT_URIS"
 )
+EXACT_HTTPS_REDIRECT_ORIGINS = " ".join(
+    sorted(
+        {
+            f"{parsed.scheme}://{parsed.netloc}"
+            for uri in EXACT_HTTPS_REDIRECT_URIS
+            if (parsed := urlparse(uri))
+        }
+    )
+)
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 
 RATE_WINDOW_SECONDS = positive_int_env("OAUTH_RATE_WINDOW_SECONDS", 600)
@@ -702,7 +711,8 @@ def login_page(request_id: str, error: str = "") -> HTMLResponse:
             "Content-Security-Policy": (
                 "default-src 'none'; style-src 'unsafe-inline'; "
                 "form-action 'self' https://chatgpt.com https://www.chatgpt.com "
-                "workbuddy: http://127.0.0.1:*; "
+                "workbuddy: http://127.0.0.1:* "
+                f"{EXACT_HTTPS_REDIRECT_ORIGINS}; "
                 "base-uri 'none'; frame-ancestors 'none'"
             ),
         },
