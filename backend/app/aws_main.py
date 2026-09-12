@@ -354,6 +354,14 @@ async def cancel_gpt_relay_job(job_id: str) -> dict[str, Any] | JSONResponse:
         return _gpt_relay_error_response(exc)
 
 
+@app.post("/api/quote-relay/jobs/{job_id}/retry-failed", response_model=None)
+async def retry_partial_gpt_relay_job(job_id: str) -> dict[str, Any] | JSONResponse:
+    try:
+        return gpt_quote_relay.retry_partial(job_id)
+    except GptRelayError as exc:
+        return _gpt_relay_error_response(exc)
+
+
 @app.get("/api/quote-relay/health")
 async def gpt_relay_health() -> dict[str, Any]:
     return {

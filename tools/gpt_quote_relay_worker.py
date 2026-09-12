@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Drive the server's logged-in browser for isolated sales quote jobs.
+"""Drive one logged-in desktop window across isolated sales quote chats.
 
-One visible Firefox process owns the administrator session. Each active quote
-uses its own tab and conversation. The shared relay queue limits new active
-work tabs to four and keeps later submissions queued until a slot is free.
+The worker never clones browser profiles or opens one tab per quote. It keeps
+the stable conversation URL for every active quote and visits those chats in a
+round-robin loop; generation continues remotely while another chat is shown.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from app.services.gpt_browser_navigation import (
     canonical_url_path,
     is_interrupted_response,
     is_new_project_chat,
-    is_persistent_permission_action,
     is_project_landing_url,
     is_scroll_to_latest_action,
     is_single_use_permission_action,
@@ -32,8 +31,16 @@ from app.services.gpt_browser_navigation import (
     is_transient_browser_poll_exception,
     should_extend_quote_deadline,
 )
+from app.services.gpt_quote_batches import (
+    build_component_batch_continuation_prompt,
+    build_component_batch_prompt,
+    build_quote_merge_prompt,
+)
 from app.services.gpt_quote_prompt import (
+    build_quote_context_prompt,
     build_quote_continuation_prompt,
+    build_quote_failed_components_retry_prompt,
+    build_quote_partial_finalization_prompt,
     build_quote_prompt,
     parse_final_response,
 )
@@ -61,7 +68,7 @@ STATE_PATH = Path(
     )
 )
 POLL_SECONDS = float(os.environ.get("ASTRAQUOTE_GPT_RELAY_POLL_SECONDS", "4"))
-QUOTE_TIMEOUT_SECONDS = int(os.environ.get("ASTRAQUOTE_GPT_QUOTE_TIMEOUT", "1800"))
+QUOTE_TIMEOUT_SECONDS = int(os.environ.get("ASTRAQUOTE_GPT_QUOTE_TIMEOUT", "600"))
 MAX_CONTINUATION_ATTEMPTS = bounded_continuation_attempts(
     os.environ.get("ASTRAQUOTE_GPT_MAX_CONTINUATIONS")
 )
@@ -109,7 +116,6 @@ def write_heartbeat(
 class ActiveQuote:
     job_id: str
     chat_url: str
-    window_handle: str
     deadline: float
     last_text: str = ""
     stable_since: float = 0.0
@@ -117,13 +123,24 @@ class ActiveQuote:
     retry_visible_since: float | None = None
     retry_clicked: bool = False
     minimum_assistant_messages: int = 0
+    generation_grace_used: bool = False
+    batch_index: int = 0
+    batch_count: int = 1
+    role: str = "coordinator"
+    component_keys: tuple[str, ...] = ()
+    batch_progress_fingerprint: str = ""
+    machine_progress_fingerprint: str = ""
+    stalled_attempts: int = 0
+
+    @property
+    def session_key(self) -> str:
+        return f"{self.job_id}:{self.batch_index}"
 
 
 class ChatGptBrowser:
     def __init__(self) -> None:
         self.driver: webdriver.Firefox | None = None
         self.project_url: str | None = None
-        self.launcher_handle: str | None = None
 
     def start(self) -> None:
         if not PROFILE_DIRECTORY.is_dir():
@@ -136,7 +153,6 @@ class ChatGptBrowser:
         self.driver = webdriver.Firefox(options=options)
         self.driver.set_page_load_timeout(90)
         self.driver.get(CHATGPT_URL)
-        self.launcher_handle = self.driver.current_window_handle
 
     def close(self) -> None:
         if self.driver is not None:
@@ -146,37 +162,35 @@ class ChatGptBrowser:
                 pass
             self.driver = None
             self.project_url = None
-            self.launcher_handle = None
 
     def _driver(self) -> webdriver.Firefox:
         if self.driver is None:
             raise RuntimeError("browser is not running")
         return self.driver
 
-    def _switch_to_launcher(self) -> None:
-        driver = self._driver()
-        handles = driver.window_handles
-        if not handles:
-            raise RuntimeError("browser has no open window")
-        if self.launcher_handle not in handles:
-            self.launcher_handle = handles[0]
-        driver.switch_to.window(self.launcher_handle)
-
     def _switch_to_quote(self, quote: ActiveQuote) -> None:
         driver = self._driver()
-        if quote.window_handle not in driver.window_handles:
-            raise RuntimeError("该报价的独立工作页已关闭。")
-        driver.switch_to.window(quote.window_handle)
+        if canonical_url_path(driver.current_url) != canonical_url_path(quote.chat_url):
+            driver.get(quote.chat_url)
+            WebDriverWait(driver, 90).until(
+                lambda _: canonical_url_path(driver.current_url)
+                == canonical_url_path(quote.chat_url)
+            )
 
     def close_quote(self, quote: ActiveQuote) -> None:
-        """Close only one quote tab and preserve every other active quote."""
+        """Stop any residual generation without closing the shared window."""
 
         driver = self._driver()
-        if quote.window_handle in driver.window_handles:
-            driver.switch_to.window(quote.window_handle)
-            if len(driver.window_handles) > 1:
-                driver.close()
-        self._switch_to_launcher()
+        self._switch_to_quote(quote)
+        stop_buttons = self._visible(
+            driver.find_elements(
+                By.CSS_SELECTOR,
+                "button[data-testid='stop-button'], button[aria-label*='Stop'], "
+                "button[aria-label*='停止']",
+            )
+        )
+        if stop_buttons:
+            self._click(stop_buttons[0], driver)
 
     def capture_debug(self, job_id: str) -> None:
         """Keep a local-only screenshot and non-sensitive control inventory."""
@@ -185,7 +199,10 @@ class ChatGptBrowser:
         debug_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         driver.save_screenshot(str(debug_directory / f"{job_id}.png"))
         controls: list[dict[str, str]] = []
-        for element in driver.find_elements(By.CSS_SELECTOR, "button, a, input, textarea, [role='button']"):
+        for element in driver.find_elements(
+            By.CSS_SELECTOR,
+            "button, a, input, textarea, [role='button']",
+        ):
             if not element.is_displayed():
                 continue
             controls.append(
@@ -226,7 +243,8 @@ class ChatGptBrowser:
             return True
         composers = driver.find_elements(
             By.CSS_SELECTOR,
-            "#prompt-textarea, textarea[data-id='root'], [contenteditable='true'][data-virtualkeyboard]",
+            "#prompt-textarea, textarea[data-id='root'], "
+            "[contenteditable='true'][data-virtualkeyboard]",
         )
         if any(element.is_displayed() for element in composers):
             return True
@@ -238,7 +256,9 @@ class ChatGptBrowser:
             return True
         login_controls = driver.find_elements(
             By.XPATH,
-            "//*[self::a or self::button][contains(normalize-space(.), 'Log in') or contains(normalize-space(.), '登录')]",
+            "//*[self::a or self::button]"
+            "[contains(normalize-space(.), 'Log in') "
+            "or contains(normalize-space(.), '登录')]",
         )
         return not any(element.is_displayed() for element in login_controls) and bool(
             driver.find_elements(By.CSS_SELECTOR, "a[href*='/projects'], a[href*='/g/g-p-']")
@@ -298,7 +318,7 @@ class ChatGptBrowser:
         return None
 
     def _approve_tool_if_needed(self) -> bool:
-        """Persistently approve a tool card only inside the active quote tab."""
+        """Approve AstraQuote once inside the active quote chat."""
 
         driver = self._driver()
         controls = self._visible(
@@ -309,10 +329,11 @@ class ChatGptBrowser:
         )
 
         # The permission card is not consistently marked role=dialog. Start
-        # from the approval button that is actually visible, then verify that
-        # one of its ancestors contains an explicit ChatGPT tool question.
+        # from the single-use button that is actually visible, then verify that
+        # an ancestor names AstraQuote. Never approve another connected tool
+        # and never grant account-wide persistent permission from this robot.
         for control in controls:
-            if not is_persistent_permission_action(self._control_label(control)):
+            if not is_single_use_permission_action(self._control_label(control)):
                 continue
             container = self._tool_permission_container(control)
             if container is None:
@@ -323,48 +344,6 @@ class ChatGptBrowser:
             )
             self._click(control, driver)
             return True
-
-        # Some releases hide “始终允许” in the “允许一次” split-button menu.
-        # Open only a split control whose ancestor is a tool permission card.
-        menu_triggers: list[WebElement] = []
-        for control in controls:
-            if not is_single_use_permission_action(self._control_label(control)):
-                continue
-            container = self._tool_permission_container(control)
-            if container is None:
-                continue
-            try:
-                has_popup = str(control.get_attribute("aria-haspopup") or "").casefold()
-                if has_popup in {"menu", "listbox", "true"}:
-                    menu_triggers.append(control)
-                    continue
-                parent = control.find_element(By.XPATH, "..")
-                for sibling in self._visible(
-                    parent.find_elements(By.CSS_SELECTOR, "button, [role='button']")
-                ):
-                    has_popup = str(
-                        sibling.get_attribute("aria-haspopup") or ""
-                    ).casefold()
-                    if has_popup in {"menu", "listbox", "true"}:
-                        menu_triggers.append(sibling)
-            except WebDriverException:
-                continue
-
-        for trigger in menu_triggers:
-            self._click(trigger, driver)
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                actions = self._visible(
-                    driver.find_elements(
-                        By.CSS_SELECTOR,
-                        "button, [role='button'], [role='menuitem'], [role='option']",
-                    )
-                )
-                for action in actions:
-                    if is_persistent_permission_action(self._control_label(action)):
-                        self._click(action, driver)
-                        return True
-                time.sleep(0.2)
         return False
 
     def _scroll_to_latest(self) -> bool:
@@ -515,65 +494,73 @@ class ChatGptBrowser:
         return project_url
 
     def start_quote(self, job_id: str, prompt: str) -> ActiveQuote:
-        driver = self._driver()
-        self._switch_to_launcher()
-        driver.switch_to.new_window("tab")
-        window_handle = driver.current_window_handle
-        try:
-            state = load_state()
-            previous_chat_url = str(state.get("last_chat_url") or "") or None
-            project_url = self.open_new_project_chat()
-            chat_url = self.submit(prompt)
-            if not is_new_project_chat(project_url, chat_url, previous_chat_url):
-                raise RuntimeError("ChatGPT 没有为本次报价创建新的项目对话。")
-            atomic_json(
-                STATE_PATH,
-                {
-                    "project_url": project_url,
-                    "project_name": PROJECT_NAME,
-                    "last_chat_url": chat_url,
-                },
-            )
-            now = time.monotonic()
-            return ActiveQuote(
-                job_id=job_id,
-                chat_url=chat_url,
-                window_handle=window_handle,
-                deadline=now + QUOTE_TIMEOUT_SECONDS,
-                stable_since=now,
-            )
-        except Exception:
-            if window_handle in driver.window_handles and len(driver.window_handles) > 1:
-                driver.close()
-            self._switch_to_launcher()
-            raise
+        state = load_state()
+        previous_chat_url = str(state.get("last_chat_url") or "") or None
+        project_url = self.open_new_project_chat()
+        chat_url = self.submit(prompt)
+        if not is_new_project_chat(project_url, chat_url, previous_chat_url):
+            raise RuntimeError("ChatGPT 没有为本次报价创建新的项目对话。")
+        atomic_json(
+            STATE_PATH,
+            {
+                "project_url": project_url,
+                "project_name": PROJECT_NAME,
+                "last_chat_url": chat_url,
+            },
+        )
+        now = time.monotonic()
+        return ActiveQuote(
+            job_id=job_id,
+            chat_url=chat_url,
+            deadline=now + QUOTE_TIMEOUT_SECONDS,
+            stable_since=now,
+        )
 
-    def resume_quote(self, job_id: str, chat_url: str) -> ActiveQuote:
+    def start_component_batch(
+        self,
+        job_id: str,
+        prompt: str,
+        *,
+        batch_index: int,
+        batch_count: int,
+        component_keys: list[str],
+    ) -> ActiveQuote:
+        active = self.start_quote(job_id, prompt)
+        active.batch_index = batch_index
+        active.batch_count = batch_count
+        active.role = "component_batch"
+        active.component_keys = tuple(component_keys)
+        return active
+
+    def resume_quote(
+        self,
+        job_id: str,
+        chat_url: str,
+        *,
+        batch_index: int = 0,
+        batch_count: int = 1,
+        role: str = "coordinator",
+        component_keys: list[str] | None = None,
+    ) -> ActiveQuote:
         """Open an already-submitted conversation without resending source text."""
 
         driver = self._driver()
-        self._switch_to_launcher()
-        driver.switch_to.new_window("tab")
-        window_handle = driver.current_window_handle
-        try:
-            driver.get(chat_url)
-            WebDriverWait(driver, 90).until(
-                lambda _: canonical_url_path(driver.current_url)
-                == canonical_url_path(chat_url)
-            )
-            now = time.monotonic()
-            return ActiveQuote(
-                job_id=job_id,
-                chat_url=chat_url,
-                window_handle=window_handle,
-                deadline=now + QUOTE_TIMEOUT_SECONDS,
-                stable_since=now,
-            )
-        except Exception:
-            if window_handle in driver.window_handles and len(driver.window_handles) > 1:
-                driver.close()
-            self._switch_to_launcher()
-            raise
+        driver.get(chat_url)
+        WebDriverWait(driver, 90).until(
+            lambda _: canonical_url_path(driver.current_url)
+            == canonical_url_path(chat_url)
+        )
+        now = time.monotonic()
+        return ActiveQuote(
+            job_id=job_id,
+            chat_url=chat_url,
+            deadline=now + QUOTE_TIMEOUT_SECONDS,
+            stable_since=now,
+            batch_index=batch_index,
+            batch_count=batch_count,
+            role=role,
+            component_keys=tuple(component_keys or []),
+        )
 
     def poll_quote(
         self,
@@ -588,21 +575,12 @@ class ChatGptBrowser:
         if self._approve_tool_if_needed():
             now = time.monotonic()
             quote.stable_since = now
-            quote.deadline = now + QUOTE_TIMEOUT_SECONDS
+            if now >= quote.deadline:
+                raise TimeoutError("报价授权后仍未在期限内产生后台进展。")
             return None
         retry = self._text_control(("重试", "Retry"))
         if retry is not None:
             now = time.monotonic()
-            if should_extend_quote_deadline(
-                deadline_reached=now >= quote.deadline,
-                generation_active=False,
-                retry_visible=True,
-            ):
-                if completion_check is not None and completion_check():
-                    return None
-                quote.deadline = now + QUOTE_TIMEOUT_SECONDS
-                quote.retry_visible_since = now
-                quote.retry_clicked = False
             if quote.retry_visible_since is None:
                 quote.retry_visible_since = now
             if not quote.retry_clicked and now - quote.retry_visible_since >= 60:
@@ -611,6 +589,8 @@ class ChatGptBrowser:
                 self._click(retry, driver)
                 quote.retry_clicked = True
                 quote.retry_visible_since = now
+            if now >= quote.deadline:
+                raise TimeoutError("ChatGPT 重试页面没有恢复，也没有后台进展。")
             return None
         quote.retry_visible_since = None
         messages = self._visible(
@@ -620,7 +600,8 @@ class ChatGptBrowser:
         stop_buttons = self._visible(
             driver.find_elements(
                 By.CSS_SELECTOR,
-                "button[data-testid='stop-button'], button[aria-label*='Stop'], button[aria-label*='停止']",
+                "button[data-testid='stop-button'], button[aria-label*='Stop'], "
+                "button[aria-label*='停止']",
             )
         )
         if len(messages) < quote.minimum_assistant_messages:
@@ -628,8 +609,9 @@ class ChatGptBrowser:
                 deadline_reached=now >= quote.deadline,
                 generation_active=bool(stop_buttons),
                 retry_visible=False,
-            ):
+            ) and not quote.generation_grace_used:
                 quote.deadline = now + QUOTE_TIMEOUT_SECONDS
+                quote.generation_grace_used = True
                 return None
             if now >= quote.deadline:
                 raise TimeoutError(
@@ -642,7 +624,6 @@ class ChatGptBrowser:
             if current != quote.last_text:
                 quote.last_text = current
                 quote.stable_since = now
-                quote.deadline = now + QUOTE_TIMEOUT_SECONDS
         if current and not stop_buttons and is_interrupted_response(current):
             return current
         if quote.saw_assistant and not stop_buttons and now - quote.stable_since >= 8:
@@ -651,8 +632,9 @@ class ChatGptBrowser:
             deadline_reached=now >= quote.deadline,
             generation_active=bool(stop_buttons),
             retry_visible=False,
-        ):
+        ) and not quote.generation_grace_used:
             quote.deadline = now + QUOTE_TIMEOUT_SECONDS
+            quote.generation_grace_used = True
             return None
         if now >= quote.deadline:
             raise TimeoutError(f"ChatGPT quote did not finish in {QUOTE_TIMEOUT_SECONDS} seconds")
@@ -666,13 +648,18 @@ class ChatGptBrowser:
             stop_buttons = self._visible(
                 driver.find_elements(
                     By.CSS_SELECTOR,
-                    "button[data-testid='stop-button'], button[aria-label*='Stop'], button[aria-label*='停止']",
+                    "button[data-testid='stop-button'], button[aria-label*='Stop'], "
+                    "button[aria-label*='停止']",
                 )
             )
             if stop_buttons:
                 self._click(stop_buttons[0], driver)
-            for dialog in self._visible(driver.find_elements(By.CSS_SELECTOR, "[role='dialog']")):
-                for control in self._visible(dialog.find_elements(By.CSS_SELECTOR, "button, [role='button']")):
+            for dialog in self._visible(
+                driver.find_elements(By.CSS_SELECTOR, "[role='dialog']")
+            ):
+                for control in self._visible(
+                    dialog.find_elements(By.CSS_SELECTOR, "button, [role='button']")
+                ):
                     label = " ".join(
                         (control.text or control.get_attribute("aria-label") or "").split()
                     ).casefold()
@@ -749,6 +736,7 @@ class ChatGptBrowser:
         quote.saw_assistant = False
         quote.retry_visible_since = None
         quote.retry_clicked = False
+        quote.generation_grace_used = False
 
     def wait_for_final_response(self, timeout_seconds: int) -> str:
         driver = self._driver()
@@ -769,7 +757,8 @@ class ChatGptBrowser:
             stop_buttons = self._visible(
                 driver.find_elements(
                     By.CSS_SELECTOR,
-                    "button[data-testid='stop-button'], button[aria-label*='Stop'], button[aria-label*='停止']",
+                    "button[data-testid='stop-button'], button[aria-label*='Stop'], "
+                    "button[aria-label*='停止']",
                 )
             )
             if saw_assistant and not stop_buttons and time.monotonic() - stable_since >= 8:
@@ -800,7 +789,13 @@ def submit_job(
     if not customer_request:
         store.update_if_not_cancelled(
             job_id,
-            {"status": "failed", "error": {"code": "source_missing", "message": "待清洗客户需求已不存在。"}},
+            {
+                "status": "failed",
+                "error": {
+                    "code": "source_missing",
+                    "message": "待清洗客户需求已不存在。",
+                },
+            },
             stage="failed",
             message="客户需求缺失，任务已安全停止",
         )
@@ -816,39 +811,265 @@ def submit_job(
         submission_code=str(record.get("submission_code") or "").strip(),
     )
     active = browser.start_quote(job_id, prompt)
-    store.update_if_not_cancelled(
+    store.record_chat_session(
         job_id,
-        {"chat_url": active.chat_url, "project_name": PROJECT_NAME},
-        stage="submitted",
-        message="已在 AstraQuote 项目中创建独立对话并提交需求清洗",
+        batch_index=0,
+        batch_count=1,
+        chat_url=active.chat_url,
+        role="coordinator",
+        component_keys=[],
+    )
+    store.update_if_not_cancelled(
+        job_id, {"project_name": PROJECT_NAME}, stage="submitted",
+        message="已在 AstraQuote 项目中创建总控对话并提交需求清洗",
     )
     store.purge_source(job_id)
     return active
 
 
+def batch_progress_fingerprint(batch: dict[str, Any], previous: str = "") -> str:
+    try:
+        prior = json.loads(previous or "[]")
+    except ValueError:
+        prior = []
+    if isinstance(prior, dict):
+        prior = [key for key, state in prior.items() if state == "completed"]
+    completed = {
+        key for key, state in (batch.get("component_states") or {}).items()
+        if state == "completed"
+    }
+    return json.dumps(
+        sorted(set(prior) | completed),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def batch_is_finished(batch: dict[str, Any]) -> bool:
+    states = list((batch.get("component_states") or {}).values())
+    return bool(states) and all(state in {"completed", "failed"} for state in states)
+
+
+def active_batch(
+    store: GptQuoteRelayStore,
+    active: ActiveQuote,
+) -> dict[str, Any] | None:
+    return next(
+        (
+            batch
+            for batch in store.quote_chat_batches(active.job_id)
+            if int(batch["batch_index"]) == active.batch_index
+        ),
+        None,
+    )
+
+
+def refresh_progress_deadline(store: GptQuoteRelayStore, active: ActiveQuote) -> None:
+    """Only saved successful work extends the no-progress deadline."""
+
+    batch = active_batch(store, active) if active.batch_count > 1 else None
+    if batch is not None and active.role != "merge":
+        fingerprint = batch_progress_fingerprint(batch, active.machine_progress_fingerprint)
+    else:
+        fingerprint = store._merge_progress(
+            active.machine_progress_fingerprint,
+            store.progress_fingerprint(active.job_id),
+        )
+    if fingerprint != active.machine_progress_fingerprint:
+        active.machine_progress_fingerprint = fingerprint
+        active.deadline = time.monotonic() + QUOTE_TIMEOUT_SECONDS
+        active.generation_grace_used = False
+
+
+def continue_component_batch(
+    store: GptQuoteRelayStore,
+    browser: ChatGptBrowser,
+    active: ActiveQuote,
+) -> bool:
+    """Continue a child batch twice only while its machine state is unchanged."""
+
+    batch = active_batch(store, active)
+    if batch is None:
+        return False
+    fingerprint = batch_progress_fingerprint(batch, active.batch_progress_fingerprint)
+    if fingerprint != active.batch_progress_fingerprint:
+        active.batch_progress_fingerprint = fingerprint
+        active.stalled_attempts = 0
+    if batch_is_finished(batch):
+        store.update_chat_session(active.job_id, active.batch_index, status="saved")
+        return False
+    if active.stalled_attempts >= MAX_CONTINUATION_ATTEMPTS:
+        store.update_chat_session(
+            active.job_id,
+            active.batch_index,
+            status="stalled",
+            stalled_attempts=active.stalled_attempts,
+        )
+        return False
+    active.stalled_attempts += 1
+    # Reserve before sending. An uncertain send or worker restart must not
+    # restore the same allowance and repeat the instruction forever.
+    store.update_chat_session(
+        active.job_id,
+        active.batch_index,
+        status="running",
+        stalled_attempts=active.stalled_attempts,
+        progress_fingerprint=fingerprint,
+    )
+    latest = store.get(active.job_id)
+    browser.continue_quote(
+        active,
+        build_component_batch_continuation_prompt(
+            relay_job_id=active.job_id,
+            submission_code=str(latest.get("submission_code") or ""),
+            price_batch_id=str(batch["price_batch_id"]),
+            batch_index=active.batch_index,
+            batch_count=int(batch["batch_count"]),
+            component_keys=list(batch["component_keys"]),
+        ),
+    )
+    return True
+
+
+def create_missing_component_chats(
+    store: GptQuoteRelayStore,
+    browser: ChatGptBrowser,
+    active_quotes: dict[str, ActiveQuote],
+    job_id: str,
+) -> None:
+    """Open pending component chats through the one shared desktop window."""
+
+    batches = store.quote_chat_batches(job_id)
+    if len(batches) <= 1:
+        return
+    record = store.get(job_id)
+    if record.get("status") != "processing":
+        return
+    sessions = {
+        int(item.get("batch_index", -1)): item
+        for item in (record.get("chat_sessions") or [])
+    }
+    coordinator = sessions.get(0)
+    if coordinator:
+        store.update_chat_session(
+            job_id, 0,
+            batch_count=len(batches),
+            component_keys=list(batches[0]["component_keys"]),
+        )
+        current = active_quotes.get(f"{job_id}:0")
+        if current is not None:
+            current.batch_count = len(batches)
+            current.component_keys = tuple(batches[0]["component_keys"])
+
+    for batch in batches[1:]:
+        batch_index = int(batch["batch_index"])
+        if batch_is_finished(batch) or batch_index in sessions:
+            continue
+        if len(active_quotes) >= store.max_concurrent_quotes:
+            break
+        prompt = build_component_batch_prompt(
+            relay_job_id=job_id,
+            submission_code=str(record.get("submission_code") or ""),
+            price_batch_id=str(batch["price_batch_id"]),
+            batch_index=batch_index,
+            batch_count=int(batch["batch_count"]),
+            components=list(batch["components"]),
+            quote_context=build_quote_context_prompt(record.get("quote_options") or {}),
+        )
+        active = browser.start_component_batch(
+            job_id,
+            prompt,
+            batch_index=batch_index,
+            batch_count=int(batch["batch_count"]),
+            component_keys=list(batch["component_keys"]),
+        )
+        store.record_chat_session(
+            job_id,
+            batch_index=batch_index,
+            batch_count=int(batch["batch_count"]),
+            chat_url=active.chat_url,
+            role="component_batch",
+            component_keys=list(batch["component_keys"]),
+        )
+        active.batch_progress_fingerprint = batch_progress_fingerprint(batch)
+        active_quotes[active.session_key] = active
+
+
+def maybe_start_final_merge(
+    store: GptQuoteRelayStore,
+    browser: ChatGptBrowser,
+    active_quotes: dict[str, ActiveQuote],
+    job_id: str,
+) -> None:
+    """Return to the coordinator only after every component chat has stopped."""
+
+    batches = store.quote_chat_batches(job_id)
+    if len(batches) <= 1:
+        return
+    record = store.get(job_id)
+    if record.get("status") != "processing":
+        return
+    if any(active.job_id == job_id for active in active_quotes.values()):
+        return
+    if len(active_quotes) >= store.max_concurrent_quotes:
+        return
+    sessions = {
+        int(item.get("batch_index", -1)): item
+        for item in (record.get("chat_sessions") or [])
+    }
+    for batch in batches:
+        if batch_is_finished(batch):
+            continue
+        session = sessions.get(int(batch["batch_index"]))
+        if not session or session.get("status") != "stalled":
+            return
+    if any(item.get("status") == "merging" for item in sessions.values()):
+        return
+    if any(item.get("status") == "running" for item in sessions.values()):
+        return
+    coordinator = sessions.get(0)
+    if not coordinator:
+        return
+    active = active_quotes.get(f"{job_id}:0")
+    if active is None:
+        active = browser.resume_quote(
+            job_id,
+            str(coordinator["chat_url"]),
+            batch_index=0,
+            batch_count=len(batches),
+            role="merge",
+            component_keys=list(batches[0]["component_keys"]),
+        )
+    else:
+        active.role = "merge"
+    browser.continue_quote(
+        active,
+        build_quote_merge_prompt(
+            relay_job_id=job_id,
+            submission_code=str(record.get("submission_code") or ""),
+            price_batch_id=str(batches[0]["price_batch_id"]),
+        ),
+    )
+    store.update_chat_session(job_id, 0, status="merging")
+    active_quotes[active.session_key] = active
+
+
 def complete_job(store: GptQuoteRelayStore, job_id: str, response: str) -> str:
     current = store.reconcile_delivery_receipt(job_id)
-    if current.get("status") in {"cancelled", "completed"}:
+    if current.get("status") in {"cancelled", "completed", "partial", "failed"}:
         return str(current["status"])
     status, summary = parse_final_response(response)
-    if status == "incomplete":
+    # A completion sentence is not delivery evidence. Only the receipt above
+    # may complete the job. A confirmed blocker skips futile retry messages.
+    if current.get("partial_finalization_requested"):
+        summary = "部分报价收口仍未产生可用交付回执。"
+    elif store.has_unrecoverable_failure(job_id):
+        if store.request_partial_finalization(job_id):
+            return "partial_finalize"
+        summary = summary or "报价遇到当前无法继续的阻塞。"
+    elif status in {"incomplete", "displayed_on_page", "delivered", "blocked"}:
         return "continue"
-    # `displayed_on_page` is the current delivery contract. `delivered` is
-    # accepted only for conversations started before the contract changed.
-    if status in {"displayed_on_page", "delivered"}:
-        store.update_if_not_cancelled(
-            job_id,
-            {
-                "status": "completed",
-                "result_status": status,
-                "result_summary": summary,
-                "error": None,
-                "lease_expires_at": None,
-            },
-            stage="completed",
-            message="报价文档和可用链接已完成交付",
-        )
-        return "completed"
     store.update_if_not_cancelled(
         job_id,
         {
@@ -858,7 +1079,7 @@ def complete_job(store: GptQuoteRelayStore, job_id: str, response: str) -> str:
             "lease_expires_at": None,
         },
         stage="failed",
-        message="ChatGPT 未通过最终报价核对，任务已安全停止",
+        message="报价无法继续，已保存当前处理结果",
     )
     return "failed"
 
@@ -889,9 +1110,35 @@ def continue_from_saved_stage(
 ) -> bool:
     """Resume one unfinished quote in the same conversation without source text."""
 
-    latest = store.get(active.job_id)
-    attempts = int(latest.get("continuation_attempts") or 0)
-    if attempts >= MAX_CONTINUATION_ATTEMPTS:
+    latest = store.reconcile_delivery_receipt(active.job_id)
+    if latest.get("status") != "processing":
+        return False
+    if latest.get("partial_finalization_requested"):
+        fail_continuation_limit(store, active.job_id)
+        return False
+    if store.has_unrecoverable_failure(active.job_id):
+        if store.request_partial_finalization(active.job_id):
+            browser.continue_quote(
+                active,
+                build_quote_partial_finalization_prompt(
+                    relay_job_id=active.job_id,
+                    submission_code=str(latest.get("submission_code") or ""),
+                ),
+            )
+            return True
+        complete_job(store, active.job_id, "")
+        return False
+    if not store.reserve_continuation(
+        active.job_id,
+        maximum=MAX_CONTINUATION_ATTEMPTS,
+    ):
+        if store.request_partial_finalization(active.job_id):
+            partial_prompt = build_quote_partial_finalization_prompt(
+                relay_job_id=active.job_id,
+                submission_code=str(latest.get("submission_code") or ""),
+            )
+            browser.continue_quote(active, partial_prompt)
+            return True
         fail_continuation_limit(store, active.job_id)
         return False
     continuation_prompt = build_quote_continuation_prompt(
@@ -901,7 +1148,7 @@ def continue_from_saved_stage(
     browser.continue_quote(active, continuation_prompt)
     store.update_if_not_cancelled(
         active.job_id,
-        {"continuation_attempts": attempts + 1},
+        {},
         stage="continuing",
         message=message,
     )
@@ -929,6 +1176,133 @@ def fail_job(store: GptQuoteRelayStore, job_id: str, exc: Exception) -> None:
     )
 
 
+def handle_no_progress_timeout(
+    store: GptQuoteRelayStore,
+    browser: ChatGptBrowser,
+    active: ActiveQuote,
+    active_quotes: dict[str, ActiveQuote],
+) -> None:
+    """Use the same durable budget for timeouts and repeated DOM failures."""
+
+    current = store.reconcile_delivery_receipt(active.job_id)
+    if current.get("status") in {"completed", "partial", "cancelled", "failed"}:
+        browser.close_quote(active)
+        active_quotes.pop(active.session_key, None)
+        return
+    batches = store.quote_chat_batches(active.job_id)
+    if len(batches) > 1 and active.role != "merge":
+        if not continue_component_batch(store, browser, active):
+            active_quotes.pop(active.session_key, None)
+        maybe_start_final_merge(store, browser, active_quotes, active.job_id)
+        return
+    if not continue_from_saved_stage(
+        store,
+        browser,
+        active,
+        message="报价等待超时，已在原对话从保存阶段自动继续",
+    ):
+        browser.close_quote(active)
+        active_quotes.pop(active.session_key, None)
+
+
+def reattach_job_chats(
+    store: GptQuoteRelayStore,
+    browser: ChatGptBrowser,
+    record: dict[str, Any],
+    active_quotes: dict[str, ActiveQuote],
+) -> None:
+    """Restore every running logical chat after the desktop worker restarts."""
+
+    sessions = list(record.get("chat_sessions") or [])
+    if not sessions and record.get("chat_url"):
+        sessions = [{
+            "batch_index": 0,
+            "batch_count": 1,
+            "chat_url": record["chat_url"],
+            "role": "coordinator",
+            "component_keys": [],
+            "status": "running",
+        }]
+    for session in sessions:
+        if record.get("partial_retry_pending"):
+            continue
+        if session.get("status") not in {"running", "merging"}:
+            continue
+        batch_index = int(session.get("batch_index") or 0)
+        active = browser.resume_quote(
+            record["job_id"],
+            str(session["chat_url"]),
+            batch_index=batch_index,
+            batch_count=int(session.get("batch_count") or 1),
+            role=("merge" if session.get("status") == "merging" else str(
+                session.get("role") or "coordinator"
+            )),
+            component_keys=list(session.get("component_keys") or []),
+        )
+        active.stalled_attempts = int(session.get("stalled_attempts") or 0)
+        active.batch_progress_fingerprint = str(
+            session.get("progress_fingerprint") or ""
+        )
+        active_quotes[active.session_key] = active
+
+    if record.get("partial_retry_pending"):
+        coordinator = next(
+            (item for item in sessions if int(item.get("batch_index") or 0) == 0),
+            None,
+        )
+        if coordinator:
+            active = active_quotes.get(f"{record['job_id']}:0")
+            if active is None:
+                active = browser.resume_quote(
+                    record["job_id"],
+                    str(coordinator["chat_url"]),
+                    batch_index=0,
+                    batch_count=int(coordinator.get("batch_count") or 1),
+                    role="merge",
+                    component_keys=list(coordinator.get("component_keys") or []),
+                )
+            browser.continue_quote(
+                active,
+                build_quote_failed_components_retry_prompt(
+                    relay_job_id=record["job_id"],
+                    submission_code=str(record.get("submission_code") or ""),
+                ),
+            )
+            active.role = "merge"
+            active_quotes[active.session_key] = active
+            store.update_chat_session(record["job_id"], 0, status="merging")
+            store.update_if_not_cancelled(
+                record["job_id"],
+                {"partial_retry_pending": False},
+                stage="retry",
+                message="已在总控对话中仅重试未完成组件",
+            )
+
+
+def stop_terminal_job_chats(
+    browser: ChatGptBrowser,
+    active_quotes: dict[str, ActiveQuote],
+    job_id: str,
+    *,
+    cancelled: bool = False,
+) -> None:
+    """Stop every still-running chat before releasing its shared slot."""
+
+    for session_key, quote in list(active_quotes.items()):
+        if quote.job_id != job_id:
+            continue
+        try:
+            if cancelled:
+                browser.cancel_quote(quote)
+            else:
+                browser.close_quote(quote)
+        except (RuntimeError, WebDriverException):
+            # Keep the slot and retry on the next poll.  Forgetting a chat on
+            # an uncertain stop is what allowed old batches to run overnight.
+            continue
+        active_quotes.pop(session_key, None)
+
+
 def main() -> int:
     store = GptQuoteRelayStore()
     browser = ChatGptBrowser()
@@ -942,11 +1316,13 @@ def main() -> int:
                     limit=None,
                     lease_minutes=35,
                 ):
-                    active = browser.resume_quote(
-                        record["job_id"],
-                        str(record["chat_url"]),
+                    reattach_job_chats(store, browser, record, active_quotes)
+                    create_missing_component_chats(
+                        store, browser, active_quotes, record["job_id"],
                     )
-                    active_quotes[active.job_id] = active
+                    maybe_start_final_merge(
+                        store, browser, active_quotes, record["job_id"],
+                    )
             logged_in = browser.logged_in()
             if logged_in:
                 store.resume_login_waiting()
@@ -961,14 +1337,31 @@ def main() -> int:
                     else "等待销售报价任务"
                 ) if logged_in else "等待管理员登录 ChatGPT",
             )
+            if logged_in:
+                for record in store.claim_submitted_for_monitoring(
+                    WORKER_ID,
+                    limit=None,
+                    lease_minutes=35,
+                    exclude_job_ids={quote.job_id for quote in active_quotes.values()},
+                ):
+                    reattach_job_chats(store, browser, record, active_quotes)
+                    create_missing_component_chats(
+                        store, browser, active_quotes, record["job_id"],
+                    )
+                    maybe_start_final_merge(
+                        store, browser, active_quotes, record["job_id"],
+                    )
             while logged_in:
                 record = store.claim_next(WORKER_ID, lease_minutes=35)
                 if record is None:
                     break
                 try:
-                    active = submit_job(store, browser, record)
-                    if active is not None:
-                        active_quotes[active.job_id] = active
+                    if record.get("partial_retry_pending") and record.get("chat_url"):
+                        reattach_job_chats(store, browser, record, active_quotes)
+                    else:
+                        active = submit_job(store, browser, record)
+                        if active is not None:
+                            active_quotes[active.session_key] = active
                 except Exception as exc:
                     try:
                         browser.capture_debug(record["job_id"])
@@ -976,35 +1369,65 @@ def main() -> int:
                         pass
                     fail_job(store, record["job_id"], exc)
 
-            for job_id in active_quote_poll_order(active_quotes):
-                active = active_quotes.get(job_id)
+            processing_job_ids = {
+                quote.job_id for quote in active_quotes.values()
+            }
+            for job_id in processing_job_ids:
+                create_missing_component_chats(
+                    store, browser, active_quotes, job_id,
+                )
+                maybe_start_final_merge(store, browser, active_quotes, job_id)
+
+            for session_key in active_quote_poll_order(active_quotes):
+                active = active_quotes.get(session_key)
                 if active is None:
                     continue
+                job_id = active.job_id
                 current = store.reconcile_delivery_receipt(job_id)
-                if current.get("status") == "completed":
-                    try:
-                        browser.close_quote(active)
-                    finally:
-                        active_quotes.pop(job_id, None)
+                if current.get("status") in {"completed", "partial", "failed"}:
+                    stop_terminal_job_chats(browser, active_quotes, job_id)
                     continue
                 if current.get("status") == "cancelled":
-                    try:
-                        browser.cancel_quote(active)
-                    finally:
-                        active_quotes.pop(job_id, None)
+                    stop_terminal_job_chats(
+                        browser,
+                        active_quotes,
+                        job_id,
+                        cancelled=True,
+                    )
                     continue
                 try:
                     store.renew_lease(job_id, WORKER_ID, lease_minutes=35)
+                    refresh_progress_deadline(store, active)
                     response = browser.poll_quote(
                         active,
                         completion_check=lambda job_id=job_id: (
                             store.reconcile_delivery_receipt(job_id).get("status")
-                            == "completed"
+                            in {"completed", "partial"}
                         ),
                     )
                     if response is None:
                         continue
+                    batches = store.quote_chat_batches(job_id)
+                    if len(batches) > 1 and active.role != "merge":
+                        if not continue_component_batch(store, browser, active):
+                            active_quotes.pop(session_key, None)
+                        maybe_start_final_merge(
+                            store, browser, active_quotes, job_id,
+                        )
+                        continue
                     outcome = complete_job(store, job_id, response)
+                    if outcome == "partial_finalize":
+                        latest = store.get(job_id)
+                        browser.continue_quote(
+                            active,
+                            build_quote_partial_finalization_prompt(
+                                relay_job_id=job_id,
+                                submission_code=str(
+                                    latest.get("submission_code") or ""
+                                ),
+                            ),
+                        )
+                        continue
                     if outcome == "continue":
                         if not continue_from_saved_stage(
                             store,
@@ -1013,37 +1436,27 @@ def main() -> int:
                             message="报价尚未完成，已在原对话从保存阶段自动继续",
                         ):
                             browser.close_quote(active)
-                            active_quotes.pop(job_id, None)
+                            active_quotes.pop(session_key, None)
                         continue
                     browser.close_quote(active)
-                    active_quotes.pop(job_id, None)
+                    active_quotes.pop(session_key, None)
                 except TimeoutError:
-                    current = store.reconcile_delivery_receipt(job_id)
-                    if current.get("status") == "completed":
-                        browser.close_quote(active)
-                        active_quotes.pop(job_id, None)
-                        continue
-                    if not continue_from_saved_stage(
-                        store,
-                        browser,
-                        active,
-                        message="报价等待超时，已在原对话从保存阶段自动继续",
-                    ):
-                        browser.close_quote(active)
-                        active_quotes.pop(job_id, None)
+                    handle_no_progress_timeout(store, browser, active, active_quotes)
                 except Exception as exc:
                     if is_transient_browser_poll_exception(exc):
                         # ChatGPT replaces live DOM nodes while generating. The
                         # next polling round must locate fresh elements; the
                         # quote itself is still running and must remain active.
                         active.stable_since = time.monotonic()
+                        if active.stable_since >= active.deadline:
+                            handle_no_progress_timeout(store, browser, active, active_quotes)
                         continue
                     fail_job(store, job_id, exc)
                     try:
                         browser.close_quote(active)
                     except Exception:
                         pass
-                    active_quotes.pop(job_id, None)
+                    active_quotes.pop(session_key, None)
             time.sleep(POLL_SECONDS)
         except KeyboardInterrupt:
             browser.close()

@@ -20,12 +20,106 @@ from app.services.gpt_browser_navigation import (
     is_transient_browser_poll_exception,
     should_extend_quote_deadline,
 )
+from app.services.gpt_quote_batches import (
+    build_component_batch_prompt,
+    split_component_plan,
+)
 from app.services.gpt_quote_prompt import (
     build_quote_continuation_prompt,
+    build_quote_partial_finalization_prompt,
     build_quote_prompt,
     parse_final_response,
 )
 from app.services.gpt_quote_relay import GptQuoteRelayStore, GptRelayError
+
+
+def test_component_plan_splits_twenty_top_level_groups_and_keeps_children_together() -> None:
+    plan = [
+        {
+            "component_key": f"cmp_root_{index:04d}",
+            "customer_owned_source": f"组件 {index}。",
+            "billing_scopes": [{"billing_key": "base"}],
+        }
+        for index in range(41)
+    ]
+    plan.insert(
+        22,
+        {
+            "component_key": "cmp_child_0001",
+            "parent_component_key": "cmp_root_0019",
+            "customer_owned_source": "组件 19 的独立磁盘。",
+            "billing_scopes": [{"billing_key": "storage"}],
+        },
+    )
+
+    batches = split_component_plan(plan)
+
+    assert len(batches) == 3
+    assert [batch[0]["component_key"] for batch in batches] == [
+        "cmp_root_0000",
+        "cmp_root_0020",
+        "cmp_root_0040",
+    ]
+    first_keys = {item["component_key"] for item in batches[0]}
+    assert "cmp_root_0019" in first_keys
+    assert "cmp_child_0001" in first_keys
+    assert "cmp_child_0001" not in {
+        item["component_key"] for batch in batches[1:] for item in batch
+    }
+
+    forty = split_component_plan(
+        [
+            {
+                "component_key": f"cmp_forty_{index:04d}",
+                "customer_owned_source": f"组件 {index}。",
+                "billing_scopes": [{"billing_key": "base"}],
+            }
+            for index in range(40)
+        ]
+    )
+    sixty = split_component_plan(
+        [
+            {
+                "component_key": f"cmp_sixty_{index:04d}",
+                "customer_owned_source": f"组件 {index}。",
+                "billing_scopes": [{"billing_key": "base"}],
+            }
+            for index in range(60)
+        ]
+    )
+    assert [len(batch) for batch in forty] == [20, 20]
+    assert [len(batch) for batch in sixty] == [20, 20, 20]
+
+
+def test_component_batch_prompt_contains_only_that_batches_cleaned_sources() -> None:
+    current = [{
+        "component_key": "cmp_compute_0001",
+        "customer_owned_source": "云服务器：2 台，4 核 16 GiB。",
+        "billing_scopes": [{"billing_key": "compute"}],
+    }]
+
+    prompt = build_component_batch_prompt(
+        relay_job_id="gpt-" + "a" * 32,
+        submission_code="2",
+        price_batch_id="aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        batch_index=1,
+        batch_count=2,
+        components=current,
+        quote_context=(
+            "云厂商：AWS（销售已选定，不得改换）。\n"
+            "账号站点：AWS 全球站（凭证范围 global）。\n"
+            "销售首选地域：ap-southeast-1。\n"
+            "计价选项：按需付费；使用率 100%。"
+        ),
+    )
+
+    assert "云服务器：2 台，4 核 16 GiB。" in prompt
+    assert "对象存储" not in prompt
+    assert "客户原话" not in prompt
+    assert "第 2/2 批" in prompt
+    assert "不要生成最终整单" in prompt
+    assert "AWS 全球站" in prompt
+    assert "ap-southeast-1" in prompt
 
 
 def test_host_relay_uses_python39_compatible_datetime_api() -> None:
@@ -98,14 +192,32 @@ def test_worker_claims_one_job_and_purges_source_after_submission(tmp_path: Path
 
 
 def test_relay_runs_at_most_four_quotes_and_reports_the_waiting_queue(tmp_path: Path) -> None:
+    checkpoints = tmp_path / "v2-quotes"
     store = GptQuoteRelayStore(
-        tmp_path,
+        tmp_path / "relay",
+        checkpoint_directory=checkpoints,
         max_concurrent_quotes=4,
         default_quote_seconds=600,
     )
     jobs = [store.create(f"报价需求 {index}，两台云服务器。", {}) for index in range(6)]
 
-    claimed = [store.claim_next("worker-1") for _ in range(4)]
+    checkpoints.mkdir(parents=True)
+    claimed = []
+    for _ in range(4):
+        record = store.claim_next("worker-1")
+        claimed.append(record)
+        assert record is not None
+        (checkpoints / f"relay-{record['job_id']}.json").write_text(
+            json.dumps(
+                {
+                    "relay_job_id": record["job_id"],
+                    "stage": "requirements_cleaned",
+                    "top_level_component_count": 1,
+                    "total_component_count": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
 
     assert [record["job_id"] for record in claimed if record] == [
         job["job_id"] for job in jobs[:4]
@@ -130,6 +242,37 @@ def test_relay_runs_at_most_four_quotes_and_reports_the_waiting_queue(tmp_path: 
     next_job = store.claim_next("worker-1")
     assert next_job is not None
     assert next_job["job_id"] == jobs[4]["job_id"]
+
+
+def test_relay_admits_only_one_unplanned_intake_until_its_component_count_is_sealed(
+    tmp_path: Path,
+) -> None:
+    checkpoints = tmp_path / "v2-quotes"
+    store = GptQuoteRelayStore(
+        tmp_path / "relay",
+        checkpoint_directory=checkpoints,
+        max_concurrent_quotes=4,
+    )
+    first = store.create("第一份未知规模报价。", {})
+    second = store.create("第二份未知规模报价。", {})
+
+    assert store.claim_next("worker-a")["job_id"] == first["job_id"]
+    assert store.claim_next("worker-a") is None
+
+    checkpoints.mkdir(parents=True)
+    (checkpoints / f"relay-{first['job_id']}.json").write_text(
+        json.dumps(
+            {
+                "relay_job_id": first["job_id"],
+                "stage": "requirements_cleaned",
+                "top_level_component_count": 40,
+                "total_component_count": 40,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert store.claim_next("worker-a")["job_id"] == second["job_id"]
 
 
 def test_cancelled_job_is_purged_and_never_claimed_again(tmp_path: Path) -> None:
@@ -287,6 +430,136 @@ def test_delivery_receipt_never_revives_a_cancelled_job(tmp_path: Path) -> None:
     assert store.public_get(public["job_id"])["status"] == "cancelled"
 
 
+def test_partial_receipt_returns_successful_rows_and_unpriced_components(tmp_path: Path) -> None:
+    store = GptQuoteRelayStore(tmp_path)
+    public = store.create("东京 EC2 和对象存储，按需。", {})
+    store.claim_next("worker-1")
+    store.purge_source(public["job_id"])
+    store.completions_directory.mkdir(parents=True, exist_ok=True)
+    store._completion_path(public["job_id"]).write_text(
+        json.dumps(
+            {
+                "schema_version": "astraquote-relay-completion/1",
+                "job_id": public["job_id"],
+                "submission_code": public["submission_code"],
+                "quote_id": "aqv2_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "status": "partial_page_result_ready",
+                "delivered_at": "2026-09-12T01:02:03.000Z",
+                "spreadsheet_url": "https://baojia.tontiancloud.com/api/backend/api/quote-artifacts/aqdl_"
+                + "c" * 48,
+                "page_result": {
+                    "schema_version": "astraquote-page-result/1",
+                    "is_partial": True,
+                    "currency": "USD",
+                    "region": "ap-northeast-1",
+                    "components": [
+                        {
+                            "service_name": "Amazon EC2",
+                            "scenario_costs": [
+                                {
+                                    "scenario_key": "on_demand",
+                                    "label": "按需付费",
+                                    "monthly_cost": "100",
+                                    "upfront_cost": "0",
+                                }
+                            ],
+                        }
+                    ],
+                    "unpriced_components": [
+                        {
+                            "service_name": "Amazon S3",
+                            "quantity": "2 TiB",
+                            "configuration_summary": "S3 Standard 2 TiB，价格尚未取得。",
+                            "failure_code": "official_price_unavailable",
+                            "failure_category": "rate_limit",
+                            "provider_code": "TooManyRequestsException",
+                            "retryable": True,
+                        }
+                    ],
+                    "scenarios": [
+                        {
+                            "scenario_key": "on_demand",
+                            "label": "按需付费",
+                            "monthly_total": "100",
+                            "upfront_total": "0",
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sales = store.public_get(public["job_id"])
+
+    assert sales["status"] == "partial"
+    assert sales["quick_quote_result"]["is_partial"] is True
+    assert sales["quick_quote_result"]["unpriced_components"][0]["service_name"] == "Amazon S3"
+    assert sales["quick_quote_result"]["unpriced_components"][0]["failure_category"] == "rate_limit"
+    assert (
+        sales["quick_quote_result"]["unpriced_components"][0]["provider_code"]
+        == "TooManyRequestsException"
+    )
+    assert sales["quick_quote_result"]["scenarios"][0]["monthly_total"] == "100"
+
+    retried = store.retry_partial(public["job_id"])
+    assert retried["status"] == "queued"
+    internal = store.get(public["job_id"])
+    assert internal["customer_request"] == ""
+    assert internal["partial_retry_generation"] == 1
+    # The old partial receipt must not immediately complete the retried job.
+    assert store.public_get(public["job_id"])["status"] == "queued"
+
+
+def test_sales_page_notice_is_fixed_and_never_forwards_internal_error_text() -> None:
+    public_result = GptQuoteRelayStore._page_result_public(
+        {
+            "schema_version": "astraquote-page-result/1",
+            "is_partial": False,
+            "currency": "USD",
+            "region": "ap-southeast-1",
+            "pricing_notice": "internal-query-id=secret; TooManyRequests raw trace",
+            "components": [
+                {
+                    "service_name": "Amazon EC2",
+                    "scenario_costs": [
+                        {
+                            "scenario_key": "on_demand",
+                            "label": "按需付费",
+                            "monthly_cost": "100",
+                            "upfront_cost": "0",
+                        }
+                    ],
+                }
+            ],
+            "unpriced_components": [],
+            "scenarios": [
+                {
+                    "scenario_key": "on_demand",
+                    "label": "按需付费",
+                    "monthly_total": "100",
+                    "upfront_total": "0",
+                }
+            ],
+        }
+    )
+
+    assert public_result is not None
+    assert public_result["pricing_notice"].startswith("销售提示：")
+    assert "internal-query-id" not in public_result["pricing_notice"]
+    assert "TooManyRequests" not in public_result["pricing_notice"]
+
+
+def test_retry_partial_rejects_non_partial_jobs(tmp_path: Path) -> None:
+    store = GptQuoteRelayStore(tmp_path)
+    public = store.create("东京 EC2 一台。", {})
+
+    with pytest.raises(GptRelayError) as raised:
+        store.retry_partial(public["job_id"])
+
+    assert raised.value.code == "gpt_relay_partial_retry_unavailable"
+
+
 def test_mismatched_delivery_receipt_is_not_trusted(tmp_path: Path) -> None:
     store = GptQuoteRelayStore(tmp_path)
     public = store.create("东京 EC2 两台，按需。", {})
@@ -388,6 +661,28 @@ def test_per_quote_prompt_carries_the_current_nearest_lower_policy() -> None:
     assert "完全匹配" in prompt
     assert "总报价最低" in prompt
     assert "由 GPT" in prompt
+    assert "云厂商和账号站点对应的官方地域代码" in prompt
+    assert "不得套用其他云厂商同名代码" in prompt
+    assert "当前官方地域清单" in prompt
+
+
+def test_unknown_sales_region_is_recoverable_and_ai_must_choose_nearest_official_region() -> None:
+    prompt = build_quote_prompt(
+        "ECS 两台，Linux。",
+        {
+            "pricing_scenarios": ["on_demand"],
+            "utilization_percent": 100,
+            "cloud_provider": "alibaba",
+            "preferred_region": "not-a-real-region",
+        },
+        relay_job_id="gpt-cccccccccccccccccccccccccccccccc",
+        submission_code="4",
+    )
+
+    assert "不在当前官方地域清单" in prompt
+    assert "不得因此停止报价" in prompt
+    assert "同一云厂商、同一账号站点内选择距离最近" in prompt
+    assert "杭州（cn-hangzhou）" in prompt
 
 
 def test_default_comparison_prompt_lists_all_three_selected_scenarios() -> None:
@@ -536,27 +831,46 @@ def test_continuation_prompt_reuses_identity_without_restoring_customer_text() -
     assert "build_estimate" not in prompt
 
 
-def test_browser_worker_accepts_the_current_page_delivery_marker() -> None:
+def test_partial_finalization_prompt_returns_saved_successes_without_customer_text() -> None:
+    prompt = build_quote_partial_finalization_prompt(
+        relay_job_id="gpt-dddddddddddddddddddddddddddddddd",
+        submission_code="6",
+    )
+
+    assert "两次" in prompt
+    assert "部分报价" in prompt
+    assert "未取得价格的组件不得按 0 元" in prompt
+    assert "gpt-dddddddddddddddddddddddddddddddd" in prompt
+    assert "客户需求" not in prompt
+
+
+def test_browser_worker_keeps_continuation_and_receipt_integration() -> None:
     worker = (
         Path(__file__).resolve().parents[2] / "tools/gpt_quote_relay_worker.py"
     ).read_text(encoding="utf-8")
 
-    assert 'status in {"displayed_on_page", "delivered"}' in worker
+    assert "store.reconcile_delivery_receipt(job_id)" in worker
     assert 'if outcome == "continue":' in worker
+    assert 'if outcome == "partial_finalize":' in worker
+    assert "store.request_partial_finalization(job_id)" in worker
+    assert "build_quote_partial_finalization_prompt(" in worker
     assert "browser.continue_quote(active, continuation_prompt)" in worker
+    assert "is_persistent_permission_action(" not in worker
+    assert "is_single_use_permission_action(self._control_label(control))" in worker
+    assert "stop_terminal_job_chats(browser, active_quotes, job_id)" in worker
     assert "quote.deadline = quote.stable_since + QUOTE_TIMEOUT_SECONDS" in worker
     assert "except TimeoutError:" in worker
     assert "报价等待超时，已在原对话从保存阶段自动继续" in worker
     assert "delivered_without_calculator_link" not in worker
 
 
-def test_permission_detection_accepts_any_explicit_tool_card() -> None:
+def test_permission_detection_accepts_only_astraquote_tool_cards() -> None:
     assert is_tool_permission_prompt("允许 ChatGPT 使用 AstraQuote？")
     assert is_tool_permission_prompt(
         "AstraQuote V2 允许 ChatGPT 使用 AstraQuote V2? 始终允许 拒绝 允许一次"
     )
-    assert is_tool_permission_prompt("允许 ChatGPT 使用 Gmail？")
-    assert is_tool_permission_prompt("Allow ChatGPT to use a pricing tool?")
+    assert not is_tool_permission_prompt("允许 ChatGPT 使用 Gmail？")
+    assert not is_tool_permission_prompt("Allow ChatGPT to use a pricing tool?")
     assert not is_tool_permission_prompt("AstraQuote 已调用工具")
 
 
@@ -592,21 +906,21 @@ def test_project_navigation_requires_a_fresh_chat_in_the_same_project() -> None:
     assert canonical_url_path(old_chat_url) == "/g/g-p-abc123/c/old-chat"
 
 
-def test_browser_worker_has_no_fixed_parallel_tab_cap() -> None:
+def test_browser_worker_uses_one_desktop_window_instead_of_browser_tabs() -> None:
     worker = (
         Path(__file__).resolve().parents[2] / "tools/gpt_quote_relay_worker.py"
     ).read_text(encoding="utf-8")
 
-    assert "MAX_CONCURRENCY" not in worker
-    assert "while logged_in:" in worker
+    assert 'new_window("tab")' not in worker
+    assert "window_handle" not in worker
 
 
 def test_automatic_continuation_attempts_are_bounded_and_config_safe() -> None:
-    assert bounded_continuation_attempts(None) == 20
-    assert bounded_continuation_attempts("8") == 8
+    assert bounded_continuation_attempts(None) == 2
+    assert bounded_continuation_attempts("2") == 2
     assert bounded_continuation_attempts("0") == 1
-    assert bounded_continuation_attempts("99") == 20
-    assert bounded_continuation_attempts("invalid") == 20
+    assert bounded_continuation_attempts("99") == 2
+    assert bounded_continuation_attempts("invalid") == 2
 
 
 def test_every_active_quote_tab_is_visited_in_each_polling_round() -> None:
@@ -708,13 +1022,13 @@ def test_active_worker_heartbeat_prevents_false_quote_failure(tmp_path: Path) ->
     assert sales["failure_code"] is None
 
 
-def test_visible_generation_or_retry_control_extends_quote_deadline() -> None:
+def test_only_real_generation_can_receive_one_bounded_grace_period() -> None:
     assert should_extend_quote_deadline(
         deadline_reached=True,
         generation_active=True,
         retry_visible=False,
     )
-    assert should_extend_quote_deadline(
+    assert not should_extend_quote_deadline(
         deadline_reached=True,
         generation_active=False,
         retry_visible=True,
@@ -729,6 +1043,306 @@ def test_visible_generation_or_retry_control_extends_quote_deadline() -> None:
         generation_active=True,
         retry_visible=False,
     )
+
+
+def test_sales_progress_comes_from_backend_checkpoint_not_chat_text(tmp_path: Path) -> None:
+    checkpoints = tmp_path / "v2-quotes"
+    store = GptQuoteRelayStore(tmp_path / "relay", checkpoint_directory=checkpoints)
+    public = store.create("东京 EC2 两台，按需。", {})
+    store.claim_next("worker-a")
+    checkpoints.mkdir(parents=True)
+    (checkpoints / f"relay-{public['job_id']}.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "astraquote-relay-checkpoint/1",
+                "relay_job_id": public["job_id"],
+                "stage": "pricing_partial",
+                "total_component_count": 40,
+                "completed_component_count": 38,
+                "failed_component_count": 2,
+                "updated_at": "2026-09-12T01:02:03.000Z",
+                "incomplete_query_ids": ["must-not-leak"],
+                "error": {"message": "must-not-leak"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sales = store.public_get(public["job_id"])
+
+    assert sales["progress"] == {
+        "stage": "pricing_partial",
+        "total_component_count": 40,
+        "completed_component_count": 38,
+        "failed_component_count": 2,
+        "updated_at": "2026-09-12T01:02:03.000Z",
+    }
+    assert "incomplete_query_ids" not in json.dumps(sales)
+    assert "must-not-leak" not in json.dumps(sales)
+
+
+def test_same_stalled_checkpoint_allows_only_two_continuations(tmp_path: Path) -> None:
+    checkpoints = tmp_path / "v2-quotes"
+    store = GptQuoteRelayStore(tmp_path / "relay", checkpoint_directory=checkpoints)
+    public = store.create("东京 EC2 两台，按需。", {})
+    store.claim_next("worker-a")
+    checkpoints.mkdir(parents=True)
+    checkpoint_path = checkpoints / f"relay-{public['job_id']}.json"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "relay_job_id": public["job_id"],
+                "stage": "pricing_partial",
+                "total_component_count": 40,
+                "completed_component_count": 38,
+                "failed_component_count": 2,
+                "updated_at": "2026-09-12T01:02:03.000Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert store.reserve_continuation(public["job_id"], maximum=2) is True
+    assert store.reserve_continuation(public["job_id"], maximum=2) is True
+    assert store.reserve_continuation(public["job_id"], maximum=2) is False
+    record = store.get(public["job_id"])
+    assert record["continuation_attempts"] == 2
+    assert record["stalled_continuation_attempts"] == 2
+    assert store.request_partial_finalization(public["job_id"]) is True
+    assert store.request_partial_finalization(public["job_id"]) is False
+
+
+def test_real_checkpoint_progress_resets_the_stalled_retry_counter(tmp_path: Path) -> None:
+    checkpoints = tmp_path / "v2-quotes"
+    store = GptQuoteRelayStore(tmp_path / "relay", checkpoint_directory=checkpoints)
+    public = store.create("东京 EC2 两台，按需。", {})
+    store.claim_next("worker-a")
+    checkpoints.mkdir(parents=True)
+    checkpoint_path = checkpoints / f"relay-{public['job_id']}.json"
+    checkpoint = {
+        "relay_job_id": public["job_id"],
+        "stage": "pricing_partial",
+        "total_component_count": 40,
+        "completed_component_count": 20,
+        "failed_component_count": 20,
+    }
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+    assert store.reserve_continuation(public["job_id"], maximum=2) is True
+    assert store.reserve_continuation(public["job_id"], maximum=2) is True
+
+    checkpoint.update({"completed_component_count": 38, "failed_component_count": 2})
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+
+    assert store.reserve_continuation(public["job_id"], maximum=2) is True
+    record = store.get(public["job_id"])
+    assert record["continuation_attempts"] == 3
+    assert record["stalled_continuation_attempts"] == 1
+
+
+def test_failed_attempt_churn_cannot_reset_retry_budget(tmp_path: Path) -> None:
+    checkpoints = tmp_path / "v2-quotes"
+    store = GptQuoteRelayStore(tmp_path / "relay", checkpoint_directory=checkpoints)
+    job_id = store.create("独立组件。", {})["job_id"]
+    store.claim_next("worker-a")
+    checkpoints.mkdir(parents=True)
+    checkpoint_path = checkpoints / f"relay-{job_id}.json"
+    checkpoint = {
+        "relay_job_id": job_id,
+        "stage": "pricing_partial",
+        "total_component_count": 40,
+        "completed_component_count": 38,
+        "completed_component_keys": [f"cmp-{i}" for i in range(38)],
+        "failed_component_count": 0,
+        "batch_query_count": 40,
+        "incomplete_query_count": 2,
+    }
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+    assert store.reserve_continuation(job_id)
+    checkpoint.update(batch_query_count=55, incomplete_query_count=17, failed_component_count=2)
+    checkpoint["completed_component_keys"].reverse()
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+    assert store.reserve_continuation(job_id)
+    checkpoint.update(stage="pricing_request_rejected", batch_query_count=80)
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+    assert not store.reserve_continuation(job_id)
+    checkpoint.update(stage="pricing_partial", failed_component_count=0)
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+    assert not store.reserve_continuation(job_id)
+
+
+def test_stage_progress_only_resets_once_and_partial_closing_stays_closed(tmp_path: Path) -> None:
+    checkpoints = tmp_path / "v2-quotes"
+    store = GptQuoteRelayStore(tmp_path / "relay", checkpoint_directory=checkpoints)
+    job_id = store.create("独立组件。", {})["job_id"]
+    store.claim_next("worker-a")
+    checkpoints.mkdir(parents=True)
+    checkpoint_path = checkpoints / f"relay-{job_id}.json"
+    checkpoint = {
+        "relay_job_id": job_id, "stage": "pricing_partial",
+        "total_component_count": 40, "completed_component_count": 38,
+    }
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+    assert store.reserve_continuation(job_id)
+    assert store.reserve_continuation(job_id)
+    checkpoint.update(stage="estimate_validated")
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+    assert store.reserve_continuation(job_id)
+    assert store.reserve_continuation(job_id)
+    checkpoint.update(stage="pricing_partial")
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+    assert not store.reserve_continuation(job_id)
+    assert store.request_partial_finalization(job_id)
+    checkpoint.update(stage="artifacts_generated")
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+    assert not store.reserve_continuation(job_id)
+
+
+def test_component_batches_consume_the_shared_four_chat_slots(tmp_path: Path) -> None:
+    checkpoints = tmp_path / "v2-quotes"
+    store = GptQuoteRelayStore(
+        tmp_path / "relay",
+        checkpoint_directory=checkpoints,
+        max_concurrent_quotes=4,
+    )
+    first = store.create("第一份大型报价。", {})
+    second = store.create("第二份大型报价。", {})
+    third = store.create("第三份普通报价。", {})
+    first_record = store.claim_next("worker-a")
+    assert first_record is not None
+    checkpoints.mkdir(parents=True)
+    (checkpoints / f"relay-{first['job_id']}.json").write_text(
+        json.dumps(
+            {
+                "relay_job_id": first["job_id"],
+                "stage": "requirements_cleaned",
+                "total_component_count": 40,
+            }
+        ),
+        encoding="utf-8",
+    )
+    second_record = store.claim_next("worker-a")
+    assert second_record is not None
+    (checkpoints / f"relay-{second['job_id']}.json").write_text(
+        json.dumps(
+            {
+                "relay_job_id": second["job_id"],
+                "stage": "requirements_cleaned",
+                "total_component_count": 40,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert store.claim_next("worker-a") is None
+    queued = store.public_get(third["job_id"])
+    assert queued["active_quote_count"] == 4
+    assert queued["max_concurrent_quotes"] == 4
+
+
+def test_relay_builds_private_chat_batches_from_the_sealed_price_plan(tmp_path: Path) -> None:
+    checkpoints = tmp_path / "v2-quotes"
+    store = GptQuoteRelayStore(tmp_path / "relay", checkpoint_directory=checkpoints)
+    public = store.create("整单原始报价资料。", {})
+    store.claim_next("worker-a")
+    store.purge_source(public["job_id"])
+    checkpoints.mkdir(parents=True)
+    batch_id = "aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    (checkpoints / f"relay-{public['job_id']}.json").write_text(
+        json.dumps({"relay_job_id": public["job_id"], "price_batch_id": batch_id}),
+        encoding="utf-8",
+    )
+    component_plan = [
+        {
+            "component_key": f"cmp_root_{index:04d}",
+            "customer_owned_source": f"清洗组件 {index}。",
+            "billing_scopes": [{"billing_key": "base"}],
+        }
+        for index in range(21)
+    ]
+    (checkpoints / f"{batch_id}.json").write_text(
+        json.dumps(
+            {
+                "price_batch_id": batch_id,
+                "relay_job_id": public["job_id"],
+                "quote_components": component_plan,
+                "component_lifecycle": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    batches = store.quote_chat_batches(public["job_id"])
+
+    assert [len(batch["components"]) for batch in batches] == [20, 1]
+    assert batches[1]["component_keys"] == ["cmp_root_0020"]
+    sales = store.public_get(public["job_id"])
+    assert "customer_owned_source" not in json.dumps(sales)
+    assert "整单原始报价资料" not in json.dumps(sales)
+
+
+def test_relay_persists_multiple_chat_urls_for_one_sales_quote(tmp_path: Path) -> None:
+    store = GptQuoteRelayStore(tmp_path)
+    public = store.create("两批报价。", {})
+    store.claim_next("worker-a")
+
+    store.record_chat_session(
+        public["job_id"], batch_index=0, batch_count=2,
+        chat_url="https://chatgpt.com/g/g-p-abc123/c/coordinator",
+        role="coordinator", component_keys=["cmp_root_0001"],
+    )
+    store.record_chat_session(
+        public["job_id"], batch_index=1, batch_count=2,
+        chat_url="https://chatgpt.com/g/g-p-abc123/c/batch-2",
+        role="component_batch", component_keys=["cmp_root_0021"],
+    )
+
+    record = store.get(public["job_id"])
+    assert record["chat_url"].endswith("/coordinator")
+    assert [item["batch_index"] for item in record["chat_sessions"]] == [0, 1]
+    assert "chat_sessions" not in store.public_get(public["job_id"])
+
+
+def test_sales_receipt_accepts_sixty_successful_components(tmp_path: Path) -> None:
+    store = GptQuoteRelayStore(tmp_path)
+    components = [
+        {
+            "service_name": f"云服务 {index + 1}",
+            "model_or_plan": "标准规格",
+            "quantity": "1",
+            "configuration_summary": "已核价配置",
+            "scenario_costs": [
+                {
+                    "scenario_key": "on_demand",
+                    "label": "按需付费",
+                    "monthly_cost": "1.00",
+                    "upfront_cost": "0",
+                }
+            ],
+        }
+        for index in range(60)
+    ]
+
+    public_result = store._page_result_public(
+        {
+            "schema_version": "astraquote-page-result/1",
+            "is_partial": False,
+            "currency": "USD",
+            "region": "ap-southeast-1",
+            "components": components,
+            "unpriced_components": [],
+            "scenarios": [
+                {
+                    "scenario_key": "on_demand",
+                    "label": "按需付费",
+                    "monthly_total": "60.00",
+                    "upfront_total": "0",
+                }
+            ],
+        }
+    )
+
+    assert public_result is not None
+    assert len(public_result["components"]) == 60
 
 
 def test_submitted_processing_job_can_be_reattached_after_worker_restart(
@@ -759,18 +1373,39 @@ def test_submitted_processing_job_can_be_reattached_after_worker_restart(
 def test_existing_submitted_jobs_are_reattached_after_the_new_limit_is_enabled(
     tmp_path: Path,
 ) -> None:
-    legacy_store = GptQuoteRelayStore(tmp_path, max_concurrent_quotes=6)
+    checkpoints = tmp_path / "v2-quotes"
+    checkpoints.mkdir(parents=True)
+    legacy_store = GptQuoteRelayStore(
+        tmp_path / "relay",
+        checkpoint_directory=checkpoints,
+        max_concurrent_quotes=6,
+    )
     jobs = [legacy_store.create(f"报价需求 {index}", {}) for index in range(6)]
     for job in jobs:
         claimed = legacy_store.claim_next("worker-old")
         assert claimed is not None
+        (checkpoints / f"relay-{job['job_id']}.json").write_text(
+            json.dumps(
+                {
+                    "relay_job_id": job["job_id"],
+                    "stage": "requirements_cleaned",
+                    "top_level_component_count": 1,
+                    "total_component_count": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
         legacy_store.update(
             job["job_id"],
             {"chat_url": f"https://chatgpt.com/g/g-p-abc123/c/quote-{job['job_id']}"},
         )
         legacy_store.purge_source(job["job_id"])
 
-    store = GptQuoteRelayStore(tmp_path, max_concurrent_quotes=4)
+    store = GptQuoteRelayStore(
+        tmp_path / "relay",
+        checkpoint_directory=checkpoints,
+        max_concurrent_quotes=4,
+    )
     resumed = store.claim_submitted_for_monitoring(
         "worker-new",
         limit=None,

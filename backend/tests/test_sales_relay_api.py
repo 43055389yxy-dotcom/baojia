@@ -69,7 +69,67 @@ def test_sales_region_catalog_is_scoped_to_the_configured_provider_site() -> Non
     assert all(item["code"] and item["label"] for item in payload["regions"])
 
 
-def test_sales_accepts_a_new_region_name_without_a_hardcoded_allowlist(
+@pytest.mark.parametrize(
+    ("provider", "code", "label"),
+    [
+        ("aws", "ap-southeast-1", "新加坡"),
+        ("alibaba", "eu-west-1", "伦敦"),
+        ("huawei", "ap-southeast-1", "香港"),
+        ("volcengine", "ap-southeast-1", "柔佛"),
+        ("oci", "ap-singapore-1", "新加坡"),
+        ("tencent", "ap-singapore", "新加坡"),
+    ],
+)
+def test_sales_region_labels_are_provider_scoped(
+    provider: str,
+    code: str,
+    label: str,
+) -> None:
+    payload = TestClient(aws_main.app).get(
+        f"/api/quote-relay/providers/{provider}/regions"
+    ).json()
+    labels = {item["code"]: item["label"] for item in payload["regions"]}
+
+    assert label in labels[code]
+
+
+def test_sales_region_catalog_has_no_duplicate_codes_and_exposes_source() -> None:
+    client = TestClient(aws_main.app)
+    for provider in (
+        "aws", "azure", "oci", "gcp", "tencent", "alibaba",
+        "huawei", "baidu", "volcengine", "ctyun",
+    ):
+        payload = client.get(f"/api/quote-relay/providers/{provider}/regions").json()
+        codes = [item["code"] for item in payload["regions"]]
+        assert len(codes) == len(set(codes)), provider
+        assert payload["official_source_url"].startswith("https://"), provider
+        assert payload["catalog_role"] == "official_provider_regions_only"
+        assert payload["catalog_checked_at"] == "2026-09-12"
+
+
+def test_alibaba_uses_the_official_hohhot_region_code() -> None:
+    payload = TestClient(aws_main.app).get(
+        "/api/quote-relay/providers/alibaba/regions"
+    ).json()
+    codes = {item["code"] for item in payload["regions"]}
+
+    assert "cn-huhehaote" in codes
+    assert "cn-hohhot" not in codes
+
+
+def test_provider_catalog_keeps_current_official_region_codes_and_access_labels() -> None:
+    client = TestClient(aws_main.app)
+    azure = client.get("/api/quote-relay/providers/azure/regions").json()
+    azure_labels = {item["code"]: item["label"] for item in azure["regions"]}
+    assert "受限" not in azure_labels["australiacentral"]
+    assert "受限" in azure_labels["australiacentral2"]
+
+    huawei = client.get("/api/quote-relay/providers/huawei/regions").json()
+    huawei_codes = {item["code"] for item in huawei["regions"]}
+    assert {"cn-south-4", "cn-north-11", "cn-north-12"} <= huawei_codes
+
+
+def test_sales_keeps_an_unknown_region_as_a_recoverable_preference(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -89,6 +149,28 @@ def test_sales_accepts_a_new_region_name_without_a_hardcoded_allowlist(
 
     assert response.status_code == 200
     assert response.json()["preferred_region"] == "not-a-real-region"
+
+
+def test_sales_accepts_a_provider_scoped_region_code(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = GptQuoteRelayStore(tmp_path / "valid-region")
+    monkeypatch.setattr(aws_main, "gpt_quote_relay", store)
+    response = TestClient(aws_main.app).post(
+        "/api/quote-relay/jobs",
+        json={
+            "customer_request": "ECS 2 核 4 GiB，一台。",
+            "cloud_provider": "alibaba",
+            "preferred_region": "ap-southeast-1",
+            "pricing_scenarios": ["on_demand"],
+            "utilization_percent": 100,
+            "client_request_id": "123e4567-e89b-42d3-a456-426614174001",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["preferred_region"] == "ap-southeast-1"
 
 
 def test_public_health_marks_only_unconfigured_gcp_catalog_as_pending(
@@ -112,3 +194,37 @@ def test_public_health_marks_only_unconfigured_gcp_catalog_as_pending(
     assert catalogs["oci"]["available"] is True
     assert catalogs["gcp"]["available"] is False
     assert "API Key" in catalogs["gcp"]["message"]
+
+
+def test_sales_can_retry_only_the_failed_part_of_a_partial_quote(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = GptQuoteRelayStore(tmp_path / "partial-retry")
+    monkeypatch.setattr(aws_main, "gpt_quote_relay", store)
+    public = store.create("原始需求随后会被删除。", {})
+    store.claim_next("worker-a")
+    store.purge_source(public["job_id"])
+    store.update(
+        public["job_id"],
+        {
+            "status": "partial",
+            "quick_quote_result": {
+                "schema_version": "astraquote-page-result/1",
+                "is_partial": True,
+                "unpriced_components": [{"service_name": "对象存储"}],
+            },
+            "quote_download_url": "https://example.test/partial.xlsx",
+        },
+    )
+
+    response = TestClient(aws_main.app).post(
+        f"/api/quote-relay/jobs/{public['job_id']}/retry-failed"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "queued"
+    internal = store.get(public["job_id"])
+    assert internal["customer_request"] == ""
+    assert internal["partial_retry_generation"] == 1
+    assert internal["partial_retry_pending"] is True

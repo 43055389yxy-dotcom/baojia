@@ -659,6 +659,7 @@ def test_successful_authenticated_route_returns_verifiable_learning_metadata() -
 
 def test_transient_official_transport_failure_is_retried_without_changing_query() -> None:
     calls = 0
+    delays: list[float] = []
 
     def eventually_succeeds(_: Any) -> dict[str, Any]:
         nonlocal calls
@@ -675,6 +676,8 @@ def test_transient_official_transport_failure_is_retried_without_changing_query(
     service = OfficialPricingService(
         _UnusedAwsExecutor(),
         authenticated_request=eventually_succeeds,
+        retry_sleep=delays.append,
+        retry_delays=(0.25, 0.75),
         provider_credentials={
             "tencent": {
                 "access_key_id": "configured",
@@ -705,5 +708,57 @@ def test_transient_official_transport_failure_is_retried_without_changing_query(
     )["results"][0]
 
     assert calls == 2
+    assert delays == [0.25]
     assert result["status"] == "exact"
     assert result["attempt_count"] == 2
+
+
+def test_non_transient_provider_failure_is_not_retried_or_delayed() -> None:
+    calls = 0
+    delays: list[float] = []
+
+    def authorization_denied(_: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        raise OfficialCloudClientError(
+            "The pricing action is not authorized.",
+            code="tencent_official_api_error",
+            category="authorization",
+            retryable=False,
+            details={"provider_code": "AuthFailure"},
+        )
+
+    service = OfficialPricingService(
+        _UnusedAwsExecutor(),
+        authenticated_request=authorization_denied,
+        retry_sleep=delays.append,
+        retry_delays=(0.25, 0.75),
+        provider_credentials={
+            "tencent": {
+                "access_key_id": "configured",
+                "secret_access_key": "configured",
+            }
+        },
+    )
+    result = service.get_prices(
+        GetPricesRequest(
+            queries=[
+                TencentPriceQuery(
+                    query_id="redis-price",
+                    endpoint="redis.tencentcloudapi.com",
+                    service="redis",
+                    action="InquiryPriceCreateInstance",
+                    version="2018-04-12",
+                    region="ap-singapore",
+                    response_items_path="result.items",
+                    item_id_paths=["sku"],
+                    rate_fields=[CommercialRateField(unit_price_path="price", currency_code="CNY")],
+                )
+            ]
+        )
+    )["results"][0]
+
+    assert calls == 1
+    assert delays == []
+    assert result["error_category"] == "authorization"
+    assert result["retryable"] is False

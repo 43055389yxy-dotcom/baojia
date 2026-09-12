@@ -323,8 +323,15 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .sales-job-progress b { display: inline-flex; align-items: center; gap: 7px; color: var(--cyan); font-size: 10px; }
 .sales-job-progress b > i { width: 6px; height: 6px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 0 5px rgba(67, 220, 255, .08); animation: sales-status-pulse 1.5s ease-in-out infinite; }
 .sales-job-progress > i { position: relative; display: block; overflow: hidden; height: 4px; margin-top: 13px; border-radius: 999px; background: rgba(93, 153, 184, .14); }
-.sales-job-progress > i > span { position: absolute; width: 34%; inset: 0 auto 0 -34%; border-radius: inherit; background: linear-gradient(90deg, transparent, var(--cyan), var(--blue), transparent); box-shadow: 0 0 16px rgba(60, 160, 229, .34); animation: sales-progress-scan 2.4s ease-in-out infinite; }
+.sales-job-progress > i > span { position: absolute; inset: 0 auto 0 0; border-radius: inherit; background: linear-gradient(90deg, var(--cyan), var(--blue)); box-shadow: 0 0 16px rgba(60, 160, 229, .34); transition: width .35s ease; }
 .sales-job-progress small { display: block; margin-top: 10px; color: #66879c; font-size: 10px; text-align: right; }
+.sales-result-unpriced { margin: 18px 0 0; padding: 16px; border: 1px solid rgba(224, 143, 53, .34); border-radius: 12px; background: rgba(224, 143, 53, .08); }
+.sales-result-notice { margin: 18px 0 0; padding: 12px 14px; border: 1px solid rgba(62, 126, 152, .25); border-radius: 10px; color: #486b79; background: rgba(94, 175, 205, .09); }
+.sales-result-unpriced > strong { display: block; margin-bottom: 10px; color: #b76d18; }
+.sales-result-unpriced p { display: grid; grid-template-columns: minmax(120px, 180px) 1fr; gap: 12px; margin: 0; padding: 9px 0; border-top: 1px solid rgba(224, 143, 53, .16); }
+.sales-result-unpriced p span { color: #6f7f89; }
+.sales-result-unpriced p small { display: block; margin-top: 5px; color: #946529; line-height: 1.6; }
+.sales-result-action-note > small { display: block; margin-top: 6px; color: var(--danger); }
 .sales-job-stages { display: flex; align-items: center; gap: 10px; }
 .sales-job-stages span { display: inline-flex; align-items: center; gap: 7px; color: #526f82; font-size: 10px; white-space: nowrap; }
 .sales-job-stages span > i { width: 8px; height: 8px; border: 1px solid #506d80; border-radius: 50%; }

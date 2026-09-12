@@ -40,6 +40,10 @@ def test_jenkins_health_checks_explain_the_failure_stage() -> None:
         encoding="utf-8"
     )
     assert "ASTRAQUOTE_GPT_RELAY_MAX_TABS" not in unit
+    assert (
+        "Environment=ASTRAQUOTE_V2_STATE_DIR=/home/ec2-user/astraquote/data/v2-quotes"
+        in unit
+    )
 
 
 def test_runtime_image_contains_the_host_namespace_helper() -> None:

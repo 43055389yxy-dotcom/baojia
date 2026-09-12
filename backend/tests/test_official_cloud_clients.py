@@ -5,7 +5,11 @@ from typing import Any
 
 import pytest
 
-from app.services.mcp_v2_pricing import AlibabaPriceQuery, BaiduPriceQuery
+from app.services.mcp_v2_pricing import (
+    AlibabaPriceQuery,
+    BaiduPriceQuery,
+    TencentPriceQuery,
+)
 from app.services.official_cloud_clients import (
     OfficialCloudApiClient,
     OfficialCloudClientError,
@@ -13,11 +17,24 @@ from app.services.official_cloud_clients import (
 
 
 class _Response:
-    def __init__(self, payload: dict[str, Any], *, status_code: int = 200) -> None:
+    def __init__(
+        self,
+        payload: dict[str, Any],
+        *,
+        status_code: int = 200,
+        url: str = "",
+        history: list[Any] | None = None,
+        json_error: bool = False,
+    ) -> None:
         self._payload = payload
         self.status_code = status_code
+        self.url = url
+        self.history = history or []
+        self.json_error = json_error
 
     def json(self) -> dict[str, Any]:
+        if self.json_error:
+            raise ValueError("not JSON")
         return self._payload
 
     def raise_for_status(self) -> None:
@@ -164,6 +181,109 @@ def test_alibaba_unsupported_disk_value_is_a_correctable_parameter_error() -> No
     assert error.details["provider_code"] == (
         "InvalidSystemDiskCategory.ValueNotSupported"
     )
+
+
+@pytest.mark.parametrize(
+    ("code", "message", "expected_category", "expected_retryable"),
+    [
+        (
+            "AuthFailure.UnauthorizedOperation",
+            "You do not have permission to perform this operation.",
+            "authorization",
+            False,
+        ),
+        (
+            "InvalidParameter",
+            "The selected instance specification is not sold in this region.",
+            "invalid_request",
+            True,
+        ),
+        (
+            "InternalError",
+            "The service encountered an internal error.",
+            "provider_unavailable",
+            True,
+        ),
+        (
+            "InvalidModuleCode",
+            "The supplied pricing module is invalid.",
+            "invalid_request",
+            True,
+        ),
+    ],
+)
+def test_successful_http_with_provider_error_envelope_is_not_a_price_result(
+    code: str,
+    message: str,
+    expected_category: str,
+    expected_retryable: bool,
+) -> None:
+    recorder = _RequestRecorder(
+        _Response(
+            {
+                "Response": {
+                    "Error": {"Code": code, "Message": message},
+                    "RequestId": "request-business-error-123",
+                }
+            },
+            status_code=200,
+        )
+    )
+    client = OfficialCloudApiClient(_credentials("tencent"), request=recorder)
+    query = TencentPriceQuery(
+        query_id="tencent-price-error",
+        endpoint="redis.tencentcloudapi.com",
+        service="redis",
+        action="InquiryPriceCreateInstance",
+        version="2018-04-12",
+        region="ap-singapore",
+        response_items_path="Response",
+        item_id_paths=["RequestId"],
+    )
+
+    with pytest.raises(OfficialCloudClientError) as captured:
+        client.execute(query)
+
+    error = captured.value
+    assert error.category == expected_category
+    assert error.retryable is expected_retryable
+    assert error.details == {
+        "http_status": 200,
+        "provider_code": code,
+        "request_id": "request-business-error-123",
+    }
+
+
+def test_official_maintenance_redirect_is_a_retryable_provider_outage() -> None:
+    redirect = type("Redirect", (), {"status_code": 302})()
+    recorder = _RequestRecorder(
+        _Response(
+            {},
+            status_code=200,
+            url="https://www.oracle.com/splash/collabsuite/maintenance/external/index.html",
+            history=[redirect],
+            json_error=True,
+        )
+    )
+    client = OfficialCloudApiClient(_credentials("alibaba"), request=recorder)
+    query = AlibabaPriceQuery(
+        query_id="provider-maintenance",
+        endpoint="business.aliyuncs.com",
+        service="bssopenapi",
+        action="QueryPrice",
+        version="2017-12-14",
+        region="ap-southeast-1",
+    )
+
+    with pytest.raises(OfficialCloudClientError) as captured:
+        client.execute(query)
+
+    assert captured.value.category == "provider_unavailable"
+    assert captured.value.retryable is True
+    assert captured.value.details == {
+        "http_status": 200,
+        "redirect_statuses": [302],
+    }
 
 
 def test_baidu_known_official_hostname_mismatch_uses_chain_verified_tls_only() -> None:

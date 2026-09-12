@@ -197,6 +197,69 @@ test('parameter errors are remembered but never damage a valid route', (t) => {
 });
 
 
+test('a recent authorization denial becomes a scoped capability preflight blocker', (t) => {
+  const { store } = temporaryStore(t);
+  const query = quoteQuery();
+  store.recordBatch([query], [{
+    query_id: query.query_id,
+    provider: query.provider,
+    status: 'query_failed',
+    terminal: true,
+    retryable: false,
+    error_category: 'authorization',
+    code: 'alibaba_forbidden',
+    details: { provider_code: 'Forbidden.RAM' },
+    recovery: { next_action: 'verify_cloud_read_and_billing_access' },
+  }]);
+
+  const blocker = store.capabilityBlocker(query);
+  assert.equal(blocker.error_category, 'authorization');
+  assert.equal(blocker.provider_code, 'Forbidden.RAM');
+  assert.equal(blocker.next_action, 'verify_cloud_read_and_billing_access');
+  assert.equal(store.capabilityBlocker(quoteQuery({ action: 'DescribePricingModule' })), null);
+  assert.equal(store.capabilityBlocker(quoteQuery({ region: 'cn-hangzhou' })), null);
+});
+
+
+test('a missing provider credential blocks repeated services until any official call succeeds', (t) => {
+  const { store } = temporaryStore(t);
+  const query = quoteQuery();
+  store.recordBatch([query], [{
+    query_id: query.query_id,
+    provider: query.provider,
+    status: 'query_failed',
+    terminal: true,
+    retryable: false,
+    error_category: 'credentials',
+    code: 'alibaba_credentials_missing',
+    recovery: { next_action: 'configure_official_api_credentials' },
+  }]);
+
+  const otherService = quoteQuery({
+    query_id: 'another-service', service: 'r-kvstore', action: 'DescribePrice',
+  });
+  assert.equal(store.capabilityBlocker(otherService).error_category, 'credentials');
+
+  store.recordBatch([otherService], [{ ...verifiedResult(), query_id: otherService.query_id }]);
+  assert.equal(store.capabilityBlocker(query), null);
+});
+
+
+test('a later accepted call clears the learned capability blocker', (t) => {
+  const { store } = temporaryStore(t);
+  const query = quoteQuery();
+  store.recordBatch([query], [{
+    query_id: query.query_id, provider: query.provider, status: 'query_failed',
+    terminal: true, retryable: false, error_category: 'authorization',
+    details: { provider_code: 'Forbidden.RAM' },
+  }]);
+  assert.ok(store.capabilityBlocker(query));
+
+  store.recordBatch([query], [verifiedResult()]);
+  assert.equal(store.capabilityBlocker(query), null);
+});
+
+
 test('three consecutive route-level failures quarantine only that route revision', (t) => {
   const { store } = temporaryStore(t);
   const query = quoteQuery();

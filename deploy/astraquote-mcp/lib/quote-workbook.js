@@ -1,8 +1,9 @@
 'use strict';
 
 const ExcelJS = require('exceljs');
+const { regionLabels } = require('./cloud-market-profiles');
 
-const REGION_LABELS = Object.freeze({
+const AWS_REGION_LABELS = Object.freeze({
   'ap-northeast-1': '东京',
   'ap-northeast-2': '首尔',
   'ap-northeast-3': '大阪',
@@ -69,9 +70,12 @@ function currencyNumberFormat(currency) {
   return formats[code] || `"${code.replace(/"/g, '')} "#,##0.00`;
 }
 
-function friendlyRegion(value) {
+function friendlyRegion(value, provider = 'aws', marketProfile) {
   const code = String(value || '').trim();
-  return REGION_LABELS[code] || code || '-';
+  const configured = regionLabels(provider, marketProfile).get(code);
+  if (configured) return configured;
+  if (provider === 'aws') return AWS_REGION_LABELS[code] || code || '-';
+  return code || '-';
 }
 
 function simplifyCustomerText(value) {
@@ -156,7 +160,11 @@ function componentDetails(record) {
   const components = [
     ...(record.resource_ir || []),
     ...(record.zero_cost_ir || []),
+    ...(record.unpriced_ir || []),
   ];
+  const unpricedKeys = new Set(
+    (record.unpriced_ir || []).map((component) => component.component_key),
+  );
   const lineItemsByComponent = new Map(
     (record.verification?.costs?.line_items || [])
       .filter((item) => item.component_key)
@@ -183,7 +191,10 @@ function componentDetails(record) {
     const scenarioCosts = new Map(
       (component.scenario_costs || []).map((cost) => [cost.scenario_key, Number(cost.monthly_cost)]),
     );
-    const priceCells = scenarios.length > 0
+    const isUnpriced = unpricedKeys.has(component.component_key);
+    const priceCells = isUnpriced
+      ? Array.from({ length: Math.max(1, scenarios.length) }, () => null)
+      : scenarios.length > 0
       ? scenarios.map((scenario) => (
         component.pricing_basis === 'official_no_additional_charge'
           ? 0
@@ -195,13 +206,20 @@ function componentDetails(record) {
       simplifyCustomerText(
         display.service_name || component.component_key,
       ),
-      friendlyRegion(component.region || record.default_region),
+      friendlyRegion(
+        component.region || record.default_region,
+        record.cloud_provider,
+        record.market_profile,
+      ),
       simplifyCustomerText(display.model_or_plan || component.instance || '官方方案'),
       simplifyCustomerText(display.quantity || '-'),
       simplifyCustomerText(display.configuration_summary || '-'),
       ...priceCells.map((value) => (Number.isFinite(value) ? value : null)),
       simplifyCustomerText(display.reference_unit_price || ''),
-      (adjustmentsByComponent.get(component.component_key) || []).join('；') || null,
+      [
+        ...(adjustmentsByComponent.get(component.component_key) || []),
+        ...(isUnpriced ? ['未完成报价：官方价格尚未取得，未计入合计'] : []),
+      ].join('；') || null,
     ];
   });
 }
@@ -216,7 +234,7 @@ function applyBorder(cell) {
 }
 
 async function buildQuoteWorkbook(record) {
-  const allowedStatuses = new Set(['official_price_verified']);
+  const allowedStatuses = new Set(['official_price_verified', 'official_price_partial']);
   if (!allowedStatuses.has(record.verification?.status)) {
     const error = new Error('Only an official-price-verified quote can be rendered.');
     error.code = 'quote_not_verified';
@@ -230,7 +248,10 @@ async function buildQuoteWorkbook(record) {
   const rows = componentDetails(record);
   const priceColumnCount = scenarios.length || 1;
   const moneyFormat = currencyNumberFormat(record.currency);
-  if (rows.some((row) => row.slice(6, 6 + priceColumnCount).some((value) => !Number.isFinite(value)))) {
+  const pricedRowCount = (record.resource_ir || []).length + (record.zero_cost_ir || []).length;
+  if (rows.slice(0, pricedRowCount).some(
+    (row) => row.slice(6, 6 + priceColumnCount).some((value) => !Number.isFinite(value)),
+  )) {
     const error = new Error('Every quote component must have a verified monthly cost.');
     error.code = 'component_monthly_cost_required';
     throw error;
@@ -356,7 +377,7 @@ async function buildQuoteWorkbook(record) {
     && record.region_adjustment_reason) {
     const regionRow = sheet.addRow([
       '地域调整',
-      `${friendlyRegion(record.preferred_region)} → ${friendlyRegion(record.default_region)}：${simplifyCustomerText(record.region_adjustment_reason)}`,
+      `${friendlyRegion(record.preferred_region, record.cloud_provider, record.market_profile)} → ${friendlyRegion(record.default_region, record.cloud_provider, record.market_profile)}：${simplifyCustomerText(record.region_adjustment_reason)}`,
     ]);
     sheet.mergeCells(
       `B${regionRow.number}:${sheet.getColumn(lastColumn).letter}${regionRow.number}`,

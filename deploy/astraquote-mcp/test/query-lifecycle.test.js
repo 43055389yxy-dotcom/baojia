@@ -26,7 +26,12 @@ function fixture(t) {
     },
   };
   const store = new V2QuoteStore({ directory });
-  const workflow = new AstraQuoteV2Workflow({ backend, store, deliverer: {} });
+  const workflow = new AstraQuoteV2Workflow({
+    backend,
+    store,
+    deliverer: {},
+    priceCache: { get: () => null, put: () => false },
+  });
   return { workflow, store, calls, backend };
 }
 
@@ -58,7 +63,12 @@ test('new successful attempt retires old failure in the same billing scope, not 
   const saved = store.getPriceBatch(first.price_batch_id);
   assert.equal(saved.result.results.find((r) => r.query_id === 'old').status, 'not_found');
   assert.equal(saved.query_lifecycle.find((r) => r.query_id === 'old').superseded_by, 'new');
-  const restarted = new AstraQuoteV2Workflow({ backend: workflow.backend, store, deliverer: {} });
+  const restarted = new AstraQuoteV2Workflow({
+    backend: workflow.backend,
+    store,
+    deliverer: {},
+    priceCache: { get: () => null, put: () => false },
+  });
   const third = await restarted.getPrices({
     price_batch_id: first.price_batch_id, queries: [query('disk-fixed', true)],
     query_contexts: [context('disk-fixed', 'disk')],
@@ -233,4 +243,261 @@ test('final evidence can ignore failed exploration but cannot omit a declared bi
   input.services[0].component_key = 'cmp_resource_0002';
   assert.throws(() => workflow.validatePriceEvidence(input, store.getPriceBatch(next.price_batch_id)),
     (err) => err.details.violations.some((v) => v.startsWith('price_query_component_mismatch:')));
+});
+
+test('a sealed cleaned component plan produces machine-readable component progress', async (t) => {
+  const { workflow, store } = fixture(t);
+  const relayJobId = 'gpt-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const relayDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'aq-component-progress-relay-'));
+  const previousRelayDirectory = process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+  process.env.ASTRAQUOTE_GPT_RELAY_DIR = relayDirectory;
+  fs.mkdirSync(path.join(relayDirectory, 'jobs'), { recursive: true });
+  fs.writeFileSync(path.join(relayDirectory, 'jobs', `${relayJobId}.json`), JSON.stringify({
+    job_id: relayJobId, submission_code: '1', status: 'processing',
+  }));
+  t.after(() => {
+    fs.rmSync(relayDirectory, { recursive: true, force: true });
+    if (previousRelayDirectory === undefined) delete process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+    else process.env.ASTRAQUOTE_GPT_RELAY_DIR = previousRelayDirectory;
+  });
+  const result = await workflow.getPrices({
+    relay_job_id: relayJobId,
+    submission_code: '1',
+    queries: [query('compute-found', true)],
+    query_contexts: [context('compute-found', 'compute', 'cmp_resource_0001')],
+    quote_components: [
+      {
+        component_key: 'cmp_resource_0001',
+        customer_owned_source: '云服务器：1 台，4 核 16 GiB。',
+        billing_scopes: [{ billing_key: 'compute' }],
+      },
+      {
+        component_key: 'cmp_resource_0002',
+        customer_owned_source: '对象存储：2 TiB。',
+        billing_scopes: [{ billing_key: 'storage' }],
+      },
+    ],
+  });
+
+  assert.equal(result.total_component_count, 2);
+  assert.equal(result.top_level_component_count, 2);
+  assert.equal(result.component_chat_count, 1);
+  assert.equal(result.completed_component_count, 1);
+  assert.equal(result.failed_component_count, 0);
+  assert.equal(result.pending_component_count, 1);
+  const checkpoint = store.getCheckpoint(relayJobId);
+  assert.equal(checkpoint.total_component_count, 2);
+  assert.equal(checkpoint.top_level_component_count, 2);
+  assert.equal(checkpoint.component_chat_count, 1);
+  assert.equal(checkpoint.completed_component_count, 1);
+  assert.equal(checkpoint.pending_component_count, 1);
+  assert.equal(checkpoint.quote_components, undefined);
+  assert.deepEqual(
+    store.getPriceBatch(result.price_batch_id).quote_components.map((item) => item.component_key),
+    ['cmp_resource_0001', 'cmp_resource_0002'],
+  );
+});
+
+test('component chat count uses top-level groups and keeps child components in the parent slot', async (t) => {
+  const { workflow } = fixture(t);
+  const quoteComponents = [
+    ...Array.from({ length: 21 }, (_, index) => ({
+      component_key: `cmp_root_${String(index).padStart(4, '0')}`,
+      customer_owned_source: `清洗组件 ${index}。`,
+      billing_scopes: [{ billing_key: 'base' }],
+    })),
+    {
+      component_key: 'cmp_child_0001',
+      parent_component_key: 'cmp_root_0000',
+      customer_owned_source: '清洗后的子组件。',
+      billing_scopes: [{ billing_key: 'storage' }],
+    },
+  ];
+
+  const result = await workflow.getPrices({
+    queries: [query('compute-found', true)],
+    query_contexts: [context('compute-found', 'base', 'cmp_root_0000')],
+    quote_components: quoteComponents,
+  });
+
+  assert.equal(result.total_component_count, 22);
+  assert.equal(result.top_level_component_count, 21);
+  assert.equal(result.component_chat_count, 2);
+});
+
+test('parallel component chats merge into one price batch without overwriting each other', async (t) => {
+  const { workflow, store, backend } = fixture(t);
+  const first = await workflow.getPrices({
+    queries: [query('first', true)],
+    query_contexts: [context('first', 'base', 'cmp_resource_0001')],
+  });
+  const original = backend.getPrices.bind(backend);
+  backend.getPrices = async (input) => {
+    if (input.queries[0].query_id === 'second') {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return original(input);
+  };
+
+  await Promise.all([
+    workflow.getPrices({
+      price_batch_id: first.price_batch_id,
+      queries: [query('second', true)],
+      query_contexts: [context('second', 'storage', 'cmp_resource_0002')],
+    }),
+    workflow.getPrices({
+      price_batch_id: first.price_batch_id,
+      queries: [query('third', true)],
+      query_contexts: [context('third', 'requests', 'cmp_resource_0003')],
+    }),
+  ]);
+
+  const saved = store.getPriceBatch(first.price_batch_id);
+  assert.deepEqual(
+    saved.result.results.map((item) => item.query_id).sort(),
+    ['first', 'second', 'third'],
+  );
+});
+
+test('the cleaned component plan is immutable after the first saved price batch', async (t) => {
+  const { workflow, calls } = fixture(t);
+  const plan = [{
+    component_key: 'cmp_resource_0001',
+    customer_owned_source: '云服务器：1 台，4 核 16 GiB。',
+    billing_scopes: [{ billing_key: 'compute' }],
+  }];
+  const first = await workflow.getPrices({
+    queries: [query('compute-found', true)],
+    query_contexts: [context('compute-found')],
+    quote_components: plan,
+  });
+
+  await assert.rejects(workflow.getPrices({
+    price_batch_id: first.price_batch_id,
+    queries: [query('disk-found', true)],
+    query_contexts: [context('disk-found', 'disk')],
+    quote_components: [{
+      ...plan[0],
+      customer_owned_source: '被修改后的组件。',
+    }],
+  }), (err) => err.code === 'quote_component_plan_immutable');
+  assert.equal(calls.length, 1);
+});
+
+test('an old exact error envelope is re-queried and cannot count as completed evidence', async (t) => {
+  const { workflow, store, calls } = fixture(t);
+  const first = await workflow.getPrices({ queries: [query('price', true)] });
+  const saved = store.getPriceBatch(first.price_batch_id);
+  saved.result.results[0] = {
+    query_id: 'price', provider: 'azure', status: 'exact', official_item_ids: ['hash-of-error'],
+    items: [{ Error: { Code: 'UnauthorizedOperation', Message: 'Permission missing' } }],
+    official_rate_candidates: [],
+  };
+  store.putPriceBatch(saved);
+  const result = await workflow.getPrices({ price_batch_id: first.price_batch_id, queries: [query('price', true)] });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(result.queried_query_ids, ['price']);
+  assert.deepEqual(result.results[0].official_item_ids, ['item-1']);
+});
+
+test('explicit pricing without rates is retried while legacy unscoped successful results remain reusable', async (t) => {
+  const { workflow, store, calls } = fixture(t);
+  const first = await workflow.getPrices({ queries: [query('price', true)] });
+  const saved = store.getPriceBatch(first.price_batch_id);
+  saved.result.results[0].official_rate_candidates = [];
+  store.putPriceBatch(saved);
+  const legacy = await workflow.getPrices({ price_batch_id: first.price_batch_id, queries: [query('price', true)] });
+  assert.deepEqual(legacy.reused_query_ids, ['price']);
+  assert.equal(calls.length, 1);
+  const scoped = await workflow.getPrices({ price_batch_id: first.price_batch_id, queries: [query('price', true)],
+    query_contexts: [context('price')],
+  });
+  assert.deepEqual(scoped.queried_query_ids, ['price']);
+  assert.equal(calls.length, 2);
+});
+
+test('a late failure cannot overwrite a concurrently completed identical query', async (t) => {
+  const { workflow, store, backend } = fixture(t);
+  const batch = await workflow.getPrices({ queries: [query('seed', true)] });
+  const requests = [];
+  backend.getPrices = (input) => new Promise((resolve) => requests.push({ input, resolve }));
+  const args = { price_batch_id: batch.price_batch_id, queries: [query('concurrent', true)], query_contexts: [context('concurrent')] };
+  const slow = workflow.getPrices(args);
+  const fast = workflow.getPrices(args);
+  requests[1].resolve({ results: [{ query_id: 'concurrent', provider: 'azure', status: 'exact',
+    official_item_ids: ['item-2'], official_rate_candidates: [{ rate_id: 'rate-2', official_item_id: 'item-2', unit_price: '2', currency: 'USD' }],
+  }] });
+  await fast;
+  requests[0].resolve({ results: [{ query_id: 'concurrent', provider: 'azure', status: 'query_failed', retryable: true }] });
+  const late = await slow;
+  const saved = store.getPriceBatch(batch.price_batch_id);
+  assert.equal(saved.result.results.find((result) => result.query_id === 'concurrent').status, 'exact');
+  assert.equal(late.results[0].status, 'exact');
+});
+
+test('a component plan with a parent cycle is rejected before official calls', async (t) => {
+  const { workflow, calls } = fixture(t);
+  await assert.rejects(workflow.getPrices({ queries: [query('first', true)], quote_components: [
+    { component_key: 'cmp_first_0001', parent_component_key: 'cmp_other_0002', customer_owned_source: '独立清洗组件一。', billing_scopes: [{ billing_key: 'base' }] },
+    { component_key: 'cmp_other_0002', parent_component_key: 'cmp_first_0001', customer_owned_source: '独立清洗组件二。', billing_scopes: [{ billing_key: 'base' }] },
+  ] }), (error) => error.code === 'quote_component_plan_invalid');
+  assert.equal(calls.length, 0);
+});
+
+test('publishing a component requires every sealed billing scope including scopes never queried', async (t) => {
+  const { workflow, store } = fixture(t);
+  const batch = await workflow.getPrices({ queries: [query('base', true)], query_contexts: [context('base', 'base')],
+    quote_components: [{ component_key: 'cmp_resource_0001', customer_owned_source: '服务及容量配置。',
+      billing_scopes: [{ billing_key: 'base' }, { billing_key: 'capacity' }],
+    }],
+  });
+  assert.equal(batch.completed_component_count, 0);
+  const input = { cloud_provider: 'azure', currency: 'USD', services: [{
+    component_key: 'cmp_resource_0001', price_evidence: [{ query_id: 'base', official_item_ids: ['item-1'], official_rate_ids: ['rate-1'] }],
+  }] };
+  assert.throws(() => workflow.validatePriceEvidence(input, store.getPriceBatch(batch.price_batch_id)),
+    (error) => error.details.violations.includes('billing_query_evidence_missing:cmp_resource_0001:capacity:base'));
+});
+
+test('explicitly unpriced components may keep failed attempts without blocking verified partial delivery', async (t) => {
+  const { workflow, store } = fixture(t);
+  const batch = await workflow.getPrices({ queries: [query('good', true), query('failed')],
+    query_contexts: [context('good'), context('failed', 'capacity', 'cmp_resource_0002')],
+  });
+  const input = { is_partial: true, cloud_provider: 'azure', currency: 'USD', services: [{
+    component_key: 'cmp_resource_0001', price_evidence: [{ query_id: 'good', official_item_ids: ['item-1'], official_rate_ids: ['rate-1'] }],
+  }], unpriced_services: [{ component_key: 'cmp_resource_0002' }] };
+  assert.doesNotThrow(() => workflow.validatePriceEvidence(input, store.getPriceBatch(batch.price_batch_id)));
+  input.is_partial = false;
+  assert.throws(() => workflow.validatePriceEvidence(input, store.getPriceBatch(batch.price_batch_id)),
+    (error) => error.details.violations.some((violation) => violation.startsWith('billing_query_evidence_missing:')));
+});
+
+test('a terminal failure leaves other unqueried planned components running', async (t) => {
+  const { workflow, backend } = fixture(t);
+  backend.getPrices = async () => ({ results: [{ query_id: 'blocked', provider: 'azure', status: 'query_failed', terminal: true, retryable: false }] });
+  const result = await workflow.getPrices({ queries: [query('blocked')], query_contexts: [context('blocked')],
+    quote_components: [
+      { component_key: 'cmp_resource_0001', customer_owned_source: '清洗后的组件一。', billing_scopes: [{ billing_key: 'compute' }] },
+      { component_key: 'cmp_resource_0002', customer_owned_source: '清洗后的组件二。', billing_scopes: [{ billing_key: 'storage' }] },
+    ],
+  });
+  assert.equal(result.failed_component_count, 1);
+  assert.equal(result.pending_component_count, 1);
+  assert.equal(result.quote_terminal, false);
+  assert.equal(result.must_continue, true);
+});
+
+test('direct publication cannot bypass a saved exact error envelope', async (t) => {
+  const { workflow, store } = fixture(t);
+  const batch = await workflow.getPrices({ queries: [query('price', true)] });
+  const saved = store.getPriceBatch(batch.price_batch_id);
+  saved.result.results[0] = { query_id: 'price', provider: 'azure', status: 'exact',
+    official_item_ids: ['hash-of-error'], items: [{ Error: { Code: 'Denied', Message: 'Access denied' } }],
+  };
+  const input = { cloud_provider: 'azure', currency: 'USD', services: [{
+    component_key: 'cmp_resource_0001', price_evidence: [{ query_id: 'price', official_item_ids: ['hash-of-error'] }],
+  }] };
+  assert.throws(() => workflow.validatePriceEvidence(input, saved),
+    (error) => error.details.violations.some((violation) => violation.startsWith('price_query_unusable:')));
 });

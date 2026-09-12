@@ -1,5 +1,6 @@
 {
   "schema_version": "astraquote-cloud-market-profiles/1",
+  "catalog_checked_at": "2026-09-12",
   "providers": {
     "aws": {
       "default_profile": "aws-global",
@@ -10,7 +11,26 @@
           "credential_scope": "global",
           "currency_policy": "official_response",
           "official_source_url": "https://docs.aws.amazon.com/global-infrastructure/latest/regions/aws-regions.html",
-          "regions": []
+          "official_price_page_hosts": ["aws.amazon.com", "docs.aws.amazon.com", "calculator.aws"],
+          "regions": [
+            ["us-east-1", "美国弗吉尼亚北部"], ["us-east-2", "美国俄亥俄"],
+            ["us-west-1", "美国加利福尼亚北部"], ["us-west-2", "美国俄勒冈"],
+            ["af-south-1", "南非开普敦"], ["ap-east-1", "中国香港"],
+            ["ap-east-2", "中国台北"], ["ap-south-1", "印度孟买"],
+            ["ap-south-2", "印度海得拉巴"], ["ap-northeast-1", "东京"],
+            ["ap-northeast-2", "韩国首尔"], ["ap-northeast-3", "日本大阪"],
+            ["ap-southeast-1", "新加坡"], ["ap-southeast-2", "澳大利亚悉尼"],
+            ["ap-southeast-3", "印度尼西亚雅加达"], ["ap-southeast-4", "澳大利亚墨尔本"],
+            ["ap-southeast-5", "马来西亚"], ["ap-southeast-6", "新西兰"],
+            ["ap-southeast-7", "泰国"], ["ca-central-1", "加拿大中部"],
+            ["ca-west-1", "加拿大卡尔加里"], ["eu-central-1", "德国法兰克福"],
+            ["eu-central-2", "瑞士苏黎世"], ["eu-north-1", "瑞典斯德哥尔摩"],
+            ["eu-south-1", "意大利米兰"], ["eu-south-2", "西班牙"],
+            ["eu-west-1", "爱尔兰"], ["eu-west-2", "英国伦敦"],
+            ["eu-west-3", "法国巴黎"], ["il-central-1", "以色列特拉维夫"],
+            ["me-central-1", "阿联酋"], ["me-south-1", "巴林"],
+            ["mx-central-1", "墨西哥中部"], ["sa-east-1", "巴西圣保罗"]
+          ]
         }
       }
     },
@@ -22,20 +42,35 @@
           "market_scope": "global",
           "credential_scope": "global",
           "currency_policy": "official_response",
-          "official_source_url": "https://azure.microsoft.com/explore/global-infrastructure/geographies/",
+          "official_source_url": "https://learn.microsoft.com/en-us/azure/reliability/regions-list",
+          "official_price_page_hosts": ["azure.microsoft.com", "learn.microsoft.com", "prices.azure.com"],
           "regions": [
-            ["australiaeast", "澳大利亚东部"], ["australiasoutheast", "澳大利亚东南部"],
-            ["brazilsouth", "巴西南部"], ["canadacentral", "加拿大中部"], ["canadaeast", "加拿大东部"],
-            ["centralindia", "印度中部"], ["centralus", "美国中部"], ["eastasia", "东亚（香港）"],
-            ["eastus", "美国东部"], ["eastus2", "美国东部 2"], ["francecentral", "法国中部"],
-            ["germanywestcentral", "德国中西部"], ["japaneast", "日本东部"], ["japanwest", "日本西部"],
-            ["koreacentral", "韩国中部"], ["northcentralus", "美国中北部"], ["northeurope", "北欧（爱尔兰）"],
-            ["norwayeast", "挪威东部"], ["qatarcentral", "卡塔尔中部"], ["southafricanorth", "南非北部"],
-            ["southcentralus", "美国中南部"], ["southeastasia", "东南亚（新加坡）"], ["southindia", "印度南部"],
-            ["swedencentral", "瑞典中部"], ["switzerlandnorth", "瑞士北部"], ["uaenorth", "阿联酋北部"],
-            ["uksouth", "英国南部"], ["ukwest", "英国西部"], ["westcentralus", "美国中西部"],
-            ["westeurope", "西欧（荷兰）"], ["westus", "美国西部"], ["westus2", "美国西部 2"],
-            ["westus3", "美国西部 3"]
+            ["australiacentral", "澳大利亚堪培拉"], ["australiacentral2", "澳大利亚堪培拉 2（受限）"],
+            ["australiaeast", "澳大利亚新南威尔士"], ["australiasoutheast", "澳大利亚维多利亚"],
+            ["austriaeast", "奥地利维也纳"], ["belgiumcentral", "比利时布鲁塞尔"],
+            ["brazilsouth", "巴西圣保罗"], ["brazilsoutheast", "巴西里约（受限）"],
+            ["canadacentral", "加拿大多伦多"], ["canadaeast", "加拿大魁北克"],
+            ["centralindia", "印度浦那"], ["centralus", "美国爱荷华"], ["chilecentral", "智利圣地亚哥"],
+            ["denmarkeast", "丹麦哥本哈根"], ["eastasia", "中国香港"],
+            ["eastus", "美国弗吉尼亚"], ["eastus2", "美国弗吉尼亚 2"],
+            ["francecentral", "法国巴黎"], ["francesouth", "法国马赛（受限）"],
+            ["germanynorth", "德国柏林（受限）"], ["germanywestcentral", "德国法兰克福"],
+            ["indiasouthcentral", "印度海得拉巴"], ["indonesiacentral", "印度尼西亚雅加达"],
+            ["israelcentral", "以色列"], ["italynorth", "意大利米兰"],
+            ["japaneast", "日本东京"], ["japanwest", "日本大阪"],
+            ["koreacentral", "韩国首尔"], ["koreasouth", "韩国釜山"],
+            ["malaysiawest", "马来西亚吉隆坡"], ["mexicocentral", "墨西哥克雷塔罗"],
+            ["newzealandnorth", "新西兰奥克兰"], ["northcentralus", "美国伊利诺伊"],
+            ["northeurope", "爱尔兰"], ["norwayeast", "挪威东部"], ["norwaywest", "挪威西部（受限）"],
+            ["polandcentral", "波兰华沙"], ["qatarcentral", "卡塔尔多哈"],
+            ["southafricanorth", "南非约翰内斯堡"], ["southafricawest", "南非开普敦（受限）"],
+            ["southcentralus", "美国得克萨斯"], ["southindia", "印度金奈"],
+            ["southeastasia", "新加坡"], ["spaincentral", "西班牙马德里"],
+            ["swedencentral", "瑞典耶夫勒"], ["switzerlandnorth", "瑞士苏黎世"],
+            ["switzerlandwest", "瑞士日内瓦（受限）"], ["uaecentral", "阿联酋阿布扎比（受限）"],
+            ["uaenorth", "阿联酋迪拜"], ["uksouth", "英国伦敦"], ["ukwest", "英国卡迪夫"],
+            ["westcentralus", "美国怀俄明"], ["westeurope", "荷兰"], ["westindia", "印度孟买"],
+            ["westus", "美国加利福尼亚"], ["westus2", "美国华盛顿州"], ["westus3", "美国凤凰城"]
           ]
         }
       }
@@ -49,18 +84,24 @@
           "credential_scope": "global",
           "currency_policy": "official_response",
           "official_source_url": "https://docs.oracle.com/en-us/iaas/Content/General/Concepts/regions.htm",
+          "official_price_page_hosts": ["oracle.com"],
           "regions": [
-            ["ap-chuncheon-1", "韩国春川"], ["ap-hyderabad-1", "印度海得拉巴"], ["ap-melbourne-1", "澳大利亚墨尔本"],
-            ["ap-mumbai-1", "印度孟买"], ["ap-osaka-1", "日本大阪"], ["ap-seoul-1", "韩国首尔"],
-            ["ap-singapore-1", "新加坡"], ["ap-sydney-1", "澳大利亚悉尼"], ["ap-tokyo-1", "日本东京"],
+            ["af-casablanca-1", "摩洛哥卡萨布兰卡"], ["af-johannesburg-1", "南非约翰内斯堡"],
+            ["ap-batam-1", "印度尼西亚巴淡"], ["ap-chuncheon-1", "韩国春川"], ["ap-hyderabad-1", "印度海得拉巴"],
+            ["ap-kulai-2", "马来西亚古来"], ["ap-melbourne-1", "澳大利亚墨尔本"], ["ap-mumbai-1", "印度孟买"],
+            ["ap-osaka-1", "日本大阪"], ["ap-seoul-1", "韩国首尔"], ["ap-singapore-1", "新加坡"],
+            ["ap-singapore-2", "新加坡西部"], ["ap-sydney-1", "澳大利亚悉尼"], ["ap-tokyo-1", "日本东京"],
             ["ca-montreal-1", "加拿大蒙特利尔"], ["ca-toronto-1", "加拿大多伦多"], ["eu-amsterdam-1", "荷兰阿姆斯特丹"],
-            ["eu-frankfurt-1", "德国法兰克福"], ["eu-madrid-1", "西班牙马德里"], ["eu-marseille-1", "法国马赛"],
+            ["eu-frankfurt-1", "德国法兰克福"], ["eu-jovanovac-1", "塞尔维亚约万诺瓦茨"],
+            ["eu-madrid-1", "西班牙马德里"], ["eu-madrid-3", "西班牙马德里 3"], ["eu-marseille-1", "法国马赛"],
             ["eu-milan-1", "意大利米兰"], ["eu-paris-1", "法国巴黎"], ["eu-stockholm-1", "瑞典斯德哥尔摩"],
-            ["eu-zurich-1", "瑞士苏黎世"], ["me-dubai-1", "阿联酋迪拜"], ["me-jeddah-1", "沙特吉达"],
+            ["eu-turin-1", "意大利都灵"], ["eu-zurich-1", "瑞士苏黎世"], ["il-jerusalem-1", "以色列耶路撒冷"],
+            ["me-abudhabi-1", "阿联酋阿布扎比"], ["me-dubai-1", "阿联酋迪拜"], ["me-jeddah-1", "沙特吉达"],
+            ["me-riyadh-1", "沙特利雅得"], ["mx-monterrey-1", "墨西哥蒙特雷"], ["mx-queretaro-1", "墨西哥克雷塔罗"],
             ["sa-bogota-1", "哥伦比亚波哥大"], ["sa-santiago-1", "智利圣地亚哥"], ["sa-saopaulo-1", "巴西圣保罗"],
-            ["uk-cardiff-1", "英国卡迪夫"], ["uk-london-1", "英国伦敦"], ["us-ashburn-1", "美国阿什本"],
-            ["us-chicago-1", "美国芝加哥"], ["us-phoenix-1", "美国凤凰城"], ["us-sanjose-1", "美国圣何塞"],
-            ["eu-dublin-1", "爱尔兰都柏林"]
+            ["sa-valparaiso-1", "智利瓦尔帕莱索"], ["sa-vinhedo-1", "巴西维涅杜"],
+            ["uk-cardiff-1", "英国纽波特"], ["uk-london-1", "英国伦敦"], ["us-ashburn-1", "美国阿什本"],
+            ["us-chicago-1", "美国芝加哥"], ["us-phoenix-1", "美国凤凰城"], ["us-sanjose-1", "美国圣何塞"]
           ]
         }
       }
@@ -73,16 +114,24 @@
           "market_scope": "global",
           "credential_scope": "global",
           "currency_policy": "official_response",
-          "official_source_url": "https://cloud.google.com/about/locations",
+          "official_source_url": "https://docs.cloud.google.com/compute/docs/regions-zones",
+          "official_price_page_hosts": ["cloud.google.com"],
           "regions": [
-            ["asia-east1", "台湾彰化"], ["asia-east2", "香港"], ["asia-northeast1", "日本东京"],
+            ["africa-south1", "南非约翰内斯堡"], ["asia-east1", "台湾彰化"], ["asia-east2", "香港"], ["asia-northeast1", "日本东京"],
             ["asia-northeast2", "日本大阪"], ["asia-northeast3", "韩国首尔"], ["asia-south1", "印度孟买"],
-            ["asia-southeast1", "新加坡"], ["asia-southeast2", "印度尼西亚雅加达"], ["australia-southeast1", "澳大利亚悉尼"],
-            ["europe-north1", "芬兰"], ["europe-west1", "比利时"], ["europe-west2", "英国伦敦"],
+            ["asia-south2", "印度德里"], ["asia-southeast1", "新加坡"], ["asia-southeast2", "印度尼西亚雅加达"],
+            ["asia-southeast3", "泰国曼谷"], ["australia-southeast1", "澳大利亚悉尼"], ["australia-southeast2", "澳大利亚墨尔本"],
+            ["europe-central2", "波兰华沙"], ["europe-north1", "芬兰哈米纳"], ["europe-north2", "瑞典斯德哥尔摩"],
+            ["europe-southwest1", "西班牙马德里"], ["europe-west1", "比利时"], ["europe-west2", "英国伦敦"],
             ["europe-west3", "德国法兰克福"], ["europe-west4", "荷兰"], ["europe-west6", "瑞士苏黎世"],
-            ["me-central1", "卡塔尔多哈"], ["northamerica-northeast1", "加拿大蒙特利尔"], ["southamerica-east1", "巴西圣保罗"],
+            ["europe-west8", "意大利米兰"], ["europe-west9", "法国巴黎"], ["europe-west10", "德国柏林"],
+            ["europe-west12", "意大利都灵"], ["me-central1", "卡塔尔多哈"], ["me-central2", "沙特达曼"],
+            ["me-west1", "以色列特拉维夫"], ["northamerica-northeast1", "加拿大蒙特利尔"],
+            ["northamerica-northeast2", "加拿大多伦多"], ["northamerica-south1", "墨西哥克雷塔罗"],
+            ["southamerica-east1", "巴西圣保罗"], ["southamerica-west1", "智利圣地亚哥"],
             ["us-central1", "美国爱荷华"], ["us-east1", "美国南卡罗来纳"], ["us-east4", "美国北弗吉尼亚"],
-            ["us-west1", "美国俄勒冈"], ["us-west2", "美国洛杉矶"], ["us-west3", "美国盐湖城"], ["us-west4", "美国拉斯维加斯"]
+            ["us-east5", "美国俄亥俄"], ["us-south1", "美国达拉斯"], ["us-west1", "美国俄勒冈"],
+            ["us-west2", "美国洛杉矶"], ["us-west3", "美国盐湖城"], ["us-west4", "美国拉斯维加斯"]
           ]
         }
       }
@@ -96,7 +145,8 @@
           "credential_scope": "tencent-cn",
           "currency_policy": "official_response",
           "official_source_url": "https://cloud.tencent.com/document/product/213/6091",
-          "regions": [["ap-beijing", "北京"], ["ap-chengdu", "成都"], ["ap-chongqing", "重庆"], ["ap-guangzhou", "广州"], ["ap-nanjing", "南京"], ["ap-shanghai", "上海"], ["ap-hongkong", "中国香港"], ["ap-tokyo", "日本东京"], ["ap-seoul", "韩国首尔"], ["ap-singapore", "新加坡"], ["ap-bangkok", "泰国曼谷"], ["ap-jakarta", "印度尼西亚雅加达"], ["na-siliconvalley", "美国硅谷"], ["na-ashburn", "美国弗吉尼亚"], ["eu-frankfurt", "德国法兰克福"], ["sa-saopaulo", "巴西圣保罗"]]
+          "official_price_page_hosts": ["cloud.tencent.com", "buy.cloud.tencent.com"],
+          "regions": [["ap-beijing", "北京"], ["ap-chengdu", "成都"], ["ap-chongqing", "重庆"], ["ap-guangzhou", "广州"], ["ap-nanjing", "南京"], ["ap-shanghai", "上海"], ["ap-hongkong", "中国香港"], ["ap-tokyo", "日本东京"], ["ap-osaka", "日本大阪"], ["ap-seoul", "韩国首尔"], ["ap-singapore", "新加坡"], ["ap-johorbahru", "马来西亚新山"], ["ap-bangkok", "泰国曼谷"], ["ap-jakarta", "印度尼西亚雅加达"], ["me-saudi-arabia", "沙特利雅得"], ["na-queretaro", "墨西哥克雷塔罗"], ["na-siliconvalley", "美国硅谷"], ["na-ashburn", "美国弗吉尼亚"], ["eu-frankfurt", "德国法兰克福"], ["sa-saopaulo", "巴西圣保罗"]]
         }
       }
     },
@@ -109,7 +159,8 @@
           "credential_scope": "alibaba-cn",
           "currency_policy": "official_response",
           "official_source_url": "https://help.aliyun.com/zh/ecs/user-guide/regions-and-zones",
-          "regions": [["cn-beijing", "北京"], ["cn-hangzhou", "杭州"], ["cn-shanghai", "上海"], ["cn-shenzhen", "深圳"], ["cn-heyuan", "河源"], ["cn-guangzhou", "广州"], ["cn-chengdu", "成都"], ["cn-zhangjiakou", "张家口"], ["cn-hongkong", "中国香港"], ["ap-southeast-1", "新加坡"], ["ap-southeast-2", "澳大利亚悉尼"], ["ap-southeast-3", "马来西亚吉隆坡"], ["ap-southeast-5", "印度尼西亚雅加达"], ["ap-northeast-1", "日本东京"], ["ap-northeast-2", "韩国首尔"], ["eu-central-1", "德国法兰克福"], ["eu-west-1", "英国伦敦"], ["us-east-1", "美国弗吉尼亚"], ["us-west-1", "美国硅谷"], ["me-east-1", "阿联酋迪拜"]]
+          "official_price_page_hosts": ["aliyun.com", "help.aliyun.com"],
+          "regions": [["cn-qingdao", "青岛"], ["cn-beijing", "北京"], ["cn-zhangjiakou", "张家口"], ["cn-huhehaote", "呼和浩特"], ["cn-wulanchabu", "乌兰察布"], ["cn-hangzhou", "杭州"], ["cn-shanghai", "上海"], ["cn-wuhan-lr", "武汉"], ["cn-shenzhen", "深圳"], ["cn-heyuan", "河源"], ["cn-guangzhou", "广州"], ["cn-chengdu", "成都"], ["cn-zhongwei", "中卫"], ["cn-hongkong", "中国香港"], ["ap-southeast-1", "新加坡"], ["ap-southeast-3", "马来西亚吉隆坡"], ["ap-southeast-5", "印度尼西亚雅加达"], ["ap-southeast-6", "菲律宾马尼拉"], ["ap-southeast-7", "泰国曼谷"], ["ap-southeast-8", "马来西亚柔佛州"], ["ap-northeast-1", "日本东京"], ["ap-northeast-2", "韩国首尔"], ["eu-central-1", "德国法兰克福"], ["eu-west-1", "英国伦敦"], ["eu-west-2", "法国巴黎"], ["us-east-1", "美国弗吉尼亚"], ["us-west-1", "美国硅谷"], ["me-east-1", "阿联酋迪拜"], ["me-central-1", "沙特利雅得（合作伙伴运营）"], ["na-south-1", "墨西哥"], ["sa-east-1", "巴西圣保罗"]]
         }
       }
     },
@@ -121,8 +172,9 @@
           "market_scope": "china_site",
           "credential_scope": "huawei-cn",
           "currency_policy": "official_response",
-          "official_source_url": "https://support.huaweicloud.com/intl/zh-cn/productdesc-region/zh-cn_topic_0182205862.html",
-          "regions": [["cn-north-1", "华北-北京一"], ["cn-north-4", "华北-北京四"], ["cn-east-2", "华东-上海二"], ["cn-east-3", "华东-上海一"], ["cn-south-1", "华南-广州"], ["cn-southwest-2", "西南-贵阳一"], ["ap-southeast-1", "中国香港"], ["ap-southeast-3", "新加坡"], ["ap-southeast-2", "泰国曼谷"], ["ap-southeast-4", "印度尼西亚雅加达"], ["ap-northeast-1", "日本东京"], ["la-south-2", "智利圣地亚哥"], ["sa-brazil-1", "巴西圣保罗"], ["af-south-1", "南非约翰内斯堡"], ["tr-west-1", "土耳其伊斯坦布尔"]]
+          "official_source_url": "https://support.huaweicloud.com/intl/zh-cn/usermanual-iam5/iam_01_1334.html",
+          "official_price_page_hosts": ["huaweicloud.com", "support.huaweicloud.com"],
+          "regions": [["cn-north-1", "华北-北京一"], ["cn-north-4", "华北-北京四"], ["cn-north-9", "华北-乌兰察布一"], ["cn-north-11", "华北-乌兰察布-汽车一"], ["cn-north-12", "华北三"], ["cn-east-2", "华东-上海二"], ["cn-east-3", "华东-上海一"], ["cn-east-4", "华东二"], ["cn-east-5", "华东-青岛"], ["cn-south-1", "华南-广州"], ["cn-south-4", "华南-广州-友好用户环境"], ["cn-southwest-2", "西南-贵阳一"], ["ap-southeast-1", "中国香港"], ["ap-southeast-2", "泰国曼谷"], ["ap-southeast-3", "新加坡"], ["ap-southeast-4", "印度尼西亚雅加达"], ["ap-southeast-5", "菲律宾马尼拉"], ["me-east-1", "沙特利雅得"], ["af-north-1", "埃及开罗"], ["af-south-1", "南非约翰内斯堡"], ["na-mexico-1", "墨西哥城一"], ["la-north-2", "墨西哥城二"], ["la-south-2", "智利圣地亚哥"], ["sa-brazil-1", "巴西圣保罗"], ["tr-west-1", "土耳其伊斯坦布尔"]]
         }
       }
     },
@@ -135,7 +187,8 @@
           "credential_scope": "baidu-cn",
           "currency_policy": "official_response",
           "official_source_url": "https://cloud.baidu.com/doc/BCC/s/2k3sbu6ne",
-          "regions": [["bj", "北京"], ["gz", "广州"], ["su", "苏州"], ["hkg", "中国香港"], ["fwh", "武汉"], ["bd", "保定"]]
+          "official_price_page_hosts": ["cloud.baidu.com"],
+          "regions": [["bj", "北京"], ["bd", "保定"], ["cd", "成都"], ["gz", "广州"], ["su", "苏州"], ["fsh", "上海"], ["fwh", "武汉"], ["hkg", "中国香港"]]
         }
       }
     },
@@ -147,8 +200,9 @@
           "market_scope": "china_site",
           "credential_scope": "volcengine-cn",
           "currency_policy": "official_response",
-          "official_source_url": "https://www.volcengine.com/docs/6396/107714",
-          "regions": [["cn-beijing", "华北 2（北京）"], ["cn-shanghai", "华东 2（上海）"], ["cn-guangzhou", "华南 1（广州）"], ["cn-hongkong", "中国香港"], ["ap-southeast-1", "新加坡"]]
+          "official_source_url": "https://www.volcengine.com/docs/6617/87001?lang=en",
+          "official_price_page_hosts": ["volcengine.com"],
+          "regions": [["cn-beijing", "华北 2（北京）"], ["cn-shanghai", "华东 2（上海）"], ["cn-guangzhou", "华南 1（广州）"], ["cn-hongkong", "中国香港"], ["ap-southeast-1", "亚太东南（柔佛）"], ["ap-southeast-3", "亚太东南（雅加达）"]]
         }
       }
     },
@@ -160,8 +214,9 @@
           "market_scope": "china_site",
           "credential_scope": "ctyun-cn",
           "currency_policy": "official_response",
-          "official_source_url": "https://www.ctyun.cn/document/10026730/10028822",
-          "regions": [["cn-beijing5", "北京 5"], ["cn-shanghai4", "上海 4"], ["cn-guangzhou4", "广州 4"], ["cn-chengdu", "成都"], ["cn-wuhan", "武汉"], ["cn-hongkong", "中国香港"]]
+          "official_source_url": "https://www.ctyun.cn/document/10033813/11095008",
+          "official_price_page_hosts": ["ctyun.cn"],
+          "regions": [["200000002368", "西南1"], ["200000001704", "南宁23"], ["200000002401", "长沙42"], ["200000001852", "华北2"], ["200000002527", "南昌5"], ["200000001703", "青岛20"], ["200000001790", "上海36"], ["200000002530", "华南2"], ["bb9fdb42056f11eda1610242ac110002", "华东1"], ["200000002689", "太原4"], ["200000001781", "武汉41"], ["200000002586", "郑州5"], ["200000001851", "西安7"], ["200000002927", "西南2-贵州"], ["200000003329", "杭州7"], ["200000003327", "芜湖4"], ["200000003573", "呼和浩特3"], ["200000003664", "庆阳2"], ["200000002529", "北京行业云20"], ["200000004098", "乌鲁木齐7"], ["200000003330", "上海15"], ["200000004421", "佛山7"], ["200000003335", "沈阳8"], ["200000004705", "长春3"], ["200000004885", "宁波2"]]
         }
       }
     }

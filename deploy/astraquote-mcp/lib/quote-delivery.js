@@ -129,13 +129,38 @@ function buildPageResult(record) {
     monthly_total: String(scenario.monthly_total),
     upfront_total: String(scenario.upfront_total || '0'),
   }));
+  const unpricedComponents = (record.unpriced_ir || []).map((component) => ({
+    service_name: String(
+      simplifyCustomerText(component.customer_facing?.service_name)
+      || component.component_key,
+    ).slice(0, 120),
+    model_or_plan: simplifyCustomerText(component.customer_facing?.model_or_plan).slice(0, 160),
+    quantity: simplifyCustomerText(component.customer_facing?.quantity).slice(0, 80),
+    configuration_summary: String(
+      simplifyCustomerText(component.customer_facing?.configuration_summary),
+    ).slice(0, 1200),
+    failure_code: String(component.failure_code || 'official_price_unavailable').slice(0, 80),
+    failure_category: String(component.failure_category || '').slice(0, 40),
+    provider_code: String(component.provider_code || '').slice(0, 120),
+    retryable: component.retryable !== false,
+  }));
+  const pricingNotices = [];
+  if (record.verification?.cache_fallback?.used === true) {
+    pricingNotices.push('销售提示：官方价格接口临时不可用，部分价格采用带时间戳的最近官方价格快照；建议发送客户前再次确认。');
+  }
+  if (record.verification?.official_pricing_page_evidence?.used === true) {
+    pricingNotices.push('销售提示：部分计费项在官方 API 连续三次未取得可用费率后，采用云厂商官方价格页并保存了来源和读取时间。');
+  }
   return {
     schema_version: 'astraquote-page-result/1',
+    is_partial: record.is_partial === true,
     currency: record.currency,
     region: record.default_region || '',
     preferred_region: record.preferred_region || record.default_region || '',
     region_adjustment_reason: record.region_adjustment_reason || '',
+    pricing_notice: pricingNotices.join(' '),
     components,
+    unpriced_components: unpricedComponents,
     scenarios,
   };
 }
@@ -167,7 +192,9 @@ async function writeRelayCompletionReceipt(
     job_id: relayJobId,
     submission_code: submissionCode,
     quote_id: String(record.quote_id || ''),
-    status: deliveryResult.status === 'displayed_on_page' ? 'page_result_ready' : 'delivered',
+    status: record.is_partial === true
+      ? 'partial_page_result_ready'
+      : deliveryResult.status === 'displayed_on_page' ? 'page_result_ready' : 'delivered',
     delivered_at: new Date().toISOString(),
   };
   if (deliveryResult.page_result) receipt.page_result = deliveryResult.page_result;

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -468,6 +469,8 @@ class OfficialPricingService:
         gcp_api_key: str | None = None,
         authenticated_request: Any | None = None,
         provider_credentials: dict[str, dict[str, str]] | None = None,
+        retry_sleep: Any = time.sleep,
+        retry_delays: tuple[float, ...] | None = None,
     ) -> None:
         self._executor = executor
         self._http_get = http_get
@@ -484,6 +487,13 @@ class OfficialPricingService:
         self._authenticated_request = authenticated_request or OfficialCloudApiClient(
             self._provider_credentials
         ).execute
+        self._retry_sleep = retry_sleep
+        if retry_delays is None:
+            retry_delays = (
+                _bounded_retry_delay(os.getenv("ASTRAQUOTE_PROVIDER_RETRY_DELAY_1"), 0.25),
+                _bounded_retry_delay(os.getenv("ASTRAQUOTE_PROVIDER_RETRY_DELAY_2"), 0.75),
+            )
+        self._retry_delays = tuple(max(0.0, float(delay)) for delay in retry_delays)
 
     def catalog_availability(self) -> dict[str, dict[str, Any]]:
         return {
@@ -598,6 +608,9 @@ class OfficialPricingService:
                     not in {"transport", "rate_limit", "provider_unavailable"}
                 ):
                     break
+                if self._retry_delays:
+                    delay_index = min(attempt - 1, len(self._retry_delays) - 1)
+                    self._retry_sleep(self._retry_delays[delay_index])
         assert last_error is not None
         recovery = _recovery_plan(category, retryable)
         details = getattr(last_error, "details", {})
@@ -1046,6 +1059,14 @@ def _safe_error_message(value: str) -> str:
         without_queries,
     )
     return without_secrets[:800]
+
+
+def _bounded_retry_delay(value: str | None, fallback: float) -> float:
+    try:
+        parsed = float(value) if value is not None else fallback
+    except (TypeError, ValueError):
+        return fallback
+    return min(30.0, max(0.0, parsed))
 
 
 def _error_recovery_traits(exc: Exception) -> tuple[str, bool]:

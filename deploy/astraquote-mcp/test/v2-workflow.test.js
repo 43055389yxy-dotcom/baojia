@@ -6,12 +6,14 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { AstraQuoteV2Workflow } = require('../lib/v2-workflow');
+const { AstraQuoteV2Workflow, enrichUnpricedServices } = require('../lib/v2-workflow');
 const { V2QuoteStore } = require('../lib/v2-quote-store');
+const { OfficialPriceCache } = require('../lib/official-price-cache');
+const { providerRegionMismatch } = require('../lib/cloud-market-profiles');
 
 function fixture({
   status = 'exact', provider = 'azure', itemIds = ['item-1'], rateCandidates = [],
-  resultByteBudget,
+  resultByteBudget, priceCache,
 } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-api-workflow-'));
   const delivered = [];
@@ -52,6 +54,7 @@ function fixture({
       store: new V2QuoteStore({ directory }),
       deliverer,
       resultByteBudget,
+      priceCache,
     }),
   };
 }
@@ -108,6 +111,104 @@ async function priceBatch(workflow, provider = 'azure') {
   });
 }
 
+async function failedPricingAttempts(workflow, count = 3, {
+  provider = 'azure', errorCategory,
+} = {}) {
+  let priceBatchId;
+  for (let index = 1; index <= count; index += 1) {
+    const queryId = `page-attempt-${index}`;
+    const result = await workflow.getPrices({
+      ...(priceBatchId ? { price_batch_id: priceBatchId } : {}),
+      queries: [{ provider, query_id: queryId, filter: `missing-${index}` }],
+      query_contexts: [{
+        query_id: queryId, purpose: 'pricing',
+        component_key: 'cmp_compute_0001', billing_key: 'compute',
+      }],
+      ...(!priceBatchId ? {
+        quote_components: [{
+          component_key: 'cmp_compute_0001',
+          customer_owned_source: '云服务器数量：1。',
+          billing_scopes: [{ billing_key: 'compute' }],
+        }],
+      } : {}),
+    });
+    priceBatchId = result.price_batch_id;
+  }
+  if (errorCategory) {
+    const batch = workflow.store.getPriceBatch(priceBatchId);
+    batch.result.results = batch.result.results.map((result) => ({
+      ...result,
+      status: 'query_failed',
+      terminal: errorCategory === 'authorization' || errorCategory === 'credentials',
+      retryable: !['authorization', 'credentials'].includes(errorCategory),
+      error_category: errorCategory,
+      official_item_ids: [],
+      official_rate_candidates: [],
+    }));
+    workflow.store.putPriceBatch(batch);
+  }
+  return priceBatchId;
+}
+
+function officialPageEvidence(attemptIds, overrides = {}) {
+  return {
+    billing_key: 'compute',
+    source_url: 'https://azure.microsoft.com/en-us/pricing/details/virtual-machines/',
+    source_title: 'Azure Virtual Machines pricing',
+    price_item: 'Linux pay as you go',
+    region: 'eastasia',
+    currency: 'USD',
+    unit_price: '0.12',
+    unit: 'instance hour',
+    observed_at: new Date().toISOString(),
+    source_excerpt: 'East Asia Linux pay as you go: USD 0.12 per instance hour.',
+    api_attempt_query_ids: attemptIds,
+    ...overrides,
+  };
+}
+
+test('unpriced components inherit the authoritative provider failure without leaking raw messages', () => {
+  const enriched = enrichUnpricedServices({
+    unpriced_services: [{
+      component_key: 'cmp_redis_0001',
+      failure_code: 'official_price_unavailable',
+      retryable: true,
+    }],
+  }, {
+    query_contexts: [{ query_id: 'q-redis', component_key: 'cmp_redis_0001' }],
+    result: { results: [{
+      query_id: 'q-redis', status: 'query_failed', error_category: 'authorization',
+      retryable: false, code: 'tencent_official_api_error',
+      message: 'secret upstream detail that must not reach sales',
+      details: { provider_code: 'AuthFailure' },
+    }] },
+  });
+
+  assert.equal(enriched[0].failure_category, 'authorization');
+  assert.equal(enriched[0].provider_code, 'AuthFailure');
+  assert.equal(enriched[0].retryable, false);
+  assert.doesNotMatch(JSON.stringify(enriched[0]), /secret upstream detail/);
+});
+
+test('unpriced failure selection is generic and prefers a hard blocker over transient noise', () => {
+  const enriched = enrichUnpricedServices({
+    unpriced_services: [{ component_key: 'cmp_api_0001', retryable: true }],
+  }, {
+    query_contexts: [
+      { query_id: 'q-timeout', component_key: 'cmp_api_0001' },
+      { query_id: 'q-invalid', component_key: 'cmp_api_0001' },
+    ],
+    result: { results: [
+      { query_id: 'q-timeout', status: 'query_failed', error_category: 'transport', retryable: true },
+      { query_id: 'q-invalid', status: 'query_failed', error_category: 'invalid_request', retryable: true, details: { provider_code: 'InvalidParameter' } },
+    ] },
+  });
+
+  assert.equal(enriched[0].failure_category, 'invalid_request');
+  assert.equal(enriched[0].provider_code, 'InvalidParameter');
+  assert.equal(enriched[0].retryable, true);
+});
+
 test('get_prices stores raw official evidence without choosing or calculating', async (t) => {
   const { workflow, directory } = fixture();
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -119,6 +220,202 @@ test('get_prices stores raw official evidence without choosing or calculating', 
   assert.equal(result.selection_policy, undefined);
   assert.equal(result.selected_item, undefined);
   assert.equal(result.monthly_total, undefined);
+});
+
+test('three failed official API attempts unlock GPT-selected official pricing page evidence', async (t) => {
+  const { workflow, directory } = fixture({ status: 'not_found', itemIds: [] });
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const batchId = await failedPricingAttempts(workflow);
+  const input = quoteInput(batchId, { evidence: [] });
+  input.idempotency_key = 'official-page-after-three-api-failures';
+  input.services[0].official_page_price_evidence = [officialPageEvidence([
+    'page-attempt-1', 'page-attempt-2', 'page-attempt-3',
+  ])];
+
+  const delivered = await workflow.buildEstimate(input);
+  const saved = workflow.store.get(delivered.quote_id);
+
+  assert.equal(saved.verification.official_pricing_page_evidence.used, true);
+  assert.equal(saved.verification.official_pricing_page_evidence.count, 1);
+  assert.equal(saved.price_ir[0].source, 'official_pricing_page');
+  assert.equal(saved.price_ir[0].billing_key, 'compute');
+  assert.equal(saved.fact_coverage.F1[0].coverage_type, 'official_price_page');
+  assert.equal(saved.billing_usage_ir[0].official_page_price_evidence.length, 1);
+});
+
+test('official pricing page evidence stays locked until three qualifying API failures', async (t) => {
+  const { workflow, directory } = fixture({ status: 'not_found', itemIds: [] });
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const batchId = await failedPricingAttempts(workflow, 2);
+  const input = quoteInput(batchId, { evidence: [] });
+  input.services[0].official_page_price_evidence = [officialPageEvidence([
+    'page-attempt-1', 'page-attempt-2', 'page-attempt-2',
+  ])];
+
+  await assert.rejects(
+    workflow.buildEstimate(input),
+    (error) => error.code === 'official_price_evidence_invalid'
+      && error.details.violations.some(
+        (violation) => violation.startsWith('official_page_requires_three_api_attempts:'),
+      ),
+  );
+});
+
+test('official pricing page fallback rejects third-party hosts and permission failures', async (t) => {
+  const thirdParty = fixture({ status: 'not_found', itemIds: [] });
+  t.after(() => fs.rmSync(thirdParty.directory, { recursive: true, force: true }));
+  const thirdPartyBatch = await failedPricingAttempts(thirdParty.workflow);
+  const thirdPartyInput = quoteInput(thirdPartyBatch, { evidence: [] });
+  thirdPartyInput.services[0].official_page_price_evidence = [officialPageEvidence([
+    'page-attempt-1', 'page-attempt-2', 'page-attempt-3',
+  ], { source_url: 'https://azure.microsoft.com.example.test/prices' })];
+  await assert.rejects(
+    thirdParty.workflow.buildEstimate(thirdPartyInput),
+    (error) => error.code === 'official_price_evidence_invalid'
+      && error.details.violations.some(
+        (violation) => violation.startsWith('official_page_host_not_allowed:'),
+      ),
+  );
+
+  const denied = fixture({ status: 'not_found', itemIds: [] });
+  t.after(() => fs.rmSync(denied.directory, { recursive: true, force: true }));
+  const deniedBatch = await failedPricingAttempts(
+    denied.workflow, 3, { errorCategory: 'authorization' },
+  );
+  const deniedInput = quoteInput(deniedBatch, { evidence: [] });
+  deniedInput.services[0].official_page_price_evidence = [officialPageEvidence([
+    'page-attempt-1', 'page-attempt-2', 'page-attempt-3',
+  ])];
+  await assert.rejects(
+    denied.workflow.buildEstimate(deniedInput),
+    (error) => error.code === 'official_price_evidence_invalid'
+      && error.details.violations.some(
+        (violation) => violation.startsWith('official_page_api_attempt_is_permission_blocker:'),
+      ),
+  );
+});
+
+test('a usable API rate remains preferred over an official pricing page fallback', async (t) => {
+  const context = fixture({ status: 'not_found', itemIds: [] });
+  t.after(() => fs.rmSync(context.directory, { recursive: true, force: true }));
+  const batchId = await failedPricingAttempts(context.workflow);
+  context.backend.getPrices = async (input) => ({
+    status: 'completed',
+    results: input.queries.map((query) => ({
+      query_id: query.query_id, provider: query.provider, status: 'exact',
+      official_item_ids: ['api-item'],
+      official_rate_candidates: [{
+        rate_id: 'api-rate', official_item_id: 'api-item', unit_price: '0.11', currency: 'USD',
+      }],
+    })),
+  });
+  await context.workflow.getPrices({
+    price_batch_id: batchId,
+    queries: [{ provider: 'azure', query_id: 'api-success', filter: 'valid' }],
+    query_contexts: [{
+      query_id: 'api-success', purpose: 'pricing',
+      component_key: 'cmp_compute_0001', billing_key: 'compute',
+    }],
+  });
+  const input = quoteInput(batchId, { evidence: [] });
+  input.services[0].official_page_price_evidence = [officialPageEvidence([
+    'page-attempt-1', 'page-attempt-2', 'page-attempt-3',
+  ])];
+
+  await assert.rejects(
+    context.workflow.buildEstimate(input),
+    (error) => error.code === 'official_price_evidence_invalid'
+      && error.details.violations.some(
+        (violation) => violation.startsWith('official_page_fallback_forbidden_when_api_price_exists:'),
+      ),
+  );
+});
+
+
+test('a second identical quote uses the shared exact official price cache', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-price-cache-flow-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const priceCache = new OfficialPriceCache({ directory: path.join(directory, 'cache') });
+  const context = fixture({
+    rateCandidates: [{
+      rate_id: 'rate-1', official_item_id: 'item-1', unit_price: '12.34', currency: 'USD',
+    }],
+    priceCache,
+  });
+  t.after(() => fs.rmSync(context.directory, { recursive: true, force: true }));
+  let backendCalls = 0;
+  const original = context.backend.getPrices;
+  context.backend.getPrices = async (input) => {
+    backendCalls += 1;
+    return original(input);
+  };
+
+  await context.workflow.getPrices({
+    queries: [{ provider: 'azure', query_id: 'first', filter: 'same-official-query' }],
+  });
+  const repeated = await context.workflow.getPrices({
+    queries: [{ provider: 'azure', query_id: 'second', filter: 'same-official-query' }],
+  });
+
+  assert.equal(backendCalls, 1);
+  assert.deepEqual(repeated.price_cache_hit_query_ids, ['second']);
+  assert.equal(repeated.results[0].query_id, 'second');
+  assert.equal(repeated.results[0].cache_status, 'fresh');
+});
+
+
+test('transient provider outage uses bounded stale official evidence but authorization never does', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-stale-flow-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  let now = Date.parse('2026-09-12T00:00:00.000Z');
+  const priceCache = new OfficialPriceCache({
+    directory: path.join(directory, 'cache'), freshTtlMs: 1_000,
+    maximumStaleMs: 60_000, now: () => now,
+  });
+  const context = fixture({
+    rateCandidates: [{
+      rate_id: 'rate-1', official_item_id: 'item-1', unit_price: '12.34', currency: 'USD',
+    }],
+    priceCache,
+  });
+  t.after(() => fs.rmSync(context.directory, { recursive: true, force: true }));
+  await context.workflow.getPrices({
+    queries: [{ provider: 'azure', query_id: 'seed', filter: 'same-official-query' }],
+  });
+  now += 2_000;
+  context.backend.getPrices = async (input) => ({ results: input.queries.map((item) => ({
+    query_id: item.query_id, provider: item.provider, status: 'query_failed', terminal: false,
+    retryable: true, error_category: 'provider_unavailable', code: 'catalog_maintenance',
+    message: 'Official catalog is temporarily unavailable.', official_item_ids: [],
+  })) });
+
+  const fallback = await context.workflow.getPrices({
+    queries: [{ provider: 'azure', query_id: 'outage', filter: 'same-official-query' }],
+  });
+  assert.equal(fallback.results[0].status, 'exact');
+  assert.equal(fallback.results[0].cache_status, 'stale_fallback');
+  assert.equal(fallback.results[0].live_error.error_category, 'provider_unavailable');
+  const fallbackQuote = quoteInput(fallback.price_batch_id, {
+    evidence: [{ query_id: 'outage', official_item_ids: ['item-1'] }],
+  });
+  fallbackQuote.idempotency_key = 'workflow-stale-official-cache-disclosure';
+  const delivered = await context.workflow.buildEstimate(fallbackQuote);
+  const saved = context.workflow.store.get(delivered.quote_id);
+  assert.equal(saved.verification.cache_fallback.used, true);
+  assert.deepEqual(saved.adjustments, []);
+  assert.deepEqual(saved.verification.cache_fallback.query_ids, ['outage']);
+  assert.doesNotMatch(JSON.stringify(saved.resource_ir), /维护|限流|连接中断|价格快照/);
+
+  context.backend.getPrices = async (input) => ({ results: input.queries.map((item) => ({
+    query_id: item.query_id, provider: item.provider, status: 'query_failed', terminal: true,
+    retryable: false, error_category: 'authorization', code: 'forbidden',
+    message: 'Permission denied.', official_item_ids: [],
+  })) });
+  const denied = await context.workflow.getPrices({
+    queries: [{ provider: 'azure', query_id: 'denied', filter: 'same-official-query' }],
+  });
+  assert.equal(denied.results[0].status, 'query_failed');
+  assert.equal(denied.results[0].cache_status, undefined);
 });
 
 test('a legacy partial batch can deliver with selected complete evidence and keeps unused attempts only in the batch', async (t) => {
@@ -138,6 +435,194 @@ test('a legacy partial batch can deliver with selected complete evidence and kee
   assert.equal(displayed.length, 1);
   assert.deepEqual(workflow.store.get(result.quote_id).price_ir.map((r) => r.query_id), ['price-1']);
   assert.equal(workflow.store.getPriceBatch(batch.price_batch_id).result.results.length, 2);
+});
+
+test('a partial quote delivers verified components and preserves failed components without pricing them', async (t) => {
+  const { workflow, directory, displayed } = fixture({ rateCandidates: [{
+    rate_id: 'rate-1', official_item_id: 'item-1', unit_price: '12.34', currency: 'USD',
+  }] });
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const batch = await workflow.getPrices({
+    queries: [{ provider: 'azure', query_id: 'price-1', filter: 'caller supplied query' }],
+    query_contexts: [{
+      query_id: 'price-1', purpose: 'pricing',
+      component_key: 'cmp_compute_0001', billing_key: 'compute',
+    }],
+    quote_components: [
+      {
+        component_key: 'cmp_compute_0001',
+        customer_owned_source: '云服务器：1 台。',
+        billing_scopes: [{ billing_key: 'compute' }],
+      },
+      {
+        component_key: 'cmp_storage_0002',
+        customer_owned_source: '对象存储：2 TiB。',
+        billing_scopes: [{ billing_key: 'storage' }],
+      },
+    ],
+  });
+  const input = quoteInput(batch.price_batch_id);
+  input.is_partial = true;
+  input.fact_ledger.push({
+    fact_id: 'F2', component_key: 'cmp_storage_0002', field: 'storage_gib',
+    value: 2048, unit: 'GiB', scope: 'total', cleaned_evidence: '对象存储：2 TiB。',
+    disposition: 'billable',
+  });
+  input.unpriced_services = [{
+    component_key: 'cmp_storage_0002', region: 'eastasia', fact_ids: ['F2'],
+    failure_code: 'official_price_unavailable', retryable: true,
+    customer_facing: {
+      service_name: '对象存储', quantity: '2 TiB',
+      requirement_summary: '对象存储 2 TiB。',
+      configuration_summary: '对象存储 2 TiB，价格尚未取得。',
+    },
+  }];
+
+  const result = await workflow.buildEstimate(input);
+
+  assert.equal(result.status, 'displayed_on_page');
+  assert.equal(displayed.length, 1);
+  const saved = workflow.store.get(result.quote_id);
+  assert.equal(saved.is_partial, true);
+  assert.equal(saved.verification.status, 'official_price_partial');
+  assert.equal(saved.unpriced_ir[0].component_key, 'cmp_storage_0002');
+  assert.equal(saved.verification.costs.monthly, 12.34);
+});
+
+test('a complete quote cannot hide an unpriced component', async (t) => {
+  const { workflow, directory } = fixture();
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const batch = await priceBatch(workflow);
+  const input = quoteInput(batch.price_batch_id);
+  input.unpriced_services = [{
+    component_key: 'cmp_storage_0002', fact_ids: ['F2'],
+    failure_code: 'retry_limit_reached', retryable: true,
+    customer_facing: {
+      service_name: '对象存储', requirement_summary: '对象存储 2 TiB。',
+      configuration_summary: '对象存储 2 TiB，价格尚未取得。',
+    },
+  }];
+
+  await assert.rejects(
+    workflow.buildEstimate(input),
+    (error) => error.code === 'partial_quote_contract_invalid',
+  );
+});
+
+test('retrying a delivered partial quote creates a newer complete quote instead of replaying it', async (t) => {
+  const { workflow, directory } = fixture({ rateCandidates: [{
+    rate_id: 'rate-1', official_item_id: 'item-1', unit_price: '12.34', currency: 'USD',
+  }] });
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const relayDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'aq-partial-retry-relay-'));
+  const previousRelayDirectory = process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+  process.env.ASTRAQUOTE_GPT_RELAY_DIR = relayDirectory;
+  const relayJobId = 'gpt-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  const relayJobPath = path.join(relayDirectory, 'jobs', `${relayJobId}.json`);
+  fs.mkdirSync(path.dirname(relayJobPath), { recursive: true });
+  const relayJob = {
+    job_id: relayJobId, submission_code: '2', status: 'processing',
+    partial_retry_generation: 0,
+    quote_options: {
+      cloud_provider: 'azure', preferred_region: 'eastasia',
+      pricing_scenarios: ['on_demand'],
+    },
+  };
+  fs.writeFileSync(relayJobPath, JSON.stringify(relayJob));
+  t.after(() => {
+    fs.rmSync(relayDirectory, { recursive: true, force: true });
+    if (previousRelayDirectory === undefined) delete process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+    else process.env.ASTRAQUOTE_GPT_RELAY_DIR = previousRelayDirectory;
+  });
+
+  const plan = [
+    {
+      component_key: 'cmp_compute_0001', customer_owned_source: '云服务器：1 台。',
+      billing_scopes: [{ billing_key: 'compute' }],
+    },
+    {
+      component_key: 'cmp_storage_0002', customer_owned_source: '对象存储：2 TiB。',
+      billing_scopes: [{ billing_key: 'storage' }],
+    },
+  ];
+  const batch = await workflow.getPrices({
+    relay_job_id: relayJobId, submission_code: '2', quote_components: plan,
+    queries: [{ provider: 'azure', query_id: 'price-1', filter: 'valid' }],
+    query_contexts: [{
+      query_id: 'price-1', purpose: 'pricing',
+      component_key: 'cmp_compute_0001', billing_key: 'compute',
+    }],
+  });
+  const partial = quoteInput(batch.price_batch_id);
+  Object.assign(partial, {
+    relay_job_id: relayJobId,
+    is_partial: true,
+    pricing_scenarios: [{
+      scenario_key: 'on_demand', monthly_total: '12.34', upfront_total: '0',
+    }],
+  });
+  partial.services[0].scenario_costs = [{
+    scenario_key: 'on_demand', pricing_basis: 'on_demand',
+    monthly_cost: '12.34', upfront_cost: '0',
+  }];
+  partial.fact_ledger.push({
+    fact_id: 'F2', component_key: 'cmp_storage_0002', field: 'storage_gib', value: 2048,
+    unit: 'GiB', scope: 'total', cleaned_evidence: '对象存储：2 TiB。', disposition: 'billable',
+  });
+  partial.unpriced_services = [{
+    component_key: 'cmp_storage_0002', fact_ids: ['F2'],
+    failure_code: 'retry_limit_reached', retryable: true,
+    customer_facing: {
+      service_name: '对象存储', requirement_summary: '对象存储 2 TiB。',
+      configuration_summary: '对象存储 2 TiB，价格尚未取得。',
+    },
+  }];
+  const firstDelivery = await workflow.buildEstimate(partial);
+
+  fs.writeFileSync(relayJobPath, JSON.stringify({
+    ...relayJob, partial_retry_generation: 1,
+  }));
+  await workflow.getPrices({
+    relay_job_id: relayJobId, submission_code: '2', price_batch_id: batch.price_batch_id,
+    queries: [{ provider: 'azure', query_id: 'price-2', filter: 'valid' }],
+    query_contexts: [{
+      query_id: 'price-2', purpose: 'pricing',
+      component_key: 'cmp_storage_0002', billing_key: 'storage',
+    }],
+  });
+  const complete = quoteInput(batch.price_batch_id, { monthly: '17.34' });
+  Object.assign(complete, {
+    relay_job_id: relayJobId,
+    pricing_scenarios: [{
+      scenario_key: 'on_demand', monthly_total: '17.34', upfront_total: '0',
+    }],
+    idempotency_key: 'complete-after-partial-retry',
+  });
+  complete.fact_ledger.push(partial.fact_ledger[1]);
+  complete.services[0].scenario_costs = [{
+    scenario_key: 'on_demand', pricing_basis: 'on_demand',
+    monthly_cost: '12.34', upfront_cost: '0',
+  }];
+  complete.services[0].expected_monthly_cost = '12.34';
+  complete.services.push({
+    component_key: 'cmp_storage_0002', region: 'eastasia', fact_ids: ['F2'],
+    price_evidence: [{ query_id: 'price-2', official_item_ids: ['item-1'] }],
+    expected_monthly_cost: '5.00',
+    scenario_costs: [{
+      scenario_key: 'on_demand', pricing_basis: 'on_demand',
+      monthly_cost: '5.00', upfront_cost: '0',
+    }],
+    customer_facing: {
+      service_name: '对象存储', quantity: '2 TiB', requirement_summary: '对象存储 2 TiB。',
+      configuration_summary: '对象存储 2 TiB。',
+    },
+  });
+
+  const secondDelivery = await workflow.buildEstimate(complete);
+
+  assert.notEqual(secondDelivery.quote_id, firstDelivery.quote_id);
+  assert.equal(workflow.store.get(secondDelivery.quote_id).is_partial, false);
+  assert.equal(workflow.store.findByRelayJobId(relayJobId).quote_id, secondDelivery.quote_id);
 });
 
 test('resuming a price batch queries only unfinished ids and reuses successful results', async (t) => {
@@ -252,6 +737,32 @@ test('large get_prices deltas are compacted while complete official evidence sta
   });
   assert.equal(saved.results[0].items[0].official_payload.length, 4_000);
   assert.equal(saved.results[0].official_rate_candidates[0].rate_id, 'rate-0');
+});
+
+test('saved details page all official rates with complete counts and never modify stored evidence', async (t) => {
+  const { workflow, directory, backend } = fixture();
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const rates = Array.from({ length: 45 }, (_, index) => ({
+    rate_id: `rate-${index}`, official_item_id: `item-${index}`, unit_price: String(index), currency: 'USD',
+  }));
+  backend.getPrices = async () => ({ results: [{ query_id: 'many', provider: 'azure', status: 'exact',
+    official_item_ids: rates.map((rate) => rate.official_item_id), official_rate_candidates: rates,
+    items: rates.map((rate) => ({ id: rate.official_item_id, raw_details: { meter: rate.rate_id } })),
+  }] });
+  const batch = await workflow.getPrices({ queries: [{ provider: 'azure', query_id: 'many', filter: 'official' }] });
+  const observed = [];
+  let offset = 0;
+  do {
+    const page = workflow.getPriceResults({ price_batch_id: batch.price_batch_id, query_ids: ['many'], detail_offset: offset });
+    const result = page.results[0];
+    assert.equal(result.detail_page.total_rates, 45);
+    assert.ok(result.official_rate_candidates.length <= 20);
+    assert.equal(result.items[0].raw_details.meter, `rate-${offset}`);
+    observed.push(...result.official_rate_candidates.map((rate) => rate.rate_id));
+    offset = result.detail_page.next_offset;
+  } while (offset !== null);
+  assert.deepEqual(observed, rates.map((rate) => rate.rate_id));
+  assert.equal(workflow.store.getPriceBatch(batch.price_batch_id).result.results[0].official_rate_candidates.length, 45);
 });
 
 test('get_prices persists learned official routes and can reuse a route id', async (t) => {
@@ -450,7 +961,7 @@ test('a mixed free-tier catalog SKU cannot be disguised as a zero-cost service',
   });
   input.zero_cost_services = [{
     component_key: 'cmp_oci_a1_0002',
-    region: 'eu-dublin-1',
+    region: 'eu-frankfurt-1',
     fact_ids: ['F2'],
     pricing_basis: 'official_no_additional_charge',
     official_evidence: {
@@ -591,6 +1102,60 @@ test('a signed cloud quote must bind the positive official commercial rate selec
   });
   const result = await workflow.buildEstimate(input);
   assert.equal(result.status, 'displayed_on_page');
+});
+
+test('a region code owned by another provider cannot be published under the selected cloud', async (t) => {
+  const positiveRate = {
+    rate_id: 'tencent:item-1:paid', official_item_id: 'item-1',
+    unit_price: '0.25', currency: 'CNY', unit: 'hour', is_zero_rate: false,
+  };
+  const { workflow, directory } = fixture({ provider: 'tencent', rateCandidates: [positiveRate] });
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const batch = await priceBatch(workflow, 'tencent');
+  const input = quoteInput(batch.price_batch_id, {
+    provider: 'tencent', currency: 'CNY', evidence: [{
+      query_id: 'price-1', official_item_ids: ['item-1'], official_rate_ids: [positiveRate.rate_id],
+    }],
+  });
+  input.default_region = 'ap-singapore-1';
+  input.services[0].region = 'ap-singapore-1';
+
+  await assert.rejects(
+    workflow.buildEstimate(input),
+    (error) => error.code === 'quote_region_provider_mismatch'
+      && error.details.known_owners.some((owner) => owner.provider === 'oci'),
+  );
+});
+
+test('provider region validation covers component regions and keeps shared codes provider-scoped', async (t) => {
+  assert.equal(providerRegionMismatch('aws', 'ap-southeast-1', 'aws-global'), null);
+  assert.equal(providerRegionMismatch('aws', 'eu-west-1', 'aws-global'), null);
+  assert.deepEqual(
+    providerRegionMismatch('aws', 'not-a-real-region', 'aws-global'),
+    { provider: 'aws', region: 'not-a-real-region', known_owners: [] },
+  );
+
+  const positiveRate = {
+    rate_id: 'tencent:item-1:paid', official_item_id: 'item-1',
+    unit_price: '0.25', currency: 'CNY', unit: 'hour', is_zero_rate: false,
+  };
+  const { workflow, directory } = fixture({ provider: 'tencent', rateCandidates: [positiveRate] });
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const batch = await priceBatch(workflow, 'tencent');
+  const input = quoteInput(batch.price_batch_id, {
+    provider: 'tencent', currency: 'CNY', evidence: [{
+      query_id: 'price-1', official_item_ids: ['item-1'], official_rate_ids: [positiveRate.rate_id],
+    }],
+  });
+  input.default_region = 'ap-singapore';
+  input.services[0].region = 'ap-singapore-1';
+
+  await assert.rejects(
+    workflow.buildEstimate(input),
+    (error) => error.code === 'quote_region_provider_mismatch'
+      && error.details.component_key === input.services[0].component_key
+      && error.details.known_owners.some((owner) => owner.provider === 'oci'),
+  );
 });
 
 test('the quote currency must match the selected official commercial rate', async (t) => {

@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { canRetryUnpriced, money, processingStatusDetail, progressPercent, queuedStatusDetail, unpricedRecoveryText } from "./presentation";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "/api/backend";
 const ACTIVE_JOB_KEY = "astraquote.sales.active-job.v1";
@@ -22,10 +23,12 @@ type PageScenarioCost = {
 
 type QuickQuoteResult = {
   schema_version: "astraquote-page-result/1";
+  is_partial?: boolean;
   currency: string;
   region: string;
   preferred_region?: string;
   region_adjustment_reason?: string;
+  pricing_notice?: string;
   components: Array<{
     service_name: string;
     model_or_plan?: string;
@@ -33,13 +36,23 @@ type QuickQuoteResult = {
     configuration_summary?: string;
     scenario_costs: PageScenarioCost[];
   }>;
+  unpriced_components?: Array<{
+    service_name: string;
+    model_or_plan?: string;
+    quantity?: string;
+    configuration_summary?: string;
+    failure_code: string;
+    failure_category?: string;
+    provider_code?: string;
+    retryable: boolean;
+  }>;
   scenarios: PageScenarioCost[];
 };
 
 type RelayJob = {
   job_id: string;
   submission_code: string;
-  status: "queued" | "processing" | "needs_login" | "completed" | "failed" | "cancelled";
+  status: "queued" | "processing" | "needs_login" | "completed" | "partial" | "failed" | "cancelled";
   created_at?: string;
   updated_at?: string;
   cloud_provider?: CloudProvider;
@@ -55,6 +68,16 @@ type RelayJob = {
   queued_ahead_count?: number;
   jobs_ahead_count?: number;
   estimated_wait_minutes?: number;
+  progress?: {
+    stage: string;
+    total_component_count?: number;
+    top_level_component_count?: number;
+    component_chat_count?: number;
+    completed_component_count?: number;
+    failed_component_count?: number;
+    pending_component_count?: number;
+    updated_at?: string;
+  };
 };
 
 type RegionCatalog = {
@@ -74,10 +97,11 @@ type RelayHealth = {
 };
 
 const statusCopy: Record<RelayJob["status"], { title: string; detail?: string }> = {
-  queued: { title: "报价正在排队", detail: "正在为本次报价创建独立工作标签。" },
+  queued: { title: "报价正在排队", detail: "正在等待可用的报价名额。" },
   processing: { title: "报价申请已提交" },
   needs_login: { title: "报价等待登录", detail: "报价服务正在等待管理员恢复登录。" },
   completed: { title: "报价已完成", detail: "报价结果和 Excel 已生成。" },
+  partial: { title: "部分报价已完成", detail: "已返回成功组件；未取得价格的组件没有计入合计。" },
   failed: { title: "报价失败", detail: "报价已经停止，请联系管理员处理。" },
   cancelled: { title: "报价已撤回", detail: "本次报价已停止处理。" },
 };
@@ -153,18 +177,6 @@ function estimateWindow() {
   return "5～10 分钟";
 }
 
-function queuedStatusDetail(job: RelayJob) {
-  const activeCount = job.active_quote_count ?? 0;
-  const queuedAhead = job.queued_ahead_count ?? 0;
-  const waitMinutes = job.estimated_wait_minutes ?? 0;
-  const parts = [];
-  if (activeCount > 0) parts.push(`${activeCount} 个任务正在报价`);
-  if (queuedAhead > 0) parts.push(`${queuedAhead} 个任务排在您前面`);
-  if (parts.length === 0) parts.push("正在等待报价引擎启动");
-  const wait = waitMinutes > 0 ? `预计等待约 ${waitMinutes} 分钟` : "即将开始";
-  return `${parts.join("，")}，${wait}。`;
-}
-
 function providerLabel(provider: CloudProvider | undefined) {
   return PROVIDER_META[provider ?? "aws"].label;
 }
@@ -176,18 +188,10 @@ function safeSubmissionError(status: number) {
   return "报价提交失败，请检查填写内容后重试。";
 }
 
-function money(value: string | undefined, currency: string) {
-  const amount = Number(value ?? 0);
-  const formatted = Number.isFinite(amount)
-    ? amount.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-    : "0.00";
-  return `${formatted}${currency ? ` ${currency}` : ""}`;
-}
-
 function quoteCopyText(job: RelayJob) {
   const result = job.quick_quote_result;
   if (!result) return "";
-  const lines = [`云厂商：${providerLabel(job.cloud_provider)}`, `区域：${result.region}`, ""];
+  const lines = [result.is_partial ? "部分报价（未完成组件未计入合计）" : "报价结果", `云厂商：${providerLabel(job.cloud_provider)}`, `区域：${result.region}`, ""];
   result.components.forEach((component, index) => {
     const identity = [component.service_name, component.model_or_plan, component.quantity]
       .filter(Boolean).join(" · ");
@@ -201,7 +205,14 @@ function quoteCopyText(job: RelayJob) {
     });
     lines.push("");
   });
-  lines.push("报价合计");
+  (result.unpriced_components || []).forEach((component, index) => {
+    const identity = [component.service_name, component.model_or_plan, component.quantity]
+      .filter(Boolean).join(" · ");
+    lines.push(`${result.components.length + index + 1}. ${identity}`);
+    if (component.configuration_summary) lines.push(`配置：${component.configuration_summary}`);
+    lines.push("状态：尚未取得官方价格，未计入合计", "");
+  });
+  lines.push(result.is_partial ? "已核价部分小计" : "报价合计");
   result.scenarios.forEach((scenario) => {
     const upfront = Number(scenario.upfront_total || 0) > 0
       ? `；预付总额 ${money(scenario.upfront_total, result.currency)}`
@@ -234,22 +245,30 @@ export default function SalesQuotePage() {
   const [health, setHealth] = useState<RelayHealth | null>(null);
   const [job, setJob] = useState<RelayJob | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [pageError, setPageError] = useState("");
   const [trackedJobId, setTrackedJobId] = useState("");
   const [resultOpen, setResultOpen] = useState(false);
   const [copied, setCopied] = useState<"" | "quote" | "link">("");
   const active = Boolean(job && ["queued", "processing", "needs_login"].includes(job.status));
+  const retryAvailable = job?.status === "partial" && canRetryUnpriced(job.quick_quote_result);
+  const completedPercent = job ? progressPercent(job) : null;
+  const resultReady = Boolean(job?.quick_quote_result);
+  const inventoryReady = Boolean(job?.progress?.total_component_count || resultReady);
+  const pricesReady = completedPercent === 100 || Boolean(job?.status === "completed" && resultReady);
 
-  const loadJob = useCallback(async (jobId: string) => {
+  const loadJob = useCallback(async (jobId: string, signal: AbortSignal) => {
     const response = await fetch(`${API_BASE}/api/quote-relay/jobs/${encodeURIComponent(jobId)}`, {
       cache: "no-store",
+      signal,
     });
     if (!response.ok) throw new Error("暂时无法获取报价状态，请稍后重试。");
     const payload = await response.json() as RelayJob;
+    if (signal.aborted) return payload;
     setJob(payload);
-    if (payload.status === "completed" && payload.quick_quote_result) setResultOpen(true);
+    if (["completed", "partial"].includes(payload.status) && payload.quick_quote_result) setResultOpen(true);
     setPageError("");
-    if (["completed", "failed", "cancelled"].includes(payload.status)) {
+    if (["completed", "partial", "failed", "cancelled"].includes(payload.status)) {
       window.sessionStorage.removeItem(ACTIVE_JOB_KEY);
       setTrackedJobId("");
     }
@@ -277,9 +296,6 @@ export default function SalesQuotePage() {
 
   useEffect(() => {
     let stopped = false;
-    setRegionLoading(true);
-    setPreferredRegion("");
-    setRegionOpen(false);
     async function loadRegions() {
       try {
         const response = await fetch(
@@ -321,17 +337,28 @@ export default function SalesQuotePage() {
   useEffect(() => {
     if (!trackedJobId) return;
     let stopped = false;
+    let inFlight = false;
+    let requestController: AbortController | null = null;
     async function poll() {
+      if (stopped || inFlight) return;
+      inFlight = true;
+      requestController = new AbortController();
+      const controller = requestController;
+      const timeout = window.setTimeout(() => controller.abort(), 12000);
       try {
-        await loadJob(trackedJobId);
+        await loadJob(trackedJobId, controller.signal);
       } catch {
         if (!stopped) setPageError("报价状态正在同步，请稍候。");
+      } finally {
+        window.clearTimeout(timeout);
+        inFlight = false;
       }
     }
     void poll();
     const timer = window.setInterval(poll, 3000);
     return () => {
       stopped = true;
+      requestController?.abort();
       window.clearInterval(timer);
     };
   }, [trackedJobId, loadJob]);
@@ -373,6 +400,14 @@ export default function SalesQuotePage() {
   }
 
   function chooseProvider(provider: CloudProvider) {
+    if (provider === cloudProvider) {
+      setProviderOpen(false);
+      return;
+    }
+    setRegionLoading(true);
+    setRegionCatalog(null);
+    setPreferredRegion("");
+    setRegionOpen(false);
     setCloudProvider(provider);
     setProviderOpen(false);
     setSelectedScenarios(new Set<ScenarioKey>(["on_demand"]));
@@ -463,6 +498,28 @@ export default function SalesQuotePage() {
     }
   }
 
+  async function retryFailedComponents() {
+    if (!job || !retryAvailable || retrying) return;
+    setRetrying(true);
+    setPageError("");
+    try {
+      const response = await fetch(
+        `${API_BASE}/api/quote-relay/jobs/${encodeURIComponent(job.job_id)}/retry-failed`,
+        { method: "POST" },
+      );
+      if (!response.ok) throw new Error();
+      const payload = await response.json() as RelayJob;
+      window.sessionStorage.setItem(ACTIVE_JOB_KEY, payload.job_id);
+      setTrackedJobId(payload.job_id);
+      setJob(payload);
+      setResultOpen(false);
+    } catch {
+      setPageError("未完成组件暂时无法重试，请稍后再试。");
+    } finally {
+      setRetrying(false);
+    }
+  }
+
   function reset() {
     window.sessionStorage.removeItem(ACTIVE_JOB_KEY);
     window.sessionStorage.removeItem(PENDING_SUBMISSION_KEY);
@@ -543,7 +600,7 @@ export default function SalesQuotePage() {
                   <span><strong>{PROVIDER_META[cloudProvider].label}</strong><small>{PROVIDER_META[cloudProvider].detail}</small></span>
                   <i aria-hidden="true">⌄</i>
                 </button>
-                {providerOpen && <div className="sales-choice-row sales-provider-row" id="sales-provider-options" role="listbox">
+                {providerOpen && <div className="sales-choice-row sales-provider-row" id="sales-provider-options" role="radiogroup">
                   {PROVIDER_ORDER.map((value) => {
                     const catalog = health?.provider_catalogs?.[value];
                     const provider = PROVIDER_META[value];
@@ -551,8 +608,6 @@ export default function SalesQuotePage() {
                       <label
                         className={`${cloudProvider === value ? "selected" : ""} ${catalog?.available === false ? "unavailable" : ""}`}
                         key={value}
-                        role="option"
-                        aria-selected={cloudProvider === value}
                       >
                         <input
                           type="radio"
@@ -582,7 +637,7 @@ export default function SalesQuotePage() {
               <div className="sales-section-heading">
                 <div>
                   <label htmlFor="sales-region">选择首选地域</label>
-                  <p>{regionCatalog?.site_label ?? "正在读取账号站点"} · 整套产品不支持时，GPT 会选择同站点最近可用地域并说明</p>
+                  <p>{regionCatalog?.site_label ?? "正在读取账号站点"} · 地域代码按当前云厂商解释，最终可购性以每个产品的官方响应为准</p>
                 </div>
                 <span>02 / 04</span>
               </div>
@@ -590,19 +645,16 @@ export default function SalesQuotePage() {
                 <input
                   id="sales-region"
                   value={preferredRegion}
-                  onChange={(event) => {
-                    setPreferredRegion(event.target.value);
-                    setRegionOpen(true);
-                  }}
+                  readOnly
                   onFocus={() => setRegionOpen(true)}
                   onKeyDown={(event) => {
                     if (event.key === "Escape") setRegionOpen(false);
                     if (event.key === "ArrowDown") setRegionOpen(true);
                   }}
                   disabled={regionLoading}
-                  placeholder={regionLoading ? "正在加载地域建议…" : "选择或输入官方地域"}
+                  placeholder={regionLoading ? "正在加载官方地域…" : "请选择官方地域"}
                   role="combobox"
-                  aria-autocomplete="list"
+                  aria-autocomplete="none"
                   aria-expanded={regionOpen}
                   aria-controls="sales-region-options"
                   required
@@ -633,7 +685,7 @@ export default function SalesQuotePage() {
                         <small>{item.code}</small>
                       </button>
                     )) : (
-                      <p>没有匹配的建议地域，可保留当前输入，由 GPT 根据官方目录核对。</p>
+                      <p>当前云厂商暂无可选官方地域，请联系管理员更新地域目录。</p>
                     )}
                   </div>
                 )}
@@ -718,17 +770,21 @@ export default function SalesQuotePage() {
             <span className="sales-job-node sales-job-node-one" />
             <span className="sales-job-node sales-job-node-two" />
             <div className="sales-job-status-icon">
-              {job.status === "completed" ? "✓" : job.status === "failed" ? "!" : job.status === "cancelled" ? "×" : <i />}
+              {["completed", "partial"].includes(job.status) ? "✓" : job.status === "failed" ? "!" : job.status === "cancelled" ? "×" : <i />}
             </div>
           </div>
           <div className="sales-job-copy">
             <p>LIVE QUOTE WORKFLOW · {providerLabel(job.cloud_provider)}</p>
             <h1>{statusCopy[job.status].title}</h1>
-            <span>{job.status === "completed" && job.quick_quote_result
-              ? "报价结果和 Excel 已生成，可查看、复制或下载。"
+            <span>{["completed", "partial"].includes(job.status) && job.quick_quote_result
+              ? job.status === "partial"
+                ? "已生成部分报价和 Excel，成功组件可立即使用，未报价组件没有计入合计。"
+                : "报价结果和 Excel 已生成，可查看、复制或下载。"
               : job.status === "queued"
                 ? queuedStatusDetail(job)
-              : statusCopy[job.status].detail ?? `预计 ${estimateWindow()}完成，结果将在当前页面显示。`}</span>
+              : job.status === "processing"
+                ? processingStatusDetail(job)
+                : statusCopy[job.status].detail ?? `预计 ${estimateWindow()}完成，结果将在当前页面显示。`}</span>
             {job.status === "failed" && (
               <small className="sales-failure-reference">
                 错误码 {job.failure_code || "AQ-QUOTE-FAILED"}
@@ -737,24 +793,26 @@ export default function SalesQuotePage() {
           </div>
 
           {active && (
-            <div className="sales-job-progress" aria-label="报价引擎处理中">
-              <div><span>{job.status === "queued" ? "等待启动" : "报价引擎处理中"}</span><b><i /> {job.status === "queued" ? "排队中" : "正在运行"}</b></div>
-              <i><span /></i>
-              <small>{job.status === "queued" ? queuedStatusDetail(job) : `正在读取官网价格并生成报价，预计 ${estimateWindow()}`}</small>
+            <div className="sales-job-progress" aria-label="报价处理状态">
+              <div><span>{job.status === "queued" ? "等待启动" : job.status === "needs_login" ? "等待服务恢复" : "组件核价进度"}</span><b>{job.status === "processing" && <i />} {job.status === "queued" ? "排队中" : job.status === "needs_login" ? "等待管理员" : "正在运行"}</b></div>
+              {completedPercent !== null && <i role="progressbar" aria-label="已完成核价的组件比例" aria-valuemin={0} aria-valuemax={100} aria-valuenow={completedPercent}><span style={{ width: `${completedPercent}%` }} /></i>}
+              <small>{job.status === "queued" ? queuedStatusDetail(job) : job.status === "needs_login" ? "请联系管理员恢复服务，恢复后将继续处理本次报价。" : processingStatusDetail(job)}</small>
             </div>
           )}
 
           <div className="sales-job-stages" aria-hidden="true">
-            <span className="complete"><i />需求识别</span>
+            <span className={inventoryReady ? "complete" : job.status === "processing" ? "current" : ""}><i />需求识别</span>
             <b />
-            <span className={active ? "current" : "complete"}><i />官方核价</span>
+            <span className={pricesReady ? "complete" : job.status === "processing" && inventoryReady ? "current" : ""}><i />官方核价</span>
             <b />
-            <span className={job.status === "completed" ? "complete" : ""}><i />生成结果</span>
+            <span className={["completed", "partial"].includes(job.status) && resultReady ? "complete" : job.status === "processing" && pricesReady ? "current" : ""}><i />生成结果</span>
           </div>
 
           <div className="sales-job-actions">
             {active
-              ? <button type="button" className="sales-button sales-button-ghost" onClick={() => void cancelJob()}>撤回报价</button>
+              ? <>{job.quick_quote_result && <button type="button" className="sales-button sales-button-secondary" onClick={() => setResultOpen(true)}>查看已保存的部分报价</button>}<button type="button" className="sales-button sales-button-ghost" onClick={() => void cancelJob()}>撤回报价</button></>
+              : job.status === "partial" && job.quick_quote_result
+                ? <><button type="button" className="sales-button sales-button-primary" onClick={() => setResultOpen(true)}>查看部分报价 <i aria-hidden="true">→</i></button>{retryAvailable && <button type="button" className="sales-button sales-button-secondary" disabled={retrying} onClick={() => void retryFailedComponents()}>{retrying ? "正在提交重试…" : "只重试未完成组件"}</button>}<button type="button" className="sales-button sales-button-ghost" onClick={reset}>新建报价</button></>
               : job.quick_quote_result
                 ? <><button type="button" className="sales-button sales-button-primary" onClick={() => setResultOpen(true)}>查看报价结果 <i aria-hidden="true">→</i></button><button type="button" className="sales-button sales-button-secondary" onClick={reset}>新建报价</button></>
                 : <button type="button" className="sales-button sales-button-primary" onClick={reset}>新建报价 <i aria-hidden="true">→</i></button>}
@@ -771,20 +829,20 @@ export default function SalesQuotePage() {
             <header>
               <div className="sales-result-title">
                 <span className="sales-result-status" aria-hidden="true">✓</span>
-                <div><small>{providerLabel(job.cloud_provider)} · {job.quick_quote_result.region}</small><h2 id="sales-result-title">报价已生成</h2><p>官方价格已核对，Excel 文件已就绪</p></div>
+                <div><small>{providerLabel(job.cloud_provider)} · {job.quick_quote_result.region}</small><h2 id="sales-result-title">{job.quick_quote_result.is_partial ? "部分报价已生成" : "报价已生成"}</h2><p>{job.quick_quote_result.is_partial ? "成功组件已核价；未完成组件未计入合计" : "官方价格已核对，Excel 文件已就绪"}</p></div>
               </div>
               <button className="sales-result-close" type="button" aria-label="关闭报价结果" onClick={() => setResultOpen(false)}>×</button>
             </header>
             <div className="sales-result-layout">
               <section className="sales-result-summary">
-                <div className="sales-result-summary-heading"><small>QUOTE SUMMARY</small><h3>报价合计</h3></div>
+                <div className="sales-result-summary-heading"><small>QUOTE SUMMARY</small><h3>{job.quick_quote_result.is_partial ? "已核价部分小计" : "报价合计"}</h3></div>
                 <div className="sales-result-totals">
                   {job.quick_quote_result.scenarios.map((scenario) => (
                     <div key={scenario.scenario_key}>
                       <span>{scenario.label}</span>
-                      <strong>{money(scenario.monthly_total, job.quick_quote_result.currency)}</strong>
+                      <strong>{money(scenario.monthly_total, job.quick_quote_result!.currency)}</strong>
                       <small>折合月费</small>
-                      {Number(scenario.upfront_total || 0) > 0 && <em>预付总额 {money(scenario.upfront_total, job.quick_quote_result.currency)}</em>}
+                      {Number(scenario.upfront_total || 0) > 0 && <em>预付总额 {money(scenario.upfront_total, job.quick_quote_result!.currency)}</em>}
                     </div>
                   ))}
                 </div>
@@ -824,7 +882,7 @@ export default function SalesQuotePage() {
                               ? <details className="sales-result-config"><summary>{component.configuration_summary}</summary><p>{component.configuration_summary}</p></details>
                               : <span className="sales-result-empty">—</span>}
                           </td>
-                          {job.quick_quote_result.scenarios.map((scenario) => {
+                          {job.quick_quote_result!.scenarios.map((scenario) => {
                             const cost = component.scenario_costs.find((item) => item.scenario_key === scenario.scenario_key);
                             return (
                               <td className="sales-result-price" key={scenario.scenario_key}>
@@ -839,11 +897,28 @@ export default function SalesQuotePage() {
                     </tbody>
                   </table>
                 </div>
+                {job.quick_quote_result.pricing_notice && (
+                  <div className="sales-result-notice" role="status">
+                    {job.quick_quote_result.pricing_notice}
+                  </div>
+                )}
+                {(job.quick_quote_result.unpriced_components || []).length > 0 && (
+                  <div className="sales-result-unpriced" role="status">
+                    <strong>以下 {(job.quick_quote_result.unpriced_components || []).length} 个组件尚未报价，未计入合计</strong>
+                    {(job.quick_quote_result.unpriced_components || []).map((component, index) => (
+                      <p key={`${component.service_name}-${index}`}>
+                        <b>{component.service_name}</b>
+                        <span>{[component.model_or_plan, component.quantity, component.configuration_summary].filter(Boolean).join(" · ")}<small>{unpricedRecoveryText(component)}</small></span>
+                      </p>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
             <footer className="sales-result-actions">
-              <span className="sales-result-action-note">报价和文件均可直接发送给客户</span>
+              <span className="sales-result-action-note">{job.quick_quote_result.is_partial ? "这是部分报价，发送客户前请确认未完成项" : "报价和文件均可直接发送给客户"}{pageError && <small role="alert">{pageError}</small>}</span>
               <div>
+                {retryAvailable && <button type="button" className="sales-button sales-button-primary" disabled={retrying} onClick={() => void retryFailedComponents()}>{retrying ? "正在提交重试…" : "只重试未完成组件"}</button>}
                 <button type="button" className="sales-button sales-button-ghost" onClick={() => void copyDownloadLink()} disabled={!job.quote_download_url}><i aria-hidden="true">↗</i>{copied === "link" ? "链接已复制" : "复制下载链接"}</button>
                 {job.quote_download_url && <a className="sales-button sales-button-secondary sales-download" href={job.quote_download_url} download={job.quote_download_filename || undefined}><i aria-hidden="true">↓</i>下载 Excel</a>}
                 <button type="button" className="sales-button sales-button-primary" onClick={() => void copyQuoteResult()}><i aria-hidden="true">□</i>{copied === "quote" ? "报价已复制" : "复制报价"}</button>

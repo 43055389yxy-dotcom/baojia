@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.10.0';
+const VERSION = '3.11.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -219,6 +219,22 @@ const queryContext = z.object({
   ),
 }).strict();
 
+const componentBillingScope = z.object({
+  billing_key: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/),
+  scenario_key: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/).optional(),
+}).strict();
+
+const quoteComponentPlan = z.object({
+  component_key: componentKey,
+  parent_component_key: componentKey.optional(),
+  customer_owned_source: z.string().min(1).max(2000).describe(
+    '第一遍清洗后仅属于本组件的标准化配置；不得放入整单原文、兄弟组件或清洗前文本。',
+  ),
+  billing_scopes: z.array(componentBillingScope).min(1).max(30).describe(
+    '本组件正式报价必须完成的计费身份。它只用于进度与完整性核对，不发送给云厂商。',
+  ),
+}).strict();
+
 const getPricesInputSchema = z.object({
   queries: z.array(priceQuery).min(1).max(50).describe(
     'Current incremental query group. For a long quote, GPT chooses a suitably small group from response complexity and continues the same price_batch_id; this is a transport ceiling, not a required batch size.',
@@ -228,8 +244,14 @@ const getPricesInputSchema = z.object({
   ),
   relay_job_id: z.string().regex(/^gpt-[a-f0-9]{32}$/).optional(),
   submission_code: z.string().regex(/^[1-9]$/).optional(),
+  quote_components: z.array(quoteComponentPlan).min(1).max(200).optional().describe(
+    '整单清洗完成后一次性提交并封存的组件计划。后续批次只复用，不得修改。用于按每 20 个组件分配对话名额、显示真实组件进度和部分交付。',
+  ),
   price_batch_id: z.string().regex(/^aqpb_[a-f0-9-]{36}$/).optional().describe(
     'Saved batch to extend during resume. Existing successful query_ids are reused.',
+  ),
+  force_capability_recheck: z.boolean().optional().describe(
+    'Use only after an administrator has repaired cloud API permissions. It bypasses a recent scoped authorization-denial memory once; it never bypasses provider authorization.',
   ),
 }).strict();
 
@@ -275,6 +297,15 @@ function parseGetPricesInput(args) {
 const getPriceResultsInput = z.object({
   price_batch_id: z.string().regex(/^aqpb_[a-f0-9-]{36}$/),
   query_ids: z.array(z.string().min(1).max(100)).min(1).max(10),
+  detail_offset: z.number().int().min(0).optional().describe(
+    'Saved evidence page offset, initially 0. Use each result.detail_page.next_offset to read remaining rates and items.',
+  ),
+  detail_limit: z.number().int().min(1).max(50).optional().describe(
+    'Maximum rates/items per query in this response; defaults to 20. Pagination never changes the saved evidence.',
+  ),
+  include_raw_items: z.boolean().optional().describe(
+    'Set true only when nested official item fields are needed in text-only clients. Normally the text includes identities, scalar attributes and every rate in the current page.',
+  ),
   relay_job_id: z.string().regex(/^gpt-[a-f0-9]{32}$/).optional(),
   submission_code: z.string().regex(/^[1-9]$/).optional(),
 }).strict();
@@ -304,6 +335,29 @@ const officialPriceEvidence = z.object({
   ),
 }).strict();
 
+const officialPagePriceEvidence = z.object({
+  billing_key: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/).describe(
+    '与 query_contexts 中相同的稳定计费项。程序只核对归属，不替 GPT 选择价格。',
+  ),
+  scenario_key: scenarioKey.optional(),
+  source_url: z.string().url().max(2000).describe(
+    'GPT 在官方 API 对同一计费项连续三次未取得可用费率后选择的云厂商官方 HTTPS 价格页。',
+  ),
+  source_title: z.string().min(1).max(300),
+  price_item: z.string().min(1).max(500).describe('官方页面中的具体计费项目或价格档位。'),
+  region,
+  currency: z.string().regex(/^[A-Z]{3}$/),
+  unit_price: z.string().regex(/^(?:0*[1-9]\d*(?:\.\d{1,12})?|0*\.\d*[1-9]\d*)$/).describe(
+    'GPT 从官方价格页选择的正数单位价格；MCP 不据此替 GPT 计算金额。',
+  ),
+  unit: z.string().min(1).max(120),
+  observed_at: z.string().datetime({ offset: true }).describe('GPT 读取官方价格页的时间。'),
+  source_excerpt: z.string().min(1).max(1000).describe('足以核对价格、币种、单位和适用范围的简短官方页面摘录。'),
+  api_attempt_query_ids: z.array(z.string().min(1).max(100)).min(3).max(30).describe(
+    '同一组件、计费项和方案下至少三个未取得可用费率的官方 API 查询 ID。',
+  ),
+}).strict();
+
 const componentScenarioCost = z.object({
   scenario_key: scenarioKey,
   label: z.string().min(1).max(40).optional().describe('GPT 根据本次官方方案给出的客户可读名称。'),
@@ -316,6 +370,9 @@ const componentScenarioCost = z.object({
   ),
   price_query_ids: z.array(z.string().min(1).max(100)).min(1).max(30).optional(),
   price_evidence: z.array(officialPriceEvidence).min(1).max(30).optional(),
+  official_page_price_evidence: z.array(officialPagePriceEvidence).min(1).max(30).optional().describe(
+    '仅在同一计费项的官方 API 已连续三次未取得可用费率后使用；仍由 GPT 选价格和计算。',
+  ),
 }).strict();
 
 const quoteScenarioTotal = z.object({
@@ -351,6 +408,9 @@ const pricedService = z.object({
   price_evidence: z.array(officialPriceEvidence).min(1).max(30).optional().describe(
     'GPT 从官方原始结果中选中的查询、SKU/价格项及具体费率身份。正式商业报价不得选择 Free Tier、Always Free、免费试用或账户赠送额度。',
   ),
+  official_page_price_evidence: z.array(officialPagePriceEvidence).min(1).max(30).optional().describe(
+    'API 优先；同一计费项连续三次未取得可用费率后，GPT 可提交对应账号站点的云厂商官方价格页证据。',
+  ),
   fact_ids: z.array(factId).min(1).max(100).describe(
     '该组件在 ResourceIR、BillingUsageIR 和 PriceIR 中消费的客户事实 ID。',
   ),
@@ -383,6 +443,20 @@ const zeroCostService = z.object({
   customer_facing: customerFacingService,
 }).strict();
 
+const unpricedService = z.object({
+  component_key: componentKey,
+  region: region.optional(),
+  fact_ids: z.array(factId).min(1).max(100),
+  failure_code: z.enum([
+    'official_price_unavailable',
+    'official_query_failed',
+    'unsupported_in_region',
+    'retry_limit_reached',
+  ]),
+  retryable: z.boolean().default(true),
+  customer_facing: customerFacingService,
+}).strict();
+
 const quoteAdjustment = z.object({
   component_key: componentKey,
   customer_requirement: z.string().min(1).max(500).describe('客户能看懂的原需求简述。'),
@@ -397,7 +471,7 @@ const buildEstimateInput = z.object({
   relay_job_id: z.string().regex(/^gpt-[a-f0-9]{32}$/).optional().describe('销售前端提供的内部任务编号，用于撤回后的交付保护。'),
   default_region: region,
   region_adjustment_reason: z.string().min(1).max(500).optional().describe(
-    '仅当实际报价地域不同于销售首选地域时填写，说明该地域不能承载整套产品以及 GPT 选择的同站点相邻地域。',
+    '仅当实际报价地域不同于销售首选地域时填写。实际地域必须是当前云厂商和账号站点的官方地域代码，不得复制其他云厂商同名代码的含义；说明首选地域不能承载整套产品以及所选同站点相邻地域。',
   ),
   currency: z.string().regex(/^[A-Z]{3}$/).describe(
     '整张报价使用的官方币种，必须与所选官方费率证据一致；不得静默换汇。',
@@ -406,14 +480,20 @@ const buildEstimateInput = z.object({
   display_result_on_page: z.boolean().optional().describe(
     '兼容字段；当前所有报价均生成 Excel 并返回销售页面，不发送 WebHook。',
   ),
+  is_partial: z.boolean().default(false).describe(
+    '仅在有限重试后仍有组件无法取得官方价格时设为 true；已成功组件照常交付，未核价组件必须全部列入 unpriced_services。',
+  ),
   expected_monthly_total: z.string().regex(/^\d+(?:\.\d{1,10})?$/),
   pricing_scenarios: z.array(quoteScenarioTotal).min(1).max(3).optional().describe(
     '销售所选方案的整单合计；每一项必须等于全部 services[].scenario_costs 的机械加总。',
   ),
   fact_ledger: z.array(fact).max(500),
-  services: z.array(pricedService).min(1).max(50),
-  zero_cost_services: z.array(zeroCostService).max(50).default([]).describe(
+  services: z.array(pricedService).min(1).max(200),
+  zero_cost_services: z.array(zeroCostService).max(200).default([]).describe(
     '不产生额外云费用的结构化资源。只能消费 disposition=zero_cost 的客户事实。',
+  ),
+  unpriced_services: z.array(unpricedService).max(200).default([]).describe(
+    '部分报价中仍未取得官方价格的组件。它们不参与金额合计，禁止按 0 元处理。完整报价必须为空。',
   ),
   assumptions: z.array(z.string().min(1).max(500).describe('客户可直接阅读的中文报价假设。')).max(100).default([]),
   adjustments: z.array(quoteAdjustment).max(200).default([]),
@@ -425,39 +505,88 @@ const quoteJobInput = z.object({
   submission_code: z.string().regex(/^[1-9]$/),
 }).strict();
 
-function ok(payload) {
-  const summary = {};
-  for (const key of [
-    'status', 'code', 'price_batch_id', 'quote_id', 'next_action',
-    'result_count', 'batch_result_count', 'relay_job_id', 'stage',
-    'terminal', 'quote_terminal', 'must_continue', 'response_compacted',
-    'response_bytes', 'response_bytes_before_compaction', 'response_byte_budget', 'batch_query_count',
-    'completed_query_count', 'incomplete_query_count',
-    'progress_guidance', 'discovery_query_count', 'superseded_query_ids',
-  ]) {
-    if (payload?.[key] !== undefined) summary[key] = payload[key];
+const RATE_SUMMARY_FIELDS = [
+  'rate_id', 'official_item_id', 'unit_price', 'currency', 'unit', 'description',
+  'pricing_model', 'purchase_option', 'term_years', 'payment_option',
+  'offering_class', 'tier_start', 'tier_end', 'tier_unit', 'is_zero_rate',
+];
+
+function compactRateForText(rate) {
+  if (!rate || typeof rate !== 'object') return undefined;
+  const compact = {};
+  for (const key of RATE_SUMMARY_FIELDS) {
+    if (rate[key] !== undefined) compact[key] = rate[key];
   }
+  return Object.keys(compact).length > 0 ? compact : undefined;
+}
+
+function compactOfficialItemForText(item) {
+  if (!item || typeof item !== 'object') return undefined;
+  const compact = {};
+  for (const [key, value] of Object.entries(item)) {
+    if (value === null || ['number', 'boolean'].includes(typeof value)
+      || (typeof value === 'string' && value.length <= 1000)) compact[key] = value;
+  }
+  if (item.attributes && typeof item.attributes === 'object' && !Array.isArray(item.attributes)) {
+    compact.attributes = Object.fromEntries(
+      Object.entries(item.attributes)
+        .filter(([, value]) => ['string', 'number', 'boolean'].includes(typeof value)),
+    );
+  }
+  return Object.keys(compact).length > 0 ? compact : undefined;
+}
+
+function ok(payload) {
+  // Some MCP clients expose content text only. Keep all public non-price
+  // fields (discovery values, recovery, progress and delivery URLs) available.
+  // Only raw price evidence and learned route bodies need a concise rendering.
+  const summary = { ...payload };
+  delete summary.learned_routes;
   if (Array.isArray(payload?.results)) {
     summary.results = payload.results.map((item) => {
       const result = {
         query_id: item?.query_id,
+        provider: item?.provider,
         status: item?.status,
       };
       for (const key of [
         'terminal', 'retryable', 'error_category', 'code', 'reused_route_id',
         'not_found_reason', 'raw_item_count', 'filtered_item_count',
+        'detail_page', 'details_available', 'refinement_fields', 'matched_count',
+        'official_item_count', 'official_item_id_count', 'official_rate_candidate_count',
+        'provider_code', 'cache_status', 'official_price_observed_at',
+        'cache_age_seconds', 'source_request_skipped', 'capability_preflight',
       ]) {
         if (item?.[key] !== undefined) result[key] = item[key];
       }
       if (item?.details?.provider_code) {
         result.provider_code = item.details.provider_code;
       }
+      if (item?.details?.request_id) result.request_id = item.details.request_id;
+      if (typeof item?.message === 'string' && item.message) {
+        result.message = item.message.slice(0, 800);
+      }
+      if (Array.isArray(item?.official_item_ids)) {
+        result.official_item_ids = item.official_item_ids;
+        result.official_item_id_count = item.official_item_ids.length;
+      }
+      if (Array.isArray(item?.official_rate_candidates)) {
+        result.official_rate_candidates = item.official_rate_candidates
+          .map(compactRateForText).filter(Boolean);
+        result.official_rate_candidate_count = item.official_rate_candidates.length;
+      }
+      const officialItems = [item?.items, item?.products, item?.skus, item?.services]
+        .find((candidate) => Array.isArray(candidate));
+      if (officialItems) {
+        result.official_items = item.include_raw_items === true
+          ? officialItems : officialItems.map(compactOfficialItemForText).filter(Boolean);
+        result.official_item_count = officialItems.length;
+        if (item.include_raw_items !== true) {
+          result.raw_item_access = { tool: 'get_price_results', include_raw_items: true };
+        }
+      }
       if (item?.recovery) {
-        result.recovery = {
-          next_action: item.recovery.next_action,
-          field: item.recovery.field,
-          parameter: item.recovery.parameter,
-        };
+        result.recovery = item.recovery;
       }
       if (Array.isArray(item?.pricing_knowledge)) {
         result.pricing_knowledge_count = item.pricing_knowledge.length;
@@ -572,7 +701,7 @@ function buildServer(workflow) {
 
   server.registerTool('get_price_results', {
     title: 'Read selected saved official price results',
-    description: 'Reads only explicitly requested query IDs from a saved batch. Use it instead of replaying the whole historical batch.',
+    description: 'Reads explicitly requested query IDs from a saved batch, with complete official evidence paged by detail_offset/detail_limit (default 20). Continue using each result.detail_page.next_offset until null. The text response includes every returned rate and official identity even in clients that hide structuredContent. Do not replay price queries or download a full cloud catalog to recover these details.',
     inputSchema: getPriceResultsInput,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, guarded((args) => workflow.getPriceResults(args)));

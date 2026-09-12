@@ -24,12 +24,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from app.services.gpt_quote_batches import split_component_plan
+
 UTC = timezone.utc  # noqa: UP017 - the host-side worker still supports Python 3.9
 
-TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+TERMINAL_STATUSES = {"completed", "partial", "failed", "cancelled"}
 DELIVERY_RECEIPT_STATUSES = {
     "delivered",
     "page_result_ready",
+    "partial_page_result_ready",
 }
 PUBLIC_FIELDS = {
     "job_id",
@@ -44,10 +47,27 @@ PUBLIC_FIELDS = {
     "quick_quote_result",
     "quote_download_url",
     "quote_download_filename",
+    "progress",
 }
 
 DEFAULT_MAX_CONCURRENT_QUOTES = 4
 DEFAULT_QUOTE_SECONDS = 600
+COMPONENTS_PER_CHAT = 20
+
+PUBLIC_FAILURE_CATEGORIES = {
+    "credentials",
+    "authorization",
+    "provider_unavailable",
+    "transport",
+    "rate_limit",
+    "invalid_request",
+    "response_schema",
+    "official_api_error",
+}
+SALES_CACHE_FALLBACK_NOTICE = (
+    "销售提示：官方价格接口临时不可用，部分价格采用带时间戳的最近官方价格快照；"
+    "建议发送客户前再次确认。"
+)
 
 
 def utc_now() -> str:
@@ -68,6 +88,7 @@ class GptQuoteRelayStore:
         *,
         max_concurrent_quotes: int | None = None,
         default_quote_seconds: int | None = None,
+        checkpoint_directory: Path | str | None = None,
     ) -> None:
         configured_limit = max_concurrent_quotes or DEFAULT_MAX_CONCURRENT_QUOTES
         configured_duration = default_quote_seconds or DEFAULT_QUOTE_SECONDS
@@ -99,6 +120,17 @@ class GptQuoteRelayStore:
         self._set_owner(self.requests_directory)
         self.lock_path = self.directory / ".queue.lock"
         self.heartbeat_path = self.directory / "worker-heartbeat.json"
+        configured_checkpoints = checkpoint_directory or os.environ.get(
+            "ASTRAQUOTE_V2_STATE_DIR"
+        )
+        self.checkpoint_directory = Path(
+            configured_checkpoints
+            or (
+                "/data/v2-quotes"
+                if Path("/data").is_dir()
+                else Path(__file__).resolve().parents[3] / ".data" / "v2-quotes"
+            )
+        )
 
     def _set_owner(self, path: Path | str) -> None:
         if self.owner_uid is None and self.owner_gid is None:
@@ -217,6 +249,8 @@ class GptQuoteRelayStore:
                 "result_summary": None,
                 "error": None,
                 "continuation_attempts": 0,
+                "stalled_continuation_attempts": 0,
+                "last_progress_fingerprint": None,
             }
             self._write_atomic(self._path(job_id), record)
             self._write_atomic(
@@ -233,6 +267,11 @@ class GptQuoteRelayStore:
 
     def public(self, record: dict[str, Any]) -> dict[str, Any]:
         payload = {key: record.get(key) for key in PUBLIC_FIELDS}
+        progress = self._public_progress(record)
+        if progress is not None:
+            payload["progress"] = progress
+        else:
+            payload.pop("progress", None)
         payload["failure_code"] = (
             "AQ-QUOTE-FAILED" if record.get("status") == "failed" else None
         )
@@ -240,10 +279,337 @@ class GptQuoteRelayStore:
             payload.update(self._queue_metadata(record))
         return payload
 
+    def _checkpoint_path(self, job_id: str) -> Path:
+        self._path(job_id)
+        return self.checkpoint_directory / f"relay-{job_id}.json"
+
+    def _checkpoint(self, job_id: str) -> dict[str, Any] | None:
+        path = self._checkpoint_path(job_id)
+        if not path.exists():
+            return None
+        try:
+            checkpoint = self._read(path)
+        except (OSError, ValueError, TypeError):
+            return None
+        if checkpoint.get("relay_job_id") not in {None, job_id}:
+            return None
+        return checkpoint
+
+    def quote_chat_batches(self, job_id: str) -> list[dict[str, Any]]:
+        """Read private, sealed component batches for the desktop worker.
+
+        This data never enters the public sales payload.  The batch file only
+        contains first-pass cleaned per-component sources; raw intake text has
+        already been purged before this method can return anything.
+        """
+
+        record = self.get(job_id)
+        if not record.get("source_purged_at"):
+            return []
+        checkpoint = self._checkpoint(job_id) or {}
+        batch_id = str(checkpoint.get("price_batch_id") or "")
+        if not re.fullmatch(r"aqpb_[a-f0-9-]{36}", batch_id):
+            return []
+        batch_path = self.checkpoint_directory / f"{batch_id}.json"
+        try:
+            batch = self._read(batch_path)
+        except (OSError, ValueError, TypeError):
+            return []
+        if str(batch.get("relay_job_id") or "") != job_id:
+            return []
+        components = batch.get("quote_components")
+        if not isinstance(components, list) or not components:
+            return []
+        try:
+            grouped = split_component_plan(components)
+        except (KeyError, TypeError, ValueError):
+            return []
+        lifecycle_by_key = {
+            str(item.get("component_key") or ""): str(item.get("state") or "pending")
+            for item in (batch.get("component_lifecycle") or [])
+            if isinstance(item, dict)
+        }
+        return [
+            {
+                "batch_index": index,
+                "batch_count": len(grouped),
+                "price_batch_id": batch_id,
+                "component_keys": [str(item["component_key"]) for item in group],
+                "components": group,
+                "component_states": {
+                    str(item["component_key"]): lifecycle_by_key.get(
+                        str(item["component_key"]), "pending"
+                    )
+                    for item in group
+                },
+            }
+            for index, group in enumerate(grouped)
+        ]
+
+    def record_chat_session(
+        self,
+        job_id: str,
+        *,
+        batch_index: int,
+        batch_count: int,
+        chat_url: str,
+        role: str,
+        component_keys: list[str],
+    ) -> dict[str, Any]:
+        """Persist one logical chat while the robot keeps a single window."""
+
+        if role not in {"coordinator", "component_batch"}:
+            raise GptRelayError("无效的报价对话角色。", code="gpt_relay_chat_role_invalid")
+        if not 0 <= batch_index < batch_count <= 200:
+            raise GptRelayError("无效的报价对话批次。", code="gpt_relay_chat_batch_invalid")
+        if not str(chat_url).startswith("https://chatgpt.com/"):
+            raise GptRelayError("无效的报价对话地址。", code="gpt_relay_chat_url_invalid")
+        with self._lock():
+            path = self._path(job_id)
+            record = self._read(path)
+            sessions = [
+                item
+                for item in (record.get("chat_sessions") or [])
+                if int(item.get("batch_index", -1)) != batch_index
+            ]
+            sessions.append(
+                {
+                    "batch_index": batch_index,
+                    "batch_count": batch_count,
+                    "chat_url": str(chat_url),
+                    "role": role,
+                    "component_keys": list(component_keys),
+                    "status": "running",
+                    "updated_at": utc_now(),
+                }
+            )
+            sessions.sort(key=lambda item: int(item["batch_index"]))
+            record["chat_sessions"] = sessions
+            if role == "coordinator":
+                record["chat_url"] = str(chat_url)
+            record["updated_at"] = utc_now()
+            self._write_atomic(path, record)
+            return record
+
+    def update_chat_session(
+        self,
+        job_id: str,
+        batch_index: int,
+        **changes: Any,
+    ) -> dict[str, Any]:
+        """Update only worker bookkeeping; component results stay in V2 state."""
+
+        with self._lock():
+            path = self._path(job_id)
+            record = self._read(path)
+            sessions = list(record.get("chat_sessions") or [])
+            found = False
+            for item in sessions:
+                if int(item.get("batch_index", -1)) == batch_index:
+                    item.update(changes)
+                    item["updated_at"] = utc_now()
+                    found = True
+                    break
+            if not found:
+                raise GptRelayError(
+                    "报价对话批次不存在。", code="gpt_relay_chat_batch_not_found"
+                )
+            record["chat_sessions"] = sessions
+            record["updated_at"] = utc_now()
+            self._write_atomic(path, record)
+            return record
+
+    @staticmethod
+    def _safe_count(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            return None
+        return count if count >= 0 else None
+
+    def _public_progress(self, record: dict[str, Any]) -> dict[str, Any] | None:
+        checkpoint = self._checkpoint(str(record.get("job_id") or ""))
+        if checkpoint is None:
+            return None
+        progress: dict[str, Any] = {
+            "stage": str(checkpoint.get("stage") or "processing")[:80],
+        }
+        for key in (
+            "total_component_count",
+            "top_level_component_count",
+            "component_chat_count",
+            "completed_component_count",
+            "failed_component_count",
+            "pending_component_count",
+        ):
+            count = self._safe_count(checkpoint.get(key))
+            if count is not None:
+                progress[key] = count
+        updated_at = str(checkpoint.get("updated_at") or "").strip()
+        if updated_at:
+            progress["updated_at"] = updated_at[:80]
+        return progress
+
+    def progress_fingerprint(self, job_id: str) -> str:
+        """Return a stable machine-progress identity, excluding timestamps/text."""
+
+        checkpoint = self._checkpoint(job_id) or {}
+        stable = self._progress_snapshot(checkpoint)
+        return json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    @classmethod
+    def _progress_snapshot(cls, checkpoint: dict[str, Any]) -> dict[str, Any]:
+        # Attempts, failures, query IDs and discovery results are activity, not
+        # progress. Pricing status can oscillate as the next query starts.
+        stage_ranks = {
+            "requirements_cleaned": 1,
+            "pricing_request_rejected": 1,
+            "pricing_partial": 2,
+            "pricing_completed": 2,
+            "estimate_validated": 3,
+            "artifacts_generated": 4,
+            "delivery_completed": 5,
+        }
+        return {
+            "stage_rank": stage_ranks.get(str(checkpoint.get("stage") or ""), 0),
+            "completed_component_count": cls._safe_count(
+                checkpoint.get("completed_component_count")
+            ) or 0,
+            "completed_component_keys": sorted({
+                key for key in (checkpoint.get("completed_component_keys") or [])
+                if isinstance(key, str) and key
+            }),
+        }
+
+    @classmethod
+    def _merge_progress(cls, previous: str | None, current: str) -> str:
+        """Remember high-water marks so state regressions cannot buy retries."""
+
+        try:
+            prior = json.loads(previous or "{}")
+        except (TypeError, ValueError):
+            prior = {}
+        if not isinstance(prior, dict):
+            prior = {}
+        if "stage_rank" not in prior:
+            prior = cls._progress_snapshot(prior)
+        latest = json.loads(current)
+        merged = {
+            "stage_rank": max(prior.get("stage_rank") or 0, latest["stage_rank"]),
+            "completed_component_count": max(
+                prior.get("completed_component_count") or 0,
+                latest["completed_component_count"],
+            ),
+            "completed_component_keys": sorted(
+                set(prior.get("completed_component_keys") or [])
+                | set(latest["completed_component_keys"])
+            ),
+        }
+        return json.dumps(merged, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def has_unrecoverable_failure(self, job_id: str) -> bool:
+        checkpoint = self._checkpoint(job_id) or {}
+        record = self.get(job_id)
+        if int(checkpoint.get("partial_retry_generation") or 0) < int(
+            record.get("partial_retry_generation") or 0
+        ):
+            return False
+        if checkpoint.get("quote_terminal") is True:
+            return True
+        error = checkpoint.get("error") or {}
+        return checkpoint.get("stage") == "failed" and error.get("retryable") is not True
+
+    def reserve_continuation(self, job_id: str, *, maximum: int = 2) -> bool:
+        """Atomically reserve one retry for the current unchanged checkpoint."""
+
+        maximum = max(1, min(2, int(maximum)))
+        with self._lock():
+            path = self._path(job_id)
+            if not path.exists():
+                raise GptRelayError("GPT 报价任务不存在。", code="gpt_relay_job_not_found")
+            record = self._read(path)
+            if record.get("status") != "processing" or record.get(
+                "partial_finalization_requested"
+            ):
+                return False
+            previous = record.get("last_progress_fingerprint")
+            fingerprint = self._merge_progress(previous, self.progress_fingerprint(job_id))
+            stalled = int(record.get("stalled_continuation_attempts") or 0)
+            if previous != fingerprint:
+                stalled = 0
+            if stalled >= maximum:
+                return False
+            record.update(
+                {
+                    "continuation_attempts": int(record.get("continuation_attempts") or 0) + 1,
+                    "stalled_continuation_attempts": stalled + 1,
+                    "last_progress_fingerprint": fingerprint,
+                    "updated_at": utc_now(),
+                }
+            )
+            self._write_atomic(path, record)
+            return True
+
+    def request_partial_finalization(self, job_id: str) -> bool:
+        """Reserve one final partial-delivery instruction after stalled retries."""
+
+        checkpoint = self._checkpoint(job_id) or {}
+        completed = self._safe_count(checkpoint.get("completed_component_count")) or 0
+        total = self._safe_count(checkpoint.get("total_component_count")) or 0
+        if completed < 1 or total <= completed:
+            return False
+        with self._lock():
+            path = self._path(job_id)
+            record = self._read(path)
+            if record.get("status") != "processing" or record.get(
+                "partial_finalization_requested"
+            ):
+                return False
+            record.update(
+                {
+                    "partial_finalization_requested": True,
+                    "updated_at": utc_now(),
+                    "events": [
+                        *(record.get("events") or []),
+                        self._event(
+                            "partial_finalization",
+                            "停滞重试已结束，正在交付已完成组件",
+                        ),
+                    ][-100:],
+                }
+            )
+            self._write_atomic(path, record)
+            return True
+
+    def _slot_count(self, record: dict[str, Any]) -> int:
+        checkpoint = self._checkpoint(str(record.get("job_id") or "")) or {}
+        total = (
+            self._safe_count(checkpoint.get("top_level_component_count"))
+            or self._safe_count(checkpoint.get("total_component_count"))
+            or 0
+        )
+        return min(
+            self.max_concurrent_quotes,
+            max(1, math.ceil(total / COMPONENTS_PER_CHAT)),
+        )
+
+    def _has_sealed_component_count(self, record: dict[str, Any]) -> bool:
+        checkpoint = self._checkpoint(str(record.get("job_id") or "")) or {}
+        return (
+            self._safe_count(checkpoint.get("top_level_component_count")) or 0
+        ) > 0 or (
+            self._safe_count(checkpoint.get("total_component_count")) or 0
+        ) > 0
+
     @staticmethod
     def _timestamp(value: Any) -> datetime | None:
         try:
-            return datetime.fromisoformat(str(value or ""))
+            text = str(value or "")
+            if text.endswith("Z"):
+                text = f"{text[:-1]}+00:00"
+            return datetime.fromisoformat(text)
         except ValueError:
             return None
 
@@ -276,6 +642,10 @@ class GptQuoteRelayStore:
 
         now = datetime.now(UTC)
         active = [record for record in records if record.get("status") == "processing"]
+        active_slot_count = min(
+            self.max_concurrent_quotes,
+            sum(self._slot_count(record) for record in active),
+        )
         waiting = sorted(
             (
                 record
@@ -301,7 +671,9 @@ class GptQuoteRelayStore:
         for record in active:
             started_at = self._timestamp(record.get("processing_started_at"))
             elapsed = max(0.0, (now - started_at).total_seconds()) if started_at else 0.0
-            slot_availability.append(max(60.0, typical_seconds - elapsed))
+            slot_availability.extend(
+                [max(60.0, typical_seconds - elapsed)] * self._slot_count(record)
+            )
         while len(slot_availability) < self.max_concurrent_quotes:
             slot_availability.append(0.0)
         heapq.heapify(slot_availability)
@@ -316,10 +688,10 @@ class GptQuoteRelayStore:
 
         return {
             "max_concurrent_quotes": self.max_concurrent_quotes,
-            "active_quote_count": len(active),
+            "active_quote_count": active_slot_count,
             "queue_position": target_index + 1,
             "queued_ahead_count": target_index,
-            "jobs_ahead_count": len(active) + target_index,
+            "jobs_ahead_count": active_slot_count + target_index,
             "estimated_wait_minutes": math.ceil(target_wait_seconds / 60),
         }
 
@@ -346,7 +718,7 @@ class GptQuoteRelayStore:
             if record.get("status") == "cancelled":
                 return record
             if (
-                record.get("status") == "completed"
+                record.get("status") in {"completed", "partial"}
                 and record.get("quick_quote_result")
                 and record.get("quote_download_url")
             ):
@@ -357,6 +729,12 @@ class GptQuoteRelayStore:
             try:
                 receipt = self._read(receipt_path)
             except (OSError, ValueError, TypeError):
+                return record
+            retry_requested_at = self._timestamp(record.get("partial_retry_requested_at"))
+            receipt_delivered_at = self._timestamp(receipt.get("delivered_at"))
+            if retry_requested_at and (
+                receipt_delivered_at is None or receipt_delivered_at <= retry_requested_at
+            ):
                 return record
             if (
                 receipt.get("schema_version") != "astraquote-relay-completion/1"
@@ -374,7 +752,9 @@ class GptQuoteRelayStore:
                 return record
             record.update(
                 {
-                    "status": "completed",
+                    "status": (
+                        "partial" if page_result.get("is_partial") is True else "completed"
+                    ),
                     "result_status": receipt["status"],
                     "result_summary": "报价结果和 Excel 已生成。",
                     "quick_quote_result": page_result,
@@ -388,8 +768,12 @@ class GptQuoteRelayStore:
                     "events": [
                         *(record.get("events") or []),
                         self._event(
-                            "completed",
-                            "报价结果和 Excel 已生成",
+                            "partial" if page_result.get("is_partial") is True else "completed",
+                            (
+                                "部分报价和 Excel 已生成"
+                                if page_result.get("is_partial") is True
+                                else "报价结果和 Excel 已生成"
+                            ),
                         ),
                     ][-100:],
                 }
@@ -406,7 +790,7 @@ class GptQuoteRelayStore:
             return None
         components = value.get("components")
         scenarios = value.get("scenarios")
-        if not isinstance(components, list) or not 1 <= len(components) <= 50:
+        if not isinstance(components, list) or not 1 <= len(components) <= 200:
             return None
         if not isinstance(scenarios, list) or not 1 <= len(scenarios) <= 3:
             return None
@@ -479,8 +863,46 @@ class GptQuoteRelayStore:
                     "upfront_total": str(scenario["upfront_total"]),
                 }
             )
-        return {
+        unpriced_components = value.get("unpriced_components") or []
+        if not isinstance(unpriced_components, list) or len(unpriced_components) > 200:
+            return None
+        public_unpriced = []
+        allowed_failure_codes = {
+            "official_price_unavailable",
+            "official_query_failed",
+            "unsupported_in_region",
+            "retry_limit_reached",
+        }
+        for component in unpriced_components:
+            if not isinstance(component, dict):
+                return None
+            service_name = str(component.get("service_name") or "").strip()
+            failure_code = str(component.get("failure_code") or "")
+            if not service_name or failure_code not in allowed_failure_codes:
+                return None
+            public_component = {
+                "service_name": service_name[:120],
+                "model_or_plan": str(component.get("model_or_plan") or "")[:160],
+                "quantity": str(component.get("quantity") or "")[:80],
+                "configuration_summary": str(
+                    component.get("configuration_summary") or ""
+                )[:1200],
+                "failure_code": failure_code,
+                "retryable": component.get("retryable") is not False,
+            }
+            failure_category = str(component.get("failure_category") or "")
+            if failure_category in PUBLIC_FAILURE_CATEGORIES:
+                public_component["failure_category"] = failure_category
+            provider_code = str(component.get("provider_code") or "")
+            if re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", provider_code):
+                public_component["provider_code"] = provider_code
+            public_unpriced.append(public_component)
+        is_partial = value.get("is_partial") is True
+        if is_partial != bool(public_unpriced):
+            return None
+        public_result = {
             "schema_version": "astraquote-page-result/1",
+            "is_partial": is_partial,
             "currency": currency,
             "region": str(value.get("region") or "")[:32],
             "preferred_region": str(value.get("preferred_region") or "")[:80],
@@ -488,8 +910,12 @@ class GptQuoteRelayStore:
                 value.get("region_adjustment_reason") or ""
             )[:500],
             "components": public_components,
+            "unpriced_components": public_unpriced,
             "scenarios": public_scenarios,
         }
+        if value.get("pricing_notice"):
+            public_result["pricing_notice"] = SALES_CACHE_FALLBACK_NOTICE
+        return public_result
 
     @staticmethod
     def _download_url_public(value: Any) -> str | None:
@@ -539,14 +965,14 @@ class GptQuoteRelayStore:
         stage: str | None = None,
         message: str | None = None,
     ) -> dict[str, Any]:
-        """Apply a worker transition without ever reviving a cancelled job."""
+        """Apply a worker transition without reviving cancellation or delivery."""
 
         with self._lock():
             path = self._path(job_id)
             if not path.exists():
                 raise GptRelayError("GPT 报价任务不存在。", code="gpt_relay_job_not_found")
             record = self._read(path)
-            if record.get("status") == "cancelled":
+            if record.get("status") in {"cancelled", "completed", "partial"}:
                 return record
             record.update(changes)
             record["updated_at"] = utc_now()
@@ -563,6 +989,7 @@ class GptQuoteRelayStore:
             now = datetime.now(UTC)
             candidates: list[tuple[str, Path, dict[str, Any]]] = []
             active_count = 0
+            active_has_unplanned_intake = False
             for path in self.jobs_directory.glob("gpt-*.json"):
                 try:
                     record = self._read(path)
@@ -577,12 +1004,28 @@ class GptQuoteRelayStore:
                     except ValueError:
                         expired = True
                 if status == "processing" and not expired:
-                    active_count += 1
+                    active_count += self._slot_count(record)
+                    active_has_unplanned_intake = (
+                        active_has_unplanned_intake
+                        or not self._has_sealed_component_count(record)
+                    )
                 if status == "queued" or expired:
                     candidates.append((str(record.get("created_at") or ""), path, record))
             if active_count >= self.max_concurrent_quotes or not candidates:
                 return None
-            _, path, record = min(candidates, key=lambda item: item[0])
+            # The exact slot demand is known only after the first-pass clean
+            # plan is sealed. Admit at most one such intake at a time so four
+            # one-slot placeholders cannot later expand into twelve chats.
+            if active_has_unplanned_intake:
+                return None
+            eligible = [
+                item
+                for item in candidates
+                if active_count + self._slot_count(item[2]) <= self.max_concurrent_quotes
+            ]
+            if not eligible:
+                return None
+            _, path, record = min(eligible, key=lambda item: item[0])
             record.update(
                 {
                     "status": "processing",
@@ -627,6 +1070,7 @@ class GptQuoteRelayStore:
         *,
         limit: int | None,
         lease_minutes: int = 30,
+        exclude_job_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Reattach submitted conversations after the browser worker restarts.
 
@@ -637,6 +1081,7 @@ class GptQuoteRelayStore:
         if limit is not None and limit < 1:
             return []
         claimed: list[dict[str, Any]] = []
+        excluded = exclude_job_ids or set()
         with self._lock():
             candidates: list[tuple[str, Path, dict[str, Any]]] = []
             for path in self.jobs_directory.glob("gpt-*.json"):
@@ -646,6 +1091,7 @@ class GptQuoteRelayStore:
                     continue
                 if (
                     record.get("status") == "processing"
+                    and record.get("job_id") not in excluded
                     and record.get("source_purged_at")
                     and str(record.get("chat_url") or "").strip()
                 ):
@@ -688,6 +1134,50 @@ class GptQuoteRelayStore:
             message="报价任务已取消",
         )
         return self.public(updated)
+
+    def retry_partial(self, job_id: str) -> dict[str, Any]:
+        """Resume only the unpriced part of a previously delivered partial quote."""
+
+        with self._lock():
+            path = self._path(job_id)
+            if not path.exists():
+                raise GptRelayError("GPT 报价任务不存在。", code="gpt_relay_job_not_found")
+            record = self._read(path)
+            result = record.get("quick_quote_result") or {}
+            retryable = [
+                item
+                for item in (result.get("unpriced_components") or [])
+                if isinstance(item, dict) and item.get("retryable") is not False
+            ]
+            if record.get("status") != "partial" or not retryable:
+                raise GptRelayError(
+                    "当前报价没有可重试的未完成组件。",
+                    code="gpt_relay_partial_retry_unavailable",
+                )
+            now = utc_now()
+            record.update(
+                {
+                    "status": "queued",
+                    "worker_id": None,
+                    "lease_expires_at": None,
+                    "partial_retry_requested_at": now,
+                    "partial_retry_pending": True,
+                    "partial_retry_generation": int(
+                        record.get("partial_retry_generation") or 0
+                    )
+                    + 1,
+                    "partial_finalization_requested": False,
+                    "stalled_continuation_attempts": 0,
+                    "last_progress_fingerprint": None,
+                    "updated_at": now,
+                    "events": [
+                        *(record.get("events") or []),
+                        self._event("retry", "仅重试未完成组件"),
+                    ][-100:],
+                }
+            )
+            self._write_atomic(path, record)
+            return self.public(record)
 
     def resume_login_waiting(self) -> int:
         """Return login-blocked jobs to the queue after the browser signs in."""

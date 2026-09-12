@@ -61,5 +61,14 @@ def provider_region_catalog(provider: str) -> dict[str, Any]:
         **profile,
         "regions": regions,
         "region_count": len(regions),
-        "catalog_role": "editable_sales_suggestions_only",
+        "catalog_checked_at": str(_catalog().get("catalog_checked_at") or ""),
+        "catalog_role": "official_provider_regions_only",
     }
+
+
+def is_provider_region(provider: str, region: str) -> bool:
+    code = str(region).strip()
+    return any(
+        item["code"] == code
+        for item in provider_region_catalog(provider)["regions"]
+    )

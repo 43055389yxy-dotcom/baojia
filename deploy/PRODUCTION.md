@@ -13,7 +13,9 @@
 - 火山引擎官方目录/询价 API
 - 天翼云官方目录/询价 API
 
-销售在报价页选择云厂商。GPT 负责理解需求、组织官网查询参数、选择官方价格项、换算用量和计算报价；MCP 只负责执行官方查询、保存原始证据、做 schema / 事实归属 / 金额加总一致性等机械校验，并交付页面结果或 Excel。
+销售在报价页选择云厂商。GPT 负责理解需求、组织官网查询参数、选择官方价格项、换算用量和计算报价；MCP 只负责执行官方查询、保存原始证据、做 schema / 事实归属 / 金额加总一致性等机械校验，并交付页面结果或 Excel。程序不替 GPT 选型号、补业务参数或算钱。
+
+官方 API 优先。同一组件、计费项和方案使用三个不同查询仍未取得可用费率后，GPT 可选择当前云厂商、当前账号站点的官方 HTTPS 价格页，并提交价格项目、地区、币种、单位、读取时间和前三次查询 ID。MCP 只校验失败次数、计费归属、官方域名与价格上下文；权限/凭据失败仍由管理员修复，最近权限拒绝的五分钟预检保持不变。有可用 API 价格时禁止网页证据覆盖。
 
 生产运行路径不包含 AWS Pricing Calculator、Calculator 浏览器、模板映射或创建后回读流程。
 
@@ -62,16 +64,28 @@ ASTRAQUOTE_XLSX_REGION=...
 ASTRAQUOTE_PUBLIC_BASE_URL=https://baojia.tontiancloud.com
 ```
 
+官方价格证据缓存和瞬时故障退避可按需调整；不配置时分别为新鲜 6 小时、最大陈旧 72 小时、重试等待 0.25 秒和 0.75 秒：
+
+```text
+ASTRAQUOTE_OFFICIAL_PRICE_FRESH_SECONDS=21600
+ASTRAQUOTE_OFFICIAL_PRICE_MAX_STALE_SECONDS=259200
+ASTRAQUOTE_PROVIDER_RETRY_DELAY_1=0.25
+ASTRAQUOTE_PROVIDER_RETRY_DELAY_2=0.75
+```
+
+缓存键包含云厂商、账号站点、地域和完整标准化查询。陈旧快照只允许在官方服务维护、限流或连接中断时临时降级，并只在销售页面披露；客户 Excel 不展示技术故障或缓存降级。权限、凭据或请求错误不会使用陈旧价格。
+
 ## MCP 工具
 
-生产 MCP 只公开六个工具：
+生产 MCP 只公开七个工具：
 
 1. `describe_service`：查询 AWS Price List 服务元数据。
 2. `get_attribute_values`：查询 AWS 官方属性值。
 3. `get_prices`：按 GPT 提供的精确参数查询所选云厂商的官方价目或询价接口。
-4. `get_quote_job_status`：读取已保存的报价阶段和批次。
-5. `resume_quote_job`：只返回下一缺失步骤，不重跑已成功动作。
-6. `build_estimate`：验证 GPT 选中的官方证据与计算结果，然后生成 Excel 并返回销售页面。
+4. `get_price_results`：按需读取已保存的官方价格明细，不重复请求官网。
+5. `get_quote_job_status`：读取已保存的报价阶段和批次。
+6. `resume_quote_job`：只返回下一缺失步骤，不重跑已成功动作。
+7. `build_estimate`：验证 GPT 选中的官方 API 证据，或满足三次失败门槛后的官方价格页证据及计算结果，然后生成 Excel 并返回销售页面。
 
 ## 部署与检查
 

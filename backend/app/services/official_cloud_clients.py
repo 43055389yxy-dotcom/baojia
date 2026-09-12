@@ -160,16 +160,41 @@ class OfficialCloudApiClient:
             payload = response.json()
         except Exception as exc:
             payload = None
-            if int(getattr(response, "status_code", 200) or 200) < 400:
+            response_status = int(getattr(response, "status_code", 200) or 200)
+            response_url = str(getattr(response, "url", "") or "").casefold()
+            redirect_statuses = [
+                int(getattr(item, "status_code", 0) or 0)
+                for item in (getattr(response, "history", None) or [])
+            ]
+            maintenance_redirect = bool(redirect_statuses) and (
+                any(status in {301, 302, 303, 307, 308} for status in redirect_statuses)
+                or any(token in response_url for token in ("maintenance", "/splash/"))
+            )
+            if response_status < 400:
                 raise OfficialCloudClientError(
-                    "Official cloud API returned an invalid JSON response.",
-                    code="official_catalog_invalid_response",
-                    category="response_schema",
+                    (
+                        "Official cloud pricing service is temporarily unavailable."
+                        if maintenance_redirect
+                        else "Official cloud API returned an invalid JSON response."
+                    ),
+                    code=(
+                        f"{query.provider}_official_catalog_unavailable"
+                        if maintenance_redirect
+                        else "official_catalog_invalid_response"
+                    ),
+                    category=(
+                        "provider_unavailable"
+                        if maintenance_redirect
+                        else "response_schema"
+                    ),
                     retryable=True,
                     details={
-                        "http_status": int(
-                            getattr(response, "status_code", 200) or 200
-                        )
+                        "http_status": response_status,
+                        **(
+                            {"redirect_statuses": redirect_statuses}
+                            if redirect_statuses
+                            else {}
+                        ),
                     },
                 ) from exc
 
@@ -184,6 +209,8 @@ class OfficialCloudApiClient:
                 retryable=True,
                 details={"http_status": status_code},
             )
+        if _has_official_error_envelope(payload):
+            raise _official_api_error(query.provider, payload, status_code)
         return payload
 
     @staticmethod
@@ -451,6 +478,41 @@ def _first_text(payload: Any, paths: tuple[tuple[str, ...], ...]) -> str:
     return ""
 
 
+def _has_official_error_envelope(payload: dict[str, Any]) -> bool:
+    """Detect provider business errors returned inside an HTTP 2xx response."""
+
+    candidates = (
+        payload.get("Error"),
+        payload.get("error"),
+        (payload.get("Response") or {}).get("Error")
+        if isinstance(payload.get("Response"), dict)
+        else None,
+        (payload.get("ResponseMetadata") or {}).get("Error")
+        if isinstance(payload.get("ResponseMetadata"), dict)
+        else None,
+    )
+    if any(
+        isinstance(candidate, dict)
+        and any(candidate.get(key) for key in ("Code", "code", "Message", "message"))
+        for candidate in candidates
+    ):
+        return True
+    success = payload.get("Success", payload.get("success"))
+    return success is False and bool(
+        _first_text(
+            payload,
+            (
+                ("Code",),
+                ("code",),
+                ("Message",),
+                ("message",),
+                ("error_code",),
+                ("error_msg",),
+            ),
+        )
+    )
+
+
 def _redact_error_text(value: str) -> str:
     redacted = _SENSITIVE_TEXT.sub(lambda match: f"{match.group(1)}=[REDACTED]", value)
     return redacted[:800]
@@ -465,6 +527,8 @@ def _official_api_error(
             ("Code",),
             ("code",),
             ("error_code",),
+            ("Error", "Code"),
+            ("error", "code"),
             ("Response", "Error", "Code"),
             ("ResponseMetadata", "Error", "Code"),
             ("statusCode",),
@@ -476,6 +540,8 @@ def _official_api_error(
             ("Message",),
             ("message",),
             ("error_msg",),
+            ("Error", "Message"),
+            ("error", "message"),
             ("Response", "Error", "Message"),
             ("ResponseMetadata", "Error", "Message"),
         ),
@@ -510,13 +576,32 @@ def _official_api_error(
         for token in ("unauthor", "forbidden", "permission")
     ):
         category, retryable = "authorization", False
+    elif any(
+        token in folded
+        for token in (
+            "internalerror",
+            "internal error",
+            "serviceunavailable",
+            "service unavailable",
+            "temporarily unavailable",
+            "maintenance",
+        )
+    ):
+        category, retryable = "provider_unavailable", True
     elif status_code == 404 or any(
-        token in folded for token in ("notfound", "not found", "unknown action")
+        token in folded
+        for token in ("notfound", "not found", "productnotfind", "unknown action")
     ):
         category, retryable = "route_not_found", True
     elif status_code == 400 or any(
         token in folded
-        for token in ("missingparameter", "invalidparameter", "invalid parameter")
+        for token in (
+            "missingparameter",
+            "invalidparameter",
+            "invalid parameter",
+            "invalidmodulecode",
+            "not spu object",
+        )
     ):
         category, retryable = "invalid_request", True
     elif status_code >= 500:

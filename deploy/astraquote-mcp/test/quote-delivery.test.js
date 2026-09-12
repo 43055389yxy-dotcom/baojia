@@ -27,6 +27,67 @@ test('sales-page result removes internal cheapest-candidate wording', () => {
   );
 });
 
+test('partial sales-page result separates verified and unpriced components', () => {
+  const pageRecord = record();
+  pageRecord.is_partial = true;
+  pageRecord.verification.status = 'official_price_partial';
+  pageRecord.unpriced_ir = [{
+    component_key: 'cmp_s3_0002',
+    failure_code: 'official_price_unavailable',
+    retryable: true,
+    customer_facing: {
+      service_name: 'Amazon S3', quantity: '2 TiB',
+      configuration_summary: 'S3 Standard 2 TiB，价格尚未取得。',
+    },
+  }];
+
+  const result = buildPageResult(pageRecord);
+
+  assert.equal(result.is_partial, true);
+  assert.equal(result.components.length, 1);
+  assert.equal(result.unpriced_components.length, 1);
+  assert.equal(result.unpriced_components[0].service_name, 'Amazon S3');
+  assert.equal(result.unpriced_components[0].retryable, true);
+});
+
+test('partial sales-page result exposes safe actionable failure categories and cache disclosure', () => {
+  const pageRecord = record();
+  pageRecord.is_partial = true;
+  pageRecord.verification.status = 'official_price_partial';
+  pageRecord.verification.cache_fallback = { used: true };
+  pageRecord.unpriced_ir = [{
+    component_key: 'cmp_redis_0002',
+    failure_code: 'official_price_unavailable',
+    failure_category: 'authorization',
+    provider_code: 'AuthFailure',
+    retryable: false,
+    customer_facing: { service_name: 'Redis' },
+  }];
+
+  const result = buildPageResult(pageRecord);
+
+  assert.equal(result.unpriced_components[0].failure_category, 'authorization');
+  assert.equal(result.unpriced_components[0].provider_code, 'AuthFailure');
+  assert.match(result.pricing_notice, /最近官方价格快照/);
+  assert.match(result.pricing_notice, /销售/);
+  assert.doesNotMatch(result.pricing_notice, /Excel/);
+});
+
+test('official pricing page fallback is disclosed only as a safe sales-page notice', () => {
+  const pageRecord = record();
+  pageRecord.verification.official_pricing_page_evidence = {
+    used: true,
+    count: 1,
+    source_urls: ['https://aws.amazon.com/ec2/pricing/on-demand/'],
+  };
+
+  const result = buildPageResult(pageRecord);
+
+  assert.match(result.pricing_notice, /官方 API 连续三次/);
+  assert.match(result.pricing_notice, /官方价格页/);
+  assert.doesNotMatch(JSON.stringify(result.components), /source_urls|api_attempt_query_ids/);
+});
+
 test('uses a short provider-specific Excel filename', () => {
   assert.equal(
     shortQuoteFilename({

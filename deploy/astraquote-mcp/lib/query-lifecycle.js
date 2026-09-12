@@ -16,9 +16,27 @@ function scope(context) {
     : null;
 }
 
+function pricingScopeKey(componentKey, billingKey, scenarioKey = null) {
+  return componentKey && billingKey
+    ? JSON.stringify([componentKey, billingKey, scenarioKey || null])
+    : null;
+}
+
 function usable(result) {
   return ['exact', 'ambiguous'].includes(result?.status)
-    && Array.isArray(result.official_item_ids) && result.official_item_ids.length > 0;
+    && Array.isArray(result.official_item_ids) && result.official_item_ids.length > 0
+    && !(Array.isArray(result.items) ? result.items : []).some((item) => {
+      const error = item?.Error || item?.error || item?.Response?.Error;
+      return error && typeof error === 'object' && (error.Code || error.code)
+        && (error.Message || error.message);
+    });
+}
+
+function reusableQueryResult(result, context) {
+  // Legacy public clients did not submit query contexts or flattened rates.
+  // Preserve their valid catalog results, but never a known API error envelope.
+  return usable(result) && (!scope(context)
+    || (Array.isArray(result.official_rate_candidates) && result.official_rate_candidates.length > 0));
 }
 
 // Context is task metadata, never an official API parameter or a learned route.
@@ -88,7 +106,8 @@ function queryProgress(queries, results, contexts = []) {
   for (const q of queries) {
     // A directory envelope with an item ID but no rate must not close pricing.
     if (key(q.query_id) && usable(byResult.get(q.query_id))
-      && byResult.get(q.query_id).official_rate_candidates?.length > 0) {
+      && Array.isArray(byResult.get(q.query_id).official_rate_candidates)
+      && byResult.get(q.query_id).official_rate_candidates.length > 0) {
       successes.set(key(q.query_id), q.query_id);
     }
   }
@@ -96,8 +115,7 @@ function queryProgress(queries, results, contexts = []) {
     const context = byContext.get(q.query_id);
     const result = byResult.get(q.query_id);
     const purpose = context?.purpose || 'pricing';
-    const rateRequired = Boolean(scope(context));
-    const completed = usable(result) && (!rateRequired || result.official_rate_candidates?.length > 0);
+    const completed = reusableQueryResult(result, context);
     const candidate = !completed && key(q.query_id) ? successes.get(key(q.query_id)) : null;
     const successor = candidate && (
       positions.get(candidate) > positions.get(q.query_id)
@@ -133,6 +151,63 @@ function queryProgress(queries, results, contexts = []) {
   };
 }
 
+function componentProgress(components = [], lifecycle = [], results = []) {
+  const resultById = new Map(results.map((item) => [item.query_id, item]));
+  const lifecycleByScope = new Map();
+  for (const item of lifecycle) {
+    const ownedScope = scope(item);
+    if (!ownedScope) continue;
+    const key = JSON.stringify([
+      item.component_key,
+      item.billing_key,
+      item.scenario_key || null,
+    ]);
+    const entries = lifecycleByScope.get(key) || [];
+    entries.push(item);
+    lifecycleByScope.set(key, entries);
+  }
+
+  const states = components.map((component) => {
+    const scopeStates = (component.billing_scopes || []).map((billing) => {
+      const key = JSON.stringify([
+        component.component_key,
+        billing.billing_key,
+        billing.scenario_key || null,
+      ]);
+      const attempts = lifecycleByScope.get(key) || [];
+      if (attempts.some((item) => item.state === 'completed')) return 'completed';
+      const terminalFailures = attempts.filter((item) => {
+        const result = resultById.get(item.query_id);
+        return item.state === 'pending'
+          && result?.status === 'query_failed'
+          && result.terminal === true
+          && result.retryable !== true;
+      });
+      if (attempts.length > 0 && terminalFailures.length === attempts.length) return 'failed';
+      return 'pending';
+    });
+    const state = scopeStates.length > 0 && scopeStates.every((item) => item === 'completed')
+      ? 'completed'
+      : scopeStates.some((item) => item === 'failed')
+        ? 'failed'
+        : 'pending';
+    return { component_key: component.component_key, state };
+  });
+
+  const topLevelComponentCount = components.filter(
+    (component) => !component.parent_component_key,
+  ).length;
+  return {
+    top_level_component_count: topLevelComponentCount,
+    component_chat_count: Math.ceil(topLevelComponentCount / 20),
+    total_component_count: states.length,
+    completed_component_count: states.filter((item) => item.state === 'completed').length,
+    failed_component_count: states.filter((item) => item.state === 'failed').length,
+    pending_component_count: states.filter((item) => item.state === 'pending').length,
+    component_lifecycle: states,
+  };
+}
+
 function assertQueryIdentity(existingQueries, queries) {
   for (const query of queries) {
     const prior = existingQueries.get(query.query_id);
@@ -140,12 +215,14 @@ function assertQueryIdentity(existingQueries, queries) {
   }
 }
 
-function contextEvidenceViolations(input, batch, refsOf) {
+function contextEvidenceViolations(input, batch, refsOf, { additionalCoveredScopes = [] } = {}) {
   const contexts = batch.query_contexts || [];
   const contextMap = new Map(contexts.map((item) => [item.query_id, item]));
   const violations = [];
-  const covered = new Set();
+  const covered = new Set(additionalCoveredScopes);
   const zeroKeys = new Set((input.zero_cost_services || []).map((item) => item.component_key));
+  const unpricedKeys = new Set(input.is_partial === true
+    ? (input.unpriced_services || []).map((item) => item.component_key) : []);
   for (const component of input.services || []) {
     const groups = [
       { scenario_key: null, refs: refsOf(component) },
@@ -171,8 +248,14 @@ function contextEvidenceViolations(input, batch, refsOf) {
     }
   }
   const missing = new Map();
-  for (const context of contexts) {
-    if (scope(context) && !covered.has(scope(context)) && !zeroKeys.has(context.component_key)) {
+  const requiredScopes = contexts.concat((batch.quote_components || []).flatMap((component) => (
+    (component.billing_scopes || []).map((billing) => ({
+      purpose: 'pricing', component_key: component.component_key, ...billing,
+    }))
+  )));
+  for (const context of requiredScopes) {
+    if (scope(context) && !covered.has(scope(context)) && !zeroKeys.has(context.component_key)
+      && !unpricedKeys.has(context.component_key)) {
       missing.set(scope(context), context);
     }
   }
@@ -183,5 +266,6 @@ function contextEvidenceViolations(input, batch, refsOf) {
 }
 
 module.exports = {
-  PROGRESS_GUIDANCE, mergeQueryContexts, queryProgress, assertQueryIdentity, contextEvidenceViolations,
+  PROGRESS_GUIDANCE, mergeQueryContexts, queryProgress, componentProgress,
+  assertQueryIdentity, contextEvidenceViolations, pricingScopeKey, reusableQueryResult,
 };

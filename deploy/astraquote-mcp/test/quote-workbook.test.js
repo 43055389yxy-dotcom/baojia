@@ -69,6 +69,27 @@ test('creates a compact Excel workbook from verified quote data', async () => {
   assert.equal(sheet.getCell('G3').value.result, 245.67);
 });
 
+test('official pricing page fallback metadata stays out of the customer Excel', async () => {
+  const record = verifiedRecord();
+  record.resource_ir[0].official_page_price_evidence = [{
+    billing_key: 'compute',
+    source_url: 'https://aws.amazon.com/ec2/pricing/on-demand/',
+    source_excerpt: 'Internal evidence excerpt that is not customer-facing.',
+    api_attempt_query_ids: ['attempt-1', 'attempt-2', 'attempt-3'],
+  }];
+  record.verification.official_pricing_page_evidence = {
+    used: true,
+    source_urls: ['https://aws.amazon.com/ec2/pricing/on-demand/'],
+  };
+
+  const { sheet } = await readWorkbook(record);
+  const text = [];
+  sheet.eachRow((row) => row.eachCell((cell) => text.push(String(cell.text || ''))));
+  const documentText = text.join('\n');
+  assert.doesNotMatch(documentText, /aws\.amazon\.com|attempt-1|Internal evidence excerpt/);
+  assert.doesNotMatch(documentText, /API 连续三次|官方价格页/);
+});
+
 test('omits the large document title and keeps adjustments in the remarks column', async () => {
   const { sheet } = await readWorkbook();
   const allText = [];
@@ -102,6 +123,64 @@ test('renders a structured zero-cost resource as its own zero-dollar row', async
   assert.equal(sheet.getCell('G3').value, 0);
   assert.equal(sheet.getCell('I3').value, null);
   assert.equal(sheet.getCell('A4').value, '合计');
+});
+
+test('partial workbook keeps successful totals and marks unpriced components without inventing zero', async () => {
+  const record = verifiedRecord();
+  record.is_partial = true;
+  record.verification.status = 'official_price_partial';
+  record.unpriced_ir = [{
+    component_key: 'cmp_s3_0002',
+    region: 'ap-northeast-1',
+    failure_code: 'official_price_unavailable',
+    retryable: true,
+    customer_facing: {
+      service_name: 'Amazon S3', model_or_plan: 'S3 Standard', quantity: '2 TiB',
+      configuration_summary: 'S3 Standard 2 TiB，价格尚未取得。',
+    },
+  }];
+
+  const { sheet } = await readWorkbook(record);
+
+  assert.equal(sheet.getCell('B3').value, 'Amazon S3');
+  assert.equal(sheet.getCell('G3').value, null);
+  assert.match(String(sheet.getCell('I3').value), /未完成报价/);
+  assert.equal(sheet.getCell('A4').value, '合计');
+  assert.equal(sheet.getCell('G4').value.result, 245.67);
+});
+
+test('keeps provider maintenance, rate limits and cache fallback details out of customer Excel', async () => {
+  const record = verifiedRecord();
+  record.is_partial = true;
+  record.verification.status = 'official_price_partial';
+  record.verification.cache_fallback = {
+    used: true,
+    query_ids: ['internal-query'],
+    official_price_observed_at: ['2026-09-11T12:00:00.000Z'],
+  };
+  record.unpriced_ir = [{
+    component_key: 'cmp_s3_0002',
+    region: 'ap-northeast-1',
+    failure_code: 'official_query_failed',
+    failure_category: 'rate_limit',
+    provider_code: 'TooManyRequests',
+    retryable: true,
+    customer_facing: {
+      service_name: 'Amazon S3', model_or_plan: 'S3 Standard', quantity: '2 TiB',
+      configuration_summary: 'S3 Standard 2 TiB。',
+    },
+  }];
+
+  const { sheet } = await readWorkbook(record);
+  const text = [];
+  sheet.eachRow((row) => row.eachCell((cell) => text.push(String(cell.text || ''))));
+  const customerDocument = text.join('\n');
+
+  assert.match(customerDocument, /未完成报价/);
+  assert.doesNotMatch(
+    customerDocument,
+    /维护|限流|连接中断|rate_limit|TooManyRequests|internal-query|价格快照/,
+  );
 });
 
 test('renders every selected pricing scenario as a separate component column', async () => {
@@ -172,6 +251,16 @@ test('unchanged or incomplete adjustments are not shown to customers', () => {
   assert.equal(materialAdjustment({ customer_requirement: '2 核 4G', quoted_configuration: '2 核 4G' }), '');
   assert.equal(materialAdjustment({ customer_requirement: '', quoted_configuration: '4 核 8G' }), '');
   assert.equal(friendlyRegion('ap-northeast-1'), '东京');
+});
+
+test('region labels are scoped by provider so colliding codes are never mistranslated', () => {
+  assert.equal(friendlyRegion('ap-southeast-1', 'aws'), '新加坡');
+  assert.equal(friendlyRegion('ap-southeast-1', 'alibaba'), '新加坡');
+  assert.equal(friendlyRegion('ap-southeast-1', 'huawei'), '中国香港');
+  assert.equal(friendlyRegion('ap-southeast-1', 'volcengine'), '亚太东南（柔佛）');
+  assert.equal(friendlyRegion('eu-west-1', 'aws'), '爱尔兰');
+  assert.equal(friendlyRegion('eu-west-1', 'alibaba'), '英国伦敦');
+  assert.equal(friendlyRegion('unknown-region-9', 'huawei'), 'unknown-region-9');
 });
 
 test('removes internal cost-selection wording but preserves useful configuration facts', () => {

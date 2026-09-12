@@ -12,13 +12,18 @@ _PROJECT_ID_PATTERN = re.compile(
 
 
 def bounded_continuation_attempts(value: str | None) -> int:
-    """Keep automatic continuation finite without making large quotes too brittle."""
+    """Retry one unchanged backend stage at most twice.
+
+    A large quote may legitimately make progress many times.  That progress is
+    tracked separately by the relay store; this bound applies only while the
+    machine checkpoint has not changed.
+    """
 
     try:
-        requested = int(value or "20")
+        requested = int(value or "2")
     except (TypeError, ValueError):
-        requested = 20
-    return min(20, max(1, requested))
+        requested = 2
+    return min(2, max(1, requested))
 
 
 def active_quote_poll_order(active_quotes: Mapping[str, Any]) -> tuple[str, ...]:
@@ -33,9 +38,14 @@ def should_extend_quote_deadline(
     generation_active: bool,
     retry_visible: bool,
 ) -> bool:
-    """Do not turn visible browser activity into a false quote failure."""
+    """Allow a bounded grace period only for active generation.
 
-    return deadline_reached and (generation_active or retry_visible)
+    A visible Retry button is an error state rather than proof of work.  The
+    caller is responsible for granting this generation grace only once until
+    machine-observed progress changes.
+    """
+
+    return deadline_reached and generation_active
 
 
 def is_transient_browser_poll_exception(exc: BaseException) -> bool:
@@ -109,10 +119,19 @@ def is_new_project_chat(
 
 
 def is_tool_permission_prompt(text: str) -> bool:
-    """Recognize ChatGPT's explicit tool-permission card in either locale."""
+    """Recognize an explicit AstraQuote permission card in either locale.
+
+    The relay is a quote-only desktop worker.  A generic ChatGPT permission
+    card (for example Gmail) must never be approved merely because it happens
+    to be visible in the same account.
+    """
 
     normalized = " ".join(str(text or "").split()).casefold()
-    return "允许 chatgpt 使用" in normalized or "allow chatgpt to use" in normalized
+    asks_for_tool = (
+        "允许 chatgpt 使用" in normalized
+        or "allow chatgpt to use" in normalized
+    )
+    return asks_for_tool and "astraquote" in normalized
 
 
 def is_persistent_permission_action(text: str) -> bool:

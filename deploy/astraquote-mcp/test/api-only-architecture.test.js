@@ -9,7 +9,7 @@ const { InMemoryTransport } = require('@modelcontextprotocol/sdk/inMemory.js');
 
 const { buildServer, INSTRUCTIONS } = require('../server');
 
-test('public MCP is an official ten-cloud catalog API-only workflow', async (t) => {
+test('public MCP is an official-first ten-cloud workflow with bounded page fallback', async (t) => {
   const workflow = {
     describeService: async (input) => ({ status: 'ok', input }),
     getAttributeValues: async (input) => ({ status: 'ok', input }),
@@ -46,7 +46,12 @@ test('public MCP is an official ten-cloud catalog API-only workflow', async (t) 
   assert.match(INSTRUCTIONS, /火山引擎/);
   assert.match(INSTRUCTIONS, /天翼云/);
   assert.match(INSTRUCTIONS, /ASTRAQUOTE_STOP_CODE: AQ-QUOTE-FAILED/);
-  assert.match(INSTRUCTIONS, /不得.*needs_refinement.*终止码/s);
+  assert.match(INSTRUCTIONS, /needs_refinement.*安全重试预算/s);
+  assert.match(INSTRUCTIONS, /无真实进展.*上限.*部分交付/s);
+  assert.match(INSTRUCTIONS, /terminal=false.*不.*无限/s);
+  assert.match(INSTRUCTIONS, /三个不同 `query_id`.*官方价格页/s);
+  assert.match(INSTRUCTIONS, /权限或凭据拒绝.*不能用网页证据掩盖/s);
+  assert.match(INSTRUCTIONS, /需求理解.*最终金额都由 GPT 完成/s);
 });
 
 test('production and sales entry have no Calculator runtime or option', () => {
