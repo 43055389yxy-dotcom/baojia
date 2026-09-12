@@ -12,6 +12,11 @@
           "currency_policy": "official_response",
           "official_source_url": "https://docs.aws.amazon.com/global-infrastructure/latest/regions/aws-regions.html",
           "official_price_page_hosts": ["aws.amazon.com", "docs.aws.amazon.com", "calculator.aws"],
+          "pricing_scenarios": [
+            {"key": "on_demand", "label": "按需付费", "term_months": null},
+            {"key": "one_year_commitment", "label": "1 年预留全预付", "term_months": 12},
+            {"key": "three_year_commitment", "label": "3 年预留全预付", "term_months": 36}
+          ],
           "regions": [
             ["us-east-1", "美国弗吉尼亚北部"], ["us-east-2", "美国俄亥俄"],
             ["us-west-1", "美国加利福尼亚北部"], ["us-west-2", "美国俄勒冈"],
@@ -44,6 +49,11 @@
           "currency_policy": "official_response",
           "official_source_url": "https://learn.microsoft.com/en-us/azure/reliability/regions-list",
           "official_price_page_hosts": ["azure.microsoft.com", "learn.microsoft.com", "prices.azure.com"],
+          "pricing_scenarios": [
+            {"key": "on_demand", "label": "即用即付", "term_months": null},
+            {"key": "one_year_commitment", "label": "1 年预留", "term_months": 12},
+            {"key": "three_year_commitment", "label": "3 年预留", "term_months": 36}
+          ],
           "regions": [
             ["australiacentral", "澳大利亚堪培拉"], ["australiacentral2", "澳大利亚堪培拉 2（受限）"],
             ["australiaeast", "澳大利亚新南威尔士"], ["australiasoutheast", "澳大利亚维多利亚"],
@@ -85,6 +95,9 @@
           "currency_policy": "official_response",
           "official_source_url": "https://docs.oracle.com/en-us/iaas/Content/General/Concepts/regions.htm",
           "official_price_page_hosts": ["oracle.com"],
+          "pricing_scenarios": [
+            {"key": "on_demand", "label": "OCI 公开按量价", "term_months": null}
+          ],
           "regions": [
             ["af-casablanca-1", "摩洛哥卡萨布兰卡"], ["af-johannesburg-1", "南非约翰内斯堡"],
             ["ap-batam-1", "印度尼西亚巴淡"], ["ap-chuncheon-1", "韩国春川"], ["ap-hyderabad-1", "印度海得拉巴"],
@@ -116,6 +129,11 @@
           "currency_policy": "official_response",
           "official_source_url": "https://docs.cloud.google.com/compute/docs/regions-zones",
           "official_price_page_hosts": ["cloud.google.com"],
+          "pricing_scenarios": [
+            {"key": "on_demand", "label": "按需付费", "term_months": null},
+            {"key": "one_year_commitment", "label": "1 年承诺使用", "term_months": 12},
+            {"key": "three_year_commitment", "label": "3 年承诺使用", "term_months": 36}
+          ],
           "regions": [
             ["africa-south1", "南非约翰内斯堡"], ["asia-east1", "台湾彰化"], ["asia-east2", "香港"], ["asia-northeast1", "日本东京"],
             ["asia-northeast2", "日本大阪"], ["asia-northeast3", "韩国首尔"], ["asia-south1", "印度孟买"],
@@ -146,6 +164,11 @@
           "currency_policy": "official_response",
           "official_source_url": "https://cloud.tencent.com/document/product/213/6091",
           "official_price_page_hosts": ["cloud.tencent.com", "buy.cloud.tencent.com"],
+          "pricing_scenarios": [
+            {"key": "on_demand", "label": "按量计费", "term_months": null},
+            {"key": "one_month_subscription", "label": "包月", "term_months": 1},
+            {"key": "one_year_subscription", "label": "包年（1 年）", "term_months": 12}
+          ],
           "regions": [["ap-beijing", "北京"], ["ap-chengdu", "成都"], ["ap-chongqing", "重庆"], ["ap-guangzhou", "广州"], ["ap-nanjing", "南京"], ["ap-shanghai", "上海"], ["ap-hongkong", "中国香港"], ["ap-tokyo", "日本东京"], ["ap-osaka", "日本大阪"], ["ap-seoul", "韩国首尔"], ["ap-singapore", "新加坡"], ["ap-johorbahru", "马来西亚新山"], ["ap-bangkok", "泰国曼谷"], ["ap-jakarta", "印度尼西亚雅加达"], ["me-saudi-arabia", "沙特利雅得"], ["na-queretaro", "墨西哥克雷塔罗"], ["na-siliconvalley", "美国硅谷"], ["na-ashburn", "美国弗吉尼亚"], ["eu-frankfurt", "德国法兰克福"], ["sa-saopaulo", "巴西圣保罗"]]
         }
       }
@@ -160,6 +183,11 @@
           "currency_policy": "official_response",
           "official_source_url": "https://help.aliyun.com/zh/ecs/user-guide/regions-and-zones",
           "official_price_page_hosts": ["aliyun.com", "help.aliyun.com"],
+          "pricing_scenarios": [
+            {"key": "on_demand", "label": "按量付费", "term_months": null},
+            {"key": "one_month_subscription", "label": "包月", "term_months": 1},
+            {"key": "one_year_subscription", "label": "包年（1 年）", "term_months": 12}
+          ],
           "regions": [["cn-qingdao", "青岛"], ["cn-beijing", "北京"], ["cn-zhangjiakou", "张家口"], ["cn-huhehaote", "呼和浩特"], ["cn-wulanchabu", "乌兰察布"], ["cn-hangzhou", "杭州"], ["cn-shanghai", "上海"], ["cn-wuhan-lr", "武汉"], ["cn-shenzhen", "深圳"], ["cn-heyuan", "河源"], ["cn-guangzhou", "广州"], ["cn-chengdu", "成都"], ["cn-zhongwei", "中卫"], ["cn-hongkong", "中国香港"], ["ap-southeast-1", "新加坡"], ["ap-southeast-3", "马来西亚吉隆坡"], ["ap-southeast-5", "印度尼西亚雅加达"], ["ap-southeast-6", "菲律宾马尼拉"], ["ap-southeast-7", "泰国曼谷"], ["ap-southeast-8", "马来西亚柔佛州"], ["ap-northeast-1", "日本东京"], ["ap-northeast-2", "韩国首尔"], ["eu-central-1", "德国法兰克福"], ["eu-west-1", "英国伦敦"], ["eu-west-2", "法国巴黎"], ["us-east-1", "美国弗吉尼亚"], ["us-west-1", "美国硅谷"], ["me-east-1", "阿联酋迪拜"], ["me-central-1", "沙特利雅得（合作伙伴运营）"], ["na-south-1", "墨西哥"], ["sa-east-1", "巴西圣保罗"]]
         }
       }
@@ -174,6 +202,11 @@
           "currency_policy": "official_response",
           "official_source_url": "https://support.huaweicloud.com/intl/zh-cn/usermanual-iam5/iam_01_1334.html",
           "official_price_page_hosts": ["huaweicloud.com", "support.huaweicloud.com"],
+          "pricing_scenarios": [
+            {"key": "on_demand", "label": "按需计费", "term_months": null},
+            {"key": "one_month_subscription", "label": "包月", "term_months": 1},
+            {"key": "one_year_subscription", "label": "包年（1 年）", "term_months": 12}
+          ],
           "regions": [["cn-north-1", "华北-北京一"], ["cn-north-4", "华北-北京四"], ["cn-north-9", "华北-乌兰察布一"], ["cn-north-11", "华北-乌兰察布-汽车一"], ["cn-north-12", "华北三"], ["cn-east-2", "华东-上海二"], ["cn-east-3", "华东-上海一"], ["cn-east-4", "华东二"], ["cn-east-5", "华东-青岛"], ["cn-south-1", "华南-广州"], ["cn-south-4", "华南-广州-友好用户环境"], ["cn-southwest-2", "西南-贵阳一"], ["ap-southeast-1", "中国香港"], ["ap-southeast-2", "泰国曼谷"], ["ap-southeast-3", "新加坡"], ["ap-southeast-4", "印度尼西亚雅加达"], ["ap-southeast-5", "菲律宾马尼拉"], ["me-east-1", "沙特利雅得"], ["af-north-1", "埃及开罗"], ["af-south-1", "南非约翰内斯堡"], ["na-mexico-1", "墨西哥城一"], ["la-north-2", "墨西哥城二"], ["la-south-2", "智利圣地亚哥"], ["sa-brazil-1", "巴西圣保罗"], ["tr-west-1", "土耳其伊斯坦布尔"]]
         }
       }
@@ -188,6 +221,11 @@
           "currency_policy": "official_response",
           "official_source_url": "https://cloud.baidu.com/doc/BCC/s/2k3sbu6ne",
           "official_price_page_hosts": ["cloud.baidu.com"],
+          "pricing_scenarios": [
+            {"key": "on_demand", "label": "按量付费", "term_months": null},
+            {"key": "one_month_subscription", "label": "包月预付", "term_months": 1},
+            {"key": "one_year_subscription", "label": "包年预付（1 年）", "term_months": 12}
+          ],
           "regions": [["bj", "北京"], ["bd", "保定"], ["cd", "成都"], ["gz", "广州"], ["su", "苏州"], ["fsh", "上海"], ["fwh", "武汉"], ["hkg", "中国香港"]]
         }
       }
@@ -202,6 +240,11 @@
           "currency_policy": "official_response",
           "official_source_url": "https://www.volcengine.com/docs/6617/87001?lang=en",
           "official_price_page_hosts": ["volcengine.com"],
+          "pricing_scenarios": [
+            {"key": "on_demand", "label": "按量计费", "term_months": null},
+            {"key": "one_month_subscription", "label": "包月", "term_months": 1},
+            {"key": "one_year_subscription", "label": "包年（1 年）", "term_months": 12}
+          ],
           "regions": [["cn-beijing", "华北 2（北京）"], ["cn-shanghai", "华东 2（上海）"], ["cn-guangzhou", "华南 1（广州）"], ["cn-hongkong", "中国香港"], ["ap-southeast-1", "亚太东南（柔佛）"], ["ap-southeast-3", "亚太东南（雅加达）"]]
         }
       }
@@ -216,6 +259,11 @@
           "currency_policy": "official_response",
           "official_source_url": "https://www.ctyun.cn/document/10033813/11095008",
           "official_price_page_hosts": ["ctyun.cn"],
+          "pricing_scenarios": [
+            {"key": "on_demand", "label": "按量购买", "term_months": null},
+            {"key": "one_month_subscription", "label": "包月", "term_months": 1},
+            {"key": "one_year_subscription", "label": "包年（1 年）", "term_months": 12}
+          ],
           "regions": [["200000002368", "西南1"], ["200000001704", "南宁23"], ["200000002401", "长沙42"], ["200000001852", "华北2"], ["200000002527", "南昌5"], ["200000001703", "青岛20"], ["200000001790", "上海36"], ["200000002530", "华南2"], ["bb9fdb42056f11eda1610242ac110002", "华东1"], ["200000002689", "太原4"], ["200000001781", "武汉41"], ["200000002586", "郑州5"], ["200000001851", "西安7"], ["200000002927", "西南2-贵州"], ["200000003329", "杭州7"], ["200000003327", "芜湖4"], ["200000003573", "呼和浩特3"], ["200000003664", "庆阳2"], ["200000002529", "北京行业云20"], ["200000004098", "乌鲁木齐7"], ["200000003330", "上海15"], ["200000004421", "佛山7"], ["200000003335", "沈阳8"], ["200000004705", "长春3"], ["200000004885", "宁波2"]]
         }
       }

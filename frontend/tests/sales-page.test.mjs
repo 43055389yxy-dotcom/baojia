@@ -14,6 +14,7 @@ test("sales portal keeps its internal job identity private and recovers active j
   assert.match(page, /ACTIVE_JOB_KEY/);
   assert.match(page, /window\.sessionStorage\.setItem/);
   assert.match(page, /pricing_scenarios/);
+  assert.match(page, /regionCatalog\?\.pricing_scenarios/);
   assert.match(page, /cloud_provider: cloudProvider/);
   assert.match(page, /Microsoft Azure|微软 Azure/);
   assert.match(page, /Oracle Cloud/);
@@ -32,10 +33,6 @@ test("sales portal keeps its internal job identity private and recovers active j
   assert.match(page, /下载 Excel/);
   assert.match(page, /quote_download_url/);
   assert.match(page, /navigator\.clipboard\.writeText/);
-  assert.match(page, /即用即付/);
-  assert.match(page, /1 年预留/);
-  assert.match(page, /1 年承诺使用/);
-  assert.match(page, /OCI 公开按量价/);
   assert.match(page, /type="radio"/);
   assert.match(page, /provider_catalogs/);
   assert.match(page, /价格接口待配置/);
@@ -44,12 +41,14 @@ test("sales portal keeps its internal job identity private and recovers active j
   assert.doesNotMatch(page, /\/api\/gpt-relay/);
 });
 
-test("sales portal uses provider-native purchase labels instead of one AWS-only model", async () => {
+test("sales portal reads provider-native purchase scenarios from the backend catalog", async () => {
   const page = await readFile(new URL("../app/sales/page.tsx", import.meta.url), "utf8");
 
-  assert.match(page, /azure:\s*\[[\s\S]*即用即付[\s\S]*1 年预留[\s\S]*3 年预留[\s\S]*\]/);
-  assert.match(page, /oci:\s*\[\{[^\n]*OCI 公开按量价/);
-  assert.match(page, /gcp:\s*\[[\s\S]*1 年承诺使用[\s\S]*3 年承诺使用[\s\S]*\]/);
+  assert.doesNotMatch(page, /const PROVIDER_SCENARIOS/);
+  assert.match(page, /providerScenarios\.map/);
+  assert.match(page, /one_month_subscription/);
+  assert.match(page, /scenarioMonthlyCaption/);
+  assert.match(page, /providerScenarios\.length < 1/);
   assert.match(page, /new Set<ScenarioKey>\(\["on_demand"\]\)/);
   assert.match(page, /setSelectedScenarios\(new Set<ScenarioKey>\(\["on_demand"\]\)\)/);
 });

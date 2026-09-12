@@ -56,6 +56,28 @@ function regionLabels(provider, explicitProfile) {
 }
 
 
+function pricingScenarios(provider, explicitProfile) {
+  const scenarios = profile(provider, explicitProfile)?.pricing_scenarios;
+  if (!Array.isArray(scenarios)) return [];
+  return scenarios
+    .filter((scenario) => scenario && typeof scenario === 'object')
+    .map((scenario) => ({
+      key: String(scenario.key || ''),
+      label: String(scenario.label || ''),
+      term_months: scenario.term_months === null ? null : Number(scenario.term_months),
+    }))
+    .filter((scenario) => scenario.key && scenario.label
+      && (scenario.term_months === null
+        || (Number.isInteger(scenario.term_months) && scenario.term_months > 0)));
+}
+
+
+function pricingScenario(provider, scenarioKey, explicitProfile) {
+  return pricingScenarios(provider, explicitProfile)
+    .find((scenario) => scenario.key === String(scenarioKey || '')) || null;
+}
+
+
 function regionOwners(regionCode) {
   const code = String(regionCode || '').trim();
   const owners = [];
@@ -103,6 +125,8 @@ module.exports = {
   configuredProfileId,
   officialPricingPageUrlAllowed,
   profile,
+  pricingScenario,
+  pricingScenarios,
   providerRegionMismatch,
   regionLabels,
   regionOwners,

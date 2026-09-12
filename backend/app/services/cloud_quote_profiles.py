@@ -32,6 +32,26 @@ def active_market_profile(provider: str) -> dict[str, Any]:
         for code, label in regions
         if str(code).strip() and str(label).strip()
     ]
+    normalized_scenarios = []
+    for scenario in profile.get("pricing_scenarios") or []:
+        if not isinstance(scenario, dict):
+            continue
+        key = str(scenario.get("key") or "").strip()
+        label = str(scenario.get("label") or "").strip()
+        term_months = scenario.get("term_months")
+        if not key or not label or (
+            term_months is not None
+            and (not isinstance(term_months, int) or term_months < 1)
+        ):
+            continue
+        normalized_scenarios.append(
+            {"key": key, "label": label, "term_months": term_months}
+        )
+    if not normalized_scenarios or normalized_scenarios[0]["key"] != "on_demand":
+        raise RuntimeError(f"Configured pricing scenarios are invalid: {profile_id}")
+    scenario_keys = [item["key"] for item in normalized_scenarios]
+    if len(scenario_keys) != len(set(scenario_keys)) or len(scenario_keys) > 3:
+        raise RuntimeError(f"Configured pricing scenarios are invalid: {profile_id}")
     return {
         "provider": provider_key,
         "market_profile": str(profile_id),
@@ -41,6 +61,7 @@ def active_market_profile(provider: str) -> dict[str, Any]:
         "currency_policy": str(profile.get("currency_policy") or "official_response"),
         "official_source_url": str(profile.get("official_source_url") or ""),
         "regions": normalized_regions,
+        "pricing_scenarios": normalized_scenarios,
     }
 
 
@@ -71,4 +92,16 @@ def is_provider_region(provider: str, region: str) -> bool:
     return any(
         item["code"] == code
         for item in provider_region_catalog(provider)["regions"]
+    )
+
+
+def provider_pricing_scenarios(provider: str) -> list[dict[str, Any]]:
+    return list(active_market_profile(provider)["pricing_scenarios"])
+
+
+def is_provider_pricing_scenario(provider: str, scenario_key: str) -> bool:
+    key = str(scenario_key).strip()
+    return any(
+        item["key"] == key
+        for item in provider_pricing_scenarios(provider)
     )

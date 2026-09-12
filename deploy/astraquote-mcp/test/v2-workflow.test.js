@@ -1248,7 +1248,7 @@ test('the quote currency must match the selected official commercial rate', asyn
   );
 });
 
-test('MCP accepts a GPT-evidenced provider scenario without a provider-specific denylist', async (t) => {
+test('MCP rejects a pricing scenario that the selected provider does not offer', async (t) => {
   const { workflow, directory } = fixture({ provider: 'oci' });
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const batch = await priceBatch(workflow, 'oci');
@@ -1262,8 +1262,13 @@ test('MCP accepts a GPT-evidenced provider scenario without a provider-specific 
     price_evidence: [{ query_id: 'price-1', official_item_ids: ['item-1'] }],
   }];
 
-  const result = await workflow.buildEstimate(input);
-  assert.equal(result.status, 'displayed_on_page');
+  await assert.rejects(
+    workflow.buildEstimate(input),
+    (error) => error.code === 'pricing_scenario_semantics_invalid'
+      && error.details.violations.includes(
+        'provider_scenario_not_supported:oci:one_year_commitment',
+      ),
+  );
 });
 
 test('a component without a commitment discount keeps its on-demand monthly cost', async (t) => {

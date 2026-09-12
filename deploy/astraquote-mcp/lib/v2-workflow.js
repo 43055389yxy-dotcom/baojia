@@ -9,7 +9,7 @@ const { V2QuoteStore } = require('./v2-quote-store');
 const { QuoteDeliveryService } = require('./quote-delivery');
 const { OfficialPriceCache } = require('./official-price-cache');
 const {
-  officialPricingPageUrlAllowed, providerRegionMismatch,
+  officialPricingPageUrlAllowed, pricingScenarios, providerRegionMismatch,
 } = require('./cloud-market-profiles');
 const { PricingRouteStore, PricingRouteStoreError } = require('./pricing-route-store');
 const { canFinalizeRelayJob } = require('./relay-job-state');
@@ -248,6 +248,8 @@ function normalizeComponentCosts(input) {
 
 const SCENARIO_KEYS = Object.freeze([
   'on_demand',
+  'one_month_subscription',
+  'one_year_subscription',
   'one_year_commitment',
   'three_year_commitment',
 ]);
@@ -600,6 +602,14 @@ function normalizeScenarioCosts(input) {
 
 function validateScenarioSemantics(input) {
   const violations = [];
+  const supported = new Set(
+    pricingScenarios(input.cloud_provider).map((scenario) => scenario.key),
+  );
+  for (const scenario of input.pricing_scenarios || []) {
+    if (!supported.has(scenario.scenario_key)) {
+      violations.push(`provider_scenario_not_supported:${input.cloud_provider}:${scenario.scenario_key}`);
+    }
+  }
   for (const service of input.services || []) {
     for (const scenario of service.scenario_costs || []) {
       if (scenario.scenario_key === 'on_demand' && scenario.pricing_basis !== 'on_demand') {

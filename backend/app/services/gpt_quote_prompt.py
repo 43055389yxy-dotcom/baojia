@@ -52,53 +52,9 @@ def _pricing_summary(options: dict[str, Any]) -> str:
                 if int(years) == 3:
                     scenarios.append("three_year_commitment")
     labels = {
-        "aws": {
-            "on_demand": "按需付费",
-            "one_year_commitment": "1 年预留实例全预付",
-            "three_year_commitment": "3 年预留实例全预付",
-        },
-        "azure": {
-            "on_demand": "即用即付",
-            "one_year_commitment": "1 年预留",
-            "three_year_commitment": "3 年预留",
-        },
-        "oci": {"on_demand": "OCI 公开按量价"},
-        "gcp": {
-            "on_demand": "按需付费",
-            "one_year_commitment": "1 年承诺使用",
-            "three_year_commitment": "3 年承诺使用",
-        },
-        "tencent": {
-            "on_demand": "按量计费",
-            "one_year_commitment": "1 年包年",
-            "three_year_commitment": "3 年包年",
-        },
-        "alibaba": {
-            "on_demand": "按量付费",
-            "one_year_commitment": "1 年订阅",
-            "three_year_commitment": "3 年订阅",
-        },
-        "huawei": {
-            "on_demand": "按需计费",
-            "one_year_commitment": "1 年包年",
-            "three_year_commitment": "3 年包年",
-        },
-        "baidu": {
-            "on_demand": "后付费",
-            "one_year_commitment": "1 年预付费",
-            "three_year_commitment": "3 年预付费",
-        },
-        "volcengine": {
-            "on_demand": "按量计费",
-            "one_year_commitment": "1 年包年",
-            "three_year_commitment": "3 年包年",
-        },
-        "ctyun": {
-            "on_demand": "按量计费",
-            "one_year_commitment": "1 年包年",
-            "three_year_commitment": "3 年包年",
-        },
-    }.get(provider, {})
+        item["key"]: item["label"]
+        for item in active_market_profile(provider)["pricing_scenarios"]
+    }
     parts = [labels.get(str(scenario), str(scenario)) for scenario in scenarios]
     parts.append(f"使用率 {utilization}%")
     return "；".join(parts)

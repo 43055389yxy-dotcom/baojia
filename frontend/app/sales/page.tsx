@@ -7,7 +7,12 @@ const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "/api/backend";
 const ACTIVE_JOB_KEY = "astraquote.sales.active-job.v1";
 const PENDING_SUBMISSION_KEY = "astraquote.sales.pending-submission.v1";
 
-type ScenarioKey = "on_demand" | "one_year_commitment" | "three_year_commitment";
+type ScenarioKey =
+  | "on_demand"
+  | "one_month_subscription"
+  | "one_year_subscription"
+  | "one_year_commitment"
+  | "three_year_commitment";
 type CloudProvider =
   | "aws" | "azure" | "oci" | "gcp"
   | "tencent" | "alibaba" | "huawei" | "baidu" | "volcengine" | "ctyun";
@@ -19,6 +24,7 @@ type PageScenarioCost = {
   upfront_cost?: string;
   monthly_total?: string;
   upfront_total?: string;
+  term_months?: number | null;
 };
 
 type QuickQuoteResult = {
@@ -85,6 +91,7 @@ type RegionCatalog = {
   market_profile: string;
   site_label: string;
   regions: Array<{ code: string; label: string }>;
+  pricing_scenarios: Array<{ key: ScenarioKey; label: string; term_months: number | null }>;
 };
 
 type RelayHealth = {
@@ -104,55 +111,6 @@ const statusCopy: Record<RelayJob["status"], { title: string; detail?: string }>
   partial: { title: "部分报价已完成", detail: "已返回成功组件；未取得价格的组件没有计入合计。" },
   failed: { title: "报价失败", detail: "报价已经停止，请联系管理员处理。" },
   cancelled: { title: "报价已撤回", detail: "本次报价已停止处理。" },
-};
-
-const PROVIDER_SCENARIOS: Record<CloudProvider, Array<{ key: ScenarioKey; label: string }>> = {
-  aws: [
-    { key: "on_demand", label: "按需付费" },
-    { key: "one_year_commitment", label: "1 年预留实例全预付" },
-    { key: "three_year_commitment", label: "3 年预留实例全预付" },
-  ],
-  azure: [
-    { key: "on_demand", label: "即用即付" },
-    { key: "one_year_commitment", label: "1 年预留" },
-    { key: "three_year_commitment", label: "3 年预留" },
-  ],
-  oci: [{ key: "on_demand", label: "OCI 公开按量价" }],
-  gcp: [
-    { key: "on_demand", label: "按需付费" },
-    { key: "one_year_commitment", label: "1 年承诺使用" },
-    { key: "three_year_commitment", label: "3 年承诺使用" },
-  ],
-  tencent: [
-    { key: "on_demand", label: "按量计费" },
-    { key: "one_year_commitment", label: "1 年包年" },
-    { key: "three_year_commitment", label: "3 年包年" },
-  ],
-  alibaba: [
-    { key: "on_demand", label: "按量付费" },
-    { key: "one_year_commitment", label: "1 年订阅" },
-    { key: "three_year_commitment", label: "3 年订阅" },
-  ],
-  huawei: [
-    { key: "on_demand", label: "按需计费" },
-    { key: "one_year_commitment", label: "1 年包年" },
-    { key: "three_year_commitment", label: "3 年包年" },
-  ],
-  baidu: [
-    { key: "on_demand", label: "后付费" },
-    { key: "one_year_commitment", label: "1 年预付费" },
-    { key: "three_year_commitment", label: "3 年预付费" },
-  ],
-  volcengine: [
-    { key: "on_demand", label: "按量计费" },
-    { key: "one_year_commitment", label: "1 年包年" },
-    { key: "three_year_commitment", label: "3 年包年" },
-  ],
-  ctyun: [
-    { key: "on_demand", label: "按量计费" },
-    { key: "one_year_commitment", label: "1 年包年" },
-    { key: "three_year_commitment", label: "3 年包年" },
-  ],
 };
 
 const PROVIDER_META: Record<CloudProvider, { label: string; mark: string; detail: string }> = {
@@ -188,6 +146,19 @@ function safeSubmissionError(status: number) {
   return "报价提交失败，请检查填写内容后重试。";
 }
 
+function scenarioTermMonths(scenario: Pick<PageScenarioCost, "scenario_key" | "term_months">) {
+  if (typeof scenario.term_months === "number") return scenario.term_months;
+  if (["one_year_subscription", "one_year_commitment"].includes(scenario.scenario_key)) return 12;
+  if (scenario.scenario_key === "three_year_commitment") return 36;
+  if (scenario.scenario_key === "one_month_subscription") return 1;
+  return null;
+}
+
+function scenarioMonthlyCaption(scenario: Pick<PageScenarioCost, "scenario_key" | "term_months">) {
+  const months = scenarioTermMonths(scenario);
+  return months && months > 1 ? `折合月费（总价÷${months}个月）` : "月费";
+}
+
 function quoteCopyText(job: RelayJob) {
   const result = job.quick_quote_result;
   if (!result) return "";
@@ -201,7 +172,7 @@ function quoteCopyText(job: RelayJob) {
       const upfront = Number(scenario.upfront_cost || 0) > 0
         ? `；预付总额 ${money(scenario.upfront_cost, result.currency)}`
         : "";
-      lines.push(`${scenario.label}：折合月费 ${money(scenario.monthly_cost, result.currency)}${upfront}`);
+      lines.push(`${scenario.label}：${scenarioMonthlyCaption(scenario)} ${money(scenario.monthly_cost, result.currency)}${upfront}`);
     });
     lines.push("");
   });
@@ -217,7 +188,7 @@ function quoteCopyText(job: RelayJob) {
     const upfront = Number(scenario.upfront_total || 0) > 0
       ? `；预付总额 ${money(scenario.upfront_total, result.currency)}`
       : "";
-    lines.push(`${scenario.label}：折合月费 ${money(scenario.monthly_total, result.currency)}${upfront}`);
+    lines.push(`${scenario.label}：${scenarioMonthlyCaption(scenario)} ${money(scenario.monthly_total, result.currency)}${upfront}`);
   });
   return lines.join("\n").trim();
 }
@@ -304,7 +275,18 @@ export default function SalesQuotePage() {
         );
         if (!response.ok) throw new Error();
         const payload = await response.json() as RegionCatalog;
-        if (!stopped) setRegionCatalog(payload);
+        if (!stopped) {
+          setRegionCatalog(payload);
+          const allowed = new Set(payload.pricing_scenarios.map((scenario) => scenario.key));
+          setSelectedScenarios((current) => {
+            const kept = new Set([...current].filter((scenario) => allowed.has(scenario)));
+            if (kept.size > 0) return kept;
+            const fallback = allowed.has("on_demand")
+              ? "on_demand"
+              : payload.pricing_scenarios[0]?.key;
+            return fallback ? new Set<ScenarioKey>([fallback]) : new Set<ScenarioKey>();
+          });
+        }
       } catch {
         if (!stopped) {
           setRegionCatalog(null);
@@ -381,6 +363,7 @@ export default function SalesQuotePage() {
     () => `已选 ${selectedScenarios.size} 种报价方案`,
     [selectedScenarios],
   );
+  const providerScenarios = regionCatalog?.pricing_scenarios ?? [];
   const filteredRegions = useMemo(() => {
     const query = preferredRegion.trim().toLocaleLowerCase();
     const regions = regionCatalog?.regions ?? [];
@@ -416,14 +399,14 @@ export default function SalesQuotePage() {
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (submitting || active || selectedScenarios.size < 1 || requirement.trim().length < 3) return;
+    if (submitting || active || providerScenarios.length < 1 || selectedScenarios.size < 1 || requirement.trim().length < 3) return;
     setSubmitting(true);
     setPageError("");
     try {
       const requestDetails = {
         customer_request: requirement.trim(),
         cloud_provider: cloudProvider,
-        pricing_scenarios: PROVIDER_SCENARIOS[cloudProvider]
+        pricing_scenarios: providerScenarios
           .map((scenario) => scenario.key)
           .filter((scenario) => selectedScenarios.has(scenario)),
         utilization_percent: utilization,
@@ -721,7 +704,7 @@ export default function SalesQuotePage() {
                 <fieldset className="sales-pricing-mode sales-scenario-list">
                   <legend className="sales-visually-hidden">报价方案</legend>
                   <div className="sales-choice-row">
-                    {PROVIDER_SCENARIOS[cloudProvider].map(({ key, label }) => (
+                    {providerScenarios.map(({ key, label }) => (
                       <label className={selectedScenarios.has(key) ? "selected" : ""} key={key}>
                         <input
                           type="checkbox"
@@ -755,7 +738,7 @@ export default function SalesQuotePage() {
             {pageError && <p className="sales-form-error" role="alert">{pageError}</p>}
             <div className="sales-form-submit-row">
               <span><i aria-hidden="true" /> 数据来自所选云厂商官方价格目录</span>
-              <button className="sales-button sales-button-primary sales-submit" type="submit" disabled={submitting || regionLoading || !preferredRegion || selectedScenarios.size < 1 || requirement.trim().length < 3 || health?.status === "offline" || selectedCatalogUnavailable}>
+              <button className="sales-button sales-button-primary sales-submit" type="submit" disabled={submitting || regionLoading || providerScenarios.length < 1 || !preferredRegion || selectedScenarios.size < 1 || requirement.trim().length < 3 || health?.status === "offline" || selectedCatalogUnavailable}>
                 {submitting ? "正在提交…" : "提交报价"}
                 <i aria-hidden="true">→</i>
               </button>
@@ -841,7 +824,7 @@ export default function SalesQuotePage() {
                     <div key={scenario.scenario_key}>
                       <span>{scenario.label}</span>
                       <strong>{money(scenario.monthly_total, job.quick_quote_result!.currency)}</strong>
-                      <small>折合月费</small>
+                      <small>{scenarioMonthlyCaption(scenario)}</small>
                       {Number(scenario.upfront_total || 0) > 0 && <em>预付总额 {money(scenario.upfront_total, job.quick_quote_result!.currency)}</em>}
                     </div>
                   ))}
@@ -887,7 +870,7 @@ export default function SalesQuotePage() {
                             return (
                               <td className="sales-result-price" key={scenario.scenario_key}>
                                 {cost
-                                  ? <><strong>{money(cost.monthly_cost, job.quick_quote_result!.currency)}</strong><small>折合月费</small>{Number(cost.upfront_cost || 0) > 0 && <em>预付 {money(cost.upfront_cost, job.quick_quote_result!.currency)}</em>}</>
+                                  ? <><strong>{money(cost.monthly_cost, job.quick_quote_result!.currency)}</strong><small>{scenarioMonthlyCaption(scenario)}</small>{Number(cost.upfront_cost || 0) > 0 && <em>预付 {money(cost.upfront_cost, job.quick_quote_result!.currency)}</em>}</>
                                   : <span className="sales-result-empty">—</span>}
                               </td>
                             );

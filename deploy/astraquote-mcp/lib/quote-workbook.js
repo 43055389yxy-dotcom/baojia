@@ -1,7 +1,7 @@
 'use strict';
 
 const ExcelJS = require('exceljs');
-const { regionLabels } = require('./cloud-market-profiles');
+const { pricingScenario, regionLabels } = require('./cloud-market-profiles');
 
 const AWS_REGION_LABELS = Object.freeze({
   'ap-northeast-1': '东京',
@@ -28,33 +28,64 @@ const BORDER = 'FFD4DDE1';
 const TEXT = 'FF24313A';
 const PROVIDER_SCENARIO_LABELS = Object.freeze({
   aws: {
-    on_demand: '按需月费',
-    one_year_commitment: '1 年预留折合月费',
-    three_year_commitment: '3 年预留折合月费',
+    on_demand: '按需付费',
+    one_year_commitment: '1 年预留',
+    three_year_commitment: '3 年预留',
   },
   azure: {
-    on_demand: '即用即付月费',
-    one_year_commitment: '1 年预留折合月费',
-    three_year_commitment: '3 年预留折合月费',
+    on_demand: '即用即付',
+    one_year_commitment: '1 年预留',
+    three_year_commitment: '3 年预留',
   },
-  oci: { on_demand: 'OCI 公开按量月费' },
+  oci: { on_demand: 'OCI 公开按量价' },
   gcp: {
-    on_demand: '按需月费',
-    one_year_commitment: '1 年承诺使用折合月费',
-    three_year_commitment: '3 年承诺使用折合月费',
+    on_demand: '按需付费',
+    one_year_commitment: '1 年承诺使用',
+    three_year_commitment: '3 年承诺使用',
   },
-  tencent: { on_demand: '按量月费', one_year_commitment: '1 年包年折合月费', three_year_commitment: '3 年包年折合月费' },
-  alibaba: { on_demand: '按量月费', one_year_commitment: '1 年订阅折合月费', three_year_commitment: '3 年订阅折合月费' },
-  huawei: { on_demand: '按需月费', one_year_commitment: '1 年包年折合月费', three_year_commitment: '3 年包年折合月费' },
-  baidu: { on_demand: '后付费月费', one_year_commitment: '1 年预付费折合月费', three_year_commitment: '3 年预付费折合月费' },
-  volcengine: { on_demand: '按量月费', one_year_commitment: '1 年包年折合月费', three_year_commitment: '3 年包年折合月费' },
-  ctyun: { on_demand: '按量月费', one_year_commitment: '1 年包年折合月费', three_year_commitment: '3 年包年折合月费' },
+  tencent: { on_demand: '按量计费', one_month_subscription: '包月', one_year_subscription: '包年（1 年）' },
+  alibaba: { on_demand: '按量付费', one_month_subscription: '包月', one_year_subscription: '包年（1 年）' },
+  huawei: { on_demand: '按需计费', one_month_subscription: '包月', one_year_subscription: '包年（1 年）' },
+  baidu: { on_demand: '按量付费', one_month_subscription: '包月预付', one_year_subscription: '包年预付（1 年）' },
+  volcengine: { on_demand: '按量计费', one_month_subscription: '包月', one_year_subscription: '包年（1 年）' },
+  ctyun: { on_demand: '按量购买', one_month_subscription: '包月', one_year_subscription: '包年（1 年）' },
 });
 
 function scenarioLabel(record, scenario) {
   return scenario.label
+    || pricingScenario(
+      record.cloud_provider || 'aws', scenario.scenario_key, record.market_profile,
+    )?.label
     || PROVIDER_SCENARIO_LABELS[record.cloud_provider || 'aws']?.[scenario.scenario_key]
     || null;
+}
+
+function scenarioTermMonths(record, scenario) {
+  const configured = pricingScenario(
+    record.cloud_provider || 'aws', scenario.scenario_key, record.market_profile,
+  )?.term_months;
+  if (Number.isInteger(configured) && configured > 0) return configured;
+  return {
+    one_month_subscription: 1,
+    one_year_subscription: 12,
+    one_year_commitment: 12,
+    three_year_commitment: 36,
+  }[scenario.scenario_key] || null;
+}
+
+function scenarioColumnHeader(record, scenario) {
+  const currency = String(record.currency || '').trim();
+  const label = String(scenarioLabel(record, scenario) || '')
+    .replace(/(?:折合)?月费\s*$/u, '')
+    .trim();
+  if (scenario.scenario_key === 'on_demand') {
+    return `月费${currency ? `（${currency}）` : ''}`;
+  }
+  const months = scenarioTermMonths(record, scenario);
+  if (months && months > 1) {
+    return `${label}折合月费（总价÷${months}个月${currency ? `，${currency}` : ''}）`;
+  }
+  return `${label || '方案'}月费${currency ? `（${currency}）` : ''}`;
 }
 
 function currencyNumberFormat(currency) {
@@ -281,15 +312,14 @@ async function buildQuoteWorkbook(record) {
     { width: 24 },
     { width: 11 },
     { width: 54 },
-    ...Array.from({ length: priceColumnCount }, () => ({ width: 18 })),
+    ...Array.from({ length: priceColumnCount }, () => ({ width: 28 })),
     { width: 22 },
     { width: 42 },
   ];
 
-  const currencySuffix = record.currency ? `（${record.currency}）` : '';
   const priceHeaders = scenarios.length > 0
-    ? scenarios.map((scenario) => `${scenarioLabel(record, scenario)}${currencySuffix}`)
-    : [`月费${currencySuffix}`];
+    ? scenarios.map((scenario) => scenarioColumnHeader(record, scenario))
+    : [`月费${record.currency ? `（${record.currency}）` : ''}`];
   const headers = ['序号', '云服务', '区域', '型号 / 方案', '数量', '配置', ...priceHeaders, '参考单价', '备注'];
   const headerRow = sheet.getRow(1);
   headerRow.values = headers;

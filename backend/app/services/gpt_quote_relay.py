@@ -847,6 +847,20 @@ class GptQuoteRelayStore:
             return record
 
     @staticmethod
+    def _scenario_term_months(value: dict[str, Any]) -> int | None:
+        configured = value.get("term_months")
+        if isinstance(configured, int) and configured > 0:
+            return configured
+        return {
+            "one_month_subscription": 1,
+            "one_year_subscription": 12,
+            "one_year_commitment": 12,
+            "one_year_all_upfront": 12,
+            "three_year_commitment": 36,
+            "three_year_all_upfront": 36,
+        }.get(str(value.get("scenario_key") or ""))
+
+    @staticmethod
     def _page_result_public(value: Any) -> dict[str, Any] | None:
         if not isinstance(value, dict) or value.get("schema_version") != "astraquote-page-result/1":
             return None
@@ -861,6 +875,8 @@ class GptQuoteRelayStore:
             return None
         allowed_scenarios = {
             "on_demand",
+            "one_month_subscription",
+            "one_year_subscription",
             "one_year_commitment",
             "three_year_commitment",
             "one_year_all_upfront",
@@ -891,6 +907,7 @@ class GptQuoteRelayStore:
                     {
                         "scenario_key": cost["scenario_key"],
                         "label": str(cost.get("label") or "")[:40],
+                        "term_months": GptQuoteRelayStore._scenario_term_months(cost),
                         "monthly_cost": str(cost["monthly_cost"]),
                         "upfront_cost": str(cost.get("upfront_cost", "0")),
                     }
@@ -924,6 +941,7 @@ class GptQuoteRelayStore:
                 {
                     "scenario_key": scenario["scenario_key"],
                     "label": str(scenario.get("label") or "")[:40],
+                    "term_months": GptQuoteRelayStore._scenario_term_months(scenario),
                     "monthly_total": str(scenario["monthly_total"]),
                     "upfront_total": str(scenario["upfront_total"]),
                 }

@@ -33,7 +33,10 @@ from app.core.errors import QuoteError
 from app.domain.models import ErrorResponse
 from app.integrations.aws import AwsClients
 from app.services.aws_query_executor import ReadOnlyAwsQueryExecutor
-from app.services.cloud_quote_profiles import provider_region_catalog
+from app.services.cloud_quote_profiles import (
+    is_provider_pricing_scenario,
+    provider_region_catalog,
+)
 from app.services.gpt_quote_relay import GptQuoteRelayStore, GptRelayError
 from app.services.mcp_v2_pricing import (
     AttributeValuesRequest,
@@ -290,7 +293,13 @@ class GptRelayQuoteRequest(BaseModel):
         "ctyun",
     ] = "aws"
     pricing_scenarios: list[
-        Literal["on_demand", "one_year_commitment", "three_year_commitment"]
+        Literal[
+            "on_demand",
+            "one_month_subscription",
+            "one_year_subscription",
+            "one_year_commitment",
+            "three_year_commitment",
+        ]
     ] = Field(default_factory=lambda: ["on_demand"], min_length=1, max_length=3)
     utilization_percent: int = Field(default=100, ge=1, le=100)
     preferred_region: str = Field(min_length=2, max_length=80)
@@ -303,8 +312,11 @@ class GptRelayQuoteRequest(BaseModel):
         scenarios = list(dict.fromkeys(self.pricing_scenarios))
         if len(scenarios) != len(self.pricing_scenarios):
             raise ValueError("pricing_scenarios must be unique")
-        if self.cloud_provider == "oci" and scenarios != ["on_demand"]:
-            raise ValueError("OCI public catalog currently supports on_demand only")
+        if any(
+            not is_provider_pricing_scenario(self.cloud_provider, scenario)
+            for scenario in scenarios
+        ):
+            raise ValueError("pricing_scenarios are not offered by the selected provider")
         self.preferred_region = self.preferred_region.strip()
         if not self.preferred_region:
             raise ValueError("preferred_region must not be blank")

@@ -769,6 +769,25 @@ def test_quote_prompt_keeps_each_provider_purchase_vocabulary(
     assert forbidden not in prompt
 
 
+def test_quote_prompt_uses_provider_profile_subscription_terms() -> None:
+    prompt = build_quote_prompt(
+        "CVM 2 核 4 GiB，一台。",
+        {
+            "pricing_scenarios": [
+                "on_demand", "one_month_subscription", "one_year_subscription",
+            ],
+            "utilization_percent": 100,
+            "cloud_provider": "tencent",
+            "preferred_region": "ap-singapore",
+        },
+        relay_job_id="gpt-ffffffffffffffffffffffffffffffff",
+        submission_code="4",
+    )
+
+    assert "按量计费；包月；包年（1 年）" in prompt
+    assert "3 年包年" not in prompt
+
+
 def test_every_quote_prompt_requires_excel_and_sales_page_delivery_only() -> None:
     prompt = build_quote_prompt(
         "东京 EC2 一台。",

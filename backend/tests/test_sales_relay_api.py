@@ -17,12 +17,12 @@ from app.services.mcp_v2_pricing import OfficialPricingService
         ("azure", ["on_demand", "one_year_commitment", "three_year_commitment"]),
         ("oci", ["on_demand"]),
         ("gcp", ["on_demand", "one_year_commitment", "three_year_commitment"]),
-        ("tencent", ["on_demand", "one_year_commitment", "three_year_commitment"]),
-        ("alibaba", ["on_demand", "one_year_commitment", "three_year_commitment"]),
-        ("huawei", ["on_demand", "one_year_commitment", "three_year_commitment"]),
-        ("baidu", ["on_demand", "one_year_commitment", "three_year_commitment"]),
-        ("volcengine", ["on_demand", "one_year_commitment", "three_year_commitment"]),
-        ("ctyun", ["on_demand", "one_year_commitment", "three_year_commitment"]),
+        ("tencent", ["on_demand", "one_month_subscription", "one_year_subscription"]),
+        ("alibaba", ["on_demand", "one_month_subscription", "one_year_subscription"]),
+        ("huawei", ["on_demand", "one_month_subscription", "one_year_subscription"]),
+        ("baidu", ["on_demand", "one_month_subscription", "one_year_subscription"]),
+        ("volcengine", ["on_demand", "one_month_subscription", "one_year_subscription"]),
+        ("ctyun", ["on_demand", "one_month_subscription", "one_year_subscription"]),
     ],
 )
 def test_sales_api_preserves_the_provider_and_exact_selected_scenarios(
@@ -56,6 +56,49 @@ def test_sales_api_preserves_the_provider_and_exact_selected_scenarios(
     assert internal["quote_options"]["cloud_provider"] == provider
     assert internal["quote_options"]["pricing_scenarios"] == scenarios
     assert internal["quote_options"]["preferred_region"] == preferred_region
+
+
+def test_provider_catalog_exposes_only_its_own_sales_pricing_scenarios() -> None:
+    client = TestClient(aws_main.app)
+
+    aws = client.get("/api/quote-relay/providers/aws/regions").json()
+    tencent = client.get("/api/quote-relay/providers/tencent/regions").json()
+    oci = client.get("/api/quote-relay/providers/oci/regions").json()
+
+    assert [item["key"] for item in aws["pricing_scenarios"]] == [
+        "on_demand", "one_year_commitment", "three_year_commitment",
+    ]
+    assert [item["key"] for item in tencent["pricing_scenarios"]] == [
+        "on_demand", "one_month_subscription", "one_year_subscription",
+    ]
+    assert [item["label"] for item in tencent["pricing_scenarios"]] == [
+        "按量计费", "包月", "包年（1 年）",
+    ]
+    assert oci["pricing_scenarios"] == [
+        {"key": "on_demand", "label": "OCI 公开按量价", "term_months": None},
+    ]
+
+
+def test_sales_api_rejects_a_scenario_not_offered_by_the_selected_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = GptQuoteRelayStore(tmp_path / "provider-scenarios")
+    monkeypatch.setattr(aws_main, "gpt_quote_relay", store)
+
+    response = TestClient(aws_main.app).post(
+        "/api/quote-relay/jobs",
+        json={
+            "customer_request": "CVM 2 核 4 GiB，一台。",
+            "cloud_provider": "tencent",
+            "pricing_scenarios": ["three_year_commitment"],
+            "utilization_percent": 100,
+            "preferred_region": "ap-singapore",
+            "client_request_id": "123e4567-e89b-42d3-a456-426614174019",
+        },
+    )
+
+    assert response.status_code == 422
 
 
 def test_sales_region_catalog_is_scoped_to_the_configured_provider_site() -> None:

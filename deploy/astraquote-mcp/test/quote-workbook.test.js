@@ -197,9 +197,9 @@ test('renders every selected pricing scenario as a separate component column', a
   ];
 
   const { sheet } = await readWorkbook(record);
-  assert.equal(sheet.getCell('G1').value, '按需月费（USD）');
-  assert.equal(sheet.getCell('H1').value, '1 年预留折合月费（USD）');
-  assert.equal(sheet.getCell('I1').value, '3 年预留折合月费（USD）');
+  assert.equal(sheet.getCell('G1').value, '月费（USD）');
+  assert.equal(sheet.getCell('H1').value, '1 年预留全预付折合月费（总价÷12个月，USD）');
+  assert.equal(sheet.getCell('I1').value, '3 年预留全预付折合月费（总价÷36个月，USD）');
   assert.equal(sheet.getCell('G2').value, 245.67);
   assert.equal(sheet.getCell('H2').value, 183.92);
   assert.equal(sheet.getCell('I2').value, 117.58);
@@ -207,6 +207,28 @@ test('renders every selected pricing scenario as a separate component column', a
   assert.equal(sheet.getCell('H3').value.result, 183.92);
   assert.equal(sheet.getCell('A4').value, '预付费合计');
   assert.equal(sheet.getCell('I4').value, 4232.88);
+});
+
+test('uses provider-native monthly and annual subscription headings', async () => {
+  const record = verifiedRecord();
+  record.cloud_provider = 'tencent';
+  record.market_profile = 'tencent-cn';
+  record.currency = 'CNY';
+  record.pricing_scenarios = [
+    { scenario_key: 'on_demand', label: '按量计费', monthly_total: '245.67', upfront_total: '0' },
+    { scenario_key: 'one_month_subscription', label: '包月', monthly_total: '220.00', upfront_total: '220.00' },
+    { scenario_key: 'one_year_subscription', label: '包年（1 年）', monthly_total: '180.00', upfront_total: '2160.00' },
+  ];
+  record.resource_ir[0].scenario_costs = [
+    { scenario_key: 'on_demand', monthly_cost: '245.67', upfront_cost: '0' },
+    { scenario_key: 'one_month_subscription', monthly_cost: '220.00', upfront_cost: '220.00' },
+    { scenario_key: 'one_year_subscription', monthly_cost: '180.00', upfront_cost: '2160.00' },
+  ];
+
+  const { sheet } = await readWorkbook(record);
+  assert.equal(sheet.getCell('G1').value, '月费（CNY）');
+  assert.equal(sheet.getCell('H1').value, '包月月费（CNY）');
+  assert.equal(sheet.getCell('I1').value, '包年（1 年）折合月费（总价÷12个月，CNY）');
 });
 
 test('renders CNY quotes with an explicit CNY header and RMB number format', async () => {

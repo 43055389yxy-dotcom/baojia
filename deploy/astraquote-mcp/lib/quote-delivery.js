@@ -10,6 +10,7 @@ const {
 } = require('@aws-sdk/client-s3');
 
 const { buildQuoteWorkbook, simplifyCustomerText } = require('./quote-workbook');
+const { pricingScenario } = require('./cloud-market-profiles');
 const { canFinalizeRelayJob } = require('./relay-job-state');
 
 const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
@@ -75,12 +76,12 @@ const PROVIDER_SCENARIO_LABELS = Object.freeze({
     one_year_commitment: '1 年承诺使用',
     three_year_commitment: '3 年承诺使用',
   },
-  tencent: { on_demand: '按量计费', one_year_commitment: '1 年包年', three_year_commitment: '3 年包年' },
-  alibaba: { on_demand: '按量付费', one_year_commitment: '1 年订阅', three_year_commitment: '3 年订阅' },
-  huawei: { on_demand: '按需计费', one_year_commitment: '1 年包年', three_year_commitment: '3 年包年' },
-  baidu: { on_demand: '后付费', one_year_commitment: '1 年预付费', three_year_commitment: '3 年预付费' },
-  volcengine: { on_demand: '按量计费', one_year_commitment: '1 年包年', three_year_commitment: '3 年包年' },
-  ctyun: { on_demand: '按量计费', one_year_commitment: '1 年包年', three_year_commitment: '3 年包年' },
+  tencent: { on_demand: '按量计费', one_month_subscription: '包月', one_year_subscription: '包年（1 年）' },
+  alibaba: { on_demand: '按量付费', one_month_subscription: '包月', one_year_subscription: '包年（1 年）' },
+  huawei: { on_demand: '按需计费', one_month_subscription: '包月', one_year_subscription: '包年（1 年）' },
+  baidu: { on_demand: '按量付费', one_month_subscription: '包月预付', one_year_subscription: '包年预付（1 年）' },
+  volcengine: { on_demand: '按量计费', one_month_subscription: '包月', one_year_subscription: '包年（1 年）' },
+  ctyun: { on_demand: '按量购买', one_month_subscription: '包月', one_year_subscription: '包年（1 年）' },
 });
 
 function scenarioLabel(record, scenario) {
@@ -89,8 +90,25 @@ function scenarioLabel(record, scenario) {
     (item) => item.scenario_key === scenario.scenario_key,
   )?.label;
   if (quoteLabel) return String(quoteLabel).slice(0, 40);
+  const configured = pricingScenario(
+    record.cloud_provider, scenario.scenario_key, record.market_profile,
+  )?.label;
+  if (configured) return String(configured).slice(0, 40);
   return PROVIDER_SCENARIO_LABELS[record.cloud_provider]?.[scenario.scenario_key]
     || scenario.scenario_key;
+}
+
+function scenarioTermMonths(record, scenario) {
+  const configured = pricingScenario(
+    record.cloud_provider, scenario.scenario_key, record.market_profile,
+  )?.term_months;
+  if (Number.isInteger(configured) && configured > 0) return configured;
+  return {
+    one_month_subscription: 1,
+    one_year_subscription: 12,
+    one_year_commitment: 12,
+    three_year_commitment: 36,
+  }[scenario.scenario_key] || null;
 }
 
 function buildPageResult(record) {
@@ -119,6 +137,7 @@ function buildPageResult(record) {
     ).map((cost) => ({
       scenario_key: cost.scenario_key,
       label: scenarioLabel(record, cost),
+      term_months: scenarioTermMonths(record, cost),
       monthly_cost: String(cost.monthly_cost),
       upfront_cost: String(cost.upfront_cost || '0'),
     })),
@@ -126,6 +145,7 @@ function buildPageResult(record) {
   const scenarios = quoteScenarios.map((scenario) => ({
     scenario_key: scenario.scenario_key,
     label: scenarioLabel(record, scenario),
+    term_months: scenarioTermMonths(record, scenario),
     monthly_total: String(scenario.monthly_total),
     upfront_total: String(scenario.upfront_total || '0'),
   }));

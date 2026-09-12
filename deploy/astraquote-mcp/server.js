@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.11.1';
+const VERSION = '3.12.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -326,6 +326,8 @@ const fact = z.object({
 
 const scenarioKey = z.enum([
   'on_demand',
+  'one_month_subscription',
+  'one_year_subscription',
   'one_year_commitment',
   'three_year_commitment',
 ]);
@@ -366,7 +368,7 @@ const componentScenarioCost = z.object({
   label: z.string().min(1).max(40).optional().describe('GPT 根据本次官方方案给出的客户可读名称。'),
   pricing_basis: z.enum(['on_demand', 'reserved', 'provider_commitment', 'on_demand_fallback']),
   monthly_cost: z.string().regex(/^\d+(?:\.\d{1,10})?$/).describe(
-    '该组件按客户要求的全部数量计算后的折合月费，不是单台价格。全预付方案须把整批预付额除以合同月数，并加上该方案未覆盖的持续月费。',
+    '该组件按客户要求的全部数量计算后的月度展示金额，不是单台价格。按量和包月填月费；多月方案填整批合同总价除以合同月数后的折合月费，并加上该方案未覆盖的持续月费。',
   ),
   upfront_cost: z.string().regex(/^\d+(?:\.\d{1,10})?$/).default('0').describe(
     '该组件按客户要求的全部数量计算的一次性预付总额；没有预付款时填 0。',
@@ -382,7 +384,7 @@ const quoteScenarioTotal = z.object({
   scenario_key: scenarioKey,
   label: z.string().min(1).max(40).optional().describe('GPT 根据本次官方方案给出的客户可读名称。'),
   monthly_total: z.string().regex(/^\d+(?:\.\d{1,10})?$/).describe(
-    '整张报价在该方案下的折合月费，必须等于所有组件整批折合月费之和。',
+    '整张报价在该方案下的月度展示金额，必须等于所有组件同方案月费或折合月费之和。',
   ),
   upfront_total: z.string().regex(/^\d+(?:\.\d{1,10})?$/).default('0').describe(
     '整张报价在该方案下的一次性预付总额，必须等于所有组件预付总额之和。',
@@ -498,7 +500,9 @@ const buildEstimateInput = z.object({
   unpriced_services: z.array(unpricedService).max(200).default([]).describe(
     '部分报价中仍未取得官方价格的组件。它们不参与金额合计，禁止按 0 元处理。完整报价必须为空。',
   ),
-  assumptions: z.array(z.string().min(1).max(500).describe('客户可直接阅读的中文报价假设。')).max(100).default([]),
+  assumptions: z.array(z.string().min(1).max(500).describe(
+    '仅填写不补就无法正式查价、且 GPT 已从官方允许值中采用最小或最低价取值的必要参数；可省略的参数不得形成假设。',
+  )).max(100).default([]),
   adjustments: z.array(quoteAdjustment).max(200).default([]),
   idempotency_key: z.string().min(12).max(160),
 }).strict();
