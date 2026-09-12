@@ -48,6 +48,32 @@ def boolean_env(name: str, default: bool) -> bool:
     raise RuntimeError(f"{name} must be a boolean")
 
 
+def exact_https_redirect_uris_env(name: str) -> frozenset[str]:
+    redirect_uris = frozenset(
+        value.strip()
+        for value in os.environ.get(name, "").split(",")
+        if value.strip()
+    )
+    for uri in redirect_uris:
+        try:
+            parsed = urlparse(uri)
+        except ValueError as exc:
+            raise RuntimeError(f"{name} contains an invalid URI") from exc
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise RuntimeError(
+                f"{name} must contain only exact HTTPS redirect URIs without query or fragment"
+            )
+    return redirect_uris
+
+
 PUBLIC_ORIGIN = os.environ["PUBLIC_ORIGIN"].rstrip("/")
 MCP_PATH = os.environ.get("MCP_PATH", "/mcp")
 if not MCP_PATH.startswith("/") or MCP_PATH.endswith("/"):
@@ -78,6 +104,9 @@ CODE_TTL = positive_int_env("AUTHORIZATION_CODE_TTL_SECONDS", 300)
 READY_TIMEOUT_SECONDS = positive_int_env("READY_TIMEOUT_SECONDS", 3)
 DEFAULT_SCOPE = "pricing:read pricing:write offline_access"
 ALLOWED_SCOPES = set(DEFAULT_SCOPE.split())
+EXACT_HTTPS_REDIRECT_URIS = exact_https_redirect_uris_env(
+    "OAUTH_EXACT_HTTPS_REDIRECT_URIS"
+)
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 
 RATE_WINDOW_SECONDS = positive_int_env("OAUTH_RATE_WINDOW_SECONDS", 600)
@@ -405,6 +434,9 @@ def valid_redirect_uri(uri: str) -> bool:
     if parsed.username or parsed.password or parsed.fragment:
         return False
 
+    if uri in EXACT_HTTPS_REDIRECT_URIS:
+        return True
+
     if parsed.scheme == "https" and parsed.hostname in {
         "chatgpt.com",
         "www.chatgpt.com",
@@ -566,7 +598,7 @@ async def register(request: Request) -> JSONResponse:
     ):
         return json_error(
             "invalid_redirect_uri",
-            "Only approved ChatGPT or WorkBuddy callbacks are allowed",
+            "Only approved ChatGPT, Gemini or WorkBuddy callbacks are allowed",
         )
     method = body.get("token_endpoint_auth_method", "none")
     if method not in {"none", "client_secret_basic", "client_secret_post"}:

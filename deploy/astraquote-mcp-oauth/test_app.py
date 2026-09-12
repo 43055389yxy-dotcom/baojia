@@ -19,6 +19,7 @@ def load_gateway(
     monkeypatch: pytest.MonkeyPatch,
     *,
     passwordless_auth: bool = False,
+    exact_https_redirect_uris: str = "",
 ):
     try:
         import python_multipart  # noqa: F401
@@ -47,6 +48,12 @@ def load_gateway(
         monkeypatch.setenv("PASSWORD_SALT", salt.hex())
         monkeypatch.setenv("PASSWORD_DIGEST", digest.hex())
     monkeypatch.setenv("DB_PATH", str(tmp_path / "oauth.db"))
+    if exact_https_redirect_uris:
+        monkeypatch.setenv(
+            "OAUTH_EXACT_HTTPS_REDIRECT_URIS", exact_https_redirect_uris
+        )
+    else:
+        monkeypatch.delenv("OAUTH_EXACT_HTTPS_REDIRECT_URIS", raising=False)
 
     module_name = f"astraquote_oauth_test_{tmp_path.name}"
     spec = importlib.util.spec_from_file_location(module_name, APP_PATH)
@@ -172,6 +179,56 @@ def test_supported_mcp_clients_have_valid_redirect_uris(
     gateway = load_gateway(tmp_path, monkeypatch)
 
     assert gateway.valid_redirect_uri(redirect_uri) is True
+
+
+def test_exact_configured_gemini_redirect_uri_is_allowed_without_trusting_its_host(
+    tmp_path, monkeypatch
+):
+    redirect_uri = (
+        "https://oauth-redirect.googleusercontent.com/r/"
+        "user_bound_custom-mcp-test-pricing-mcp_example_com"
+    )
+    gateway = load_gateway(
+        tmp_path,
+        monkeypatch,
+        exact_https_redirect_uris=redirect_uri,
+    )
+
+    assert gateway.valid_redirect_uri(redirect_uri) is True
+    assert gateway.valid_redirect_uri(f"{redirect_uri}-other") is False
+    assert gateway.valid_redirect_uri(f"{redirect_uri}?next=evil") is False
+
+
+@pytest.mark.asyncio
+async def test_dynamic_registration_accepts_exact_configured_gemini_callback(
+    tmp_path, monkeypatch
+):
+    redirect_uri = (
+        "https://oauth-redirect.googleusercontent.com/r/"
+        "user_bound_custom-mcp-test-pricing-mcp_example_com"
+    )
+    gateway = load_gateway(
+        tmp_path,
+        monkeypatch,
+        exact_https_redirect_uris=redirect_uri,
+    )
+    gateway.init_db()
+    transport = httpx.ASGITransport(app=gateway.app)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://pricing-mcp.tontiancloud.com"
+    ) as client:
+        response = await client.post(
+            "/oauth/register",
+            json={
+                "client_name": "Gemini Spark",
+                "redirect_uris": [redirect_uri],
+                "token_endpoint_auth_method": "none",
+            },
+        )
+
+    assert response.status_code == 201
+    assert response.json()["redirect_uris"] == [redirect_uri]
 
 
 @pytest.mark.parametrize(

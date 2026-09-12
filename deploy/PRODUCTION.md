@@ -29,6 +29,14 @@
 /home/ec2-user/astraquote/config/oauth.env
 ```
 
+额外 MCP 客户端只能在 `oauth.env` 中按完整 HTTPS 回调地址精确放行：
+
+```text
+OAUTH_EXACT_HTTPS_REDIRECT_URIS=https://oauth-client.example/its-exact-callback
+```
+
+多个地址使用英文逗号分隔。网关按完整字符串匹配，不得只填写或放行整个域名。
+
 AWS 查询使用服务器已有的 AWS 凭证链。Azure Retail Prices API 和 OCI Price List API 是公开价目接口，不要求把账号密钥写进 MCP。Google Cloud Billing Catalog API 需要在 `backend.env` 配置：
 
 ```text

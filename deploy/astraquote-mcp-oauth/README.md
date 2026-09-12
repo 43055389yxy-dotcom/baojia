@@ -10,7 +10,11 @@ callbacks such as
 `workbuddy://workbuddy/mcp/custom-mcp%3AAstraQuote/oauth/callback`. It also
 accepts WorkBuddy's fallback callback only on
 `http://127.0.0.1:<dynamic-port>/oauth/callback`; non-loopback HTTP callbacks
-remain rejected. Both clients use OAuth 2.1 authorization code flow with PKCE.
+remain rejected. Additional clients such as Gemini Spark may be enabled only by
+listing their complete HTTPS redirect URI in the comma-separated
+`OAUTH_EXACT_HTTPS_REDIRECT_URIS` environment variable. This is an exact-match
+allowlist and does not trust the rest of the callback host. All clients use
+OAuth 2.1 authorization code flow with PKCE.
 
 The public MCP exposes exactly seven tools:
 
