@@ -783,9 +783,6 @@ def authorize_post(
     username: str | None = Form(None),
     password: str | None = Form(None),
 ):
-    limited = rate_limit(request, "login")
-    if limited:
-        return limited
     with db() as connection:
         cleanup_expired(connection)
         completed = connection.execute(
@@ -804,6 +801,9 @@ def authorize_post(
             return RedirectResponse(
                 f"{completed['redirect_uri']}?{query}", status_code=303
             )
+        limited = rate_limit(request, "login")
+        if limited:
+            return limited
         auth_request = connection.execute(
             "SELECT * FROM auth_requests WHERE request_id = ?", (request_id,)
         ).fetchone()

@@ -168,6 +168,22 @@ def test_passwordless_authorization_issues_code_without_credentials(
         )
 
 
+def test_repeated_completed_authorization_does_not_consume_login_rate_limit(
+    tmp_path, monkeypatch
+):
+    gateway = load_gateway(tmp_path, monkeypatch, passwordless_auth=True)
+    stage_authorization_request(gateway)
+    gateway.RATE_LIMITS["login"] = (1, 1)
+    request = request_from("203.0.113.12")
+
+    first = gateway.authorize_post(request, request_id="request-id")
+    repeated = gateway.authorize_post(request, request_id="request-id")
+
+    assert first.status_code == 303
+    assert repeated.status_code == 303
+    assert repeated.headers["location"] == first.headers["location"]
+
+
 def request_from(address: str) -> Request:
     return Request(
         {
