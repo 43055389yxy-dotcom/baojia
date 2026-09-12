@@ -25,6 +25,7 @@ from app.services.gemini_chat_references import (
     is_authenticated_gemini_workspace_url,
     task_id_from_gemini_reference,
 )
+from app.services.gemini_composer_selection import choose_composer_candidate
 from app.services.gpt_browser_navigation import (
     is_interrupted_response,
     should_extend_quote_deadline,
@@ -169,32 +170,52 @@ class GeminiChatBrowser:
         except Exception:  # noqa: BLE001 - browser may be on the login transition
             return False
 
-    def _new_task_composer(self) -> Any:
-        return self._execute(
+    def _composer_candidates(self) -> tuple[list[dict[str, Any]], float, float]:
+        candidates = list(
+            self._execute(
             """
-            const nodes = [...document.querySelectorAll('textarea,[contenteditable="true"],[role="textbox"]')];
-            return nodes.find(node => {
-              const label = `${node.getAttribute('aria-label') || ''} ${node.getAttribute('placeholder') || ''} ${node.innerText || ''}`;
+            const nodes = [...document.querySelectorAll(
+              'textarea,[contenteditable="true"],[role="textbox"]'
+            )];
+            return nodes.map(node => {
               const rect = node.getBoundingClientRect();
-              return rect.width > 20 && rect.height > 10 && /描述任务|Describe a task/i.test(label);
-            }) || null;
+              return {
+                element: node,
+                left: rect.left,
+                top: rect.top,
+                width: rect.width,
+                height: rect.height,
+                label: `${node.getAttribute('aria-label') || ''} ${node.getAttribute('placeholder') || ''}`.trim()
+              };
+            });
             """
+            )
+            or []
+        )
+        if self.driver is None:
+            raise RuntimeError("Gemini browser is not running")
+        window_size = self.driver.get_window_size()
+        return (
+            candidates,
+            float(window_size["width"]),
+            float(window_size["height"]),
         )
 
-    def _current_composer(self) -> Any:
-        return self._execute(
-            """
-            const nodes = [...document.querySelectorAll('textarea,[contenteditable="true"],[role="textbox"]')];
-            const visible = nodes.filter(node => {
-              const rect = node.getBoundingClientRect();
-              return rect.width > 20 && rect.height > 10;
-            });
-            return visible.find(node => {
-              const label = `${node.getAttribute('aria-label') || ''} ${node.getAttribute('placeholder') || ''}`;
-              return /接下来要做些什么|Ask Gemini|Enter a prompt|描述任务|Describe a task/i.test(label);
-            }) || visible[visible.length - 1] || null;
-            """
+    def _composer(self, *, new_task: bool) -> Any:
+        candidates, width, height = self._composer_candidates()
+        selected = choose_composer_candidate(
+            candidates,
+            new_task=new_task,
+            viewport_width=width,
+            viewport_height=height,
         )
+        return selected.get("element") if selected is not None else None
+
+    def _new_task_composer(self) -> Any:
+        return self._composer(new_task=True)
+
+    def _current_composer(self) -> Any:
+        return self._composer(new_task=False)
 
     @staticmethod
     def _write_multiline(element: Any, text: str) -> None:
@@ -257,6 +278,24 @@ class GeminiChatBrowser:
         self._write_multiline(composer, "")
         self._bind_astraquote_mention(composer, prompt)
         composer.send_keys(Keys.ENTER)
+
+    def _page_contains_marker(self, marker: str) -> bool:
+        return bool(
+            self._execute(
+                """
+                const marker = arguments[0];
+                const main = document.querySelector('main,[role="main"]');
+                return Boolean((main?.innerText || document.body?.innerText || '').includes(marker));
+                """,
+                marker,
+            )
+        )
+
+    def _confirm_new_task_started(self, job_id: str) -> None:
+        self._wait_until(
+            lambda: self._page_contains_marker(job_id),
+            timeout=45,
+        )
 
     def _current_task_contains(self, quote: Any) -> bool:
         text = str(
@@ -348,6 +387,7 @@ class GeminiChatBrowser:
 
     def start_quote(self, job_id: str, prompt: str) -> Any:
         self._send_prompt(prompt, new_task=True)
+        self._confirm_new_task_started(job_id)
         return self._new_active(job_id)
 
     def start_component_batch(
@@ -360,6 +400,7 @@ class GeminiChatBrowser:
         component_keys: list[str],
     ) -> Any:
         self._send_prompt(prompt, new_task=True)
+        self._confirm_new_task_started(job_id)
         return self._new_active(
             job_id,
             batch_index=batch_index,
