@@ -147,12 +147,17 @@ class GeminiChatBrowser:
             return bool(
                 self._execute(
                     """
-                    return [...document.querySelectorAll('textarea,[contenteditable="true"],button')]
+                    const visible = node => Boolean(
+                      node.offsetWidth || node.offsetHeight || node.getClientRects().length
+                    );
+                    const signIn = [...document.querySelectorAll('a,button,[role="button"]')]
                       .some(node => {
-                        const label = `${node.getAttribute('aria-label') || ''} ${node.getAttribute('placeholder') || ''} ${node.innerText || ''}`;
-                        const visible = Boolean(node.offsetWidth || node.offsetHeight || node.getClientRects().length);
-                        return visible && /描述任务|Describe a task|接下来要做些什么|Ask Gemini/i.test(label);
+                        const label = `${node.innerText || ''} ${node.getAttribute('aria-label') || ''}`.trim();
+                        return visible(node) && /^(登录|登入|Sign in)$/i.test(label);
                       });
+                    if (signIn) return false;
+                    const pageText = document.body?.innerText || '';
+                    return /描述任务|Describe a task|接下来要做些什么|Ask Gemini/i.test(pageText);
                     """
                 )
             )
