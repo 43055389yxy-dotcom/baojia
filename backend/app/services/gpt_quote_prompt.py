@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -92,7 +93,11 @@ def build_quote_context_prompt(options: dict[str, Any]) -> str:
         f"计价选项：{_pricing_summary(options)}。\n"
         "以上是销售已选中的全部计价方式，任何一种都不得遗漏；"
         "查价、汇总、报价页和 Excel 必须逐项保留，"
-        "不得自行替换成其他期限或计价方式。"
+        "不得自行替换成其他期限或计价方式。\n"
+        "客户未提供的参数，可省略且不影响正式查价时必须省略；"
+        "缺少后无法正式查价时，必须由 GPT 从本次官方允许值中选择最小刚需、"
+        "最低价的可计值继续，并在该组件中简短说明。"
+        "不得因为缺少参数停止组件或整张报价，程序不得替 GPT 写死业务参数。"
     )
 
 
@@ -120,14 +125,24 @@ def build_quote_continuation_prompt(
     *,
     relay_job_id: str,
     submission_code: str,
+    component_keys: list[str] | None = None,
 ) -> str:
     """Continue one submitted quote without restoring or repeating customer text."""
 
+    component_scope = ""
+    if component_keys:
+        component_scope = (
+            "后台已核对真实组件状态。本次只重新组织并补查以下尚未完成的组件一次："
+            f"{json.dumps(component_keys, ensure_ascii=False)}。"
+            "已经成功的组件及证据必须直接复用，严禁重新查询。补查结束后立即生成完整报价；"
+            "仍未成功的组件放入 unpriced_services，生成部分报价和 Excel，并标注请销售手动填写。\n\n"
+        )
     return (
         f"{ASTRAQUOTE_MENTION} 这不是新报价，当前 AstraQuote 报价尚未产生最终结果。"
         "请在本对话中从已保存阶段继续完成，不要只汇报剩余待办，"
         "也不要重复已经成功的查价、文件或交付步骤。"
         "收到后立即继续实际执行，禁止再次只输出状态、计划或待办清单。\n\n"
+        f"{component_scope}"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n\n"
         "只有报价与 Excel 下载链接已经在销售页面就绪，或者存在确实无法继续处理的"
         "单一阻塞原因时，才结束本次回复。"
@@ -142,7 +157,7 @@ def build_quote_partial_finalization_prompt(
     """Stop retrying an unchanged stage and publish verified successes."""
 
     return (
-        f"{ASTRAQUOTE_MENTION} 后台已确认同一处理阶段连续两次没有真实进展。"
+        f"{ASTRAQUOTE_MENTION} 后台已确认补发一次后仍没有真实进展。"
         "现在停止重复查价，不要整单报错。"
         "请从 AstraQuote 已保存阶段读取成功组件及其官方证据，立即生成部分报价和 Excel；"
         "仍未取得价格的组件全部放入 unpriced_services，并设置 is_partial=true。"

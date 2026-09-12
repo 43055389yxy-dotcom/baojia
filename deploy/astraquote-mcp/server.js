@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.13.0';
+const VERSION = '3.14.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -146,16 +146,13 @@ const limitedRecord = (maximum, description) => z.record(jsonValue).refine(
 
 const authenticatedCloudPriceQueryShape = {
   query_id: z.string().min(1).max(100),
-  route_id: z.string().regex(/^aqr_[a-f0-9]{24}$/).optional().describe(
-    'Previously verified official read-only route. Supply current quote parameters; saved quote-specific values are never reused.',
+  endpoint: z.string().min(4).max(255).describe(
+    'Official provider API hostname for this live request. Protocol, path, credentials and authorization are forbidden.',
   ),
-  endpoint: z.string().min(4).max(255).optional().describe(
-    'Official provider API hostname only. Omit it to look up a previously verified route by provider, service and region. Protocol, path, credentials and authorization are forbidden.',
-  ),
-  service: z.string().regex(/^[A-Za-z0-9._-]{1,80}$/).optional(),
+  service: z.string().regex(/^[A-Za-z0-9._-]{1,80}$/),
   action: z.string().regex(/^[A-Za-z0-9._-]{0,160}$/).optional(),
   version: z.string().min(1).max(40).optional(),
-  region: z.string().min(2).max(80).optional(),
+  region: z.string().min(2).max(80),
   method: z.enum(['GET', 'POST']).optional(),
   path: z.string().min(1).max(1000).optional(),
   region_parameter: z.string().regex(/^(?:none|[A-Za-z][A-Za-z0-9_.-]{0,119})$/).optional().describe(
@@ -174,7 +171,7 @@ const authenticatedCloudPriceQueryShape = {
   ),
   next_page_path: responsePath.optional(),
   official_source_url: z.string().url().max(2000).optional().describe(
-    'Official API or documentation URL used to verify a newly discovered route.',
+    'Official API or documentation URL used to verify this live request.',
   ),
   sdk_version: z.string().min(1).max(120).optional(),
 };
@@ -272,18 +269,6 @@ const getPricesInput = getPricesInputSchema.superRefine((value, context) => {
         message: 'GCP SKU price queries require the official request currency.',
         path: ['queries', index, 'currency_code'],
       });
-    }
-    if (['tencent', 'alibaba', 'huawei', 'baidu', 'volcengine', 'ctyun'].includes(query.provider)
-      && !query.route_id) {
-      for (const field of ['service', 'region']) {
-        if (!query[field]) {
-          context.addIssue({
-            code: z.ZodIssueCode.custom,
-            message: `A new official route requires GPT to provide ${field}; a learned route may use route_id.`,
-            path: ['queries', index, field],
-          });
-        }
-      }
     }
   });
 });
@@ -552,9 +537,8 @@ function compactOfficialItemForText(item) {
 function ok(payload) {
   // Some MCP clients expose content text only. Keep all public non-price
   // fields (discovery values, recovery, progress and delivery URLs) available.
-  // Only raw price evidence and learned route bodies need a concise rendering.
+  // Raw official price evidence may need a concise rendering for text-only clients.
   const summary = { ...payload };
-  delete summary.learned_routes;
   if (Array.isArray(payload?.results)) {
     summary.results = payload.results.map((item) => {
       const result = {
@@ -563,7 +547,7 @@ function ok(payload) {
         status: item?.status,
       };
       for (const key of [
-        'terminal', 'retryable', 'error_category', 'code', 'reused_route_id',
+        'terminal', 'retryable', 'error_category', 'code',
         'not_found_reason', 'raw_item_count', 'filtered_item_count',
         'detail_page', 'details_available', 'refinement_fields', 'matched_count',
         'official_item_count', 'official_item_id_count', 'official_rate_candidate_count',
@@ -604,9 +588,6 @@ function ok(payload) {
       if (Array.isArray(item?.pricing_knowledge)) {
         result.pricing_knowledge_count = item.pricing_knowledge.length;
       }
-      if (item?.pricing_route_health) {
-        result.pricing_route_health = item.pricing_route_health;
-      }
       return result;
     });
   }
@@ -614,12 +595,6 @@ function ok(payload) {
     summary.detail_query_ids = payload.detail_query_ids;
   }
   if (payload?.result_access) summary.result_access = payload.result_access;
-  if (Array.isArray(payload?.learned_routes)) {
-    summary.learned_route_count = payload.learned_routes.length;
-    summary.learned_route_ids = payload.learned_routes
-      .map((route) => route?.route_id)
-      .filter(Boolean);
-  }
   return {
     content: [{ type: 'text', text: JSON.stringify(summary) }],
     structuredContent: payload,
@@ -680,12 +655,9 @@ function normalizeBuildEstimateInput(input) {
 }
 
 function buildServer(workflow) {
-  const learnedRouteInstructions = typeof workflow.routeInstructions === 'function'
-    ? workflow.routeInstructions()
-    : '';
   const server = new McpServer(
     { name: 'astraquote-official-pricing', version: VERSION },
-    { instructions: [INSTRUCTIONS, learnedRouteInstructions].filter(Boolean).join('\n\n') },
+    { instructions: INSTRUCTIONS },
   );
 
   server.registerTool('describe_service', {
@@ -704,7 +676,7 @@ function buildServer(workflow) {
 
   server.registerTool('get_prices', {
     title: 'Batch query official cloud prices',
-    description: 'Always set quote_mode: a request for a formal quote, Excel or sales-page delivery MUST use formal_quote; never downgrade it to price_lookup because some prices are missing. Requires a non-empty incremental queries array. For a formal quote, every query MUST have a query_contexts entry. A pre-split sales relay call MUST preserve relay_batch_index, relay_batch_count and the reserved price_batch_id from its prompt, and quote_components MUST contain only that batch; the backend appends and seals each batch. A legacy formal quote registers the complete plan on its first call. Before browsing provider documentation, submit as many prepared scopes as fit this call, so verified routes run in parallel; one route miss is returned only for that query and never blocks the other queries. Full official results are persisted. If response_compacted=true, read only required details with get_price_results. For an authenticated cloud, first provide provider, service and region while omitting endpoint so AstraQuote can reuse a verified route from its persistent knowledge store. Provide a new official endpoint and response contract only for the returned route-miss queries. Invalid or unsupported parameter values are correctable: repair only the rejected fields and retry. needs_refinement, terminal=false, or must_continue=true means do not give the user a final answer. After three qualifying official API failures for the same component/billing/scenario scope, use that provider and account-site official pricing page through build_estimate. GPT chooses products, parameter values and quote totals; program-assigned sales batches are immutable.',
+    description: 'Always set quote_mode: a request for a formal quote, Excel or sales-page delivery MUST use formal_quote; never downgrade it to price_lookup because some prices are missing. Requires a non-empty incremental queries array. For a formal quote, every query MUST have a query_contexts entry. A pre-split sales relay call MUST preserve relay_batch_index, relay_batch_count and the reserved price_batch_id from its prompt, and quote_components MUST contain only that batch; the backend appends and seals each batch. A legacy formal quote registers the complete plan on its first call. Submit as many prepared scopes as fit this call so independent official requests can run in parallel. Each authenticated-cloud query must contain the complete official endpoint, service, region and current response contract chosen by GPT for that live call; the MCP does not learn or reuse product, country or region API routes. Full official results are persisted. If response_compacted=true, read only required details with get_price_results. Invalid or unsupported parameter values are correctable: repair only the rejected fields and retry. needs_refinement, terminal=false, or must_continue=true means do not give the user a final answer. After three qualifying official API failures for the same component/billing/scenario scope, use that provider and account-site official pricing page through build_estimate. GPT chooses products, required minimum parameter values and quote totals; program-assigned sales batches are immutable.',
     // Keep the JSON Schema visible to MCP clients. ZodEffects produced by
     // superRefine serializes as an empty object in the MCP SDK, so cross-field
     // checks run inside the guarded handler instead.

@@ -604,7 +604,7 @@ def test_authenticated_query_failure_returns_machine_recovery_plan() -> None:
     ]
 
 
-def test_successful_authenticated_route_returns_verifiable_learning_metadata() -> None:
+def test_successful_authenticated_query_returns_official_identity_without_route_cache_metadata() -> None:
     authenticated = _AuthenticatedRecorder(
         [{"result": {"items": [{"sku": "sku-1", "price": "1.25"}]}}]
     )
@@ -643,18 +643,10 @@ def test_successful_authenticated_route_returns_verifiable_learning_metadata() -
         )
     )["results"][0]
 
-    route = result["route_verification"]
-    assert route["route_contract_version"] == 3
-    assert route["market_profile"] == "alibaba-cn"
-    assert route["auth_scheme"] == "alibaba_rpc_hmac_sha1"
-    assert route["official_source_url"].startswith("https://help.aliyun.com/")
-    assert route["request_schema_hash"].startswith("sha256:")
-    assert route["response_schema_hash"].startswith("sha256:")
-    assert route["sdk_version"] == "astraquote-direct-signer/1"
-    assert route["failure_count"] == 0
-    assert route["confidence"] > 0
-    assert "revalidate_after" not in route
-    assert "expires_at" not in route
+    assert result["status"] == "exact"
+    assert result["official_item_ids"] == ["sku-1"]
+    assert "route_verification" not in result
+    assert "route_fingerprint" not in result
 
 
 def test_transient_official_transport_failure_is_retried_without_changing_query() -> None:

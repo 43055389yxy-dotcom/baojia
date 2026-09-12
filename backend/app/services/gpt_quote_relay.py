@@ -61,6 +61,7 @@ DEFAULT_MAX_CONCURRENT_QUOTES = 4
 DEFAULT_QUOTE_SECONDS = 600
 COMPONENTS_PER_CHAT = 20
 QUOTE_ENGINES = ("chatgpt", "gemini")
+DEFAULT_ENABLED_QUOTE_ENGINES = ("chatgpt",)
 
 PUBLIC_FAILURE_CATEGORIES = {
     "credentials",
@@ -97,11 +98,20 @@ class GptQuoteRelayStore:
         max_concurrent_quotes: int | None = None,
         default_quote_seconds: int | None = None,
         checkpoint_directory: Path | str | None = None,
+        enabled_engines: tuple[str, ...] | None = None,
     ) -> None:
         configured_limit = max_concurrent_quotes or DEFAULT_MAX_CONCURRENT_QUOTES
         configured_duration = default_quote_seconds or DEFAULT_QUOTE_SECONDS
         self.max_concurrent_quotes = max(1, configured_limit)
         self.default_quote_seconds = max(60, configured_duration)
+        configured_engines = enabled_engines or DEFAULT_ENABLED_QUOTE_ENGINES
+        self.enabled_engines = tuple(
+            dict.fromkeys(
+                self._normalize_engine(engine)
+                for engine in configured_engines
+                if str(engine or "").strip().lower() in QUOTE_ENGINES
+            )
+        ) or DEFAULT_ENABLED_QUOTE_ENGINES
         owner_uid = os.environ.get("ASTRAQUOTE_GPT_RELAY_UID")
         owner_gid = os.environ.get("ASTRAQUOTE_GPT_RELAY_GID")
         self.owner_uid = int(owner_uid) if owner_uid and owner_uid.isdigit() else None
@@ -272,22 +282,24 @@ class GptQuoteRelayStore:
                 }
                 for index, group in enumerate(intake_groups)
             ]
+            preferred_engine = self._normalize_engine(options.get("preferred_engine"))
+            if preferred_engine not in self.enabled_engines:
+                preferred_engine = self.enabled_engines[0]
+            normalized_options = {**options, "preferred_engine": preferred_engine}
             record = {
                 "schema_version": "astraquote-gpt-relay/3",
                 "job_id": job_id,
                 "submission_code": submission_code,
                 "cloud_provider": str(options.get("cloud_provider") or "aws"),
                 "preferred_region": str(options.get("preferred_region") or ""),
-                "preferred_engine": self._normalize_engine(
-                    options.get("preferred_engine")
-                ),
+                "preferred_engine": preferred_engine,
                 "assigned_engine": None,
                 "display_result_on_page": True,
                 "status": "queued",
                 "created_at": now,
                 "updated_at": now,
                 "customer_request": "" if intake_batches else text,
-                "quote_options": options,
+                "quote_options": normalized_options,
                 "source_purged_at": None,
                 "intake_component_count": (
                     len(numbered_components or []) if intake_batches else None
@@ -707,10 +719,10 @@ class GptQuoteRelayStore:
         error = checkpoint.get("error") or {}
         return checkpoint.get("stage") == "failed" and error.get("retryable") is not True
 
-    def reserve_continuation(self, job_id: str, *, maximum: int = 2) -> bool:
+    def reserve_continuation(self, job_id: str, *, maximum: int = 1) -> bool:
         """Atomically reserve one retry for the current unchanged checkpoint."""
 
-        maximum = max(1, min(2, int(maximum)))
+        maximum = 1
         with self._lock():
             path = self._path(job_id)
             if not path.exists():
@@ -723,8 +735,6 @@ class GptQuoteRelayStore:
             previous = record.get("last_progress_fingerprint")
             fingerprint = self._merge_progress(previous, self.progress_fingerprint(job_id))
             stalled = int(record.get("stalled_continuation_attempts") or 0)
-            if previous != fingerprint:
-                stalled = 0
             if stalled >= maximum:
                 return False
             record.update(
@@ -801,8 +811,8 @@ class GptQuoteRelayStore:
         records: list[dict[str, Any]],
         now: datetime,
     ) -> tuple[dict[str, int], dict[str, bool]]:
-        slots = {engine: 0 for engine in QUOTE_ENGINES}
-        has_unplanned = {engine: False for engine in QUOTE_ENGINES}
+        slots = {engine: 0 for engine in self.enabled_engines}
+        has_unplanned = {engine: False for engine in self.enabled_engines}
         for record in records:
             if record.get("status") != "processing":
                 continue
@@ -816,6 +826,8 @@ class GptQuoteRelayStore:
             if expired:
                 continue
             engine = self._record_engine(record)
+            if engine not in slots:
+                continue
             slots[engine] += self._slot_count(record)
             has_unplanned[engine] = (
                 has_unplanned[engine]
@@ -948,7 +960,7 @@ class GptQuoteRelayStore:
                     ),
                     "max_concurrent_quotes": self.max_concurrent_quotes,
                 }
-                for engine in QUOTE_ENGINES
+                for engine in self.enabled_engines
             },
         }
 
@@ -1267,6 +1279,8 @@ class GptQuoteRelayStore:
         engine: str = "chatgpt",
     ) -> dict[str, Any] | None:
         requesting_engine = self._normalize_engine(engine)
+        if requesting_engine not in self.enabled_engines:
+            return None
         with self._lock():
             now = datetime.now(UTC)
             candidates: list[tuple[str, Path, dict[str, Any]]] = []
@@ -1298,31 +1312,31 @@ class GptQuoteRelayStore:
                 required = self._slot_count(record)
                 assigned = record.get("assigned_engine")
                 preferred = self._normalize_engine(record.get("preferred_engine"))
-                alternate = "gemini" if preferred == "chatgpt" else "chatgpt"
+                if preferred not in self.enabled_engines:
+                    preferred = self.enabled_engines[0]
                 if assigned:
                     routed_engine = self._normalize_engine(assigned)
                 else:
-                    preferred_ready = self._engine_heartbeat_ready(preferred)
-                    preferred_can_run = (
-                        not active_has_unplanned[preferred]
-                        and active_slots[preferred] + required
-                        <= self.max_concurrent_quotes
-                        and preferred_ready is not False
+                    engine_order = (
+                        preferred,
+                        *(candidate for candidate in self.enabled_engines if candidate != preferred),
                     )
-                    alternate_can_run = (
-                        not active_has_unplanned[alternate]
-                        and active_slots[alternate] + required
-                        <= self.max_concurrent_quotes
-                        and (
-                            alternate == requesting_engine
-                            or self._engine_heartbeat_ready(alternate) is True
+                    routed_engine = ""
+                    for candidate in engine_order:
+                        heartbeat_ready = self._engine_heartbeat_ready(candidate)
+                        can_run = (
+                            not active_has_unplanned[candidate]
+                            and active_slots[candidate] + required
+                            <= self.max_concurrent_quotes
+                            and (
+                                candidate == requesting_engine
+                                or heartbeat_ready is True
+                            )
+                            and heartbeat_ready is not False
                         )
-                    )
-                    routed_engine = (
-                        preferred
-                        if preferred_can_run
-                        else alternate if alternate_can_run else ""
-                    )
+                        if can_run:
+                            routed_engine = candidate
+                            break
                 if routed_engine != requesting_engine:
                     continue
                 if active_has_unplanned[requesting_engine]:
@@ -1560,6 +1574,7 @@ class GptQuoteRelayStore:
                     )
                     + 1,
                     "partial_finalization_requested": False,
+                    "continuation_attempts": 0,
                     "stalled_continuation_attempts": 0,
                     "last_progress_fingerprint": None,
                     "updated_at": now,
@@ -1642,7 +1657,7 @@ class GptQuoteRelayStore:
     def health(self) -> dict[str, Any]:
         engines: dict[str, dict[str, Any]] = {}
         latest_updated_at: str | None = None
-        for engine in QUOTE_ENGINES:
+        for engine in self.enabled_engines:
             path = self.heartbeat_path_for(engine)
             heartbeat: dict[str, Any] = {}
             ready = False

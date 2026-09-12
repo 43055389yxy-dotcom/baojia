@@ -30,6 +30,7 @@ from app.services.gpt_quote_batches import (
     split_numbered_intake,
 )
 from app.services.gpt_quote_prompt import (
+    build_quote_context_prompt,
     build_quote_continuation_prompt,
     build_quote_failed_components_retry_prompt,
     build_quote_partial_finalization_prompt,
@@ -361,10 +362,23 @@ def test_quote_engine_defaults_to_chatgpt_and_is_public(tmp_path: Path) -> None:
     assert store.get(public["job_id"])["preferred_engine"] == "chatgpt"
 
 
+def test_disabled_gemini_preference_is_routed_to_chatgpt(tmp_path: Path) -> None:
+    store = GptQuoteRelayStore(tmp_path)
+
+    public = store.create("1. 东京 EC2 两台。", {"preferred_engine": "gemini"})
+
+    assert public["preferred_engine"] == "chatgpt"
+    assert store.get(public["job_id"])["quote_options"]["preferred_engine"] == "chatgpt"
+    assert store.claim_next("gemini-worker", engine="gemini") is None
+    assert store.claim_next("chatgpt-worker", engine="chatgpt")["job_id"] == public["job_id"]
+
+
 def test_each_engine_has_four_independent_slots_and_overflow_falls_back_atomically(
     tmp_path: Path,
 ) -> None:
-    store = GptQuoteRelayStore(tmp_path, max_concurrent_quotes=4)
+    store = GptQuoteRelayStore(
+        tmp_path, max_concurrent_quotes=4, enabled_engines=("chatgpt", "gemini")
+    )
     chatgpt_job = store.create(
         "1. ChatGPT 大型报价。",
         {"preferred_engine": "chatgpt"},
@@ -392,7 +406,9 @@ def test_each_engine_has_four_independent_slots_and_overflow_falls_back_atomical
 def test_gemini_preference_falls_back_to_chatgpt_when_all_gemini_slots_are_used(
     tmp_path: Path,
 ) -> None:
-    store = GptQuoteRelayStore(tmp_path, max_concurrent_quotes=4)
+    store = GptQuoteRelayStore(
+        tmp_path, max_concurrent_quotes=4, enabled_engines=("chatgpt", "gemini")
+    )
     gemini_job = store.create(
         "1. Gemini 大型报价。",
         {"preferred_engine": "gemini"},
@@ -415,7 +431,9 @@ def test_gemini_preference_falls_back_to_chatgpt_when_all_gemini_slots_are_used(
 
 
 def test_job_waits_when_neither_engine_has_enough_slots(tmp_path: Path) -> None:
-    store = GptQuoteRelayStore(tmp_path, max_concurrent_quotes=4)
+    store = GptQuoteRelayStore(
+        tmp_path, max_concurrent_quotes=4, enabled_engines=("chatgpt", "gemini")
+    )
     for engine in ("chatgpt", "gemini"):
         store.create(
             f"1. {engine} 满载任务。",
@@ -435,7 +453,7 @@ def test_job_waits_when_neither_engine_has_enough_slots(tmp_path: Path) -> None:
 
 
 def test_submitted_quote_is_reattached_only_by_its_assigned_engine(tmp_path: Path) -> None:
-    store = GptQuoteRelayStore(tmp_path)
+    store = GptQuoteRelayStore(tmp_path, enabled_engines=("chatgpt", "gemini"))
     public = store.create(
         "1. Gemini 报价。",
         {"preferred_engine": "gemini"},
@@ -1101,7 +1119,7 @@ def test_partial_finalization_prompt_returns_saved_successes_without_customer_te
     )
 
     assert prompt.startswith("@AstraQuote ")
-    assert "两次" in prompt
+    assert "补发一次" in prompt
     assert "部分报价" in prompt
     assert "未取得价格的组件不得按 0 元" in prompt
     assert "gpt-dddddddddddddddddddddddddddddddd" in prompt
@@ -1209,11 +1227,23 @@ def test_browser_worker_uses_one_desktop_window_instead_of_browser_tabs() -> Non
 
 
 def test_automatic_continuation_attempts_are_bounded_and_config_safe() -> None:
-    assert bounded_continuation_attempts(None) == 2
-    assert bounded_continuation_attempts("2") == 2
+    assert bounded_continuation_attempts(None) == 1
+    assert bounded_continuation_attempts("2") == 1
     assert bounded_continuation_attempts("0") == 1
-    assert bounded_continuation_attempts("99") == 2
-    assert bounded_continuation_attempts("invalid") == 2
+    assert bounded_continuation_attempts("99") == 1
+    assert bounded_continuation_attempts("invalid") == 1
+
+
+def test_quote_context_requires_ai_to_fill_only_minimum_required_official_values() -> None:
+    prompt = build_quote_context_prompt({
+        "cloud_provider": "alibaba",
+        "preferred_region": "cn-hangzhou",
+        "pricing_scenarios": ["on_demand"],
+    })
+
+    assert "可省略" in prompt
+    assert "最小刚需" in prompt
+    assert "不得因为缺少参数停止" in prompt
 
 
 def test_every_active_quote_tab_is_visited_in_each_polling_round() -> None:
@@ -1447,7 +1477,7 @@ def test_sales_progress_comes_from_backend_checkpoint_not_chat_text(tmp_path: Pa
     assert "must-not-leak" not in json.dumps(sales)
 
 
-def test_same_stalled_checkpoint_allows_only_two_continuations(tmp_path: Path) -> None:
+def test_same_stalled_checkpoint_allows_only_one_continuation(tmp_path: Path) -> None:
     checkpoints = tmp_path / "v2-quotes"
     store = GptQuoteRelayStore(tmp_path / "relay", checkpoint_directory=checkpoints)
     public = store.create("东京 EC2 两台，按需。", {})
@@ -1468,17 +1498,16 @@ def test_same_stalled_checkpoint_allows_only_two_continuations(tmp_path: Path) -
         encoding="utf-8",
     )
 
-    assert store.reserve_continuation(public["job_id"], maximum=2) is True
-    assert store.reserve_continuation(public["job_id"], maximum=2) is True
-    assert store.reserve_continuation(public["job_id"], maximum=2) is False
+    assert store.reserve_continuation(public["job_id"], maximum=1) is True
+    assert store.reserve_continuation(public["job_id"], maximum=1) is False
     record = store.get(public["job_id"])
-    assert record["continuation_attempts"] == 2
-    assert record["stalled_continuation_attempts"] == 2
+    assert record["continuation_attempts"] == 1
+    assert record["stalled_continuation_attempts"] == 1
     assert store.request_partial_finalization(public["job_id"]) is True
     assert store.request_partial_finalization(public["job_id"]) is False
 
 
-def test_real_checkpoint_progress_resets_the_stalled_retry_counter(tmp_path: Path) -> None:
+def test_real_checkpoint_progress_does_not_create_a_second_automatic_retry(tmp_path: Path) -> None:
     checkpoints = tmp_path / "v2-quotes"
     store = GptQuoteRelayStore(tmp_path / "relay", checkpoint_directory=checkpoints)
     public = store.create("东京 EC2 两台，按需。", {})
@@ -1493,15 +1522,14 @@ def test_real_checkpoint_progress_resets_the_stalled_retry_counter(tmp_path: Pat
         "failed_component_count": 20,
     }
     checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
-    assert store.reserve_continuation(public["job_id"], maximum=2) is True
-    assert store.reserve_continuation(public["job_id"], maximum=2) is True
+    assert store.reserve_continuation(public["job_id"], maximum=1) is True
 
     checkpoint.update({"completed_component_count": 38, "failed_component_count": 2})
     checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
 
-    assert store.reserve_continuation(public["job_id"], maximum=2) is True
+    assert store.reserve_continuation(public["job_id"], maximum=1) is False
     record = store.get(public["job_id"])
-    assert record["continuation_attempts"] == 3
+    assert record["continuation_attempts"] == 1
     assert record["stalled_continuation_attempts"] == 1
 
 
@@ -1527,7 +1555,7 @@ def test_failed_attempt_churn_cannot_reset_retry_budget(tmp_path: Path) -> None:
     checkpoint.update(batch_query_count=55, incomplete_query_count=17, failed_component_count=2)
     checkpoint["completed_component_keys"].reverse()
     checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
-    assert store.reserve_continuation(job_id)
+    assert not store.reserve_continuation(job_id)
     checkpoint.update(stage="pricing_request_rejected", batch_query_count=80)
     checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
     assert not store.reserve_continuation(job_id)
@@ -1536,7 +1564,7 @@ def test_failed_attempt_churn_cannot_reset_retry_budget(tmp_path: Path) -> None:
     assert not store.reserve_continuation(job_id)
 
 
-def test_stage_progress_only_resets_once_and_partial_closing_stays_closed(tmp_path: Path) -> None:
+def test_stage_progress_never_creates_more_than_one_automatic_retry(tmp_path: Path) -> None:
     checkpoints = tmp_path / "v2-quotes"
     store = GptQuoteRelayStore(tmp_path / "relay", checkpoint_directory=checkpoints)
     job_id = store.create("独立组件。", {})["job_id"]
@@ -1549,11 +1577,10 @@ def test_stage_progress_only_resets_once_and_partial_closing_stays_closed(tmp_pa
     }
     checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
     assert store.reserve_continuation(job_id)
-    assert store.reserve_continuation(job_id)
+    assert not store.reserve_continuation(job_id)
     checkpoint.update(stage="estimate_validated")
     checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
-    assert store.reserve_continuation(job_id)
-    assert store.reserve_continuation(job_id)
+    assert not store.reserve_continuation(job_id)
     checkpoint.update(stage="pricing_partial")
     checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
     assert not store.reserve_continuation(job_id)

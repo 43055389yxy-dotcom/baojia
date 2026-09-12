@@ -25,7 +25,7 @@ function canonical(value) {
 
 
 function queryIdentity(query, marketProfile) {
-  const { query_id: ignoredQueryId, route_id: ignoredRouteId, ...officialQuery } = query || {};
+  const { query_id: ignoredQueryId, ...officialQuery } = query || {};
   return canonical({ market_profile: marketProfile || 'unknown', query: officialQuery });
 }
 

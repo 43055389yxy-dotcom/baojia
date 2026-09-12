@@ -12,7 +12,7 @@ _PROJECT_ID_PATTERN = re.compile(
 
 
 def bounded_continuation_attempts(value: str | None) -> int:
-    """Retry one unchanged backend stage at most twice.
+    """Retry one unchanged backend stage exactly once at most.
 
     A large quote may legitimately make progress many times.  That progress is
     tracked separately by the relay store; this bound applies only while the
@@ -20,10 +20,10 @@ def bounded_continuation_attempts(value: str | None) -> int:
     """
 
     try:
-        requested = int(value or "2")
+        requested = int(value or "1")
     except (TypeError, ValueError):
-        requested = 2
-    return min(2, max(1, requested))
+        requested = 1
+    return min(1, max(1, requested))
 
 
 def active_quote_poll_order(active_quotes: Mapping[str, Any]) -> tuple[str, ...]:

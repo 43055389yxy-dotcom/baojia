@@ -257,7 +257,17 @@ def batch_progress_fingerprint(batch: dict[str, Any], previous: str = "") -> str
 
 def batch_is_finished(batch: dict[str, Any]) -> bool:
     states = list((batch.get("component_states") or {}).values())
-    return bool(states) and all(state in {"completed", "failed"} for state in states)
+    return bool(states) and all(state == "completed" for state in states)
+
+
+def incomplete_component_keys(batch: dict[str, Any]) -> list[str]:
+    """Return backend-owned component keys that still need one attempt."""
+
+    states = batch.get("component_states") or {}
+    return [
+        key for key in batch.get("component_keys") or []
+        if states.get(key) != "completed"
+    ]
 
 
 def active_batch(
@@ -296,7 +306,7 @@ def continue_component_batch(
     browser: Any,
     active: ActiveQuote,
 ) -> bool:
-    """Continue a child batch twice only while its machine state is unchanged."""
+    """Continue a child batch once only while its machine state is unchanged."""
 
     batch = active_batch(store, active)
     if batch is None:
@@ -304,7 +314,6 @@ def continue_component_batch(
     fingerprint = batch_progress_fingerprint(batch, active.batch_progress_fingerprint)
     if fingerprint != active.batch_progress_fingerprint:
         active.batch_progress_fingerprint = fingerprint
-        active.stalled_attempts = 0
     if batch_is_finished(batch):
         store.update_chat_session(active.job_id, active.batch_index, status="saved")
         return False
@@ -327,6 +336,10 @@ def continue_component_batch(
         progress_fingerprint=fingerprint,
     )
     latest = store.get(active.job_id)
+    remaining_component_keys = incomplete_component_keys(batch)
+    if not remaining_component_keys:
+        store.update_chat_session(active.job_id, active.batch_index, status="saved")
+        return False
     browser.continue_quote(
         active,
         build_component_batch_continuation_prompt(
@@ -335,7 +348,7 @@ def continue_component_batch(
             price_batch_id=str(batch["price_batch_id"]),
             batch_index=active.batch_index,
             batch_count=int(batch["batch_count"]),
-            component_keys=list(batch["component_keys"]),
+            component_keys=remaining_component_keys,
         ),
     )
     return True
@@ -523,6 +536,15 @@ def complete_job(store: GptQuoteRelayStore, job_id: str, response: str) -> str:
     if current.get("partial_finalization_requested"):
         summary = "部分报价收口仍未产生可用交付回执。"
     elif store.has_unrecoverable_failure(job_id):
+        batches = store.quote_chat_batches(job_id)
+        can_retry_single_batch = (
+            len(batches) == 1
+            and bool(incomplete_component_keys(batches[0]))
+            and int(current.get("stalled_continuation_attempts") or 0)
+            < MAX_CONTINUATION_ATTEMPTS
+        )
+        if can_retry_single_batch:
+            return "continue"
         if store.request_partial_finalization(job_id):
             return "partial_finalize"
         summary = summary or "报价遇到当前无法继续的阻塞。"
@@ -547,15 +569,15 @@ def fail_continuation_limit(store: GptQuoteRelayStore, job_id: str) -> None:
         job_id,
         {
             "status": "failed",
-            "result_summary": "报价引擎多次只返回阶段进度，未给出最终完成或明确阻塞状态。",
+            "result_summary": "报价引擎补发一次后仍未给出最终完成或明确阻塞状态。",
             "error": {
                 "code": "gpt_quote_continuation_limit",
-                "message": "报价在限定续跑次数内仍未产生最终状态。",
+                "message": "报价补发一次后仍未产生最终状态。",
             },
             "lease_expires_at": None,
         },
         stage="failed",
-        message="报价多次续跑后仍未产生最终状态",
+        message="报价补发一次后仍未产生最终状态",
     )
 
 
@@ -574,7 +596,11 @@ def continue_from_saved_stage(
     if latest.get("partial_finalization_requested"):
         fail_continuation_limit(store, active.job_id)
         return False
-    if store.has_unrecoverable_failure(active.job_id):
+    batches = store.quote_chat_batches(active.job_id)
+    single_batch_remaining = (
+        incomplete_component_keys(batches[0]) if len(batches) == 1 else []
+    )
+    if store.has_unrecoverable_failure(active.job_id) and not single_batch_remaining:
         if store.request_partial_finalization(active.job_id):
             browser.continue_quote(
                 active,
@@ -602,6 +628,7 @@ def continue_from_saved_stage(
     continuation_prompt = build_quote_continuation_prompt(
         relay_job_id=active.job_id,
         submission_code=str(latest.get("submission_code") or ""),
+        component_keys=single_batch_remaining or None,
     )
     browser.continue_quote(active, continuation_prompt)
     store.update_if_not_cancelled(
@@ -649,10 +676,12 @@ def handle_no_progress_timeout(
         return
     batches = store.quote_chat_batches(active.job_id)
     if len(batches) > 1 and active.role != "merge":
+        browser.close_quote(active)
         if not continue_component_batch(store, browser, active):
             active_quotes.pop(active.session_key, None)
         maybe_start_final_merge(store, browser, active_quotes, active.job_id)
         return
+    browser.close_quote(active)
     if not continue_from_saved_stage(
         store,
         browser,

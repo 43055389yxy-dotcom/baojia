@@ -39,7 +39,7 @@ function reusableQueryResult(result, context) {
     || (Array.isArray(result.official_rate_candidates) && result.official_rate_candidates.length > 0));
 }
 
-// Context is task metadata, never an official API parameter or a learned route.
+// Context is task metadata and never an official API parameter.
 // GPT supplies ownership and purpose; no inference from query IDs/product names.
 function mergeQueryContexts(existing, updates, queries) {
   const contexts = new Map((existing || []).map((item) => [item.query_id, { ...item }]));

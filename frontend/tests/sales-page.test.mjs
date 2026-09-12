@@ -16,12 +16,9 @@ test("sales portal keeps its internal job identity private and recovers active j
   assert.match(page, /pricing_scenarios/);
   assert.match(page, /regionCatalog\?\.pricing_scenarios/);
   assert.match(page, /cloud_provider: cloudProvider/);
-  assert.match(page, /preferred_engine: preferredEngine/);
-  assert.match(page, /type QuoteEngine = "chatgpt" \| "gemini"/);
-  assert.match(page, /useState<QuoteEngine>\("chatgpt"\)/);
+  assert.match(page, /preferred_engine: "chatgpt"/);
   assert.match(page, /ChatGPT/);
-  assert.match(page, /Gemini/);
-  assert.match(page, /选择报价引擎/);
+  assert.doesNotMatch(page, /Gemini|选择报价引擎|备用报价引擎/);
   assert.match(page, /Microsoft Azure|微软 Azure/);
   assert.match(page, /Oracle Cloud/);
   assert.match(page, /Google Cloud/);

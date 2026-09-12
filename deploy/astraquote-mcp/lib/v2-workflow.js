@@ -11,7 +11,7 @@ const { OfficialPriceCache } = require('./official-price-cache');
 const {
   officialPricingPageUrlAllowed, pricingScenarios, providerRegionMismatch,
 } = require('./cloud-market-profiles');
-const { PricingRouteStore, PricingRouteStoreError } = require('./pricing-route-store');
+const { PricingCapabilityStore } = require('./pricing-capability-store');
 const { canFinalizeRelayJob } = require('./relay-job-state');
 const {
   PROGRESS_GUIDANCE, mergeQueryContexts, queryProgress, componentProgress,
@@ -469,13 +469,6 @@ const CREATED_PRICE_NEXT_ACTION = [
 
 const DEFAULT_RESULT_BYTE_BUDGET = 128 * 1024;
 
-function routeResolutionErrorCategory(code) {
-  if (['pricing_route_identity_conflict', 'pricing_route_scope_mismatch',
-    'pricing_route_id_invalid'].includes(code)) return 'invalid_request';
-  if (code === 'pricing_route_revalidation_required') return 'response_schema';
-  return 'route_not_found';
-}
-
 function resultByteBudget(value) {
   const configured = value ?? process.env.ASTRAQUOTE_MCP_RESULT_MAX_BYTES;
   if (configured === undefined || configured === null || configured === '') {
@@ -529,7 +522,7 @@ function compactPriceResult(item) {
     details_available: true,
   };
   for (const key of [
-    'terminal', 'retryable', 'error_category', 'code', 'reused_route_id', 'matched_count',
+    'terminal', 'retryable', 'error_category', 'code', 'matched_count',
     'not_found_reason', 'raw_item_count', 'filtered_item_count', 'cache_status',
     'official_price_observed_at', 'cache_age_seconds', 'source_request_skipped',
   ]) {
@@ -551,30 +544,6 @@ function compactPriceResult(item) {
   if (refinementFields) compact.refinement_fields = refinementFields;
   const recovery = compactRecovery(item?.recovery);
   if (recovery) compact.recovery = recovery;
-  if (Array.isArray(item?.pricing_knowledge)) {
-    compact.pricing_knowledge = item.pricing_knowledge.slice(0, 3).map((knowledge) => ({
-      error_category: knowledge?.error_category,
-      provider_code: knowledge?.provider_code,
-      next_action: knowledge?.next_action,
-    }));
-  }
-  if (item?.pricing_route_health) {
-    compact.pricing_route_health = {
-      route_id: item.pricing_route_health.route_id,
-      status: item.pricing_route_health.status,
-      failure_count: item.pricing_route_health.failure_count,
-      remaining_attempts: item.pricing_route_health.remaining_attempts,
-    };
-  }
-  return compact;
-}
-
-function compactLearnedRoute(route) {
-  if (!route || typeof route !== 'object') return route;
-  const compact = {};
-  for (const key of ['route_id', 'query_id', 'provider', 'service', 'status']) {
-    if (route[key] !== undefined) compact[key] = route[key];
-  }
   return compact;
 }
 
@@ -594,7 +563,6 @@ function compactIncrementalPriceResponse(payload, byteBudget) {
   const compacted = {
     ...payload,
     results: (payload.results || []).map(compactPriceResult),
-    learned_routes: (payload.learned_routes || []).map(compactLearnedRoute),
     response_compacted: true,
     response_bytes_before_compaction: before,
     response_byte_budget: byteBudget,
@@ -1155,24 +1123,20 @@ class AstraQuoteV2Workflow {
     backend,
     store = new V2QuoteStore(),
     deliverer = new QuoteDeliveryService(),
-    routeStore,
+    capabilityStore,
     priceCache,
     resultByteBudget: configuredResultByteBudget,
   }) {
     this.backend = backend;
     this.store = store;
     this.deliverer = deliverer;
-    this.routeStore = routeStore || new PricingRouteStore({
-      directory: path.join(this.store.directory, 'pricing-routes'),
+    this.capabilityStore = capabilityStore || new PricingCapabilityStore({
+      directory: path.join(this.store.directory, 'pricing-capabilities'),
     });
     this.priceCache = priceCache || new OfficialPriceCache({
       directory: path.join(this.store.directory, 'official-price-cache'),
     });
     this.resultByteBudget = resultByteBudget(configuredResultByteBudget);
-  }
-
-  routeInstructions() {
-    return this.routeStore.instructions();
   }
 
   describeService(input) {
@@ -1304,39 +1268,7 @@ class AstraQuoteV2Workflow {
       queries: input.queries,
       queryContexts: preliminaryContexts,
     });
-    const routeResolutionFailures = [];
-    const resolvedQueries = input.queries.map((query) => {
-      try {
-        return this.routeStore.resolve(query);
-      } catch (error) {
-        if (!(error instanceof PricingRouteStoreError)) throw error;
-        const errorCategory = routeResolutionErrorCategory(error.code);
-        routeResolutionFailures.push({
-          query_id: query.query_id,
-          provider: query.provider,
-          status: 'query_failed',
-          terminal: error.retryable !== true,
-          retryable: error.retryable === true,
-          error_category: errorCategory,
-          code: error.code || 'pricing_route_resolution_failed',
-          message: error.message,
-          details: error.details || {},
-          recovery: {
-            retryable: error.retryable === true,
-            next_action: error.details?.next_action
-              || (errorCategory === 'invalid_request'
-                ? 'correct_pricing_route_input'
-                : 'discover_and_verify_official_read_only_route'),
-          },
-          official_item_ids: [],
-        });
-        return { query: { ...query }, route: null };
-      }
-    });
-    const materializedQueries = resolvedQueries.map((resolved) => resolved.query);
-    const resolvedByQueryId = new Map(
-      resolvedQueries.map((resolved) => [resolved.query.query_id, resolved]),
-    );
+    const materializedQueries = input.queries.map((query) => ({ ...query }));
     const queryIds = materializedQueries.map((query) => query.query_id);
     if (new Set(queryIds).size !== queryIds.length) {
       const error = new Error('Every official price query must have a unique query_id.');
@@ -1358,14 +1290,10 @@ class AstraQuoteV2Workflow {
     const pendingQueries = [];
     const freshCacheResults = [];
     const capabilityPreflightResults = [];
-    const routeResolutionFailureById = new Map(
-      routeResolutionFailures.map((item) => [item.query_id, item]),
-    );
     const contextById = new Map(queryContexts.map((context) => [context.query_id, context]));
     const forceCapabilityRecheck = input.force_capability_recheck === true
       || Number(relayJob?.partial_retry_generation || 0) > 0;
     for (const query of materializedQueries) {
-      if (routeResolutionFailureById.has(query.query_id)) continue;
       const priorResult = existingResults.get(query.query_id);
       if (reusableQueryResult(priorResult, contextById.get(query.query_id))) {
         if (!isDeepStrictEqual(existingQueries.get(query.query_id), query)) {
@@ -1376,7 +1304,7 @@ class AstraQuoteV2Workflow {
         }
         continue;
       }
-      const marketProfile = this.routeStore.marketProfile(query.provider);
+      const marketProfile = this.capabilityStore.marketProfile(query.provider);
       const cached = this.priceCache.get(query, { marketProfile, allowStale: false });
       if (cached) {
         freshCacheResults.push(cached);
@@ -1384,7 +1312,7 @@ class AstraQuoteV2Workflow {
       }
       const blocker = forceCapabilityRecheck
         ? null
-        : this.routeStore.capabilityBlocker(query);
+        : this.capabilityStore.capabilityBlocker(query);
       if (blocker) {
         capabilityPreflightResults.push({
           query_id: query.query_id,
@@ -1435,17 +1363,12 @@ class AstraQuoteV2Workflow {
       }
       throw error;
     }
-    const liveResults = (result.results || []).map((item) => {
-      const resolved = resolvedByQueryId.get(item.query_id);
-      return resolved?.route
-        ? { ...item, reused_route_id: resolved.route.route_id }
-        : item;
-    });
+    const liveResults = result.results || [];
     const transientCategories = new Set(['transport', 'rate_limit', 'provider_unavailable']);
     const completedLiveResults = liveResults.map((item) => {
-      const query = resolvedByQueryId.get(item.query_id)?.query;
+      const query = materializedQueries.find((candidate) => candidate.query_id === item.query_id);
       if (!query) return item;
-      const marketProfile = this.routeStore.marketProfile(query.provider);
+      const marketProfile = this.capabilityStore.marketProfile(query.provider);
       if (item.status === 'query_failed' && transientCategories.has(item.error_category)) {
         const stale = this.priceCache.get(query, { marketProfile, allowStale: true });
         if (stale?.cache_status === 'stale') {
@@ -1467,7 +1390,6 @@ class AstraQuoteV2Workflow {
     const responseResults = new Map([
       ...freshCacheResults,
       ...capabilityPreflightResults,
-      ...routeResolutionFailures,
       ...completedLiveResults,
     ].map((item) => [item.query_id, item]));
     result = {
@@ -1476,23 +1398,7 @@ class AstraQuoteV2Workflow {
       results: materializedQueries
         .map((query) => responseResults.get(query.query_id)).filter(Boolean),
     };
-    const learnedRoutes = this.routeStore.recordBatch(pendingQueries, liveResults);
-    result = {
-      ...result,
-      results: (result.results || []).map((item) => {
-        const resolved = resolvedByQueryId.get(item.query_id);
-        const query = resolved?.query;
-        const pricingKnowledge = query ? this.routeStore.knowledgeForQuery(query) : [];
-        const routeHealth = resolved?.route
-          ? this.routeStore.healthForRoute(resolved.route.route_id)
-          : null;
-        return {
-          ...item,
-          ...(pricingKnowledge.length > 0 ? { pricing_knowledge: pricingKnowledge } : {}),
-          ...(routeHealth ? { pricing_route_health: routeHealth } : {}),
-        };
-      }),
-    };
+    this.capabilityStore.recordCapabilityBatch(pendingQueries, liveResults);
     const priceBatchId = existing?.price_batch_id || input.price_batch_id || `aqpb_${randomUUID()}`;
     // Parallel component chats may finish their official API calls in either
     // order. Re-read the batch after the await and perform the final merge in
@@ -1639,7 +1545,6 @@ class AstraQuoteV2Workflow {
         queryIds.includes(item.query_id) || item.state === 'superseded'
       )),
       price_batch_id: priceBatchId,
-      learned_routes: learnedRoutes,
       resumed_batch: Boolean(existing),
       reused_query_ids: materializedQueries
         .filter((query) => !pendingQueries.includes(query)
@@ -1768,7 +1673,7 @@ class AstraQuoteV2Workflow {
       entries.push(context);
       contextsByScope.set(key, entries);
     }
-    const marketProfile = this.routeStore.marketProfile(input.cloud_provider);
+    const marketProfile = this.capabilityStore.marketProfile(input.cloud_provider);
     const coveredScopes = new Set();
     const acceptedEvidence = [];
     const violations = [];
@@ -2240,7 +2145,7 @@ class AstraQuoteV2Workflow {
     const normalizedInput = validateScenarioSemantics(
       normalizeScenarioCosts(normalizeComponentCosts(relayBoundInput)),
     );
-    const marketProfile = this.routeStore.marketProfile(normalizedInput.cloud_provider);
+    const marketProfile = this.capabilityStore.marketProfile(normalizedInput.cloud_provider);
     const regionScopes = [
       { region: normalizedInput.default_region, scope: 'quote' },
       ...(normalizedInput.services || []).map((component) => ({

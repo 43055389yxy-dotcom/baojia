@@ -6,7 +6,6 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, Literal
 from urllib.parse import quote, urlparse
@@ -15,7 +14,6 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.services.aws_query_executor import ReadOnlyAwsQueryExecutor
-from app.services.cloud_quote_profiles import active_market_profile
 from app.services.official_cloud_clients import (
     OfficialCloudApiClient,
     OfficialCloudClientError,
@@ -303,15 +301,6 @@ _PROVIDER_OFFICIAL_SOURCE_SUFFIXES = {
     "baidu": (".baidubce.com", ".baidu.com"),
     "volcengine": (".volcengineapi.com", ".volcengine.com"),
     "ctyun": (".ctyun.cn",),
-}
-
-_PROVIDER_AUTH_SCHEMES = {
-    "tencent": "tc3_hmac_sha256",
-    "alibaba": "alibaba_rpc_hmac_sha1",
-    "huawei": "huawei_sdk_hmac_sha256",
-    "baidu": "bce_auth_v1_hmac_sha256",
-    "volcengine": "volcengine_hmac_sha256",
-    "ctyun": "ctyun_eop_hmac_sha256",
 }
 
 _SAFE_ACTION = re.compile(
@@ -626,11 +615,6 @@ class OfficialPricingService:
             "message": _safe_error_message(str(last_error)),
             "details": details if isinstance(details, dict) else {},
             "recovery": recovery,
-            "route_fingerprint": (
-                _route_fingerprint(query)
-                if isinstance(query, AuthenticatedCatalogQuery)
-                else None
-            ),
             "official_item_ids": [],
         }
 
@@ -926,7 +910,6 @@ class OfficialPricingService:
                         "The requested response path is missing or is not a list of objects. "
                         "Correct the response contract."
                     ),
-                    "route_fingerprint": _route_fingerprint(query),
                     "official_item_ids": [],
                     "items": [],
                     "filtered_item_count": 0,
@@ -940,7 +923,6 @@ class OfficialPricingService:
             "response_filters": query.response_filters,
             "next_page_token": next_page_token,
             "source": PROVIDER_SOURCE_LABELS[query.provider],
-            "route_verification": _route_verification(query, payload),
         }
 
     def _official_json(self, url: str, *, params: dict[str, Any]) -> dict[str, Any]:
@@ -950,104 +932,6 @@ class OfficialPricingService:
         if not isinstance(payload, dict):
             raise ValueError("Official catalog returned a non-object JSON payload")
         return payload
-
-
-def _schema_shape(value: Any, *, depth: int = 0) -> Any:
-    if depth >= 12:
-        return "depth_limit"
-    if isinstance(value, dict):
-        return {
-            str(key): _schema_shape(item, depth=depth + 1)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-        }
-    if isinstance(value, list):
-        shapes = {
-            json.dumps(
-                _schema_shape(item, depth=depth + 1),
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            )
-            for item in value[:20]
-        }
-        return [json.loads(item) for item in sorted(shapes)]
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "boolean"
-    if isinstance(value, int):
-        return "integer"
-    if isinstance(value, float):
-        return "number"
-    return "string"
-
-
-def _schema_hash(value: Any) -> str:
-    encoded = json.dumps(
-        _schema_shape(value),
-        sort_keys=True,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
-
-
-def _route_identity(query: AuthenticatedCatalogQuery) -> dict[str, Any]:
-    market_profile = active_market_profile(query.provider)
-    return {
-        "provider": query.provider,
-        "endpoint": query.endpoint,
-        "service": query.service,
-        "action": query.action,
-        "version": query.version,
-        "region": query.region,
-        "market_profile": market_profile["market_profile"],
-        "credential_scope": market_profile["credential_scope"],
-        "region_parameter": query.region_parameter,
-        "method": query.method,
-        "path": query.path,
-        "request_schema_hash": _schema_hash(
-            {
-                "query_parameters": query.query_parameters,
-                "body": query.body,
-            }
-        ),
-    }
-
-
-def _route_fingerprint(query: AuthenticatedCatalogQuery) -> str:
-    encoded = json.dumps(
-        _route_identity(query),
-        sort_keys=True,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
-
-
-def _route_verification(
-    query: AuthenticatedCatalogQuery, payload: dict[str, Any]
-) -> dict[str, Any]:
-    verified_at = datetime.now(UTC)
-    source_url = query.official_source_url or (
-        f"https://{query.endpoint}{query.path}"
-    )
-    return {
-        **_route_identity(query),
-        "route_contract_version": 3,
-        "route_fingerprint": _route_fingerprint(query),
-        "response_schema_hash": _schema_hash(payload),
-        "response_items_path": query.response_items_path,
-        "item_id_paths": list(query.item_id_paths),
-        "rate_fields": [item.model_dump(mode="json") for item in query.rate_fields],
-        "next_page_path": query.next_page_path,
-        "auth_scheme": _PROVIDER_AUTH_SCHEMES[query.provider],
-        "sdk_version": query.sdk_version or "astraquote-direct-signer/1",
-        "last_verified_at": verified_at.isoformat(),
-        "failure_count": 0,
-        "confidence": 0.65,
-        "official_source_url": source_url,
-    }
 
 
 def _safe_error_message(value: str) -> str:

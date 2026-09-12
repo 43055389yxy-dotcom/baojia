@@ -58,7 +58,7 @@ def test_sales_api_preserves_the_provider_and_exact_selected_scenarios(
     assert internal["quote_options"]["preferred_region"] == preferred_region
 
 
-def test_sales_api_accepts_an_explicit_quote_engine_and_defaults_to_chatgpt(
+def test_sales_api_routes_disabled_quote_engines_to_chatgpt(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -87,9 +87,9 @@ def test_sales_api_accepts_an_explicit_quote_engine_and_defaults_to_chatgpt(
     assert default_response.status_code == 200
     assert default_response.json()["preferred_engine"] == "chatgpt"
     assert gemini_response.status_code == 200
-    assert gemini_response.json()["preferred_engine"] == "gemini"
+    assert gemini_response.json()["preferred_engine"] == "chatgpt"
     internal = store.get(gemini_response.json()["job_id"])
-    assert internal["quote_options"]["preferred_engine"] == "gemini"
+    assert internal["quote_options"]["preferred_engine"] == "chatgpt"
 
 
 def test_sales_api_requires_one_consecutively_numbered_component_per_line(

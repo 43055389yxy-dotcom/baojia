@@ -211,9 +211,10 @@ def build_quote_merge_prompt(
         f"{ASTRAQUOTE_MENTION} 所有组件子批次已经停止运行。"
         "请在总控对话中读取 AstraQuote 后台保存的"
         "组件计划、price_batch 和真实组件状态，立即做最终机械合并与编译器校验。"
-        "已有官方价格的组件必须全部进入报价；永久失败或两次无进展后仍未完成的组件"
+        "已有官方价格的组件必须全部进入报价；永久失败或一次补发后仍未完成的组件"
         "进入 unpriced_services，不得按 0 元，不得计入合计。若存在未核价组件，"
-        "生成部分报价和 Excel；否则生成完整报价和 Excel。不得重复查询已经成功的组件。\n\n"
+        "生成部分报价和 Excel，并将未完成项标注为请销售手动填写；"
+        "否则生成完整报价和 Excel。不得重复查询已经成功的组件。\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n"
         f"price_batch_id：{price_batch_id}。"
     )
@@ -232,7 +233,7 @@ def build_component_batch_continuation_prompt(
 
     return (
         f"{ASTRAQUOTE_MENTION} 这不是新报价。"
-        "请继续当前组件子批次，只补本批尚未完成的官方价格，"
+        "请先读取后台组件状态，只把本批尚未完成的组件重新组织后补查一次，"
         "已经成功的查询必须复用，不得处理其他批次，也不要生成最终整单。"
         f"当前为第 {batch_index + 1}/{batch_count} 批；"
         f"允许处理的 component_key：{json.dumps(component_keys, ensure_ascii=False)}。\n\n"

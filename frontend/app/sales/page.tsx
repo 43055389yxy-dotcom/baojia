@@ -17,7 +17,7 @@ type ScenarioKey =
 type CloudProvider =
   | "aws" | "azure" | "oci" | "gcp"
   | "tencent" | "alibaba" | "huawei" | "baidu" | "volcengine" | "ctyun";
-type QuoteEngine = "chatgpt" | "gemini";
+type QuoteEngine = "chatgpt";
 
 type PageScenarioCost = {
   scenario_key: ScenarioKey;
@@ -147,10 +147,6 @@ function providerLabel(provider: CloudProvider | undefined) {
   return PROVIDER_META[provider ?? "aws"].label;
 }
 
-function engineLabel(engine: QuoteEngine | null | undefined) {
-  return engine === "gemini" ? "Gemini" : "ChatGPT";
-}
-
 function safeSubmissionError(status: number) {
   if (status === 422) return "报价选项与所选云厂商不一致，请检查后重新提交。";
   if (status === 429) return "当前提交较多，请稍候再试。";
@@ -218,7 +214,6 @@ export default function SalesQuotePage() {
   );
   const [utilization, setUtilization] = useState(100);
   const [cloudProvider, setCloudProvider] = useState<CloudProvider>("aws");
-  const [preferredEngine, setPreferredEngine] = useState<QuoteEngine>("chatgpt");
   const [providerOpen, setProviderOpen] = useState(false);
   const [regionCatalog, setRegionCatalog] = useState<RegionCatalog | null>(null);
   const [preferredRegion, setPreferredRegion] = useState("");
@@ -429,7 +424,7 @@ export default function SalesQuotePage() {
           .filter((scenario) => selectedScenarios.has(scenario)),
         utilization_percent: utilization,
         preferred_region: preferredRegion,
-        preferred_engine: preferredEngine,
+        preferred_engine: "chatgpt",
       };
       const fingerprint = await submissionFingerprint(requestDetails);
       let pending: { fingerprint?: string; client_request_id?: string } = {};
@@ -580,37 +575,10 @@ export default function SalesQuotePage() {
       {!job ? (
         <section className="sales-quote-workspace">
           <form className="sales-quote-form" onSubmit={submit}>
-            <fieldset className="sales-pricing-mode sales-engine-section">
-              <div className="sales-provider-heading">
-                <legend>选择报价引擎</legend>
-                <span>01 / 05</span>
-              </div>
-              <div className="sales-engine-options" role="radiogroup" aria-label="选择报价引擎">
-                {(["chatgpt", "gemini"] as QuoteEngine[]).map((engine) => (
-                  <label className={preferredEngine === engine ? "selected" : ""} key={engine}>
-                    <input
-                      type="radio"
-                      name="quote-engine"
-                      value={engine}
-                      checked={preferredEngine === engine}
-                      onChange={() => setPreferredEngine(engine)}
-                    />
-                    <i aria-hidden="true">{engine === "chatgpt" ? "GPT" : "G"}</i>
-                    <span>
-                      <strong>{engineLabel(engine)}</strong>
-                      <small>{engine === "chatgpt" ? "默认报价引擎" : "备用报价引擎"}</small>
-                    </span>
-                    <em>{health?.engines?.[engine]?.status === "offline" ? "等待登录" : "4 个名额"}</em>
-                  </label>
-                ))}
-              </div>
-              <p className="sales-engine-note">首选引擎满载时，整张报价会自动切换到另一个可用引擎。</p>
-            </fieldset>
-
             <fieldset className="sales-pricing-mode sales-provider-section">
               <div className="sales-provider-heading">
                 <legend>选择云厂商</legend>
-                <span>02 / 05</span>
+                <span>01 / 04</span>
               </div>
               <div
                 className="sales-provider-select-wrap"
@@ -668,7 +636,7 @@ export default function SalesQuotePage() {
                   <label htmlFor="sales-region">选择首选地域</label>
                   <p>{regionCatalog?.site_label ?? "正在读取账号站点"} · 地域代码按当前云厂商解释，最终可购性以每个产品的官方响应为准</p>
                 </div>
-                <span>03 / 05</span>
+                <span>02 / 04</span>
               </div>
               <div className="sales-region-select-wrap" ref={regionPickerRef}>
                 <input
@@ -725,7 +693,7 @@ export default function SalesQuotePage() {
               <section className="sales-requirement-panel">
                 <div className="sales-section-heading">
                   <div><label htmlFor="sales-requirement">填写客户需求</label><p>规格、数量、存储及流量</p></div>
-                  <span>04 / 05</span>
+                  <span>03 / 04</span>
                 </div>
                 <div className="sales-textarea-shell">
                   <textarea
@@ -748,7 +716,7 @@ export default function SalesQuotePage() {
               <aside className="sales-options-panel">
                 <div className="sales-section-heading">
                   <div><strong>设置报价方案</strong><p>采用所选云厂商的计价方式</p></div>
-                  <span>05 / 05</span>
+                  <span>04 / 04</span>
                 </div>
                 <fieldset className="sales-pricing-mode sales-scenario-list">
                   <legend className="sales-visually-hidden">报价方案</legend>
@@ -806,7 +774,7 @@ export default function SalesQuotePage() {
             </div>
           </div>
           <div className="sales-job-copy">
-            <p>LIVE QUOTE WORKFLOW · {providerLabel(job.cloud_provider)} · {engineLabel(job.assigned_engine ?? job.preferred_engine)}</p>
+            <p>LIVE QUOTE WORKFLOW · {providerLabel(job.cloud_provider)} · ChatGPT</p>
             <h1>{statusCopy[job.status].title}</h1>
             <span>{["completed", "partial"].includes(job.status) && job.quick_quote_result
               ? job.status === "partial"

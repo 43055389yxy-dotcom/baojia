@@ -838,12 +838,13 @@ class CodexChatDesktop:
         quote.retry_visible_since = None
         messages = self._assistant_messages()
         generation_active = self._generation_active()
+        is_component_batch = quote.batch_count > 1 and quote.role != "merge"
         if len(messages) < quote.minimum_assistant_messages:
             if should_extend_quote_deadline(
                 deadline_reached=now >= quote.deadline,
                 generation_active=generation_active,
                 retry_visible=False,
-            ) and not quote.generation_grace_used:
+            ) and not quote.generation_grace_used and not is_component_batch:
                 quote.deadline = now + self.quote_timeout_seconds
                 quote.generation_grace_used = True
                 return None
@@ -866,7 +867,7 @@ class CodexChatDesktop:
             deadline_reached=now >= quote.deadline,
             generation_active=generation_active,
             retry_visible=False,
-        ) and not quote.generation_grace_used:
+        ) and not quote.generation_grace_used and not is_component_batch:
             quote.deadline = now + self.quote_timeout_seconds
             quote.generation_grace_used = True
             return None
@@ -909,7 +910,8 @@ class CodexChatDesktop:
 
     def close_quote(self, quote: Any) -> None:
         self._switch_to_quote(quote)
-        self._stop_generation()
+        if self._stop_generation():
+            self._wait_until(lambda: not self._generation_active(), timeout=15)
 
     def cancel_quote(self, quote: Any) -> None:
         self._switch_to_quote(quote)

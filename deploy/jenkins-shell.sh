@@ -311,8 +311,7 @@ restart_host_browser_relay() {
     /bin/sh -ceu '
       /usr/bin/systemctl enable astraquote-gpt-relay.service
       /usr/bin/systemctl restart astraquote-gpt-relay.service
-      /usr/bin/systemctl enable astraquote-gemini-relay.service
-      /usr/bin/systemctl restart astraquote-gemini-relay.service
+      /usr/bin/systemctl disable --now astraquote-gemini-relay.service || true
     '
 }
 
@@ -373,8 +372,8 @@ wait_for_host_browser_relay() {
     '
 }
 
-wait_for_both_quote_engines() {
-  echo "Waiting for both desktop quote engines"
+wait_for_chatgpt_quote_engine() {
+  echo "Waiting for the ChatGPT desktop quote engine"
   docker run --rm --privileged --pid=host \
     --entrypoint /usr/bin/nsenter \
     astraquote:production \
@@ -388,16 +387,13 @@ wait_for_both_quote_engines() {
     --wd=/ \
     /bin/sh -ceu '
       for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
-        if systemctl is-active --quiet astraquote-gpt-relay.service \
-          && systemctl is-active --quiet astraquote-gemini-relay.service; then
+        if systemctl is-active --quiet astraquote-gpt-relay.service; then
           sleep 5
-          systemctl is-active --quiet astraquote-gpt-relay.service \
-            && systemctl is-active --quiet astraquote-gemini-relay.service \
-            && exit 0
+          systemctl is-active --quiet astraquote-gpt-relay.service && exit 0
         fi
         sleep 5
       done
-      echo "Both desktop quote engine services did not remain active" >&2
+      echo "The ChatGPT desktop quote engine did not remain active" >&2
       exit 1
     '
 }
@@ -409,7 +405,7 @@ update_host_browser_relay() {
   install_host_relay_dependencies
   install_host_browser_relay_service
   restart_host_browser_relay
-  if ! wait_for_host_browser_relay || ! wait_for_both_quote_engines; then
+  if ! wait_for_host_browser_relay || ! wait_for_chatgpt_quote_engine; then
     diagnose_host_browser_relay
     return 1
   fi

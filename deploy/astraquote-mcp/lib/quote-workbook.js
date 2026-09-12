@@ -249,7 +249,7 @@ function componentDetails(record) {
       simplifyCustomerText(display.reference_unit_price || ''),
       [
         ...(adjustmentsByComponent.get(component.component_key) || []),
-        ...(isUnpriced ? ['未完成报价：官方价格尚未取得，未计入合计'] : []),
+        ...(isUnpriced ? ['未自动取得价格，请销售手动填写；未计入合计'] : []),
       ].join('；') || null,
     ];
   });

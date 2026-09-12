@@ -17,8 +17,9 @@ def test_jenkins_deploy_updates_and_restarts_the_host_codex_chat_relay() -> None
     assert "--entrypoint /usr/bin/nsenter" in script
     assert "/usr/bin/systemctl enable astraquote-gpt-relay.service" in script
     assert "/usr/bin/systemctl restart astraquote-gpt-relay.service" in script
-    assert "/usr/bin/systemctl enable astraquote-gemini-relay.service" in script
-    assert "/usr/bin/systemctl restart astraquote-gemini-relay.service" in script
+    assert "/usr/bin/systemctl disable --now astraquote-gemini-relay.service" in script
+    assert "/usr/bin/systemctl enable astraquote-gemini-relay.service" not in script
+    assert "/usr/bin/systemctl restart astraquote-gemini-relay.service" not in script
     assert "astraquote-chatgpt-desktop" in script
     assert "codex://threads/new?mode=chat" in script
     assert "--shm-size 1g" in script

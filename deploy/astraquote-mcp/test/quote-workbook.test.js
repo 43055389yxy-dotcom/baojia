@@ -144,7 +144,7 @@ test('partial workbook keeps successful totals and marks unpriced components wit
 
   assert.equal(sheet.getCell('B3').value, 'Amazon S3');
   assert.equal(sheet.getCell('G3').value, null);
-  assert.match(String(sheet.getCell('I3').value), /未完成报价/);
+  assert.match(String(sheet.getCell('I3').value), /请销售手动填写/);
   assert.equal(sheet.getCell('A4').value, '合计');
   assert.equal(sheet.getCell('G4').value.result, 245.67);
 });
@@ -176,7 +176,7 @@ test('keeps provider maintenance, rate limits and cache fallback details out of 
   sheet.eachRow((row) => row.eachCell((cell) => text.push(String(cell.text || ''))));
   const customerDocument = text.join('\n');
 
-  assert.match(customerDocument, /未完成报价/);
+  assert.match(customerDocument, /未自动取得价格，请销售手动填写/);
   assert.doesNotMatch(
     customerDocument,
     /维护|限流|连接中断|rate_limit|TooManyRequests|internal-query|价格快照/,

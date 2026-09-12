@@ -150,10 +150,58 @@ def test_batch_failure_state_churn_is_not_real_progress(worker, running_job, mon
     monkeypatch.setattr(worker, "active_batch", lambda *_: batch)
     browser = Mock()
     assert worker.continue_component_batch(store, browser, active)
-    assert worker.continue_component_batch(store, browser, active)
+    prompt = browser.continue_quote.call_args.args[1]
+    assert '"b"' in prompt
+    assert '"a"' not in prompt
+    assert not worker.continue_component_batch(store, browser, active)
     batch["component_states"]["a"] = "pending"
     assert not worker.continue_component_batch(store, browser, active)
+    assert browser.continue_quote.call_count == 1
+
+
+def test_single_chat_retries_only_incomplete_components_once_then_requests_partial_excel(
+    worker, running_job, monkeypatch,
+):
+    store, job_id, checkpoint_path = running_job
+    batch = {
+        "batch_index": 0,
+        "batch_count": 1,
+        "price_batch_id": "aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "component_keys": ["done", "failed", "pending"],
+        "component_states": {
+            "done": "completed", "failed": "failed", "pending": "pending",
+        },
+    }
+    checkpoint_path.write_text(json.dumps({
+        "relay_job_id": job_id,
+        "stage": "pricing_partial",
+        "quote_terminal": True,
+        "total_component_count": 3,
+        "completed_component_count": 1,
+        "completed_component_keys": ["done"],
+    }), encoding="utf-8")
+    monkeypatch.setattr(store, "quote_chat_batches", lambda *_: [batch])
+    browser = Mock()
+    active = worker.ActiveQuote(job_id, codex_chat(0), 100)
+
+    assert worker.complete_job(
+        store, job_id, "ASTRAQUOTE_STATUS: blocked\nASTRAQUOTE_SUMMARY: 两项失败",
+    ) == "continue"
+    assert worker.continue_from_saved_stage(store, browser, active, message="续跑")
+    retry_prompt = browser.continue_quote.call_args.args[1]
+    assert '"failed"' in retry_prompt
+    assert '"pending"' in retry_prompt
+    assert '"done"' not in retry_prompt
+
+    assert worker.continue_from_saved_stage(store, browser, active, message="续跑")
+    partial_prompt = browser.continue_quote.call_args.args[1]
+    assert "生成部分报价和 Excel" in partial_prompt
     assert browser.continue_quote.call_count == 2
+
+
+def test_failed_component_is_not_treated_as_completed_before_its_one_retry(worker):
+    assert not worker.batch_is_finished({"component_states": {"a": "failed"}})
+    assert worker.batch_is_finished({"component_states": {"a": "completed"}})
 
 
 def test_child_budget_is_durable_before_send_failure(worker, running_job, monkeypatch):
@@ -272,6 +320,101 @@ def test_new_visible_prose_cannot_extend_expired_no_progress_deadline(worker, mo
     with pytest.raises(TimeoutError):
         browser.poll_quote(active)
     assert active.deadline == 90
+
+
+def test_running_component_batch_cannot_extend_expired_no_progress_deadline(
+    worker, monkeypatch,
+):
+    browser = worker.CodexChatDesktop(
+        active_quote_factory=worker.ActiveQuote,
+        quote_timeout_seconds=600,
+    )
+    browser._switch_to_quote = Mock()
+    browser._scroll_to_latest = Mock()
+    browser._approve_tool_if_needed = lambda: False
+    browser._text_control_visible = lambda _: False
+    browser._assistant_messages = lambda: ["仍在调用工具"]
+    browser._generation_active = lambda: True
+    monkeypatch.setattr(worker.time, "monotonic", lambda: 100)
+    active = worker.ActiveQuote(
+        "job", codex_chat(98), 90, batch_index=1, batch_count=3,
+        role="component_batch",
+    )
+
+    with pytest.raises(TimeoutError):
+        browser.poll_quote(active)
+    assert active.deadline == 90
+
+
+def test_no_progress_timeout_stops_generation_before_single_batch_continuation(
+    worker, running_job, monkeypatch,
+):
+    store, job_id, _ = running_job
+    store.record_chat_session(
+        job_id, batch_index=0, batch_count=2,
+        chat_url=codex_chat(0), role="coordinator", component_keys=["a"],
+    )
+    active = worker.ActiveQuote(
+        job_id, codex_chat(0), 90, batch_index=0, batch_count=2,
+        role="coordinator", component_keys=["a"],
+    )
+    monkeypatch.setattr(store, "quote_chat_batches", lambda *_: [{
+        "batch_index": 0,
+        "batch_count": 2,
+        "price_batch_id": "aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "component_keys": ["a"],
+        "component_states": {"a": "pending"},
+    }])
+    calls = []
+    browser = Mock()
+    browser.close_quote.side_effect = lambda *_: calls.append("stop")
+    browser.continue_quote.side_effect = lambda *_: calls.append("continue")
+
+    worker.handle_no_progress_timeout(
+        store, browser, active, {active.session_key: active},
+    )
+
+    assert calls == ["stop", "continue"]
+
+
+def test_second_batch_timeout_stops_only_that_batch_and_leaves_other_batches_running(
+    worker, running_job, monkeypatch,
+):
+    store, job_id, _ = running_job
+    for index in range(2):
+        store.record_chat_session(
+            job_id, batch_index=index, batch_count=2,
+            chat_url=codex_chat(index),
+            role="coordinator" if index == 0 else "component_batch",
+            component_keys=[f"cmp-{index}"],
+        )
+    timed_out = worker.ActiveQuote(
+        job_id, codex_chat(0), 90, batch_index=0, batch_count=2,
+        role="coordinator", component_keys=["cmp-0"], stalled_attempts=1,
+    )
+    still_running = worker.ActiveQuote(
+        job_id, codex_chat(1), 90, batch_index=1, batch_count=2,
+        role="component_batch", component_keys=["cmp-1"],
+    )
+    batches = [{
+        "batch_index": index,
+        "batch_count": 2,
+        "price_batch_id": "aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "component_keys": [f"cmp-{index}"],
+        "component_states": {f"cmp-{index}": "pending"},
+    } for index in range(2)]
+    monkeypatch.setattr(store, "quote_chat_batches", lambda *_: batches)
+    active = {
+        timed_out.session_key: timed_out,
+        still_running.session_key: still_running,
+    }
+    browser = Mock()
+
+    worker.handle_no_progress_timeout(store, browser, timed_out, active)
+
+    assert timed_out.session_key not in active
+    assert still_running.session_key in active
+    browser.continue_quote.assert_not_called()
 
 
 def test_production_worker_constructs_codex_chat_adapter_not_firefox(worker):
