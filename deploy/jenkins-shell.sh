@@ -241,7 +241,19 @@ ensure_host_codex_chat_desktop() {
 
 install_host_relay_dependencies() {
   echo "Installing the versioned desktop relay dependencies"
-  /home/ec2-user/astraquote/gpt-relay-venv/bin/pip install --disable-pip-version-check \
+  docker run --rm --privileged --pid=host \
+    --entrypoint /usr/bin/nsenter \
+    astraquote:production \
+    --target 1 \
+    --mount \
+    --uts \
+    --ipc \
+    --net \
+    --pid \
+    --root=/proc/1/root \
+    --wd=/ \
+    /home/ec2-user/astraquote/gpt-relay-venv/bin/python -m pip \
+    install --disable-pip-version-check \
     -r /home/ec2-user/astraquote/relay-requirements.txt.next
 }
 
