@@ -40,6 +40,7 @@ CODEX_STATE_PATH = Path(
 )
 CODEX_NEW_CHAT_LINK = "codex://threads/new?mode=chat"
 CODEX_CHAT_REFERENCE_PREFIX = "codex-chat://conversations/"
+CODEX_PENDING_REFERENCE_PREFIX = "codex-chat://pending/"
 COMPOSER_SELECTOR = (
     '[contenteditable="true"][aria-label="给 ChatGPT 发消息"],'
     '[contenteditable="true"][aria-label*="ChatGPT"],'
@@ -53,6 +54,11 @@ THREAD_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
+RELAY_JOB_ID_PATTERN = re.compile(r"^gpt-[0-9a-f]{32}$", re.IGNORECASE)
+
+
+class PendingConversationReferenceError(RuntimeError):
+    """The prompt is running but Codex has not listed its stable chat id yet."""
 
 
 def split_astraquote_prompt(prompt: str) -> str:
@@ -81,6 +87,22 @@ def conversation_id_from_reference(reference: str) -> str:
     return codex_chat_reference(value.removeprefix(CODEX_CHAT_REFERENCE_PREFIX)).rsplit(
         "/", 1
     )[-1]
+
+
+def pending_chat_reference(job_id: str) -> str:
+    normalized = str(job_id).strip()
+    if not RELAY_JOB_ID_PATTERN.fullmatch(normalized):
+        raise ValueError("Codex Chat pending relay job id is invalid")
+    return f"{CODEX_PENDING_REFERENCE_PREFIX}{normalized}"
+
+
+def is_pending_chat_reference(reference: str) -> bool:
+    value = str(reference).strip()
+    return value.startswith(CODEX_PENDING_REFERENCE_PREFIX) and bool(
+        RELAY_JOB_ID_PATTERN.fullmatch(
+            value.removeprefix(CODEX_PENDING_REFERENCE_PREFIX)
+        )
+    )
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -431,19 +453,53 @@ class CodexChatDesktop:
         if not valid_user_mention:
             raise RuntimeError("已发送消息没有绑定 AstraQuote 插件。")
 
-    def _new_conversation_reference(self, previous_ids: list[str]) -> str:
+    def _new_conversation_reference(
+        self,
+        previous_ids: list[str],
+        *,
+        timeout: float = 3,
+    ) -> str | None:
         previous = set(previous_ids)
 
         def find_new() -> str | None:
             return next((value for value in self._sidebar_ids() if value not in previous), None)
 
-        thread_id = self._wait_until(find_new, timeout=45)
+        try:
+            thread_id = self._wait_until(find_new, timeout=timeout)
+        except TimeoutError:
+            return None
         return codex_chat_reference(str(thread_id))
+
+    def promote_pending_reference(self, quote: Any) -> bool:
+        """Replace a temporary sent-message handle once Codex lists the chat."""
+
+        if not is_pending_chat_reference(quote.chat_url):
+            return False
+        previous = set(getattr(quote, "previous_conversation_ids", ()) or ())
+        thread_id = next(
+            (value for value in self._sidebar_ids() if value not in previous),
+            None,
+        )
+        if thread_id is None:
+            return False
+        quote.chat_url = codex_chat_reference(thread_id)
+        quote.previous_conversation_ids = ()
+        _atomic_json(
+            CODEX_STATE_PATH,
+            {
+                "surface": "Codex Chat",
+                "last_chat_reference": quote.chat_url,
+                "updated_at": time.time(),
+            },
+        )
+        return True
 
     def start_quote(self, job_id: str, prompt: str) -> Any:
         previous_ids = self._open_new_chat()
         self._send_prompt(prompt)
-        chat_reference = self._new_conversation_reference(previous_ids)
+        chat_reference = self._new_conversation_reference(previous_ids) or (
+            pending_chat_reference(job_id)
+        )
         now = time.monotonic()
         _atomic_json(
             CODEX_STATE_PATH,
@@ -458,6 +514,7 @@ class CodexChatDesktop:
             chat_url=chat_reference,
             deadline=now + self.quote_timeout_seconds,
             stable_since=now,
+            previous_conversation_ids=tuple(previous_ids),
         )
 
     def start_component_batch(
@@ -477,8 +534,6 @@ class CodexChatDesktop:
         return active
 
     def _switch_to_quote(self, quote: Any) -> None:
-        thread_id = conversation_id_from_reference(quote.chat_url)
-
         def current_quote_visible() -> bool:
             return bool(
                 self._evaluate(
@@ -490,7 +545,16 @@ class CodexChatDesktop:
             )
 
         if current_quote_visible():
+            self.promote_pending_reference(quote)
             return
+        if (
+            is_pending_chat_reference(quote.chat_url)
+            and not self.promote_pending_reference(quote)
+        ):
+            raise PendingConversationReferenceError(
+                "Codex 报价已发送，正在等待最近对话生成标题。"
+            )
+        thread_id = conversation_id_from_reference(quote.chat_url)
         clicked = self._evaluate(
             f"""
             (() => {{
@@ -516,6 +580,7 @@ class CodexChatDesktop:
         batch_count: int = 1,
         role: str = "coordinator",
         component_keys: list[str] | None = None,
+        previous_conversation_ids: list[str] | None = None,
     ) -> Any:
         now = time.monotonic()
         active = self.active_quote_factory(
@@ -527,8 +592,14 @@ class CodexChatDesktop:
             batch_count=batch_count,
             role=role,
             component_keys=tuple(component_keys or []),
+            previous_conversation_ids=tuple(previous_conversation_ids or []),
         )
-        self._switch_to_quote(active)
+        try:
+            self._switch_to_quote(active)
+        except PendingConversationReferenceError:
+            # The submitted remote turn is still valid. Keep it monitored and
+            # promote its reference as soon as the sidebar title appears.
+            pass
         return active
 
     def _scroll_to_latest(self) -> None:

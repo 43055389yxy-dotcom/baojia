@@ -355,6 +355,7 @@ class GptQuoteRelayStore:
         chat_url: str,
         role: str,
         component_keys: list[str],
+        previous_conversation_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         """Persist one logical chat while the robot keeps a single window."""
 
@@ -362,13 +363,27 @@ class GptQuoteRelayStore:
             raise GptRelayError("无效的报价对话角色。", code="gpt_relay_chat_role_invalid")
         if not 0 <= batch_index < batch_count <= 200:
             raise GptRelayError("无效的报价对话批次。", code="gpt_relay_chat_batch_invalid")
-        if not re.fullmatch(
+        stable_reference = re.fullmatch(
             r"codex-chat://conversations/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
             r"[0-9a-f]{4}-[0-9a-f]{12}",
             str(chat_url),
             flags=re.IGNORECASE,
-        ):
+        )
+        pending_reference = str(chat_url) == f"codex-chat://pending/{job_id}"
+        if not stable_reference and not pending_reference:
             raise GptRelayError("无效的报价对话地址。", code="gpt_relay_chat_url_invalid")
+        previous_ids = list(previous_conversation_ids or [])
+        if len(previous_ids) > 200 or any(
+            re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                str(value),
+                flags=re.IGNORECASE,
+            ) is None
+            for value in previous_ids
+        ):
+            raise GptRelayError(
+                "无效的历史报价对话地址。", code="gpt_relay_chat_url_invalid"
+            )
         with self._lock():
             path = self._path(job_id)
             record = self._read(path)
@@ -384,6 +399,7 @@ class GptQuoteRelayStore:
                     "chat_url": str(chat_url),
                     "role": role,
                     "component_keys": list(component_keys),
+                    "previous_conversation_ids": previous_ids,
                     "status": "running",
                     "updated_at": utc_now(),
                 }
@@ -392,6 +408,50 @@ class GptQuoteRelayStore:
             record["chat_sessions"] = sessions
             if role == "coordinator":
                 record["chat_url"] = str(chat_url)
+            record["updated_at"] = utc_now()
+            self._write_atomic(path, record)
+            return record
+
+    def promote_chat_session_reference(
+        self,
+        job_id: str,
+        batch_index: int,
+        previous_reference: str,
+        stable_reference: str,
+    ) -> dict[str, Any]:
+        """Atomically replace one job-bound pending reference with a stable id."""
+
+        if previous_reference != f"codex-chat://pending/{job_id}" or re.fullmatch(
+            r"codex-chat://conversations/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}",
+            str(stable_reference),
+            flags=re.IGNORECASE,
+        ) is None:
+            raise GptRelayError(
+                "无效的报价对话地址。", code="gpt_relay_chat_url_invalid"
+            )
+        with self._lock():
+            path = self._path(job_id)
+            record = self._read(path)
+            sessions = list(record.get("chat_sessions") or [])
+            target = next(
+                (
+                    item
+                    for item in sessions
+                    if int(item.get("batch_index", -1)) == batch_index
+                ),
+                None,
+            )
+            if target is None or target.get("chat_url") != previous_reference:
+                raise GptRelayError(
+                    "报价对话批次不存在。", code="gpt_relay_chat_batch_not_found"
+                )
+            target["chat_url"] = stable_reference
+            target["previous_conversation_ids"] = []
+            target["updated_at"] = utc_now()
+            if target.get("role") == "coordinator":
+                record["chat_url"] = stable_reference
+            record["chat_sessions"] = sessions
             record["updated_at"] = utc_now()
             self._write_atomic(path, record)
             return record

@@ -39,7 +39,7 @@ from app.services.gpt_quote_prompt import (
     parse_final_response,
 )
 from app.services.gpt_quote_relay import GptQuoteRelayStore, utc_now
-from codex_chat_desktop import CodexChatDesktop
+from codex_chat_desktop import CodexChatDesktop, is_pending_chat_reference
 
 POLL_SECONDS = float(os.environ.get("ASTRAQUOTE_GPT_RELAY_POLL_SECONDS", "4"))
 QUOTE_TIMEOUT_SECONDS = int(os.environ.get("ASTRAQUOTE_GPT_QUOTE_TIMEOUT", "600"))
@@ -98,6 +98,7 @@ class ActiveQuote:
     batch_progress_fingerprint: str = ""
     machine_progress_fingerprint: str = ""
     stalled_attempts: int = 0
+    previous_conversation_ids: tuple[str, ...] = ()
 
     @property
     def session_key(self) -> str:
@@ -155,6 +156,7 @@ def submit_job(
         chat_url=active.chat_url,
         role="coordinator",
         component_keys=[],
+        previous_conversation_ids=list(active.previous_conversation_ids),
     )
     store.update_if_not_cancelled(
         job_id, {"project_name": None}, stage="submitted",
@@ -328,9 +330,14 @@ def create_missing_component_chats(
             chat_url=active.chat_url,
             role="component_batch",
             component_keys=list(batch["component_keys"]),
+            previous_conversation_ids=list(active.previous_conversation_ids),
         )
         active.batch_progress_fingerprint = batch_progress_fingerprint(batch)
         active_quotes[active.session_key] = active
+        if is_pending_chat_reference(active.chat_url):
+            # Do not leave a just-sent conversation before Codex exposes its
+            # stable sidebar id; the model continues running in this chat.
+            break
 
 
 def maybe_start_final_merge(
@@ -575,6 +582,9 @@ def reattach_job_chats(
                 session.get("role") or "coordinator"
             )),
             component_keys=list(session.get("component_keys") or []),
+            previous_conversation_ids=list(
+                session.get("previous_conversation_ids") or []
+            ),
         )
         active.stalled_attempts = int(session.get("stalled_attempts") or 0)
         active.batch_progress_fingerprint = str(
@@ -640,6 +650,34 @@ def stop_terminal_job_chats(
         active_quotes.pop(session_key, None)
 
 
+def pending_active_quote(
+    active_quotes: dict[str, ActiveQuote],
+) -> ActiveQuote | None:
+    return next(
+        (
+            quote
+            for quote in active_quotes.values()
+            if is_pending_chat_reference(quote.chat_url)
+        ),
+        None,
+    )
+
+
+def persist_promoted_chat_reference(
+    store: GptQuoteRelayStore,
+    active: ActiveQuote,
+    previous_reference: str,
+) -> None:
+    if active.chat_url == previous_reference:
+        return
+    store.promote_chat_session_reference(
+        active.job_id,
+        active.batch_index,
+        previous_reference,
+        active.chat_url,
+    )
+
+
 def main() -> int:
     store = GptQuoteRelayStore()
     browser = CodexChatDesktop(
@@ -691,7 +729,9 @@ def main() -> int:
                     maybe_start_final_merge(
                         store, browser, active_quotes, record["job_id"],
                     )
-            while logged_in:
+                    if pending_active_quote(active_quotes) is not None:
+                        break
+            while logged_in and pending_active_quote(active_quotes) is None:
                 record = store.claim_next(WORKER_ID, lease_minutes=35)
                 if record is None:
                     break
@@ -709,16 +749,26 @@ def main() -> int:
                         pass
                     fail_job(store, record["job_id"], exc)
 
-            processing_job_ids = {
-                quote.job_id for quote in active_quotes.values()
-            }
-            for job_id in processing_job_ids:
-                create_missing_component_chats(
-                    store, browser, active_quotes, job_id,
-                )
-                maybe_start_final_merge(store, browser, active_quotes, job_id)
+            pending_quote = pending_active_quote(active_quotes)
+            if pending_quote is None:
+                processing_job_ids = {
+                    quote.job_id for quote in active_quotes.values()
+                }
+                for job_id in processing_job_ids:
+                    create_missing_component_chats(
+                        store, browser, active_quotes, job_id,
+                    )
+                    if pending_active_quote(active_quotes) is not None:
+                        break
+                    maybe_start_final_merge(store, browser, active_quotes, job_id)
 
-            for session_key in active_quote_poll_order(active_quotes):
+            pending_quote = pending_active_quote(active_quotes)
+            poll_order = (
+                [pending_quote.session_key]
+                if pending_quote is not None
+                else active_quote_poll_order(active_quotes)
+            )
+            for session_key in poll_order:
                 active = active_quotes.get(session_key)
                 if active is None:
                     continue
@@ -738,13 +788,19 @@ def main() -> int:
                 try:
                     store.renew_lease(job_id, WORKER_ID, lease_minutes=35)
                     refresh_progress_deadline(store, active)
-                    response = browser.poll_quote(
-                        active,
-                        completion_check=lambda job_id=job_id: (
-                            store.reconcile_delivery_receipt(job_id).get("status")
-                            in {"completed", "partial"}
-                        ),
-                    )
+                    previous_reference = active.chat_url
+                    try:
+                        response = browser.poll_quote(
+                            active,
+                            completion_check=lambda job_id=job_id: (
+                                store.reconcile_delivery_receipt(job_id).get("status")
+                                in {"completed", "partial"}
+                            ),
+                        )
+                    finally:
+                        persist_promoted_chat_reference(
+                            store, active, previous_reference,
+                        )
                     if response is None:
                         continue
                     batches = store.quote_chat_batches(job_id)

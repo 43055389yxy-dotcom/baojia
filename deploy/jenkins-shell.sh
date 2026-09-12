@@ -217,7 +217,14 @@ ensure_host_codex_chat_desktop() {
       return 1
     fi
   else
-    docker start "$CODEX_CONTAINER" >/dev/null
+    if test "$(docker inspect "$CODEX_CONTAINER" --format '{{.State.Running}}')" = true; then
+      # Codex caches remote MCP tool schemas for the lifetime of the desktop
+      # process. Restart on deploy so newly added fields are usable immediately;
+      # the mounted HOME preserves login and conversation state.
+      docker restart "$CODEX_CONTAINER" >/dev/null
+    else
+      docker start "$CODEX_CONTAINER" >/dev/null
+    fi
   fi
 
   for attempt in {1..30}; do

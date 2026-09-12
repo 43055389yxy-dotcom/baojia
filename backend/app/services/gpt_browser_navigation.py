@@ -66,6 +66,7 @@ def is_transient_browser_poll_exception(exc: BaseException) -> bool:
         "WebSocketConnectionClosedException",
         "ConnectionResetError",
         "BrokenPipeError",
+        "PendingConversationReferenceError",
     }:
         return True
     message = str(exc).casefold()

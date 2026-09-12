@@ -997,6 +997,11 @@ def test_normal_stage_progress_is_not_mislabeled_as_an_interruption() -> None:
     assert not is_interrupted_response("正在调用官方价格接口，报价仍在继续。")
 
 
+def test_pending_codex_sidebar_identity_is_a_transient_renderer_state() -> None:
+    pending = type("PendingConversationReferenceError", (RuntimeError,), {})
+    assert is_transient_browser_poll_exception(pending("sidebar title pending"))
+
+
 def test_failed_job_exposes_only_the_generic_sales_failure_code(tmp_path: Path) -> None:
     store = GptQuoteRelayStore(tmp_path)
     public = store.create("东京 EC2 两台，按需。", {"preferred_region": "ap-northeast-1"})
@@ -1013,6 +1018,49 @@ def test_failed_job_exposes_only_the_generic_sales_failure_code(tmp_path: Path) 
     assert sales["failure_code"] == "AQ-QUOTE-FAILED"
     assert sales["preferred_region"] == "ap-northeast-1"
     assert "error" not in sales
+
+
+def test_pending_codex_chat_reference_can_be_atomically_promoted(tmp_path: Path) -> None:
+    store = GptQuoteRelayStore(tmp_path)
+    public = store.create("东京 EC2 两台，按需。", {})
+    job_id = public["job_id"]
+    store.claim_next("worker-a")
+    pending = f"codex-chat://pending/{job_id}"
+    stable = "codex-chat://conversations/6aa52a28-5510-83ee-b69a-42c10c9f1ddb"
+
+    store.record_chat_session(
+        job_id,
+        batch_index=0,
+        batch_count=1,
+        chat_url=pending,
+        role="coordinator",
+        component_keys=[],
+        previous_conversation_ids=[
+            "6aa5306f-4ed8-83e9-9c0d-466e73829f51"
+        ],
+    )
+    store.promote_chat_session_reference(job_id, 0, pending, stable)
+
+    record = store.get(job_id)
+    assert record["chat_url"] == stable
+    assert record["chat_sessions"][0]["chat_url"] == stable
+    assert record["chat_sessions"][0]["previous_conversation_ids"] == []
+
+
+def test_pending_codex_reference_must_match_its_relay_job(tmp_path: Path) -> None:
+    store = GptQuoteRelayStore(tmp_path)
+    public = store.create("东京 EC2 两台，按需。", {})
+    store.claim_next("worker-a")
+
+    with pytest.raises(Exception, match="无效的报价对话地址"):
+        store.record_chat_session(
+            public["job_id"],
+            batch_index=0,
+            batch_count=1,
+            chat_url="codex-chat://pending/gpt-ffffffffffffffffffffffffffffffff",
+            role="coordinator",
+            component_keys=[],
+        )
 
 
 def test_stale_worker_does_not_terminally_fail_submitted_quote(tmp_path: Path) -> None:

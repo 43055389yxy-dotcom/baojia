@@ -260,6 +260,29 @@ def test_terminal_cleanup_keeps_slot_when_stop_is_uncertain(worker):
     assert stopped.session_key not in active_quotes
 
 
+def test_promoted_pending_chat_reference_is_saved_for_restart(
+    worker, running_job,
+):
+    store, job_id, _ = running_job
+    pending = f"codex-chat://pending/{job_id}"
+    stable = codex_chat(91)
+    store.record_chat_session(
+        job_id,
+        batch_index=0,
+        batch_count=1,
+        chat_url=pending,
+        role="coordinator",
+        component_keys=[],
+    )
+    active = worker.ActiveQuote(job_id, stable, 100)
+
+    worker.persist_promoted_chat_reference(store, active, pending)
+
+    record = store.get(job_id)
+    assert record["chat_url"] == stable
+    assert record["chat_sessions"][0]["chat_url"] == stable
+
+
 def test_real_component_progress_extends_deadline_but_query_churn_does_not(
     worker, running_job, monkeypatch,
 ):

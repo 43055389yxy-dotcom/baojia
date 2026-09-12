@@ -37,6 +37,87 @@ def test_codex_chat_reference_is_stable_and_rejects_web_urls(desktop_module):
         )
 
 
+def test_pending_reference_is_bound_to_the_relay_job(desktop_module):
+    job_id = "gpt-0123456789abcdef0123456789abcdef"
+
+    reference = desktop_module.pending_chat_reference(job_id)
+
+    assert reference == f"codex-chat://pending/{job_id}"
+    assert desktop_module.is_pending_chat_reference(reference)
+    assert not desktop_module.is_pending_chat_reference(
+        "codex-chat://conversations/6aa52a28-5510-83ee-b69a-42c10c9f1ddb"
+    )
+
+
+def test_start_quote_keeps_sent_prompt_running_before_sidebar_title_exists(
+    desktop_module, monkeypatch,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=600,
+    )
+    job_id = "gpt-0123456789abcdef0123456789abcdef"
+    previous = ["6aa52a28-5510-83ee-b69a-42c10c9f1ddb"]
+
+    monkeypatch.setattr(desktop, "_open_new_chat", lambda: previous)
+    monkeypatch.setattr(desktop, "_send_prompt", lambda _prompt: None)
+    monkeypatch.setattr(desktop, "_new_conversation_reference", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(desktop_module, "_atomic_json", lambda *_args, **_kwargs: None)
+
+    active = desktop.start_quote(job_id, "@AstraQuote 正式报价")
+
+    assert active["chat_url"] == desktop_module.pending_chat_reference(job_id)
+    assert active["previous_conversation_ids"] == tuple(previous)
+
+
+def test_pending_reference_promotes_when_sidebar_row_appears(
+    desktop_module, monkeypatch,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=600,
+    )
+    job_id = "gpt-0123456789abcdef0123456789abcdef"
+    old_id = "6aa52a28-5510-83ee-b69a-42c10c9f1ddb"
+    new_id = "6aa5306f-4ed8-83e9-9c0d-466e73829f51"
+    active = {
+        "job_id": job_id,
+        "chat_url": desktop_module.pending_chat_reference(job_id),
+        "previous_conversation_ids": (old_id,),
+    }
+    quote = type("Quote", (), active)()
+    monkeypatch.setattr(desktop, "_sidebar_ids", lambda: [new_id, old_id])
+    monkeypatch.setattr(desktop_module, "_atomic_json", lambda *_args, **_kwargs: None)
+
+    assert desktop.promote_pending_reference(quote)
+    assert quote.chat_url == desktop_module.codex_chat_reference(new_id)
+    assert quote.previous_conversation_ids == ()
+
+
+def test_resume_pending_quote_waits_for_sidebar_without_failing(
+    desktop_module, monkeypatch,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=600,
+    )
+    job_id = "gpt-0123456789abcdef0123456789abcdef"
+    monkeypatch.setattr(
+        desktop,
+        "_switch_to_quote",
+        lambda _quote: (_ for _ in ()).throw(
+            desktop_module.PendingConversationReferenceError("still pending")
+        ),
+    )
+
+    active = desktop.resume_quote(
+        job_id,
+        desktop_module.pending_chat_reference(job_id),
+    )
+
+    assert active["chat_url"] == desktop_module.pending_chat_reference(job_id)
+
+
 def test_rich_mention_selector_requires_plugin_markup(desktop_module):
     assert "plugin-mention-display-name" in desktop_module.RICH_MENTION_SELECTOR
     assert "AstraQuote" in desktop_module.RICH_MENTION_SELECTOR
