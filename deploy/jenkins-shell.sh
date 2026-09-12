@@ -251,10 +251,10 @@ install_host_relay_dependencies() {
     --net \
     --pid \
     --root=/proc/1/root \
-    --wd=/ \
-    /home/ec2-user/astraquote/gpt-relay-venv/bin/python -m pip \
-    install --disable-pip-version-check \
-    -r /home/ec2-user/astraquote/relay-requirements.txt.next
+    /bin/sh -ceu \
+    'cd / && exec /home/ec2-user/astraquote/gpt-relay-venv/bin/python -m pip \
+      install --disable-pip-version-check \
+      -r /home/ec2-user/astraquote/relay-requirements.txt.next'
 }
 
 install_host_browser_relay_service() {
