@@ -40,7 +40,7 @@ def test_sales_api_preserves_the_provider_and_exact_selected_scenarios(
     response = client.post(
         "/api/quote-relay/jobs",
         json={
-            "customer_request": "2 核 4 GiB，一台，爱尔兰区域。",
+            "customer_request": "1. 2 核 4 GiB，一台，爱尔兰区域。",
             "cloud_provider": provider,
             "pricing_scenarios": scenarios,
             "utilization_percent": 100,
@@ -56,6 +56,30 @@ def test_sales_api_preserves_the_provider_and_exact_selected_scenarios(
     assert internal["quote_options"]["cloud_provider"] == provider
     assert internal["quote_options"]["pricing_scenarios"] == scenarios
     assert internal["quote_options"]["preferred_region"] == preferred_region
+
+
+def test_sales_api_requires_one_consecutively_numbered_component_per_line(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = GptQuoteRelayStore(tmp_path / "numbered-intake")
+    monkeypatch.setattr(aws_main, "gpt_quote_relay", store)
+
+    response = TestClient(aws_main.app).post(
+        "/api/quote-relay/jobs",
+        json={
+            "customer_request": "1. 云服务器\n数据库\n3. 对象存储",
+            "cloud_provider": "aws",
+            "pricing_scenarios": ["on_demand"],
+            "utilization_percent": 100,
+            "preferred_region": "ap-southeast-1",
+            "client_request_id": "123e4567-e89b-42d3-a456-426614174021",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "gpt_relay_numbered_components_invalid"
+    assert "第 2 行必须以连续序号 2. 开头" in response.json()["message"]
 
 
 def test_provider_catalog_exposes_only_its_own_sales_pricing_scenarios() -> None:
@@ -89,7 +113,7 @@ def test_sales_api_rejects_a_scenario_not_offered_by_the_selected_provider(
     response = TestClient(aws_main.app).post(
         "/api/quote-relay/jobs",
         json={
-            "customer_request": "CVM 2 核 4 GiB，一台。",
+            "customer_request": "1. CVM 2 核 4 GiB，一台。",
             "cloud_provider": "tencent",
             "pricing_scenarios": ["three_year_commitment"],
             "utilization_percent": 100,
@@ -181,7 +205,7 @@ def test_sales_keeps_an_unknown_region_as_a_recoverable_preference(
     response = TestClient(aws_main.app).post(
         "/api/quote-relay/jobs",
         json={
-            "customer_request": "ECS 2 核 4 GiB，一台。",
+            "customer_request": "1. ECS 2 核 4 GiB，一台。",
             "cloud_provider": "alibaba",
             "preferred_region": "not-a-real-region",
             "pricing_scenarios": ["on_demand"],
@@ -203,7 +227,7 @@ def test_sales_accepts_a_provider_scoped_region_code(
     response = TestClient(aws_main.app).post(
         "/api/quote-relay/jobs",
         json={
-            "customer_request": "ECS 2 核 4 GiB，一台。",
+            "customer_request": "1. ECS 2 核 4 GiB，一台。",
             "cloud_provider": "alibaba",
             "preferred_region": "ap-southeast-1",
             "pricing_scenarios": ["on_demand"],

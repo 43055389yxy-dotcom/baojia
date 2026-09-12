@@ -9,6 +9,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from app.services.gpt_quote_batches import parse_numbered_component_lines
 from app.services.gpt_quote_relay import GptQuoteRelayStore
 
 
@@ -207,6 +208,40 @@ def test_merge_cannot_take_a_fifth_active_chat_slot(worker, running_job, monkeyp
     browser.continue_quote.assert_not_called()
 
 
+def test_final_merge_is_authorized_only_when_every_batch_chat_has_stopped(
+    worker, running_job, monkeypatch,
+):
+    store, job_id, _ = running_job
+    for index in range(2):
+        store.record_chat_session(
+            job_id, batch_index=index, batch_count=2,
+            chat_url=codex_chat(index),
+            role="coordinator" if index == 0 else "component_batch",
+            component_keys=[str(index)],
+        )
+        store.update_chat_session(job_id, index, status="saved")
+    batches = [
+        {
+            "batch_index": index,
+            "batch_count": 2,
+            "price_batch_id": "aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "component_keys": [str(index)],
+            "component_states": {str(index): "completed"},
+        }
+        for index in range(2)
+    ]
+    monkeypatch.setattr(store, "quote_chat_batches", lambda *_: batches)
+    browser = Mock()
+    browser.resume_quote.side_effect = lambda job, url, **kwargs: worker.ActiveQuote(
+        job, url, 100, **kwargs,
+    )
+
+    worker.maybe_start_final_merge(store, browser, {}, job_id)
+
+    assert store.get(job_id)["merge_authorized"] is True
+    browser.continue_quote.assert_called_once()
+
+
 @pytest.mark.parametrize("status", ["partial", "completed", "cancelled"])
 def test_late_worker_failure_cannot_overwrite_delivery_or_cancellation(worker, running_job, status):
     store, job_id, _ = running_job
@@ -241,6 +276,44 @@ def test_production_worker_constructs_codex_chat_adapter_not_firefox(worker):
 
     assert "CodexChatDesktop(" in main_source
     assert "browser = ChatGptBrowser()" not in main_source
+
+
+def test_numbered_intake_is_sent_as_three_isolated_chats_before_ai_cleanup(
+    worker,
+    tmp_path: Path,
+) -> None:
+    store = GptQuoteRelayStore(tmp_path / "relay", max_concurrent_quotes=4)
+    text = "\n".join(f"{index}. 组件 {index}：配置。" for index in range(1, 45))
+    job = store.create(
+        text,
+        {"cloud_provider": "aws", "preferred_region": "ap-southeast-1"},
+        numbered_components=parse_numbered_component_lines(text),
+    )
+    record = store.claim_next("test-worker")
+    assert record is not None
+    browser = Mock()
+    browser.logged_in.return_value = True
+    browser.start_quote.return_value = worker.ActiveQuote(job["job_id"], codex_chat(0), 100)
+    browser.start_component_batch.side_effect = lambda job_id, _prompt, **kwargs: (
+        worker.ActiveQuote(job_id, codex_chat(kwargs["batch_index"]), 100, **kwargs)
+    )
+
+    first = worker.submit_job(store, browser, record)
+    assert first is not None
+    active = {first.session_key: first}
+    worker.create_missing_component_chats(store, browser, active, job["job_id"])
+
+    first_prompt = browser.start_quote.call_args.args[1]
+    child_prompts = [call.args[1] for call in browser.start_component_batch.call_args_list]
+    assert set(active) == {f"{job['job_id']}:{index}" for index in range(3)}
+    assert "cmp_intake_0001" in first_prompt
+    assert "cmp_intake_0021" not in first_prompt
+    assert "cmp_intake_0021" in child_prompts[0]
+    assert "cmp_intake_0041" not in child_prompts[0]
+    assert "cmp_intake_0041" in child_prompts[1]
+    internal = store.get(job["job_id"])
+    assert internal["source_purged_at"]
+    assert all(not batch["source_lines"] for batch in internal["intake_batches"])
 
 
 def test_terminal_cleanup_keeps_slot_when_stop_is_uncertain(worker):

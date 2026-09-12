@@ -82,6 +82,210 @@ function sealedComponentPlan(existing, supplied) {
   return incoming;
 }
 
+function tryGetPriceBatch(store, batchId) {
+  if (!batchId) return null;
+  try {
+    return store.getPriceBatch(batchId);
+  } catch (error) {
+    if (error?.code === 'price_batch_not_found') return null;
+    throw error;
+  }
+}
+
+function relayIntakeManifest(relayJob) {
+  const batches = Array.isArray(relayJob?.intake_batches)
+    ? relayJob.intake_batches.filter((item) => item && typeof item === 'object')
+    : [];
+  if (batches.length === 0) return null;
+  return {
+    batchCount: Number(relayJob.intake_batch_count || batches.length),
+    componentCount: Number(relayJob.intake_component_count || 0),
+    priceBatchId: String(relayJob.reserved_price_batch_id || ''),
+    batches,
+  };
+}
+
+function componentRootKey(componentKey, byKey) {
+  const seen = new Set();
+  let current = componentKey;
+  while (byKey.has(current)) {
+    if (seen.has(current)) return null;
+    seen.add(current);
+    const parent = byKey.get(current).parent_component_key;
+    if (!parent) return current;
+    current = parent;
+  }
+  return null;
+}
+
+function relayBatchPlan({ existing, supplied, relayJob, input }) {
+  const manifest = relayIntakeManifest(relayJob);
+  if (!manifest) {
+    return {
+      quoteComponents: sealedComponentPlan(existing?.quote_components, supplied),
+      registeredBatches: existing?.registered_relay_batches || [],
+      componentBatches: existing?.relay_component_batches || [],
+      manifest: null,
+      allBatchesRegistered: true,
+    };
+  }
+  if (!/^aqpb_[a-f0-9-]{36}$/.test(manifest.priceBatchId)
+    || input.price_batch_id !== manifest.priceBatchId) {
+    const error = new Error('The component chat must use the server-reserved price batch.');
+    error.code = 'relay_price_batch_mismatch';
+    error.retryable = true;
+    error.details = { expected: manifest.priceBatchId, received: input.price_batch_id || null };
+    throw error;
+  }
+  const batchIndex = Number(input.relay_batch_index);
+  const batchCount = Number(input.relay_batch_count);
+  const manifestBatch = manifest.batches.find(
+    (item) => Number(item.batch_index) === batchIndex,
+  );
+  if (!Number.isInteger(batchIndex) || batchCount !== manifest.batchCount || !manifestBatch) {
+    const error = new Error('The component chat batch identity does not match the sales task.');
+    error.code = 'relay_component_batch_mismatch';
+    error.retryable = true;
+    error.details = {
+      expected_batch_count: manifest.batchCount,
+      received_batch_index: input.relay_batch_index ?? null,
+      received_batch_count: input.relay_batch_count ?? null,
+    };
+    throw error;
+  }
+
+  const incoming = Array.isArray(supplied) ? supplied : [];
+  const registeredBatches = [...new Set(existing?.registered_relay_batches || [])];
+  const componentBatches = Array.isArray(existing?.relay_component_batches)
+    ? existing.relay_component_batches.map((item) => ({ ...item }))
+    : [];
+  const registered = registeredBatches.includes(batchIndex);
+  const priorBatch = componentBatches.find((item) => Number(item.batch_index) === batchIndex);
+  const existingComponents = Array.isArray(existing?.quote_components)
+    ? existing.quote_components
+    : [];
+
+  if (incoming.length === 0 && !registered) {
+    const error = new Error('This component chat must register its cleaned batch plan first.');
+    error.code = 'formal_quote_component_plan_required';
+    error.retryable = true;
+    error.details = { relay_batch_index: batchIndex };
+    throw error;
+  }
+
+  let validatedIncoming = [];
+  if (incoming.length > 0) {
+    validatedIncoming = sealedComponentPlan([], incoming);
+    const byKey = new Map(validatedIncoming.map((item) => [item.component_key, item]));
+    const incomingRoots = validatedIncoming
+      .filter((item) => componentRootKey(item.component_key, byKey) === item.component_key)
+      .map((item) => item.component_key)
+      .sort();
+    const expectedRoots = [...new Set(manifestBatch.component_keys || [])].map(String).sort();
+    if (!isDeepStrictEqual(incomingRoots, expectedRoots)) {
+      const error = new Error('The cleaned plan contains missing or cross-batch top-level components.');
+      error.code = 'relay_component_batch_mismatch';
+      error.retryable = true;
+      error.details = {
+        relay_batch_index: batchIndex,
+        expected_component_keys: expectedRoots,
+        received_component_keys: incomingRoots,
+      };
+      throw error;
+    }
+  }
+
+  if (registered) {
+    if (validatedIncoming.length > 0) {
+      const priorKeys = new Set(priorBatch?.component_keys || []);
+      const priorComponents = existingComponents.filter((item) => priorKeys.has(item.component_key));
+      if (!isDeepStrictEqual(priorComponents, validatedIncoming)) {
+        const error = new Error('The cleaned component batch is sealed and cannot be changed.');
+        error.code = 'quote_component_plan_immutable';
+        throw error;
+      }
+    }
+  } else {
+    const existingKeys = new Set(existingComponents.map((item) => item.component_key));
+    const overlap = validatedIncoming.find((item) => existingKeys.has(item.component_key));
+    if (overlap) {
+      const error = new Error('A component key is already owned by another relay batch.');
+      error.code = 'relay_component_batch_mismatch';
+      error.retryable = true;
+      error.details = { component_key: overlap.component_key };
+      throw error;
+    }
+    registeredBatches.push(batchIndex);
+    componentBatches.push({
+      batch_index: batchIndex,
+      component_keys: validatedIncoming.map((item) => item.component_key),
+    });
+  }
+
+  const quoteComponents = registered
+    ? existingComponents
+    : sealedComponentPlan([], [...existingComponents, ...validatedIncoming]);
+  const ownedKeys = new Set(
+    (componentBatches.find((item) => Number(item.batch_index) === batchIndex)?.component_keys) || [],
+  );
+  for (const context of input.query_contexts || []) {
+    if (context.purpose === 'pricing' && !ownedKeys.has(context.component_key)) {
+      const error = new Error('A pricing query cannot reference a component owned by another chat.');
+      error.code = 'relay_component_batch_mismatch';
+      error.retryable = true;
+      error.details = { relay_batch_index: batchIndex, component_key: context.component_key };
+      throw error;
+    }
+  }
+  registeredBatches.sort((left, right) => left - right);
+  componentBatches.sort((left, right) => Number(left.batch_index) - Number(right.batch_index));
+  return {
+    quoteComponents,
+    registeredBatches,
+    componentBatches,
+    manifest,
+    allBatchesRegistered: registeredBatches.length === manifest.batchCount,
+  };
+}
+
+function assertRelayBatchesReadyForEstimate(relayJob, priceBatch) {
+  const manifest = relayIntakeManifest(relayJob);
+  if (!manifest) return;
+  const registered = new Set(priceBatch.registered_relay_batches || []);
+  const components = Array.isArray(priceBatch.quote_components)
+    ? priceBatch.quote_components
+    : [];
+  const byKey = new Map(components.map((item) => [item.component_key, item]));
+  const actualRoots = components
+    .filter((item) => componentRootKey(item.component_key, byKey) === item.component_key)
+    .map((item) => item.component_key)
+    .sort();
+  const expectedRoots = manifest.batches
+    .flatMap((item) => item.component_keys || [])
+    .map(String)
+    .sort();
+  if (registered.size !== manifest.batchCount || !isDeepStrictEqual(actualRoots, expectedRoots)) {
+    const error = new Error('Not every program-assigned component batch has registered its cleaned plan.');
+    error.code = 'relay_component_batches_incomplete';
+    error.retryable = true;
+    error.terminal = false;
+    error.details = {
+      expected_batch_count: manifest.batchCount,
+      registered_batch_indexes: [...registered].sort((left, right) => left - right),
+      expected_component_keys: expectedRoots,
+      registered_component_keys: actualRoots,
+    };
+    throw error;
+  }
+  if (manifest.batchCount > 1 && relayJob.merge_authorized !== true) {
+    const error = new Error('The desktop worker has not authorized the final multi-chat merge yet.');
+    error.code = 'relay_merge_not_authorized';
+    error.retryable = true;
+    error.terminal = false;
+    throw error;
+  }
+}
+
 function assertFormalQuotePricingPlan({ quoteMode, relayJobId, quoteComponents, queries, queryContexts }) {
   if (relayJobId && quoteMode === 'price_lookup') {
     const error = new Error('A sales relay task is always a formal quote.');
@@ -1057,17 +1261,23 @@ class AstraQuoteV2Workflow {
     const relayJobId = input.relay_job_id || null;
     const relayJob = relayJobId ? assertRelayIdentity(input) : null;
     const existing = input.price_batch_id
-      ? this.store.getPriceBatch(input.price_batch_id)
+      ? tryGetPriceBatch(this.store, input.price_batch_id)
       : null;
+    if (input.price_batch_id && !existing) {
+      const manifest = relayIntakeManifest(relayJob);
+      if (!manifest || input.price_batch_id !== manifest.priceBatchId) {
+        this.store.getPriceBatch(input.price_batch_id);
+      }
+    }
     if (existing && (existing.relay_job_id || null) !== relayJobId) {
       const error = new Error('The saved price batch belongs to a different sales quote task.');
       error.code = 'price_batch_relay_context_mismatch';
       throw error;
     }
-    const quoteComponents = sealedComponentPlan(
-      existing?.quote_components,
-      input.quote_components,
-    );
+    const initialRelayPlan = relayBatchPlan({
+      existing, supplied: input.quote_components, relayJob, input,
+    });
+    const quoteComponents = initialRelayPlan.quoteComponents;
     const inferredQuoteMode = relayJobId || quoteComponents.length > 0
       ? 'formal_quote'
       : 'price_lookup';
@@ -1283,12 +1493,12 @@ class AstraQuoteV2Workflow {
         };
       }),
     };
-    const priceBatchId = existing?.price_batch_id || `aqpb_${randomUUID()}`;
+    const priceBatchId = existing?.price_batch_id || input.price_batch_id || `aqpb_${randomUUID()}`;
     // Parallel component chats may finish their official API calls in either
     // order. Re-read the batch after the await and perform the final merge in
     // one synchronous event-loop section so a later response cannot overwrite
     // evidence already saved by another chat.
-    const latest = existing ? this.store.getPriceBatch(priceBatchId) : existing;
+    const latest = tryGetPriceBatch(this.store, priceBatchId);
     const latestQueries = new Map(
       (latest?.request?.queries || []).map((item) => [item.query_id, item]),
     );
@@ -1309,10 +1519,13 @@ class AstraQuoteV2Workflow {
     const finalQueryContexts = mergeQueryContexts(
       latest?.query_contexts, input.query_contexts, finalQueries,
     );
-    const finalQuoteComponents = sealedComponentPlan(
-      latest?.quote_components || quoteComponents,
-      input.quote_components,
-    );
+    const finalRelayPlan = relayBatchPlan({
+      existing: latest,
+      supplied: input.quote_components,
+      relayJob,
+      input,
+    });
+    const finalQuoteComponents = finalRelayPlan.quoteComponents;
     const mergedResults = new Map(
       (latest?.result?.results || []).map((item) => [item.query_id, item]),
     );
@@ -1336,15 +1549,34 @@ class AstraQuoteV2Workflow {
       [...mergedResults.values()],
     );
     const incompleteQueryIds = progress.incomplete_query_ids;
+    const missingRegisteredRoots = finalRelayPlan.manifest
+      ? Math.max(
+        0,
+        finalRelayPlan.manifest.componentCount - componentStatus.top_level_component_count,
+      )
+      : 0;
+    const totalComponentCount = componentStatus.total_component_count + missingRegisteredRoots;
+    const topLevelComponentCount = finalRelayPlan.manifest
+      ? finalRelayPlan.manifest.componentCount
+      : componentStatus.top_level_component_count;
+    const componentChatCount = finalRelayPlan.manifest
+      ? finalRelayPlan.manifest.batchCount
+      : componentStatus.component_chat_count;
+    const pendingComponentCount = componentStatus.pending_component_count + missingRegisteredRoots;
     const completed = quoteComponents.length > 0
-      ? componentStatus.completed_component_count === componentStatus.total_component_count
+      ? finalRelayPlan.allBatchesRegistered
+        && componentStatus.completed_component_count === componentStatus.total_component_count
       : progress.status === 'completed';
-    const quoteTerminal = progress.quote_terminal
-      && (finalQuoteComponents.length === 0 || componentStatus.pending_component_count === 0);
+    const quoteTerminal = finalRelayPlan.allBatchesRegistered && progress.quote_terminal
+      && (finalQuoteComponents.length === 0 || pendingComponentCount === 0);
     const mergedResult = {
       status: completed ? 'completed' : 'needs_refinement',
       terminal: completed,
-      next_action: completed ? 'build_estimate' : progress.next_action,
+      next_action: completed
+        ? 'build_estimate'
+        : (finalRelayPlan.allBatchesRegistered
+          ? progress.next_action
+          : 'continue_remaining_component_batches'),
       result_count: mergedResults.size,
       results: [...mergedResults.values()],
     };
@@ -1357,6 +1589,8 @@ class AstraQuoteV2Workflow {
       quote_mode: quoteMode,
       request: { queries: [...finalQueries.values()] },
       quote_components: finalQuoteComponents,
+      registered_relay_batches: finalRelayPlan.registeredBatches,
+      relay_component_batches: finalRelayPlan.componentBatches,
       query_contexts: finalQueryContexts,
       query_lifecycle: progress.query_lifecycle,
       component_lifecycle: componentStatus.component_lifecycle,
@@ -1372,12 +1606,13 @@ class AstraQuoteV2Workflow {
         incomplete_query_count: incompleteQueryIds.length,
         superseded_query_ids: progress.superseded_query_ids,
         discovery_query_count: progress.discovery_query_count,
-        total_component_count: componentStatus.total_component_count,
-        top_level_component_count: componentStatus.top_level_component_count,
-        component_chat_count: componentStatus.component_chat_count,
+        total_component_count: totalComponentCount,
+        top_level_component_count: topLevelComponentCount,
+        component_chat_count: componentChatCount,
         completed_component_count: componentStatus.completed_component_count,
         failed_component_count: componentStatus.failed_component_count,
-        pending_component_count: componentStatus.pending_component_count,
+        pending_component_count: pendingComponentCount,
+        registered_relay_batches: finalRelayPlan.registeredBatches,
         completed_component_keys: componentStatus.component_lifecycle
           .filter((item) => item.state === 'completed').map((item) => item.component_key),
         failed_component_keys: componentStatus.component_lifecycle
@@ -1418,12 +1653,12 @@ class AstraQuoteV2Workflow {
         .map((item) => item.query_id),
       capability_preflight_query_ids: capabilityPreflightResults
         .map((item) => item.query_id),
-      total_component_count: componentStatus.total_component_count,
-      top_level_component_count: componentStatus.top_level_component_count,
-      component_chat_count: componentStatus.component_chat_count,
+      total_component_count: totalComponentCount,
+      top_level_component_count: topLevelComponentCount,
+      component_chat_count: componentChatCount,
       completed_component_count: componentStatus.completed_component_count,
       failed_component_count: componentStatus.failed_component_count,
-      pending_component_count: componentStatus.pending_component_count,
+      pending_component_count: pendingComponentCount,
       workflow_guard: priceWorkflowGuard({
         quoteMode,
         relayJobId,
@@ -1995,6 +2230,12 @@ class AstraQuoteV2Workflow {
       const error = new Error('The saved price batch belongs to a different sales quote task.');
       error.code = 'price_batch_relay_context_mismatch';
       throw error;
+    }
+    if (relayBoundInput.relay_job_id) {
+      assertRelayBatchesReadyForEstimate(
+        readRelayJob(relayBoundInput.relay_job_id),
+        priceBatch,
+      );
     }
     const normalizedInput = validateScenarioSemantics(
       normalizeScenarioCosts(normalizeComponentCosts(relayBoundInput)),

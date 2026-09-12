@@ -23,8 +23,11 @@ from app.services.gpt_browser_navigation import (
 from app.services.gpt_quote_batches import (
     build_component_batch_continuation_prompt,
     build_component_batch_prompt,
+    build_numbered_intake_batch_prompt,
     build_quote_merge_prompt,
+    parse_numbered_component_lines,
     split_component_plan,
+    split_numbered_intake,
 )
 from app.services.gpt_quote_prompt import (
     build_quote_continuation_prompt,
@@ -34,6 +37,56 @@ from app.services.gpt_quote_prompt import (
     parse_final_response,
 )
 from app.services.gpt_quote_relay import GptQuoteRelayStore, GptRelayError
+
+
+def test_numbered_sales_intake_splits_forty_four_components_before_ai() -> None:
+    components = parse_numbered_component_lines(
+        "\n".join(f"{index}. 组件 {index}：配置。" for index in range(1, 45))
+    )
+
+    batches = split_numbered_intake(components)
+
+    assert [len(batch) for batch in batches] == [20, 20, 4]
+    assert components[0]["component_key"] == "cmp_intake_0001"
+    assert components[-1]["component_key"] == "cmp_intake_0044"
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("1. 云服务器\n数据库", "第 2 行必须以连续序号 2. 开头"),
+        ("1. 云服务器\n3. 数据库", "第 2 行序号应为 2，当前为 3"),
+    ],
+)
+def test_numbered_sales_intake_rejects_missing_or_skipped_numbers(
+    text: str,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        parse_numbered_component_lines(text)
+
+
+def test_numbered_intake_prompt_contains_only_its_owned_lines() -> None:
+    components = parse_numbered_component_lines(
+        "1. 云服务器：2 台。\n2. 数据库：1 套。\n3. 对象存储：1 TiB。"
+    )
+
+    prompt = build_numbered_intake_batch_prompt(
+        relay_job_id="gpt-" + "a" * 32,
+        submission_code="2",
+        price_batch_id="aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        batch_index=1,
+        batch_count=2,
+        components=components[2:],
+        quote_context="云厂商：AWS。",
+    )
+
+    assert prompt.startswith("@AstraQuote ")
+    assert "cmp_intake_0003" in prompt
+    assert "对象存储：1 TiB" in prompt
+    assert "云服务器：2 台" not in prompt
+    assert "relay_batch_index：1" in prompt
+    assert "relay_batch_count：2" in prompt
 
 
 def test_component_plan_splits_twenty_top_level_groups_and_keeps_children_together() -> None:
@@ -160,6 +213,44 @@ def test_relay_queues_and_hides_raw_customer_text(tmp_path: Path) -> None:
     assert internal["customer_request"] == "东京 EC2 两台，按需。"
     assert internal["continuation_attempts"] == 0
     assert "sales_name" not in internal
+
+
+def test_relay_persists_only_pre_split_numbered_batches_and_reserves_three_slots(
+    tmp_path: Path,
+) -> None:
+    store = GptQuoteRelayStore(tmp_path, max_concurrent_quotes=4)
+    text = "\n".join(f"{index}. 组件 {index}：配置。" for index in range(1, 45))
+    components = parse_numbered_component_lines(text)
+
+    public = store.create(text, {"cloud_provider": "aws"}, numbered_components=components)
+
+    internal = store.get(public["job_id"])
+    assert internal["customer_request"] == ""
+    assert internal["intake_component_count"] == 44
+    assert internal["intake_batch_count"] == 3
+    assert internal["reserved_price_batch_id"].startswith("aqpb_")
+    assert [len(batch["source_lines"]) for batch in internal["intake_batches"]] == [20, 20, 4]
+    assert store._slot_count(internal) == 3
+
+
+def test_purging_one_numbered_batch_does_not_delete_unsent_batches(tmp_path: Path) -> None:
+    store = GptQuoteRelayStore(tmp_path)
+    text = "\n".join(f"{index}. 组件 {index}。" for index in range(1, 22))
+    job = store.create(
+        text,
+        {},
+        numbered_components=parse_numbered_component_lines(text),
+    )
+
+    purged = store.purge_intake_batch(job["job_id"], 0)
+
+    assert purged["intake_batches"][0]["source_lines"] == []
+    assert purged["intake_batches"][0]["status"] == "submitted"
+    assert len(purged["intake_batches"][1]["source_lines"]) == 1
+    assert purged["source_purged_at"] is None
+
+    fully_purged = store.purge_intake_batch(job["job_id"], 1)
+    assert fully_purged["source_purged_at"]
 
 
 def test_repeated_client_request_id_returns_the_original_job(tmp_path: Path) -> None:

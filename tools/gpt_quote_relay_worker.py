@@ -28,6 +28,7 @@ from app.services.gpt_browser_navigation import (
 from app.services.gpt_quote_batches import (
     build_component_batch_continuation_prompt,
     build_component_batch_prompt,
+    build_numbered_intake_batch_prompt,
     build_quote_merge_prompt,
 )
 from app.services.gpt_quote_prompt import (
@@ -123,6 +124,53 @@ def submit_job(
     if not browser.logged_in():
         mark_needs_login(store, record)
         return None
+    intake_batches = store.intake_chat_batches(job_id)
+    if intake_batches:
+        first_batch = intake_batches[0]
+        source_lines = list(first_batch.get("source_lines") or [])
+        if not source_lines:
+            store.update_if_not_cancelled(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": {
+                        "code": "source_missing",
+                        "message": "首批待清洗客户需求已不存在。",
+                    },
+                },
+                stage="failed",
+                message="客户需求缺失，任务已安全停止",
+            )
+            return None
+        prompt = build_numbered_intake_batch_prompt(
+            relay_job_id=job_id,
+            submission_code=str(record.get("submission_code") or "").strip(),
+            price_batch_id=str(record.get("reserved_price_batch_id") or ""),
+            batch_index=0,
+            batch_count=int(record.get("intake_batch_count") or len(intake_batches)),
+            components=source_lines,
+            quote_context=build_quote_context_prompt(record.get("quote_options") or {}),
+        )
+        active = browser.start_quote(job_id, prompt)
+        active.batch_count = int(record.get("intake_batch_count") or len(intake_batches))
+        active.component_keys = tuple(first_batch.get("component_keys") or [])
+        store.record_chat_session(
+            job_id,
+            batch_index=0,
+            batch_count=active.batch_count,
+            chat_url=active.chat_url,
+            role="coordinator",
+            component_keys=list(active.component_keys),
+            previous_conversation_ids=list(active.previous_conversation_ids),
+        )
+        store.update_if_not_cancelled(
+            job_id,
+            {"project_name": None},
+            stage="submitted",
+            message="已创建首个组件批次报价",
+        )
+        store.purge_intake_batch(job_id, 0)
+        return active
     customer_request = str(record.get("customer_request") or "").strip()
     if not customer_request:
         store.update_if_not_cancelled(
@@ -279,11 +327,54 @@ def create_missing_component_chats(
 ) -> None:
     """Open pending component chats through the one shared desktop window."""
 
-    batches = store.quote_chat_batches(job_id)
-    if len(batches) <= 1:
-        return
     record = store.get(job_id)
     if record.get("status") != "processing":
+        return
+    intake_batches = store.intake_chat_batches(job_id)
+    if len(intake_batches) > 1:
+        sessions = {
+            int(item.get("batch_index", -1)): item
+            for item in (record.get("chat_sessions") or [])
+        }
+        for intake_batch in intake_batches[1:]:
+            batch_index = int(intake_batch["batch_index"])
+            if batch_index in sessions or not (intake_batch.get("source_lines") or []):
+                continue
+            if len(active_quotes) >= store.max_concurrent_quotes:
+                break
+            prompt = build_numbered_intake_batch_prompt(
+                relay_job_id=job_id,
+                submission_code=str(record.get("submission_code") or ""),
+                price_batch_id=str(record.get("reserved_price_batch_id") or ""),
+                batch_index=batch_index,
+                batch_count=int(record.get("intake_batch_count") or len(intake_batches)),
+                components=list(intake_batch.get("source_lines") or []),
+                quote_context=build_quote_context_prompt(record.get("quote_options") or {}),
+            )
+            active = browser.start_component_batch(
+                job_id,
+                prompt,
+                batch_index=batch_index,
+                batch_count=int(record.get("intake_batch_count") or len(intake_batches)),
+                component_keys=list(intake_batch.get("component_keys") or []),
+            )
+            store.record_chat_session(
+                job_id,
+                batch_index=batch_index,
+                batch_count=int(record.get("intake_batch_count") or len(intake_batches)),
+                chat_url=active.chat_url,
+                role="component_batch",
+                component_keys=list(intake_batch.get("component_keys") or []),
+                previous_conversation_ids=list(active.previous_conversation_ids),
+            )
+            store.purge_intake_batch(job_id, batch_index)
+            active_quotes[active.session_key] = active
+            if is_pending_chat_reference(active.chat_url):
+                break
+        return
+
+    batches = store.quote_chat_batches(job_id)
+    if len(batches) <= 1:
         return
     sessions = {
         int(item.get("batch_index", -1)): item
@@ -387,6 +478,7 @@ def maybe_start_final_merge(
         )
     else:
         active.role = "merge"
+    store.authorize_merge(job_id)
     browser.continue_quote(
         active,
         build_quote_merge_prompt(
@@ -503,12 +595,12 @@ def fail_job(store: GptQuoteRelayStore, job_id: str, exc: Exception) -> None:
     current = store.get(job_id)
     if current.get("status") == "cancelled":
         return
-    source_was_submitted = bool(current.get("source_purged_at"))
+    store.purge_all_sources(job_id)
     store.update_if_not_cancelled(
         job_id,
         {
             "status": "failed",
-            "customer_request": "" if source_was_submitted else current.get("customer_request", ""),
+            "customer_request": "",
             "error": {
                 "code": "codex_chat_automation_failed",
                 "message": str(exc)[:1200],

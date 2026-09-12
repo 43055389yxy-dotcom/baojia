@@ -148,6 +148,8 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   assert.deepEqual(getPrices.inputSchema.properties.quote_mode.enum, ['price_lookup', 'formal_quote']);
   assert.equal(getPrices.inputSchema.properties.queries.type, 'array');
   assert.equal(getPrices.inputSchema.properties.queries.maxItems, 50);
+  assert.equal(getPrices.inputSchema.properties.relay_batch_index.type, 'integer');
+  assert.equal(getPrices.inputSchema.properties.relay_batch_count.type, 'integer');
   assert.equal(buildEstimate.inputSchema.properties.services.maxItems, 200);
   assert.match(JSON.stringify(getPrices.inputSchema.properties.queries), /provider/);
   assert.match(JSON.stringify(getPrices.inputSchema.properties.queries), /query_id/);
@@ -162,7 +164,7 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   assert.match(INSTRUCTIONS, /response_compacted.*get_price_results/s);
   assert.match(INSTRUCTIONS, /同一个.*price_batch_id.*合并/s);
   assert.match(INSTRUCTIONS, /created.*立即执行.*不得只汇报/s);
-  assert.match(getPrices.description, /formal quote.*quote_components.*query_contexts/is);
+  assert.match(getPrices.description, /formal quote.*relay_batch_index.*quote_components/is);
   assert.match(getPrices.description, /must_continue.*final answer/is);
   assert.match(getPrices.description, /three.*official API.*official pricing page/is);
   assert.match(buildEstimate.description, /official_page_price_evidence/i);

@@ -384,6 +384,91 @@ test('the cleaned component plan is immutable after the first saved price batch'
   assert.equal(calls.length, 1);
 });
 
+test('pre-split relay chats append only their own component plan into one reserved batch', async (t) => {
+  const { workflow, store } = fixture(t);
+  const relayJobId = `gpt-${'9'.repeat(32)}`;
+  const reservedBatchId = 'aqpb_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const relayDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'aq-pre-split-relay-'));
+  const previousRelayDirectory = process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+  process.env.ASTRAQUOTE_GPT_RELAY_DIR = relayDirectory;
+  fs.mkdirSync(path.join(relayDirectory, 'jobs'), { recursive: true });
+  fs.writeFileSync(path.join(relayDirectory, 'jobs', `${relayJobId}.json`), JSON.stringify({
+    job_id: relayJobId,
+    submission_code: '3',
+    status: 'processing',
+    reserved_price_batch_id: reservedBatchId,
+    intake_component_count: 2,
+    intake_batch_count: 2,
+    intake_batches: [
+      { batch_index: 0, batch_count: 2, component_keys: ['cmp_intake_0001'], source_lines: [] },
+      { batch_index: 1, batch_count: 2, component_keys: ['cmp_intake_0002'], source_lines: [] },
+    ],
+    quote_options: { cloud_provider: 'azure', pricing_scenarios: ['on_demand'] },
+  }));
+  t.after(() => {
+    fs.rmSync(relayDirectory, { recursive: true, force: true });
+    if (previousRelayDirectory === undefined) delete process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+    else process.env.ASTRAQUOTE_GPT_RELAY_DIR = previousRelayDirectory;
+  });
+
+  const first = await workflow.getPrices({
+    quote_mode: 'formal_quote', relay_job_id: relayJobId, submission_code: '3',
+    relay_batch_index: 0, relay_batch_count: 2, price_batch_id: reservedBatchId,
+    queries: [query('batch-0', true)],
+    query_contexts: [context('batch-0', 'compute', 'cmp_intake_0001')],
+    quote_components: [{
+      component_key: 'cmp_intake_0001', customer_owned_source: '云服务器 1 台。',
+      billing_scopes: [{ billing_key: 'compute' }],
+    }],
+  });
+  assert.equal(first.price_batch_id, reservedBatchId);
+  assert.equal(first.total_component_count, 2);
+  assert.equal(first.completed_component_count, 1);
+  assert.equal(first.must_continue, true);
+  await assert.rejects(workflow.buildEstimate({
+    relay_job_id: relayJobId,
+    pricing_scenarios: [{ scenario_key: 'on_demand' }],
+    cloud_provider: 'azure', default_region: 'eastasia',
+    price_batch_id: reservedBatchId,
+    idempotency_key: 'pre-split-before-all-batches',
+  }), (error) => error.code === 'relay_component_batches_incomplete');
+
+  await assert.rejects(workflow.getPrices({
+    quote_mode: 'formal_quote', relay_job_id: relayJobId, submission_code: '3',
+    relay_batch_index: 1, relay_batch_count: 2, price_batch_id: reservedBatchId,
+    queries: [query('wrong-batch', true)],
+    query_contexts: [context('wrong-batch', 'compute', 'cmp_intake_0001')],
+    quote_components: [{
+      component_key: 'cmp_intake_0001', customer_owned_source: '越界组件。',
+      billing_scopes: [{ billing_key: 'compute' }],
+    }],
+  }), (error) => error.code === 'relay_component_batch_mismatch');
+
+  const second = await workflow.getPrices({
+    quote_mode: 'formal_quote', relay_job_id: relayJobId, submission_code: '3',
+    relay_batch_index: 1, relay_batch_count: 2, price_batch_id: reservedBatchId,
+    queries: [query('batch-1', true)],
+    query_contexts: [context('batch-1', 'storage', 'cmp_intake_0002')],
+    quote_components: [{
+      component_key: 'cmp_intake_0002', customer_owned_source: '对象存储 1 TiB。',
+      billing_scopes: [{ billing_key: 'storage' }],
+    }],
+  });
+  const saved = store.getPriceBatch(reservedBatchId);
+  assert.equal(second.completed_component_count, 2);
+  assert.deepEqual(saved.registered_relay_batches, [0, 1]);
+  assert.deepEqual(saved.quote_components.map((item) => item.component_key), [
+    'cmp_intake_0001', 'cmp_intake_0002',
+  ]);
+  await assert.rejects(workflow.buildEstimate({
+    relay_job_id: relayJobId,
+    pricing_scenarios: [{ scenario_key: 'on_demand' }],
+    cloud_provider: 'azure', default_region: 'eastasia',
+    price_batch_id: reservedBatchId,
+    idempotency_key: 'pre-split-before-merge',
+  }), (error) => error.code === 'relay_merge_not_authorized');
+});
+
 test('an old exact error envelope is re-queried and cannot count as completed evidence', async (t) => {
   const { workflow, store, calls } = fixture(t);
   const first = await workflow.getPrices({ queries: [query('price', true)] });

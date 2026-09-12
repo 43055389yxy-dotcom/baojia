@@ -37,6 +37,7 @@ from app.services.cloud_quote_profiles import (
     is_provider_pricing_scenario,
     provider_region_catalog,
 )
+from app.services.gpt_quote_batches import parse_numbered_component_lines
 from app.services.gpt_quote_relay import GptQuoteRelayStore, GptRelayError
 from app.services.mcp_v2_pricing import (
     AttributeValuesRequest,
@@ -335,6 +336,13 @@ def _gpt_relay_error_response(exc: GptRelayError) -> JSONResponse:
 @app.post("/api/quote-relay/jobs", response_model=None)
 async def create_gpt_relay_job(request: GptRelayQuoteRequest) -> dict[str, Any] | JSONResponse:
     try:
+        try:
+            numbered_components = parse_numbered_component_lines(request.customer_request)
+        except ValueError as exc:
+            raise GptRelayError(
+                str(exc),
+                code="gpt_relay_numbered_components_invalid",
+            ) from exc
         return gpt_quote_relay.create(
             request.customer_request,
             {
@@ -345,6 +353,7 @@ async def create_gpt_relay_job(request: GptRelayQuoteRequest) -> dict[str, Any] 
                 "display_result_on_page": True,
                 "client_request_id": request.client_request_id,
             },
+            numbered_components=numbered_components,
         )
     except GptRelayError as exc:
         return _gpt_relay_error_response(exc)

@@ -53,6 +53,22 @@ test("sales portal reads provider-native purchase scenarios from the backend cat
   assert.match(page, /setSelectedScenarios\(new Set<ScenarioKey>\(\["on_demand"\]\)\)/);
 });
 
+test("sales portal requires consecutive numbered lines before submission", async () => {
+  const page = await readFile(new URL("../app/sales/page.tsx", import.meta.url), "utf8");
+  const validator = await readFile(
+    new URL("../app/sales/numbered-components.ts", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(page, /validateNumberedComponentLines/);
+  assert.match(page, /每行一个组件，序号必须连续/);
+  assert.match(page, /每 20 个组件自动分批/);
+  assert.match(page, /1\. Linux 云服务器/);
+  assert.match(validator, /split\("\\n"\)/);
+  assert.match(validator, /第 \$\{lineNumber\} 行必须以连续序号/);
+  assert.match(validator, /actual !== expected/);
+});
+
 test("sales portal exposes only formal progress copy and no internal implementation", async () => {
   const page = await readFile(new URL("../app/sales/page.tsx", import.meta.url), "utf8");
 

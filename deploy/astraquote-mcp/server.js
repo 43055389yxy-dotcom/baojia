@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.12.0';
+const VERSION = '3.13.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -247,8 +247,14 @@ const getPricesInputSchema = z.object({
   ),
   relay_job_id: z.string().regex(/^gpt-[a-f0-9]{32}$/).optional(),
   submission_code: z.string().regex(/^[1-9]$/).optional(),
+  relay_batch_index: z.number().int().min(0).max(199).optional().describe(
+    'Program-assigned zero-based component batch index for a pre-split sales relay quote.',
+  ),
+  relay_batch_count: z.number().int().min(1).max(200).optional().describe(
+    'Program-assigned total component chat count for the same pre-split sales relay quote.',
+  ),
   quote_components: z.array(quoteComponentPlan).min(1).max(200).optional().describe(
-    '正式报价第一次调用 get_prices 时必须一次性提交并封存完整清洗组件计划；后续批次只复用，不得修改。用于按每 20 个组件分配对话名额、显示真实组件进度和部分交付。单项查价可以省略。',
+    '正式报价必须提交清洗组件计划。程序预拆分的销售任务只提交当前 relay_batch_index 独占的组件，后台按批次追加并封存；旧任务第一次仍提交整单计划。不得放入其他批次组件。单项查价可以省略。',
   ),
   price_batch_id: z.string().regex(/^aqpb_[a-f0-9-]{36}$/).optional().describe(
     'Saved batch to extend during resume. Existing successful query_ids are reused.',
@@ -698,7 +704,7 @@ function buildServer(workflow) {
 
   server.registerTool('get_prices', {
     title: 'Batch query official cloud prices',
-    description: 'Always set quote_mode: a request for a formal quote, Excel or sales-page delivery MUST use formal_quote; never downgrade it to price_lookup because some prices are missing. Requires a non-empty incremental queries array. For a formal quote, the first call MUST include the complete quote_components plan and every query MUST have a query_contexts entry; the call is rejected before provider access when either is missing. Before browsing provider documentation, submit as many prepared scopes as fit this call, so verified routes run in parallel; one route miss is returned only for that query and never blocks the other queries. For a long quote, GPT chooses a suitably small current group based on query breadth and expected response size, then continues the same price_batch_id; do not launch speculative catalog scans. Full official results are persisted. If response_compacted=true, read only required details with get_price_results. For an authenticated cloud, first provide provider, service and region while omitting endpoint so AstraQuote can reuse a verified route from its persistent knowledge store. Provide a new official endpoint and response contract only for the returned route-miss queries. Invalid or unsupported parameter values are correctable: use the returned recovery and parameter knowledge, repair only the rejected fields, and retry. needs_refinement, terminal=false, or must_continue=true means do not give the user a final answer. After three qualifying official API failures for the same component/billing/scenario scope, use that provider and account-site official pricing page through build_estimate. GPT alone chooses products, parameter values, batch grouping and quote totals.',
+    description: 'Always set quote_mode: a request for a formal quote, Excel or sales-page delivery MUST use formal_quote; never downgrade it to price_lookup because some prices are missing. Requires a non-empty incremental queries array. For a formal quote, every query MUST have a query_contexts entry. A pre-split sales relay call MUST preserve relay_batch_index, relay_batch_count and the reserved price_batch_id from its prompt, and quote_components MUST contain only that batch; the backend appends and seals each batch. A legacy formal quote registers the complete plan on its first call. Before browsing provider documentation, submit as many prepared scopes as fit this call, so verified routes run in parallel; one route miss is returned only for that query and never blocks the other queries. Full official results are persisted. If response_compacted=true, read only required details with get_price_results. For an authenticated cloud, first provide provider, service and region while omitting endpoint so AstraQuote can reuse a verified route from its persistent knowledge store. Provide a new official endpoint and response contract only for the returned route-miss queries. Invalid or unsupported parameter values are correctable: repair only the rejected fields and retry. needs_refinement, terminal=false, or must_continue=true means do not give the user a final answer. After three qualifying official API failures for the same component/billing/scenario scope, use that provider and account-site official pricing page through build_estimate. GPT chooses products, parameter values and quote totals; program-assigned sales batches are immutable.',
     // Keep the JSON Schema visible to MCP clients. ZodEffects produced by
     // superRefine serializes as an empty object in the MCP SDK, so cross-field
     // checks run inside the guarded handler instead.

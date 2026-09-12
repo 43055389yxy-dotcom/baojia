@@ -2,6 +2,7 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { canRetryUnpriced, money, processingStatusDetail, progressPercent, queuedStatusDetail, unpricedRecoveryText } from "./presentation";
+import { validateNumberedComponentLines } from "./numbered-components";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "/api/backend";
 const ACTIVE_JOB_KEY = "astraquote.sales.active-job.v1";
@@ -400,6 +401,11 @@ export default function SalesQuotePage() {
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (submitting || active || providerScenarios.length < 1 || selectedScenarios.size < 1 || requirement.trim().length < 3) return;
+    const numberedLineError = validateNumberedComponentLines(requirement);
+    if (numberedLineError) {
+      setPageError(numberedLineError);
+      return;
+    }
     setSubmitting(true);
     setPageError("");
     try {
@@ -686,11 +692,14 @@ export default function SalesQuotePage() {
                     id="sales-requirement"
                     value={requirement}
                     maxLength={12000}
-                    onChange={(event) => setRequirement(event.target.value)}
-                    placeholder="例如：Linux 云服务器 1 台，2 核 4GB，每月运行 730 小时……"
+                    onChange={(event) => {
+                      setRequirement(event.target.value);
+                      if (pageError) setPageError("");
+                    }}
+                    placeholder={"1. Linux 云服务器 1 台，2 核 4GB\n2. 数据库 1 套，4 核 16GB"}
                   />
                   <div className="sales-field-foot">
-                    <span>支持自然语言描述</span>
+                    <span>每行一个组件，序号必须连续；每 20 个组件自动分批</span>
                     <b>{requirement.length.toLocaleString()} / 12,000</b>
                   </div>
                 </div>

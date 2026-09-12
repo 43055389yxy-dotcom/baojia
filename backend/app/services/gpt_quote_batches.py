@@ -1,19 +1,111 @@
 """Build isolated component batches for one-window quote chat automation.
 
-Only first-pass cleaned component sources enter these prompts.  A parent and
-all of its descendants always stay in the same chat, so the irreversible
-component ownership boundary is preserved while the worker visits chat URLs
-through one logged-in desktop window.
+Numbered sales lines are mechanically isolated before first-pass AI cleaning;
+later continuation prompts contain only cleaned component sources. A parent
+and all descendants stay in the same chat, preserving the irreversible
+ownership boundary while the worker visits chats through one logged-in window.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from typing import Any
 
 COMPONENTS_PER_CHAT = 20
 ASTRAQUOTE_MENTION = "@AstraQuote"
+MAX_NUMBERED_COMPONENTS = 200
+_NUMBERED_COMPONENT_LINE = re.compile(
+    r"^\s*(?:需求\s*)?(?:[（(]\s*)?(?P<number>\d{1,3})(?:\s*[)）])?"
+    r"\s*[、,，.．。:：;；\-—]\s*(?P<body>\S.*)$"
+)
+
+
+def parse_numbered_component_lines(customer_request: str) -> list[dict[str, Any]]:
+    """Mechanically validate one numbered top-level component per real line.
+
+    This boundary deliberately does not interpret product names, quantities or
+    specifications.  It only establishes stable ownership slices before each
+    slice is handed to the first-pass AI cleaner.
+    """
+
+    nonempty_lines = [
+        (line_number, line.strip())
+        for line_number, line in enumerate(str(customer_request).splitlines(), start=1)
+        if line.strip()
+    ]
+    if not nonempty_lines:
+        raise ValueError("客户需求不能为空。")
+    if len(nonempty_lines) > MAX_NUMBERED_COMPONENTS:
+        raise ValueError(f"客户需求最多支持 {MAX_NUMBERED_COMPONENTS} 个组件。")
+
+    components: list[dict[str, Any]] = []
+    for expected, (line_number, line) in enumerate(nonempty_lines, start=1):
+        match = _NUMBERED_COMPONENT_LINE.fullmatch(line)
+        if match is None:
+            raise ValueError(
+                f"第 {line_number} 行必须以连续序号 {expected}. 开头，并且一行只写一个组件。"
+            )
+        actual = int(match.group("number"))
+        if actual != expected:
+            raise ValueError(
+                f"第 {line_number} 行序号应为 {expected}，当前为 {actual}。"
+            )
+        components.append(
+            {
+                "component_number": expected,
+                "component_key": f"cmp_intake_{expected:04d}",
+                "source_line": line,
+            }
+        )
+    return components
+
+
+def split_numbered_intake(
+    components: list[dict[str, Any]],
+    *,
+    maximum_components: int = COMPONENTS_PER_CHAT,
+) -> list[list[dict[str, Any]]]:
+    """Split the mechanically numbered sales intake without reading its meaning."""
+
+    if maximum_components < 1:
+        raise ValueError("maximum_components must be positive")
+    return [
+        components[offset : offset + maximum_components]
+        for offset in range(0, len(components), maximum_components)
+    ]
+
+
+def build_numbered_intake_batch_prompt(
+    *,
+    relay_job_id: str,
+    submission_code: str,
+    price_batch_id: str,
+    batch_index: int,
+    batch_count: int,
+    components: list[dict[str, Any]],
+    quote_context: str,
+) -> str:
+    """Create the first-pass prompt for exactly one pre-split intake batch."""
+
+    owned_lines = "\n".join(
+        f"[component_key={item['component_key']}] {item['source_line']}"
+        for item in components
+    )
+    return (
+        f"{ASTRAQUOTE_MENTION} 请使用 AstraQuote 完成正式报价。"
+        f"这是同一张报价的第 {batch_index + 1}/{batch_count} 个组件批次，"
+        "只处理并保存本批；全部批次完成后由后台统一合并交付。\n\n"
+        f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n"
+        f"price_batch_id：{price_batch_id}\n"
+        f"relay_batch_index：{batch_index}\n"
+        f"relay_batch_count：{batch_count}\n\n"
+        "本批沿用以下整单报价条件：\n"
+        f"{quote_context.strip()}\n\n"
+        "本批客户需求（每个实际换行是一项独立顶层组件）：\n"
+        f"{owned_lines}"
+    )
 
 
 def split_component_plan(

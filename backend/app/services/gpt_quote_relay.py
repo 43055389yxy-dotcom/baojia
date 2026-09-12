@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from app.services.gpt_quote_batches import split_component_plan
+from app.services.gpt_quote_batches import split_component_plan, split_numbered_intake
 
 UTC = timezone.utc  # noqa: UP017 - the host-side worker still supports Python 3.9
 
@@ -198,6 +198,8 @@ class GptQuoteRelayStore:
         self,
         customer_request: str,
         options: dict[str, Any],
+        *,
+        numbered_components: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         text = customer_request.strip()
         if len(text) < 3 or len(text) > 12000:
@@ -230,8 +232,29 @@ class GptQuoteRelayStore:
                         active_codes.add(code)
             available = [str(value) for value in range(1, 10) if str(value) not in active_codes]
             submission_code = secrets.choice(available or [str(value) for value in range(1, 10)])
+            intake_groups = (
+                split_numbered_intake(numbered_components)
+                if numbered_components is not None
+                else []
+            )
+            intake_batches = [
+                {
+                    "batch_index": index,
+                    "batch_count": len(intake_groups),
+                    "component_keys": [str(item["component_key"]) for item in group],
+                    "source_lines": [
+                        {
+                            "component_key": str(item["component_key"]),
+                            "source_line": str(item["source_line"]),
+                        }
+                        for item in group
+                    ],
+                    "status": "pending",
+                }
+                for index, group in enumerate(intake_groups)
+            ]
             record = {
-                "schema_version": "astraquote-gpt-relay/2",
+                "schema_version": "astraquote-gpt-relay/3",
                 "job_id": job_id,
                 "submission_code": submission_code,
                 "cloud_provider": str(options.get("cloud_provider") or "aws"),
@@ -240,9 +263,18 @@ class GptQuoteRelayStore:
                 "status": "queued",
                 "created_at": now,
                 "updated_at": now,
-                "customer_request": text,
+                "customer_request": "" if intake_batches else text,
                 "quote_options": options,
                 "source_purged_at": None,
+                "intake_component_count": (
+                    len(numbered_components or []) if intake_batches else None
+                ),
+                "intake_batch_count": len(intake_batches) if intake_batches else None,
+                "intake_batches": intake_batches,
+                "reserved_price_batch_id": (
+                    f"aqpb_{uuid.uuid4()}" if intake_batches else None
+                ),
+                "merge_authorized": False,
                 "events": [self._event("queue", "报价申请已进入队列")],
                 "chat_url": None,
                 "project_name": None,
@@ -258,6 +290,15 @@ class GptQuoteRelayStore:
                 {"client_request_id": client_request_id, "job_id": job_id, "created_at": now},
             )
         return self.public(record)
+
+    def intake_chat_batches(self, job_id: str) -> list[dict[str, Any]]:
+        """Return the private, mechanically split first-pass intake batches."""
+
+        record = self.get(job_id)
+        batches = record.get("intake_batches")
+        if not isinstance(batches, list):
+            return []
+        return [dict(item) for item in batches if isinstance(item, dict)]
 
     def get(self, job_id: str) -> dict[str, Any]:
         path = self._path(job_id)
@@ -298,37 +339,91 @@ class GptQuoteRelayStore:
     def quote_chat_batches(self, job_id: str) -> list[dict[str, Any]]:
         """Read private, sealed component batches for the desktop worker.
 
-        This data never enters the public sales payload.  The batch file only
-        contains first-pass cleaned per-component sources; raw intake text has
-        already been purged before this method can return anything.
+        New numbered jobs expose their preassigned ownership keys immediately,
+        before AI cleaning. Raw sales lines are never returned here. Legacy jobs
+        continue to split only after their cleaned plan is sealed.
         """
 
         record = self.get(job_id)
-        if not record.get("source_purged_at"):
-            return []
         checkpoint = self._checkpoint(job_id) or {}
-        batch_id = str(checkpoint.get("price_batch_id") or "")
+        batch_id = str(
+            checkpoint.get("price_batch_id")
+            or record.get("reserved_price_batch_id")
+            or ""
+        )
         if not re.fullmatch(r"aqpb_[a-f0-9-]{36}", batch_id):
             return []
         batch_path = self.checkpoint_directory / f"{batch_id}.json"
         try:
             batch = self._read(batch_path)
         except (OSError, ValueError, TypeError):
+            batch = {}
+        if batch and str(batch.get("relay_job_id") or "") != job_id:
             return []
-        if str(batch.get("relay_job_id") or "") != job_id:
-            return []
-        components = batch.get("quote_components")
-        if not isinstance(components, list) or not components:
-            return []
-        try:
-            grouped = split_component_plan(components)
-        except (KeyError, TypeError, ValueError):
-            return []
+        components = batch.get("quote_components") or []
+        if not isinstance(components, list):
+            components = []
         lifecycle_by_key = {
             str(item.get("component_key") or ""): str(item.get("state") or "pending")
             for item in (batch.get("component_lifecycle") or [])
             if isinstance(item, dict)
         }
+
+        intake_batches = self.intake_chat_batches(job_id)
+        if intake_batches:
+            root_batch_index = {
+                str(key): int(item["batch_index"])
+                for item in intake_batches
+                for key in (item.get("component_keys") or [])
+            }
+            by_key = {
+                str(item.get("component_key") or ""): item
+                for item in components
+                if isinstance(item, dict) and item.get("component_key")
+            }
+
+            def component_root(component_key: str) -> str | None:
+                current = component_key
+                seen: set[str] = set()
+                while current in by_key and current not in seen:
+                    seen.add(current)
+                    parent = str(by_key[current].get("parent_component_key") or "")
+                    if not parent:
+                        return current
+                    current = parent
+                return None
+
+            result = []
+            for item in intake_batches:
+                batch_index = int(item["batch_index"])
+                expected_roots = [str(key) for key in (item.get("component_keys") or [])]
+                owned = [
+                    component
+                    for key, component in by_key.items()
+                    if root_batch_index.get(component_root(key) or "") == batch_index
+                ]
+                actual_keys = [str(component["component_key"]) for component in owned]
+                state_keys = list(dict.fromkeys([*expected_roots, *actual_keys]))
+                result.append(
+                    {
+                        "batch_index": batch_index,
+                        "batch_count": int(item.get("batch_count") or len(intake_batches)),
+                        "price_batch_id": batch_id,
+                        "component_keys": state_keys,
+                        "components": owned,
+                        "component_states": {
+                            key: lifecycle_by_key.get(key, "pending") for key in state_keys
+                        },
+                    }
+                )
+            return result
+
+        if not record.get("source_purged_at") or not components:
+            return []
+        try:
+            grouped = split_component_plan(components)
+        except (KeyError, TypeError, ValueError):
+            return []
         return [
             {
                 "batch_index": index,
@@ -496,10 +591,13 @@ class GptQuoteRelayStore:
 
     def _public_progress(self, record: dict[str, Any]) -> dict[str, Any] | None:
         checkpoint = self._checkpoint(str(record.get("job_id") or ""))
-        if checkpoint is None:
+        intake_total = self._safe_count(record.get("intake_component_count"))
+        intake_chat_count = self._safe_count(record.get("intake_batch_count"))
+        if checkpoint is None and intake_total is None:
             return None
+        checkpoint = checkpoint or {}
         progress: dict[str, Any] = {
-            "stage": str(checkpoint.get("stage") or "processing")[:80],
+            "stage": str(checkpoint.get("stage") or record.get("status") or "processing")[:80],
         }
         for key in (
             "total_component_count",
@@ -512,6 +610,14 @@ class GptQuoteRelayStore:
             count = self._safe_count(checkpoint.get(key))
             if count is not None:
                 progress[key] = count
+        if intake_total is not None:
+            progress.setdefault("total_component_count", intake_total)
+            progress.setdefault("top_level_component_count", intake_total)
+            progress.setdefault("pending_component_count", intake_total)
+        if intake_chat_count is not None:
+            progress.setdefault("component_chat_count", intake_chat_count)
+        progress.setdefault("completed_component_count", 0)
+        progress.setdefault("failed_component_count", 0)
         updated_at = str(checkpoint.get("updated_at") or "").strip()
         if updated_at:
             progress["updated_at"] = updated_at[:80]
@@ -649,9 +755,11 @@ class GptQuoteRelayStore:
             return True
 
     def _slot_count(self, record: dict[str, Any]) -> int:
+        intake_total = self._safe_count(record.get("intake_component_count")) or 0
         checkpoint = self._checkpoint(str(record.get("job_id") or "")) or {}
         total = (
-            self._safe_count(checkpoint.get("top_level_component_count"))
+            intake_total
+            or self._safe_count(checkpoint.get("top_level_component_count"))
             or self._safe_count(checkpoint.get("total_component_count"))
             or 0
         )
@@ -661,6 +769,8 @@ class GptQuoteRelayStore:
         )
 
     def _has_sealed_component_count(self, record: dict[str, Any]) -> bool:
+        if (self._safe_count(record.get("intake_component_count")) or 0) > 0:
+            return True
         checkpoint = self._checkpoint(str(record.get("job_id") or "")) or {}
         return (
             self._safe_count(checkpoint.get("top_level_component_count")) or 0
@@ -1157,8 +1267,9 @@ class GptQuoteRelayStore:
     ) -> list[dict[str, Any]]:
         """Reattach submitted conversations after the browser worker restarts.
 
-        Their source text has already been purged, so they must be monitored by
-        the saved conversation URL instead of being submitted a second time.
+        At least one conversation has already been submitted, so it must be
+        monitored by its saved reference instead of submitting the first batch
+        again. A very large intake may still have later unsent private batches.
         """
 
         if limit is not None and limit < 1:
@@ -1175,8 +1286,10 @@ class GptQuoteRelayStore:
                 if (
                     record.get("status") == "processing"
                     and record.get("job_id") not in excluded
-                    and record.get("source_purged_at")
-                    and str(record.get("chat_url") or "").strip()
+                    and (
+                        str(record.get("chat_url") or "").strip()
+                        or bool(record.get("chat_sessions"))
+                    )
                 ):
                     candidates.append((str(record.get("created_at") or ""), path, record))
             now = datetime.now(UTC)
@@ -1206,13 +1319,89 @@ class GptQuoteRelayStore:
             message="报价需求已进入安全处理阶段",
         )
 
+    def purge_intake_batch(self, job_id: str, batch_index: int) -> dict[str, Any]:
+        """Remove one batch's raw sales lines immediately after successful send."""
+
+        with self._lock():
+            path = self._path(job_id)
+            record = self._read(path)
+            batches = list(record.get("intake_batches") or [])
+            target = next(
+                (
+                    item
+                    for item in batches
+                    if int(item.get("batch_index", -1)) == int(batch_index)
+                ),
+                None,
+            )
+            if target is None:
+                raise GptRelayError(
+                    "报价输入批次不存在。", code="gpt_relay_intake_batch_not_found"
+                )
+            target["source_lines"] = []
+            target["status"] = "submitted"
+            target["submitted_at"] = target.get("submitted_at") or utc_now()
+            all_purged = all(not (item.get("source_lines") or []) for item in batches)
+            record.update(
+                {
+                    "customer_request": "",
+                    "intake_batches": batches,
+                    "source_purged_at": (
+                        record.get("source_purged_at") or utc_now()
+                        if all_purged
+                        else None
+                    ),
+                    "updated_at": utc_now(),
+                }
+            )
+            self._write_atomic(path, record)
+            return record
+
+    def authorize_merge(self, job_id: str) -> dict[str, Any]:
+        """Allow one final build only after the desktop worker stops every batch."""
+
+        return self.update_if_not_cancelled(
+            job_id,
+            {"merge_authorized": True},
+            stage="merge",
+            message="所有组件批次已停止，正在统一合并报价",
+        )
+
+    @staticmethod
+    def _purged_intake_batches(record: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                **item,
+                "source_lines": [],
+                "status": "cancelled",
+            }
+            for item in (record.get("intake_batches") or [])
+            if isinstance(item, dict)
+        ]
+
+    def purge_all_sources(self, job_id: str) -> dict[str, Any]:
+        record = self.get(job_id)
+        return self.update_if_not_cancelled(
+            job_id,
+            {
+                "customer_request": "",
+                "intake_batches": self._purged_intake_batches(record),
+                "source_purged_at": utc_now(),
+            },
+        )
+
     def cancel(self, job_id: str) -> dict[str, Any]:
         record = self.get(job_id)
         if record.get("status") in TERMINAL_STATUSES:
             return self.public(record)
         updated = self.update(
             job_id,
-            {"status": "cancelled", "customer_request": "", "source_purged_at": utc_now()},
+            {
+                "status": "cancelled",
+                "customer_request": "",
+                "intake_batches": self._purged_intake_batches(record),
+                "source_purged_at": utc_now(),
+            },
             stage="cancelled",
             message="报价任务已取消",
         )
