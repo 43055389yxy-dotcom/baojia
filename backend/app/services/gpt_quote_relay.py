@@ -362,7 +362,12 @@ class GptQuoteRelayStore:
             raise GptRelayError("无效的报价对话角色。", code="gpt_relay_chat_role_invalid")
         if not 0 <= batch_index < batch_count <= 200:
             raise GptRelayError("无效的报价对话批次。", code="gpt_relay_chat_batch_invalid")
-        if not str(chat_url).startswith("https://chatgpt.com/"):
+        if not re.fullmatch(
+            r"codex-chat://conversations/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}",
+            str(chat_url),
+            flags=re.IGNORECASE,
+        ):
             raise GptRelayError("无效的报价对话地址。", code="gpt_relay_chat_url_invalid")
         with self._lock():
             path = self._path(job_id)

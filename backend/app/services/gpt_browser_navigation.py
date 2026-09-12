@@ -62,6 +62,10 @@ def is_transient_browser_poll_exception(exc: BaseException) -> bool:
         "ReadTimeoutError",
         "NewConnectionError",
         "ProtocolError",
+        "WebSocketTimeoutException",
+        "WebSocketConnectionClosedException",
+        "ConnectionResetError",
+        "BrokenPipeError",
     }:
         return True
     message = str(exc).casefold()

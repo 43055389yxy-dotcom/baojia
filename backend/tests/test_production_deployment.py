@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 
-def test_jenkins_deploy_updates_and_restarts_the_host_browser_relay() -> None:
+def test_jenkins_deploy_updates_and_restarts_the_host_codex_chat_relay() -> None:
     root = Path(__file__).resolve().parents[2]
     script = (root / "deploy/jenkins-shell.sh").read_text(encoding="utf-8")
 
@@ -15,7 +15,12 @@ def test_jenkins_deploy_updates_and_restarts_the_host_browser_relay() -> None:
     assert "--pid=host" in script
     assert '"$RELAY_WORKER_COMMAND "*' in script
     assert "--entrypoint /usr/bin/nsenter" in script
-    assert "/usr/bin/systemctl restart astraquote-gpt-relay.service" in script
+    assert "/usr/bin/systemctl enable --now astraquote-gpt-relay.service" in script
+    assert "astraquote-chatgpt-desktop" in script
+    assert "codex://threads/new?mode=chat" in script
+    assert "--shm-size 1g" in script
+    assert "firefox" not in script.casefold()
+    assert "geckodriver" not in script.casefold()
     assert "rsync" not in script
     assert "sudo" not in script
 
@@ -44,6 +49,12 @@ def test_jenkins_health_checks_explain_the_failure_stage() -> None:
         "Environment=ASTRAQUOTE_V2_STATE_DIR=/home/ec2-user/astraquote/data/v2-quotes"
         in unit
     )
+    assert "ASTRAQUOTE_CODEX_CONTAINER=astraquote-chatgpt-desktop" in unit
+    assert "ASTRAQUOTE_CODEX_CDP=http://127.0.0.1:9222" in unit
+    assert "ASTRAQUOTE_FIREFOX_PROFILE" not in unit
+    assert "ASTRAQUOTE_CHATGPT_PROJECT" not in unit
+    assert "chatgpt.com/projects" not in unit
+    assert "docker.service" in unit
 
 
 def test_runtime_image_contains_the_host_namespace_helper() -> None:

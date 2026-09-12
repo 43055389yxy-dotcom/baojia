@@ -12,6 +12,10 @@ import pytest
 from app.services.gpt_quote_relay import GptQuoteRelayStore
 
 
+def codex_chat(index: int) -> str:
+    return f"codex-chat://conversations/00000000-0000-4000-8000-{index:012d}"
+
+
 @pytest.fixture
 def worker(monkeypatch):
     """Load the real worker without needing a browser driver in backend tests."""
@@ -100,7 +104,7 @@ def test_partial_retry_reuses_only_coordinator_after_queue_claim(worker, running
     for index in range(3):
         store.record_chat_session(
             job_id, batch_index=index, batch_count=3,
-            chat_url=f"https://chatgpt.com/c/batch-{index}",
+            chat_url=codex_chat(index),
             role="coordinator" if index == 0 else "component_batch",
             component_keys=[f"cmp-{index}"],
         )
@@ -130,7 +134,7 @@ def test_batch_failure_state_churn_is_not_real_progress(worker, running_job, mon
     store, job_id, _ = running_job
     store.record_chat_session(
         job_id, batch_index=1, batch_count=2,
-        chat_url="https://chatgpt.com/c/child", role="component_batch", component_keys=["a", "b"],
+        chat_url=codex_chat(1), role="component_batch", component_keys=["a", "b"],
     )
     active = worker.ActiveQuote(job_id, "https://chatgpt.com/c/child", 100, batch_index=1)
     batch = {
@@ -151,7 +155,7 @@ def test_child_budget_is_durable_before_send_failure(worker, running_job, monkey
     store, job_id, _ = running_job
     store.record_chat_session(
         job_id, batch_index=1, batch_count=2,
-        chat_url="https://chatgpt.com/c/child", role="component_batch", component_keys=["a"],
+        chat_url=codex_chat(1), role="component_batch", component_keys=["a"],
     )
     active = worker.ActiveQuote(job_id, "https://chatgpt.com/c/child", 100, batch_index=1)
     batch = {"component_states": {"a": "pending"}, "price_batch_id": "aqpb_id",
@@ -169,7 +173,7 @@ def test_final_merge_waits_until_running_chats_have_stopped(worker, running_job,
     for index in range(2):
         store.record_chat_session(
             job_id, batch_index=index, batch_count=2,
-            chat_url=f"https://chatgpt.com/c/batch-{index}",
+            chat_url=codex_chat(index),
             role="coordinator" if index == 0 else "component_batch", component_keys=[str(index)],
         )
     batches = [{"batch_index": index, "price_batch_id": "aqpb_id", "component_keys": [str(index)],
@@ -188,7 +192,7 @@ def test_merge_cannot_take_a_fifth_active_chat_slot(worker, running_job, monkeyp
     for index in range(2):
         store.record_chat_session(
             job_id, batch_index=index, batch_count=2,
-            chat_url=f"https://chatgpt.com/c/batch-{index}",
+            chat_url=codex_chat(index),
             role="coordinator" if index == 0 else "component_batch", component_keys=[str(index)],
         )
         store.update_chat_session(job_id, index, status="saved")
@@ -212,25 +216,31 @@ def test_late_worker_failure_cannot_overwrite_delivery_or_cancellation(worker, r
 
 
 def test_new_visible_prose_cannot_extend_expired_no_progress_deadline(worker, monkeypatch):
-    browser = worker.ChatGptBrowser()
-    driver = Mock(current_url="https://chatgpt.com/c/example")
-    message = Mock(text="仍在处理，准备继续查询")
-    driver.find_elements.side_effect = (
-        lambda _by, selector: [message] if "data-message-author-role" in selector else [Mock()]
+    browser = worker.CodexChatDesktop(
+        active_quote_factory=worker.ActiveQuote,
+        quote_timeout_seconds=600,
     )
-    browser._driver = lambda: driver
-    browser._visible = lambda elements: elements
     browser._switch_to_quote = Mock()
     browser._scroll_to_latest = Mock()
     browser._approve_tool_if_needed = lambda: False
-    browser._text_control = lambda _: None
+    browser._text_control_visible = lambda _: False
+    browser._assistant_messages = lambda: ["仍在处理，准备继续查询"]
+    browser._generation_active = lambda: False
     monkeypatch.setattr(worker.time, "monotonic", lambda: 100)
     active = worker.ActiveQuote(
-        "job", driver.current_url, 90, last_text="之前的状态", generation_grace_used=True,
+        "job", codex_chat(99), 90, last_text="之前的状态", generation_grace_used=True,
     )
     with pytest.raises(TimeoutError):
         browser.poll_quote(active)
     assert active.deadline == 90
+
+
+def test_production_worker_constructs_codex_chat_adapter_not_firefox(worker):
+    source = Path(worker.__file__).read_text(encoding="utf-8")
+    main_source = source[source.index("def main()") :]
+
+    assert "CodexChatDesktop(" in main_source
+    assert "browser = ChatGptBrowser()" not in main_source
 
 
 def test_terminal_cleanup_keeps_slot_when_stop_is_uncertain(worker):

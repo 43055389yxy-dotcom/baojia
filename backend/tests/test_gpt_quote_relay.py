@@ -873,10 +873,12 @@ def test_every_automated_followup_explicitly_mentions_astraquote() -> None:
     assert all(prompt.startswith("@AstraQuote ") for prompt in prompts)
 
 
-def test_browser_worker_keeps_continuation_and_receipt_integration() -> None:
+def test_codex_worker_keeps_continuation_and_receipt_integration() -> None:
+    root = Path(__file__).resolve().parents[2]
     worker = (
-        Path(__file__).resolve().parents[2] / "tools/gpt_quote_relay_worker.py"
+        root / "tools/gpt_quote_relay_worker.py"
     ).read_text(encoding="utf-8")
+    desktop = (root / "tools/codex_chat_desktop.py").read_text(encoding="utf-8")
 
     assert "store.reconcile_delivery_receipt(job_id)" in worker
     assert 'if outcome == "continue":' in worker
@@ -885,9 +887,11 @@ def test_browser_worker_keeps_continuation_and_receipt_integration() -> None:
     assert "build_quote_partial_finalization_prompt(" in worker
     assert "browser.continue_quote(active, continuation_prompt)" in worker
     assert "is_persistent_permission_action(" not in worker
-    assert "is_single_use_permission_action(self._control_label(control))" in worker
+    assert "'允许一次', 'Allow once'" in desktop
+    assert "'始终允许'" not in desktop
+    assert "belongsToAstraQuote" in desktop
     assert "stop_terminal_job_chats(browser, active_quotes, job_id)" in worker
-    assert "quote.deadline = quote.stable_since + QUOTE_TIMEOUT_SECONDS" in worker
+    assert "quote.deadline = quote.stable_since + self.quote_timeout_seconds" in desktop
     assert "except TimeoutError:" in worker
     assert "报价等待超时，已在原对话从保存阶段自动继续" in worker
     assert "delivered_without_calculator_link" not in worker
@@ -1309,26 +1313,41 @@ def test_relay_builds_private_chat_batches_from_the_sealed_price_plan(tmp_path: 
     assert "整单原始报价资料" not in json.dumps(sales)
 
 
-def test_relay_persists_multiple_chat_urls_for_one_sales_quote(tmp_path: Path) -> None:
+def test_relay_persists_multiple_codex_chat_references_for_one_sales_quote(
+    tmp_path: Path,
+) -> None:
     store = GptQuoteRelayStore(tmp_path)
     public = store.create("两批报价。", {})
     store.claim_next("worker-a")
 
     store.record_chat_session(
         public["job_id"], batch_index=0, batch_count=2,
-        chat_url="https://chatgpt.com/g/g-p-abc123/c/coordinator",
+        chat_url="codex-chat://conversations/6aa52a28-5510-83ee-b69a-42c10c9f1ddb",
         role="coordinator", component_keys=["cmp_root_0001"],
     )
     store.record_chat_session(
         public["job_id"], batch_index=1, batch_count=2,
-        chat_url="https://chatgpt.com/g/g-p-abc123/c/batch-2",
+        chat_url="codex-chat://conversations/6aa5306f-4ed8-83e9-9c0d-466e73829f51",
         role="component_batch", component_keys=["cmp_root_0021"],
     )
 
     record = store.get(public["job_id"])
-    assert record["chat_url"].endswith("/coordinator")
+    assert record["chat_url"].endswith("/6aa52a28-5510-83ee-b69a-42c10c9f1ddb")
     assert [item["batch_index"] for item in record["chat_sessions"]] == [0, 1]
     assert "chat_sessions" not in store.public_get(public["job_id"])
+
+
+def test_relay_rejects_web_chat_reference_for_new_sales_quote(tmp_path: Path) -> None:
+    store = GptQuoteRelayStore(tmp_path)
+    public = store.create("独立报价。", {})
+    store.claim_next("worker-a")
+
+    with pytest.raises(GptRelayError, match="报价对话地址"):
+        store.record_chat_session(
+            public["job_id"], batch_index=0, batch_count=1,
+            chat_url="https://chatgpt.com/c/legacy-web-chat",
+            role="coordinator", component_keys=[],
+        )
 
 
 def test_sales_receipt_accepts_sixty_successful_components(tmp_path: Path) -> None:
