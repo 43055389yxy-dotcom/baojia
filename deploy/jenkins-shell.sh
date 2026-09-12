@@ -138,6 +138,15 @@ activate_host_browser_relay() {
     '
 }
 
+host_codex_cdp_ready() {
+  # Jenkins itself runs in a container, so its 127.0.0.1 is not the Docker
+  # host.  Probe Codex from a short-lived container sharing the host network.
+  docker run --rm --network host \
+    --entrypoint /usr/bin/curl \
+    astraquote:production \
+    -fsS --max-time 3 http://127.0.0.1:9222/json/list
+}
+
 ensure_host_codex_chat_desktop() {
   echo "Ensuring the authenticated Codex Chat desktop is running"
   if ! docker image inspect "$CODEX_IMAGE" >/dev/null 2>&1; then
@@ -212,7 +221,7 @@ ensure_host_codex_chat_desktop() {
   fi
 
   for attempt in {1..30}; do
-    if curl -fsS http://127.0.0.1:9222/json/list \
+    if host_codex_cdp_ready \
       | grep -F 'app://-/index.html' >/dev/null; then
       return 0
     fi

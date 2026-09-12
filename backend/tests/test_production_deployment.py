@@ -19,6 +19,10 @@ def test_jenkins_deploy_updates_and_restarts_the_host_codex_chat_relay() -> None
     assert "astraquote-chatgpt-desktop" in script
     assert "codex://threads/new?mode=chat" in script
     assert "--shm-size 1g" in script
+    assert "host_codex_cdp_ready" in script
+    assert "--network host" in script
+    assert "--entrypoint /usr/bin/curl" in script
+    assert "if curl -fsS http://127.0.0.1:9222/json/list" not in script
     assert "firefox" not in script.casefold()
     assert "geckodriver" not in script.casefold()
     assert "rsync" not in script
