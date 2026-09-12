@@ -50,3 +50,16 @@ def test_each_poll_scrolls_the_active_quote_before_scanning_approval(
 
     assert browser.poll_quote(quote) is None
     assert events == ["switch", "scroll", "approve"]
+
+
+def test_current_task_marker_script_keeps_newline_escaped(gemini_browser) -> None:
+    browser = gemini_browser(
+        active_quote_factory=Mock(),
+        quote_timeout_seconds=600,
+    )
+    scripts: list[str] = []
+    browser._execute = lambda script, *_args: scripts.append(script) or "job-123"
+    quote = SimpleNamespace(job_id="job-123", batch_count=1, role="coordinator")
+
+    assert browser._current_task_contains(quote)
+    assert "messages.join('\\n')" in scripts[0]

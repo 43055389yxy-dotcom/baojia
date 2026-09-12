@@ -330,7 +330,7 @@ class GeminiChatBrowser:
                 const messages = [...document.querySelectorAll(
                   'user-query,[data-message-author-role="user"],[data-test-id*="user-query"],[class*="user-query"]'
                 )].map(node => node.innerText || '').filter(Boolean);
-                if (messages.length) return messages.join('\n');
+                if (messages.length) return messages.join('\\n');
                 const main = document.querySelector('main,[role="main"]');
                 return main?.innerText || '';
                 """
@@ -364,12 +364,18 @@ class GeminiChatBrowser:
             const roots = [...document.querySelectorAll('nav,aside')];
             const scope = roots.length ? roots : [document.body];
             const nodes = scope.flatMap(root => [...root.querySelectorAll('a,button,[role="button"],[tabindex="0"]')]);
-            return nodes.filter(node => {
+            const visible = nodes.filter(node => {
               const rect = node.getBoundingClientRect();
               const text = (node.innerText || '').trim();
               return rect.width > 30 && rect.height > 20 && rect.left < window.innerWidth * .48
                 && text && text.length < 240;
             });
+            const needsInput = node => /需要输入内容|Needs input|Action required/i.test(
+              node.innerText || ''
+            );
+            return visible.sort((left, right) =>
+              Number(needsInput(right)) - Number(needsInput(left))
+            );
             """
         ) or []
         for candidate in candidates[:80]:
