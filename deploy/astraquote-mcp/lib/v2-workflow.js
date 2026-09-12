@@ -82,8 +82,16 @@ function sealedComponentPlan(existing, supplied) {
   return incoming;
 }
 
-function assertFormalQuotePricingPlan({ relayJobId, quoteComponents, queries, queryContexts }) {
-  const formalQuote = Boolean(relayJobId) || quoteComponents.length > 0;
+function assertFormalQuotePricingPlan({ quoteMode, relayJobId, quoteComponents, queries, queryContexts }) {
+  if (relayJobId && quoteMode === 'price_lookup') {
+    const error = new Error('A sales relay task is always a formal quote.');
+    error.code = 'relay_quote_mode_invalid';
+    error.retryable = true;
+    error.details = { next_action: 'retry_get_prices_with_quote_mode_formal_quote' };
+    throw error;
+  }
+  const formalQuote = quoteMode === 'formal_quote'
+    || Boolean(relayJobId) || quoteComponents.length > 0;
   if (!formalQuote) return;
   if (quoteComponents.length === 0) {
     const error = new Error('Register the complete cleaned component plan before querying a sales quote.');
@@ -140,8 +148,9 @@ function assertFormalQuotePricingPlan({ relayJobId, quoteComponents, queries, qu
   }
 }
 
-function priceWorkflowGuard({ relayJobId, quoteComponents, componentLifecycle = [] }) {
-  const formalQuote = Boolean(relayJobId) || quoteComponents.length > 0;
+function priceWorkflowGuard({ quoteMode, relayJobId, quoteComponents, componentLifecycle = [] }) {
+  const formalQuote = quoteMode === 'formal_quote'
+    || Boolean(relayJobId) || quoteComponents.length > 0;
   return {
     mode: formalQuote ? 'formal_quote' : 'price_lookup',
     quote_plan_registered: quoteComponents.length > 0,
@@ -1019,6 +1028,7 @@ class AstraQuoteV2Workflow {
         .filter((item) => input.query_ids.includes(item.query_id)),
       progress_guidance: PROGRESS_GUIDANCE,
       workflow_guard: priceWorkflowGuard({
+        quoteMode: priceBatch.quote_mode,
         relayJobId: priceBatch.relay_job_id || null,
         quoteComponents: priceBatch.quote_components || [],
         componentLifecycle: componentStatus.component_lifecycle,
@@ -1041,6 +1051,17 @@ class AstraQuoteV2Workflow {
       existing?.quote_components,
       input.quote_components,
     );
+    const inferredQuoteMode = relayJobId || quoteComponents.length > 0
+      ? 'formal_quote'
+      : 'price_lookup';
+    const quoteMode = input.quote_mode || existing?.quote_mode || inferredQuoteMode;
+    if (existing?.quote_mode && existing.quote_mode !== quoteMode) {
+      const error = new Error('The saved price batch quote mode is immutable.');
+      error.code = 'price_batch_quote_mode_mismatch';
+      error.retryable = true;
+      error.details = { expected: existing.quote_mode, received: quoteMode };
+      throw error;
+    }
     const preliminaryQueries = new Map(
       (existing?.request?.queries || []).map((item) => [item.query_id, item]),
     );
@@ -1050,6 +1071,7 @@ class AstraQuoteV2Workflow {
       existing?.query_contexts, input.query_contexts, preliminaryQueries,
     );
     assertFormalQuotePricingPlan({
+      quoteMode,
       relayJobId,
       quoteComponents,
       queries: input.queries,
@@ -1282,6 +1304,7 @@ class AstraQuoteV2Workflow {
       created_at: latest?.created_at || new Date().toISOString(),
       updated_at: new Date().toISOString(),
       relay_job_id: relayJobId,
+      quote_mode: quoteMode,
       request: { queries: [...finalQueries.values()] },
       quote_components: finalQuoteComponents,
       query_contexts: finalQueryContexts,
@@ -1352,6 +1375,7 @@ class AstraQuoteV2Workflow {
       failed_component_count: componentStatus.failed_component_count,
       pending_component_count: componentStatus.pending_component_count,
       workflow_guard: priceWorkflowGuard({
+        quoteMode,
         relayJobId,
         quoteComponents: finalQuoteComponents,
         componentLifecycle: componentStatus.component_lifecycle,

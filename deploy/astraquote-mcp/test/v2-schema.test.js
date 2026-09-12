@@ -144,6 +144,8 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   const getPrices = listed.tools.find((tool) => tool.name === 'get_prices');
   const buildEstimate = listed.tools.find((tool) => tool.name === 'build_estimate');
   assert.ok(getPrices.inputSchema.required.includes('queries'));
+  assert.ok(getPrices.inputSchema.required.includes('quote_mode'));
+  assert.deepEqual(getPrices.inputSchema.properties.quote_mode.enum, ['price_lookup', 'formal_quote']);
   assert.equal(getPrices.inputSchema.properties.queries.type, 'array');
   assert.equal(getPrices.inputSchema.properties.queries.maxItems, 50);
   assert.equal(buildEstimate.inputSchema.properties.services.maxItems, 200);
@@ -177,6 +179,7 @@ test('get_prices accepts all ten provider-specific raw query shapes', async (t) 
   const result = await client.callTool({
     name: 'get_prices',
     arguments: {
+      quote_mode: 'price_lookup',
       queries: [
         {
           provider: 'aws', query_id: 'aws-1', service_code: 'AmazonEC2',
@@ -245,6 +248,7 @@ test('get_prices accepts a learned route id without repeating transport details'
   const result = await client.callTool({
     name: 'get_prices',
     arguments: {
+      quote_mode: 'price_lookup',
       queries: [{
         provider: 'alibaba', query_id: 'alibaba-reuse',
         route_id: 'aqr_aaaaaaaaaaaaaaaaaaaaaaaa',
@@ -267,6 +271,7 @@ test('get_prices accepts scoped cache lookup without endpoint or route id', asyn
   const result = await client.callTool({
     name: 'get_prices',
     arguments: {
+      quote_mode: 'price_lookup',
       queries: [{
         provider: 'alibaba', query_id: 'alibaba-auto-reuse',
         service: 'bssopenapi', region: 'ap-southeast-1',
@@ -291,6 +296,7 @@ test('query lifecycle metadata is visible in the MCP schema and survives tool va
   }];
   const result = await client.callTool({
     name: 'get_prices', arguments: {
+      quote_mode: 'price_lookup',
       queries: [{ provider: 'azure', query_id: 'replacement', currency_code: 'USD', filter: 'valid' }],
       query_contexts: queryContexts,
     },
@@ -309,6 +315,7 @@ test('get_prices returns cross-field omissions as a retryable tool result', asyn
   const result = await client.callTool({
     name: 'get_prices',
     arguments: {
+      quote_mode: 'price_lookup',
       queries: [{ provider: 'alibaba', query_id: 'alibaba-missing-route-fields' }],
     },
   });

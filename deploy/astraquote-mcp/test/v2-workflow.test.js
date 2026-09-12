@@ -1367,6 +1367,19 @@ test('a formal quote rejects unowned price queries before calling a provider', a
   assert.equal(officialCalls, 0);
 });
 
+test('a direct formal quote cannot silently fall back to untracked price lookup mode', async (t) => {
+  const { workflow, backend, directory } = fixture();
+  let officialCalls = 0;
+  backend.getPrices = async () => { officialCalls += 1; return { results: [] }; };
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+
+  await assert.rejects(workflow.getPrices({
+    quote_mode: 'formal_quote',
+    queries: [{ provider: 'azure', query_id: 'formal-price', filter: 'valid' }],
+  }), (error) => error.code === 'formal_quote_component_plan_required');
+  assert.equal(officialCalls, 0);
+});
+
 test('price lookup responses tell weaker clients that quote coverage is unknown and page fallback exists', async (t) => {
   const { workflow, directory } = fixture();
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
