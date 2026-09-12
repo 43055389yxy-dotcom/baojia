@@ -669,6 +669,39 @@ def authorize_error(redirect_uri: str, state: str, error: str, description: str)
     return RedirectResponse(f"{redirect_uri}?{query}", status_code=302)
 
 
+def authorization_success(redirect_uri: str, state: str, code: str):
+    query = urlencode({"code": code, "state": state})
+    target = f"{redirect_uri}?{query}"
+    if redirect_uri not in EXACT_HTTPS_REDIRECT_URIS:
+        return RedirectResponse(target, status_code=303)
+
+    escaped_target = html.escape(target, quote=True)
+    page = f"""<!doctype html><html lang='zh-CN'><meta charset='utf-8'>
+    <meta name='viewport' content='width=device-width,initial-scale=1'>
+    <meta http-equiv='refresh' content='0;url={escaped_target}'>
+    <title>正在返回 AI 客户端</title><style>
+    *{{box-sizing:border-box}}body{{margin:0;background:#f3f8f6;color:#17343a;font-family:system-ui,sans-serif}}
+    main{{width:min(440px,calc(100% - 32px));margin:14vh auto;background:white;border:1px solid #d7e5e2;
+    border-radius:20px;padding:32px;box-shadow:0 18px 60px #17343a1a;text-align:center}}
+    h1{{margin:0 0 12px;font-size:24px}}p{{color:#587176;line-height:1.6}}
+    a{{display:block;margin-top:24px;padding:14px;border-radius:10px;background:#087f73;color:white;
+    font-size:16px;font-weight:700;text-decoration:none}}</style><main>
+    <h1>授权成功</h1><p>正在返回 Gemini。如果没有自动返回，请点击下面的按钮。</p>
+    <a href='{escaped_target}'>返回 Gemini</a></main></html>"""
+    return HTMLResponse(
+        page,
+        headers={
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
+            "Content-Security-Policy": (
+                "default-src 'none'; style-src 'unsafe-inline'; "
+                "base-uri 'none'; frame-ancestors 'none'"
+            ),
+            "Referrer-Policy": "no-referrer",
+        },
+    )
+
+
 def login_page(request_id: str, error: str = "") -> HTMLResponse:
     error_html = f"<div class='error'>{html.escape(error)}</div>" if error else ""
     if PASSWORDLESS_AUTH:
@@ -797,9 +830,8 @@ def authorize_post(
                     "Authorization request expired. Start again in ChatGPT.",
                     status_code=400,
                 )
-            query = urlencode({"code": completed["code"], "state": completed["state"]})
-            return RedirectResponse(
-                f"{completed['redirect_uri']}?{query}", status_code=303
+            return authorization_success(
+                completed["redirect_uri"], completed["state"], completed["code"]
             )
         limited = rate_limit(request, "login")
         if limited:
@@ -857,8 +889,9 @@ def authorize_post(
         connection.execute(
             "DELETE FROM auth_requests WHERE request_id = ?", (request_id,)
         )
-    query = urlencode({"code": code, "state": auth_request["state"]})
-    return RedirectResponse(f"{auth_request['redirect_uri']}?{query}", status_code=303)
+    return authorization_success(
+        auth_request["redirect_uri"], auth_request["state"], code
+    )
 
 
 def basic_credentials(request: Request) -> tuple[str | None, str | None]:

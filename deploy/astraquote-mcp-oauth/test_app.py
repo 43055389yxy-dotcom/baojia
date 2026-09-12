@@ -184,6 +184,30 @@ def test_repeated_completed_authorization_does_not_consume_login_rate_limit(
     assert repeated.headers["location"] == first.headers["location"]
 
 
+def test_exact_https_authorization_uses_browser_navigation_fallback(
+    tmp_path, monkeypatch
+):
+    redirect_uri = (
+        "https://oauth-redirect.googleusercontent.com/r/"
+        "user_bound_custom-mcp-test-pricing-mcp_example_com"
+    )
+    gateway = load_gateway(
+        tmp_path,
+        monkeypatch,
+        passwordless_auth=True,
+        exact_https_redirect_uris=redirect_uri,
+    )
+
+    response = gateway.authorization_success(redirect_uri, "state-value", "code-value")
+    body = response.body.decode()
+
+    assert response.status_code == 200
+    assert "授权成功" in body
+    assert "返回 Gemini" in body
+    assert "code=code-value&amp;state=state-value" in body
+    assert response.headers["cache-control"] == "no-store"
+
+
 def request_from(address: str) -> Request:
     return Request(
         {
