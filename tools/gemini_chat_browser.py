@@ -22,6 +22,7 @@ from app.services.gemini_approval_policy import (
 )
 from app.services.gemini_chat_references import (
     gemini_chat_reference,
+    is_authenticated_gemini_workspace_url,
     task_id_from_gemini_reference,
 )
 from app.services.gpt_browser_navigation import (
@@ -144,6 +145,10 @@ class GeminiChatBrowser:
             url = str(self.driver.current_url or "")
             if "accounts.google.com" in url:
                 return False
+            # A private Spark task URL is issued only after the Google account
+            # and the associated app workspace have loaded successfully.
+            if is_authenticated_gemini_workspace_url(url):
+                return True
             return bool(
                 self._execute(
                     """

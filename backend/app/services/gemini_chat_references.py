@@ -6,6 +6,10 @@ import re
 
 GEMINI_CHAT_REFERENCE_PREFIX = "gemini-chat://tasks/"
 GEMINI_TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+GEMINI_SPARK_TASK_URL_PATTERN = re.compile(
+    r"^https://gemini\.google\.com/spark/chat/[A-Za-z0-9_-]+(?:[/?#]|$)",
+    re.IGNORECASE,
+)
 
 
 def is_gemini_task_id(value: object) -> bool:
@@ -17,6 +21,12 @@ def is_gemini_chat_reference(value: object) -> bool:
     return text.startswith(GEMINI_CHAT_REFERENCE_PREFIX) and is_gemini_task_id(
         text.removeprefix(GEMINI_CHAT_REFERENCE_PREFIX)
     )
+
+
+def is_authenticated_gemini_workspace_url(value: object) -> bool:
+    """Recognize the private Spark task route created after app sign-in."""
+
+    return bool(GEMINI_SPARK_TASK_URL_PATTERN.match(str(value or "").strip()))
 
 
 def gemini_chat_reference(task_id: str) -> str:

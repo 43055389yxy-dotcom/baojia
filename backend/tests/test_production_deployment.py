@@ -85,6 +85,8 @@ def test_gemini_relay_is_a_separate_visible_persistent_worker() -> None:
     assert "DISPLAY=:1" in unit
     assert "ASTRAQUOTE_GEMINI_PROFILE=" in unit
     assert "Restart=always" in unit
+    assert "pkill -u ec2-user -f astraquote-gemini" not in unit
+    assert "firefox.*astraquote-gemini" in unit
     assert "selenium==" in requirements
 
 
