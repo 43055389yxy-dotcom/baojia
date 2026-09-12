@@ -637,7 +637,7 @@ def test_queued_job_waits_for_login_without_losing_source(tmp_path: Path) -> Non
     assert waiting["customer_request"] == "东京 EC2 两台，按需。"
 
 
-def test_per_quote_prompt_carries_the_current_nearest_lower_policy() -> None:
+def test_per_quote_prompt_contains_only_per_order_context() -> None:
     prompt = build_quote_prompt(
         "东京 EC2 两台，Linux。",
         {
@@ -661,13 +661,20 @@ def test_per_quote_prompt_carries_the_current_nearest_lower_policy() -> None:
     assert "get_prices" not in prompt
     assert "build_estimate" not in prompt
     assert "ASTRAQUOTE_STATUS" not in prompt
-    assert "禁止为了满足目标而向上选择" in prompt
-    assert "完全匹配" in prompt
-    assert "总报价最低" in prompt
-    assert "由 GPT" in prompt
-    assert "云厂商和账号站点对应的官方地域代码" in prompt
-    assert "不得套用其他云厂商同名代码" in prompt
-    assert "当前官方地域清单" in prompt
+    assert "当前官方地域清单" not in prompt
+    assert "quote_components" not in prompt
+    assert "每 20 个组件" not in prompt
+    assert "禁止为了满足目标而向上选择" not in prompt
+
+    plugin_instructions = (
+        Path(__file__).resolve().parents[2]
+        / "deploy"
+        / "astraquote-mcp"
+        / "instructions.zh-CN.md"
+    ).read_text(encoding="utf-8")
+    assert "每 20 个顶层组件一批" in plugin_instructions
+    assert "销售选择的是首选地域" in plugin_instructions
+    assert "没有完全匹配时选最接近的小一档" in plugin_instructions
 
 
 def test_unknown_sales_region_is_recoverable_and_ai_must_choose_nearest_official_region() -> None:
@@ -683,10 +690,30 @@ def test_unknown_sales_region_is_recoverable_and_ai_must_choose_nearest_official
         submission_code="4",
     )
 
-    assert "不在当前官方地域清单" in prompt
+    assert "销售提供的地域偏好：not-a-real-region" in prompt
     assert "不得因此停止报价" in prompt
     assert "同一云厂商、同一账号站点内选择距离最近" in prompt
-    assert "杭州（cn-hangzhou）" in prompt
+    assert "当前官方地域清单" not in prompt
+    assert "杭州（cn-hangzhou）" not in prompt
+
+
+def test_selected_region_does_not_expand_to_every_provider_region() -> None:
+    prompt = build_quote_prompt(
+        "Redis 3 个节点。",
+        {
+            "pricing_scenarios": ["on_demand"],
+            "utilization_percent": 100,
+            "cloud_provider": "tencent",
+            "preferred_region": "ap-chengdu",
+        },
+        relay_job_id="gpt-dddddddddddddddddddddddddddddddd",
+        submission_code="6",
+    )
+
+    assert "销售首选地域：ap-chengdu" in prompt
+    assert "ap-shanghai" not in prompt
+    assert "ap-singapore" not in prompt
+    assert "eu-frankfurt" not in prompt
 
 
 def test_default_comparison_prompt_lists_all_three_selected_scenarios() -> None:
@@ -709,7 +736,7 @@ def test_default_comparison_prompt_lists_all_three_selected_scenarios() -> None:
     assert "1 年预留" in prompt
     assert "3 年预留" in prompt
     assert "云厂商：微软 Azure（销售已选定，不得改换）" in prompt
-    assert "生成 Excel，并在销售报价页提供报价与下载链接；不发送企业微信群" in prompt
+    assert "交付：销售报价页与 Excel 下载链接" in prompt
 
 
 @pytest.mark.parametrize(
@@ -757,7 +784,8 @@ def test_every_quote_prompt_requires_excel_and_sales_page_delivery_only() -> Non
     )
 
     assert "官方报价链接" not in prompt
-    assert "生成 Excel，并在销售报价页提供报价与下载链接；不发送企业微信群" in prompt
+    assert "交付：销售报价页与 Excel 下载链接" in prompt
+    assert "不发送企业微信群" not in prompt
 
 
 def test_completion_markers_are_still_parsed_outside_the_browser_driver() -> None:

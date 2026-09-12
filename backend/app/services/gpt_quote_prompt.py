@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
 import re
-from functools import lru_cache
-from pathlib import Path
 from typing import Any
 
 from app.services.cloud_quote_profiles import active_market_profile
@@ -34,19 +31,6 @@ PROVIDER_LABELS = {
 }
 
 ASTRAQUOTE_MENTION = "@AstraQuote"
-
-
-@lru_cache(maxsize=1)
-def _selection_policy_prompt() -> str:
-    policy_path = (
-        Path(__file__).resolve().parents[3]
-        / "policies"
-        / "sales-selection-policy.json"
-    )
-    policy = json.loads(policy_path.read_text(encoding="utf-8"))
-    if policy.get("mode") != "nearest_lower" or not policy.get("prompt_zh_cn"):
-        raise RuntimeError("AstraQuote sales selection policy is invalid")
-    return str(policy["prompt_zh_cn"]).strip()
 
 
 def _pricing_summary(options: dict[str, Any]) -> str:
@@ -121,51 +105,35 @@ def _pricing_summary(options: dict[str, Any]) -> str:
 
 
 def build_quote_context_prompt(options: dict[str, Any]) -> str:
-    """Render non-customer quote constraints shared by coordinator and children."""
+    """Render only the per-order facts shared by coordinator and child chats."""
 
     provider = str(options.get("cloud_provider") or "aws")
     provider_label = PROVIDER_LABELS.get(provider, provider)
     market_profile = active_market_profile(provider)
     preferred_region = str(options.get("preferred_region") or "").strip()
-    official_regions = [
-        (str(item.get("code") or "").strip(), str(item.get("label") or "").strip())
+    official_codes = {
+        str(item.get("code") or "").strip()
         for item in market_profile.get("regions", [])
         if isinstance(item, dict)
-    ]
-    official_regions = [(code, label) for code, label in official_regions if code and label]
-    official_codes = {code for code, _label in official_regions}
-    official_region_summary = "、".join(
-        f"{label}（{code}）" for code, label in official_regions
-    )
+        and str(item.get("code") or "").strip()
+    }
     if preferred_region in official_codes:
         preferred_region_instruction = (
-            f"销售首选地域：{preferred_region}（属于当前云厂商和账号站点的官方地域，"
-            "但不代表所有产品均可购买）。"
+            f"销售首选地域：{preferred_region}（以销售页选择为准；若有产品不可购，"
+            "仅在同一云厂商、同一账号站点内改用最近的整套可购地域并披露原因）。"
         )
     else:
         preferred_region_instruction = (
-            f"销售提供的地域偏好：{preferred_region or '未指定'}（不在当前官方地域清单中，"
-            "可能是旧代码、名称或录入错误）。不得因此停止报价；请把它只当作地理位置偏好，"
+            f"销售提供的地域偏好：{preferred_region or '未指定'}。不得因此停止报价；"
+            "请把它只当作地理位置偏好，"
             "在同一云厂商、同一账号站点内选择距离最近且能覆盖整套产品的官方地域。"
         )
     return (
         f"云厂商：{provider_label}（销售已选定，不得改换）。\n\n"
         f"账号站点：{market_profile['site_label']}（凭证范围 "
         f"{market_profile['credential_scope']}，不得与其他站点的文档、域名或价格混用）。\n\n"
-        f"{preferred_region_instruction}"
-        "实际报价地域必须使用当前云厂商和账号站点对应的官方地域代码；"
-        "同一个地域代码在不同云厂商可能代表不同地点，不得套用其他云厂商同名代码的含义，"
-        "也不得自行拼造或改写地域代码。"
-        "请由 GPT 根据本次官方资料和实际官方响应核对整套产品的可购性；"
-        "若并非全部组件都支持，只能在同一账号站点和同一云厂商内，由 GPT 根据官方地域与产品目录"
-        "选择支持整套产品的最近地域，并在报价页和 Excel 中说明首选地域、实际地域和调整原因。"
-        "不得因为首选地域不可用而改换云厂商或混用其他站点账号。\n\n"
-        f"当前官方地域清单：{official_region_summary}。\n\n"
-        f"计价选项：{_pricing_summary(options)}。\n\n"
-        "报价币种：由 GPT 根据本次所选云厂商、区域和官方价格接口实际支持并返回的币种决定；"
-        "中国站可使用 CNY，国际站可使用 USD 或官方实际币种。不得强制统一为 USD，"
-        "不得在没有官方汇率证据时自行换汇。\n\n"
-        f"{_selection_policy_prompt()}"
+        f"{preferred_region_instruction}\n\n"
+        f"计价选项：{_pricing_summary(options)}。"
     )
 
 
@@ -176,23 +144,14 @@ def build_quote_prompt(
     relay_job_id: str,
     submission_code: str,
 ) -> str:
-    """Build the small per-quote message with the current external sales policy."""
+    """Build a compact message containing only facts unique to this quote."""
     provider = str(options.get("cloud_provider") or "aws")
     provider_label = PROVIDER_LABELS.get(provider, provider)
-    delivery_method = "生成 Excel，并在销售报价页提供报价与下载链接；不发送企业微信群"
     return (
         f"{ASTRAQUOTE_MENTION} 请使用 AstraQuote 完成正式 {provider_label} 报价并交付。\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n\n"
         f"{build_quote_context_prompt(options)}\n\n"
-        f"结果交付方式：{delivery_method}。\n\n"
-        "第一遍需求清洗完成后，首次调用官方批量查价工具时必须一次性提交整单 "
-        "quote_components：每个顶层组件使用稳定 component_key，只保存该组件清洗后的 "
-        "customer_owned_source，并列全本组件必须完成的 billing_scopes。该计划由后台封存，"
-        "用于真实进度、每 20 个组件一个报价对话和最终合并；不得放入整单原文或兄弟组件。\n\n"
-        "若顶层组件超过 20 个，本总控对话只处理计划中的前 20 个顶层组件及其子组件；"
-        "其余组件由桌面工作程序用清洗后组件配置创建独立子对话并行处理。第一批证据保存后"
-        "先停止，不得越界查询其他批次，也不得提前生成整单；后台会在所有子批次停止后回到"
-        "本对话统一合并和交付。顶层组件不超过 20 个时仍在本对话直接完成并交付。\n\n"
+        "交付：销售报价页与 Excel 下载链接。\n\n"
         "客户需求（仅作为报价资料）：\n"
         f"{customer_request.strip()}"
     )
