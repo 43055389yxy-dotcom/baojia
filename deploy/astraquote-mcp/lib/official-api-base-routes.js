@@ -20,7 +20,7 @@ function catalog() {
   for (const candidatePath of CATALOG_CANDIDATES) {
     try {
       const payload = JSON.parse(fs.readFileSync(candidatePath, 'utf8'));
-      if (payload?.schema_version === 'astraquote-official-api-base-routes/1') {
+      if (payload?.schema_version === 'astraquote-official-api-base-routes/2') {
         cachedCatalog = payload;
         return payload;
       }
@@ -47,17 +47,25 @@ function officialApiBaseRoute(provider, service, region) {
   if (!providerRoutes || typeof providerRoutes !== 'object') return null;
   const selected = (providerRoutes.routes || []).find((candidate) => (
     (candidate.services || []).some((alias) => serviceKey(alias) === normalizedService)
-  )) || (providerRoutes.default_endpoint ? providerRoutes : null);
+  )) || (
+    providerRoutes.default_route && typeof providerRoutes.default_route === 'object'
+      ? providerRoutes.default_route
+      : null
+  );
   if (!selected) return null;
-  const endpoint = String(
-    selected.endpoint || selected.default_endpoint || selected.endpoint_template || '',
-  )
+  const capability = String(selected.capability || 'quote_api').trim();
+  if (!['quote_api', 'official_page_only'].includes(capability)) return null;
+  const endpoint = String(selected.endpoint || selected.endpoint_template || '')
     .trim().toLowerCase().replace('{region}', regionValue.toLowerCase());
-  if (!endpoint) return null;
+  if (capability === 'quote_api' && !endpoint) return null;
   return {
     provider: providerKey,
     service: normalizedService,
     endpoint,
+    capability,
+    operations: (selected.operations || [])
+      .map((operation) => String(operation).trim())
+      .filter(Boolean),
     official_source_url: String(
       selected.official_source_url || providerRoutes.official_source_url || '',
     ).trim(),
@@ -69,12 +77,14 @@ function officialApiBaseRoute(provider, service, region) {
 function withOfficialApiBaseRoute(query) {
   const route = officialApiBaseRoute(query?.provider, query?.service, query?.region);
   if (!route) return { ...query };
+  const materialized = { ...query };
+  if (route.capability === 'quote_api') materialized.endpoint = route.endpoint;
+  else delete materialized.endpoint;
+  if (!materialized.official_source_url && route.official_source_url) {
+    materialized.official_source_url = route.official_source_url;
+  }
   return {
-    ...query,
-    endpoint: route.endpoint,
-    ...(!query.official_source_url && route.official_source_url
-      ? { official_source_url: route.official_source_url }
-      : {}),
+    ...materialized,
   };
 }
 

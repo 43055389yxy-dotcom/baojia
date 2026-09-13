@@ -19,7 +19,9 @@ from app.services.mcp_v2_pricing import OfficialPricingService
         ("gcp", ["on_demand", "one_year_commitment", "three_year_commitment"]),
         ("tencent", ["on_demand", "one_month_subscription", "one_year_subscription"]),
         ("alibaba", ["on_demand", "one_month_subscription", "one_year_subscription"]),
+        ("alibaba_intl", ["on_demand", "one_month_subscription", "one_year_subscription"]),
         ("huawei", ["on_demand", "one_month_subscription", "one_year_subscription"]),
+        ("huawei_intl", ["on_demand", "one_month_subscription", "one_year_subscription"]),
         ("baidu", ["on_demand", "one_month_subscription", "one_year_subscription"]),
         ("volcengine", ["on_demand", "one_month_subscription", "one_year_subscription"]),
         ("ctyun", ["on_demand", "one_month_subscription", "one_year_subscription"]),
@@ -168,6 +170,32 @@ def test_sales_region_catalog_is_scoped_to_the_configured_provider_site() -> Non
     assert payload["market_profile"] == "alibaba-cn"
     assert payload["regions"]
     assert all(item["code"] and item["label"] for item in payload["regions"])
+
+
+@pytest.mark.parametrize(
+    ("provider", "profile", "site_label", "region"),
+    [
+        ("alibaba_intl", "alibaba-intl", "阿里云国际站", "ap-southeast-1"),
+        ("huawei_intl", "huawei-intl", "华为云国际站", "ap-southeast-3"),
+    ],
+)
+def test_sales_region_catalog_keeps_international_accounts_separate_from_china(
+    provider: str, profile: str, site_label: str, region: str
+) -> None:
+    response = TestClient(aws_main.app).get(
+        f"/api/quote-relay/providers/{provider}/regions"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["market_profile"] == profile
+    assert payload["site_label"] == site_label
+    assert payload["credential_scope"] == profile
+    assert region in {item["code"] for item in payload["regions"]}
+    assert all(
+        not item["code"].startswith("cn-") or item["code"] == "cn-hongkong"
+        for item in payload["regions"]
+    )
 
 
 @pytest.mark.parametrize(

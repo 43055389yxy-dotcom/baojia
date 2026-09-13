@@ -29,7 +29,15 @@ test('basic routes support fixed and region-scoped official hosts', () => {
   );
   assert.equal(
     officialApiBaseRoute('alibaba', 'ecs', 'cn-hangzhou').endpoint,
-    'ecs.cn-hangzhou.aliyuncs.com',
+    'business.aliyuncs.com',
+  );
+  assert.equal(
+    officialApiBaseRoute('alibaba_intl', 'ecs', 'ap-southeast-1').endpoint,
+    'business.ap-southeast-1.aliyuncs.com',
+  );
+  assert.equal(
+    officialApiBaseRoute('huawei_intl', 'ecs', 'ap-southeast-3').endpoint,
+    'bss-intl.myhuaweicloud.com',
   );
   assert.equal(
     officialApiBaseRoute('volcengine', 'ecs', 'cn-beijing').endpoint,
@@ -50,18 +58,36 @@ test('unknown services keep a supplied official endpoint and do not invent one',
   assert.equal(missing.endpoint, undefined);
 });
 
-test('the base route catalog cannot store paths, parameters, response shapes, or prices', () => {
+test('official-page-only routes clear caller-guessed API hosts', () => {
+  const route = officialApiBaseRoute('baidu', 'tsdb', 'bj');
+  const query = withOfficialApiBaseRoute({
+    provider: 'baidu', service: 'tsdb', region: 'bj', endpoint: 'guessed.example.com',
+  });
+
+  assert.equal(route.capability, 'official_page_only');
+  assert.equal(route.endpoint, '');
+  assert.equal(query.endpoint, undefined);
+  assert.equal(query.official_source_url, 'https://cloud.baidu.com/product-price/tsdb.html');
+});
+
+test('the route catalog stores only stable capabilities and operation identities', () => {
   const route = officialApiBaseRoute('ctyun', 'ecs', '200000001790');
   const serialized = JSON.stringify(route);
   const catalog = JSON.parse(fs.readFileSync(
     path.resolve(__dirname, '../../../policies/official-api-base-routes.json'), 'utf8',
   ));
 
-  assert.doesNotMatch(serialized, /path|action|parameter|response|price/i);
+  assert.ok(serialized.length > 0);
+  assert.ok(Object.keys(route).every((key) => [
+    'provider', 'service', 'endpoint', 'capability', 'operations',
+    'official_source_url', 'catalog_checked_at',
+  ].includes(key)));
   for (const provider of Object.values(catalog.providers)) {
-    for (const entry of provider.routes || []) {
+    const entries = [provider.default_route, ...(provider.routes || [])].filter(Boolean);
+    for (const entry of entries) {
       assert.ok(Object.keys(entry).every((key) => [
-        'services', 'endpoint', 'endpoint_template', 'official_source_url',
+        'services', 'capability', 'endpoint', 'endpoint_template', 'operations',
+        'official_source_url',
       ].includes(key)));
     }
   }

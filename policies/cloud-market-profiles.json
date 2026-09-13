@@ -192,6 +192,25 @@
         }
       }
     },
+    "alibaba_intl": {
+      "default_profile": "alibaba-intl",
+      "profiles": {
+        "alibaba-intl": {
+          "site_label": "阿里云国际站",
+          "market_scope": "international_site",
+          "credential_scope": "alibaba-intl",
+          "currency_policy": "official_response",
+          "official_source_url": "https://www.alibabacloud.com/help/en/user-center/developer-reference/api-bssopenapi-2023-09-30-endpoint",
+          "official_price_page_hosts": ["alibabacloud.com", "aliyun.com"],
+          "pricing_scenarios": [
+            {"key": "on_demand", "label": "按量付费", "term_months": null},
+            {"key": "one_month_subscription", "label": "包月", "term_months": 1},
+            {"key": "one_year_subscription", "label": "包年（1 年）", "term_months": 12}
+          ],
+          "regions": [["cn-hongkong", "中国香港"], ["ap-southeast-1", "新加坡"], ["ap-southeast-3", "马来西亚吉隆坡"], ["ap-southeast-5", "印度尼西亚雅加达"], ["ap-southeast-6", "菲律宾马尼拉"], ["ap-southeast-7", "泰国曼谷"], ["ap-southeast-8", "马来西亚柔佛州"], ["ap-northeast-1", "日本东京"], ["ap-northeast-2", "韩国首尔"], ["eu-central-1", "德国法兰克福"], ["eu-west-1", "英国伦敦"], ["eu-west-2", "法国巴黎"], ["us-east-1", "美国弗吉尼亚"], ["us-west-1", "美国硅谷"], ["me-east-1", "阿联酋迪拜"], ["me-central-1", "沙特利雅得"], ["na-south-1", "墨西哥"], ["sa-east-1", "巴西圣保罗"]]
+        }
+      }
+    },
     "huawei": {
       "default_profile": "huawei-cn",
       "profiles": {
@@ -208,6 +227,25 @@
             {"key": "one_year_subscription", "label": "包年（1 年）", "term_months": 12}
           ],
           "regions": [["cn-north-1", "华北-北京一"], ["cn-north-4", "华北-北京四"], ["cn-north-9", "华北-乌兰察布一"], ["cn-north-11", "华北-乌兰察布-汽车一"], ["cn-north-12", "华北三"], ["cn-east-2", "华东-上海二"], ["cn-east-3", "华东-上海一"], ["cn-east-4", "华东二"], ["cn-east-5", "华东-青岛"], ["cn-south-1", "华南-广州"], ["cn-south-4", "华南-广州-友好用户环境"], ["cn-southwest-2", "西南-贵阳一"], ["ap-southeast-1", "中国香港"], ["ap-southeast-2", "泰国曼谷"], ["ap-southeast-3", "新加坡"], ["ap-southeast-4", "印度尼西亚雅加达"], ["ap-southeast-5", "菲律宾马尼拉"], ["me-east-1", "沙特利雅得"], ["af-north-1", "埃及开罗"], ["af-south-1", "南非约翰内斯堡"], ["na-mexico-1", "墨西哥城一"], ["la-north-2", "墨西哥城二"], ["la-south-2", "智利圣地亚哥"], ["sa-brazil-1", "巴西圣保罗"], ["tr-west-1", "土耳其伊斯坦布尔"]]
+        }
+      }
+    },
+    "huawei_intl": {
+      "default_profile": "huawei-intl",
+      "profiles": {
+        "huawei-intl": {
+          "site_label": "华为云国际站",
+          "market_scope": "international_site",
+          "credential_scope": "huawei-intl",
+          "currency_policy": "official_response",
+          "official_source_url": "https://support.huaweicloud.com/intl/en-us/api-bpconsole/bcloud_01001.html",
+          "official_price_page_hosts": ["huaweicloud.com", "support.huaweicloud.com"],
+          "pricing_scenarios": [
+            {"key": "on_demand", "label": "按需计费", "term_months": null},
+            {"key": "one_month_subscription", "label": "包月", "term_months": 1},
+            {"key": "one_year_subscription", "label": "包年（1 年）", "term_months": 12}
+          ],
+          "regions": [["ap-southeast-1", "中国香港"], ["ap-southeast-2", "泰国曼谷"], ["ap-southeast-3", "新加坡"], ["ap-southeast-4", "印度尼西亚雅加达"], ["ap-southeast-5", "菲律宾马尼拉"], ["me-east-1", "沙特利雅得"], ["af-north-1", "埃及开罗"], ["af-south-1", "南非约翰内斯堡"], ["na-mexico-1", "墨西哥城一"], ["la-north-2", "墨西哥城二"], ["la-south-2", "智利圣地亚哥"], ["sa-brazil-1", "巴西圣保罗"], ["tr-west-1", "土耳其伊斯坦布尔"]]
         }
       }
     },

@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from app.services.mcp_v2_pricing import (
+    AlibabaInternationalPriceQuery,
     AlibabaPriceQuery,
     AzurePriceQuery,
     BaiduPriceQuery,
@@ -12,6 +13,7 @@ from app.services.mcp_v2_pricing import (
     CtyunPriceQuery,
     GcpPriceQuery,
     GetPricesRequest,
+    HuaweiInternationalPriceQuery,
     HuaweiPriceQuery,
     OciPriceQuery,
     OfficialPricingService,
@@ -71,6 +73,89 @@ def test_rate_candidate_rejects_missing_or_non_iso_currency() -> None:
     )
     assert candidate is not None
     assert candidate["currency"] == "CNY"
+
+
+@pytest.mark.parametrize(
+    ("query_type", "provider", "service", "region", "expected_endpoint"),
+    [
+        (
+            AlibabaInternationalPriceQuery,
+            "alibaba_intl",
+            "ecs",
+            "ap-southeast-1",
+            "business.ap-southeast-1.aliyuncs.com",
+        ),
+        (
+            HuaweiInternationalPriceQuery,
+            "huawei_intl",
+            "ecs",
+            "ap-southeast-3",
+            "bss-intl.myhuaweicloud.com",
+        ),
+    ],
+)
+def test_international_market_queries_use_their_own_endpoint_and_credentials(
+    query_type: type[Any],
+    provider: str,
+    service: str,
+    region: str,
+    expected_endpoint: str,
+) -> None:
+    authenticated = _AuthenticatedRecorder([{"result": {"items": []}}])
+    service_client = OfficialPricingService(
+        _UnusedAwsExecutor(),
+        authenticated_request=authenticated,
+        provider_credentials={
+            provider: {"access_key_id": "configured", "secret_access_key": "configured"}
+        },
+    )
+    query = query_type(
+        query_id=f"{provider}-catalog",
+        service=service,
+        action="QueryProductList" if provider == "alibaba_intl" else "",
+        version="2017-12-14" if provider == "alibaba_intl" else None,
+        region=region,
+        method="GET" if provider == "huawei_intl" else "POST",
+        path="/v2/bills/ratings/on-demand-resources"
+        if provider == "huawei_intl"
+        else "/",
+        response_items_path="result.items",
+        item_id_paths=["sku"],
+    )
+
+    service_client.get_prices(GetPricesRequest(queries=[query]))
+
+    assert authenticated.calls[0].provider == provider
+    assert authenticated.calls[0].endpoint == expected_endpoint
+
+
+def test_official_page_only_route_stops_before_credentials_or_transport() -> None:
+    authenticated = _AuthenticatedRecorder([])
+    service = OfficialPricingService(
+        _UnusedAwsExecutor(),
+        authenticated_request=authenticated,
+        provider_credentials={
+            "baidu": {"access_key_id": "configured", "secret_access_key": "configured"}
+        },
+    )
+    result = service.get_prices(
+        GetPricesRequest(
+            queries=[
+                BaiduPriceQuery(
+                    query_id="baidu-rtc-price",
+                    service="rtc",
+                    region="bj",
+                    method="GET",
+                    path="/v1/pricing",
+                    official_source_url="https://cloud.baidu.com/product-price/rtc.html",
+                )
+            ]
+        )
+    )["results"][0]
+
+    assert result["code"] == "official_price_page_required"
+    assert result["error_category"] == "official_api_unavailable"
+    assert authenticated.calls == []
 
 
 @pytest.mark.parametrize(
@@ -465,7 +550,7 @@ def test_authenticated_cloud_query_can_omit_a_cataloged_base_route() -> None:
         region="cn-hangzhou",
     )
 
-    assert query.endpoint == "ecs.cn-hangzhou.aliyuncs.com"
+    assert query.endpoint == "business.aliyuncs.com"
 
 
 def test_unknown_authenticated_service_without_endpoint_returns_a_scoped_route_failure() -> None:

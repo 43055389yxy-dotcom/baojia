@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from app.services.mcp_v2_pricing import (
+    AlibabaInternationalPriceQuery,
     AlibabaPriceQuery,
     BaiduPriceQuery,
     TencentPriceQuery,
@@ -111,6 +112,24 @@ def test_alibaba_rpc_request_never_invents_a_region_parameter() -> None:
     params = recorder.calls[0][2]["params"]
     assert "RegionId" not in params
     assert "Region" not in params
+
+
+def test_international_provider_uses_the_family_signer_and_direct_network() -> None:
+    recorder = _RequestRecorder(_Response({"Success": True}))
+    client = OfficialCloudApiClient(_credentials("alibaba_intl"), request=recorder)
+    query = AlibabaInternationalPriceQuery(
+        query_id="bss-intl-products",
+        service="ecs",
+        action="QueryProductList",
+        version="2017-12-14",
+        region="ap-southeast-1",
+    )
+
+    client.execute(query)
+
+    _, url, options = recorder.calls[0]
+    assert url == "https://business.ap-southeast-1.aliyuncs.com/"
+    assert options["trust_env"] is False
 
 
 def test_official_error_is_structured_before_http_raise_and_never_leaks_signed_url() -> None:

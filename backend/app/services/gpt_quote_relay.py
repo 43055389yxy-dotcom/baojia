@@ -78,12 +78,6 @@ PUBLIC_FAILURE_CATEGORIES = {
     "response_schema",
     "official_api_error",
 }
-SALES_CACHE_FALLBACK_NOTICE = (
-    "销售提示：官方价格接口临时不可用，部分价格采用带时间戳的最近官方价格快照；"
-    "建议发送客户前再次确认。"
-)
-
-
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -1251,8 +1245,6 @@ class GptQuoteRelayStore:
             "unpriced_components": public_unpriced,
             "scenarios": public_scenarios,
         }
-        if value.get("pricing_notice"):
-            public_result["pricing_notice"] = SALES_CACHE_FALLBACK_NOTICE
         return public_result
 
     @staticmethod
@@ -1370,7 +1362,11 @@ class GptQuoteRelayStore:
                 else:
                     engine_order = (
                         preferred,
-                        *(candidate for candidate in self.enabled_engines if candidate != preferred),
+                        *(
+                            candidate
+                            for candidate in self.enabled_engines
+                            if candidate != preferred
+                        ),
                     )
                     routed_engine = ""
                     for candidate in engine_order:

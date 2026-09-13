@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.18.0';
+const VERSION = '3.19.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -33,7 +33,8 @@ const componentKey = z.string().regex(/^cmp_[A-Za-z0-9_-]{4,76}$/);
 const factId = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,79}$/);
 const cloudProvider = z.enum([
   'aws', 'azure', 'oci', 'gcp',
-  'tencent', 'alibaba', 'huawei', 'baidu', 'volcengine', 'ctyun',
+  'tencent', 'alibaba', 'alibaba_intl', 'huawei', 'huawei_intl',
+  'baidu', 'volcengine', 'ctyun',
 ]);
 
 const describeServiceInput = z.object({ service_code: serviceCode }).strict();
@@ -183,7 +184,9 @@ const authenticatedCloudPriceQuery = (provider) => z.object({
 
 const tencentPriceQuery = authenticatedCloudPriceQuery('tencent');
 const alibabaPriceQuery = authenticatedCloudPriceQuery('alibaba');
+const alibabaInternationalPriceQuery = authenticatedCloudPriceQuery('alibaba_intl');
 const huaweiPriceQuery = authenticatedCloudPriceQuery('huawei');
+const huaweiInternationalPriceQuery = authenticatedCloudPriceQuery('huawei_intl');
 const baiduPriceQuery = authenticatedCloudPriceQuery('baidu');
 const volcenginePriceQuery = authenticatedCloudPriceQuery('volcengine');
 const ctyunPriceQuery = authenticatedCloudPriceQuery('ctyun');
@@ -195,7 +198,9 @@ const priceQuery = z.discriminatedUnion('provider', [
   gcpPriceQuery,
   tencentPriceQuery,
   alibabaPriceQuery,
+  alibabaInternationalPriceQuery,
   huaweiPriceQuery,
+  huaweiInternationalPriceQuery,
   baiduPriceQuery,
   volcenginePriceQuery,
   ctyunPriceQuery,

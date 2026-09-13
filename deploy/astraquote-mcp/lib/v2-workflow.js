@@ -2300,7 +2300,8 @@ class AstraQuoteV2Workflow {
 
   validatePriceEvidence(input, priceBatch) {
     const signedCatalogProviders = new Set([
-      'tencent', 'alibaba', 'huawei', 'baidu', 'volcengine', 'ctyun',
+      'tencent', 'alibaba', 'alibaba_intl', 'huawei', 'huawei_intl',
+      'baidu', 'volcengine', 'ctyun',
     ]);
     const priceResults = new Map(
       (priceBatch.result.results || []).map((result) => [result.query_id, result]),
@@ -2480,7 +2481,8 @@ class AstraQuoteV2Workflow {
     );
     const violations = [];
     const signedCatalogProviders = new Set([
-      'tencent', 'alibaba', 'huawei', 'baidu', 'volcengine', 'ctyun',
+      'tencent', 'alibaba', 'alibaba_intl', 'huawei', 'huawei_intl',
+      'baidu', 'volcengine', 'ctyun',
     ]);
     for (const component of input.zero_cost_services || []) {
       const source = component.official_evidence?.source;

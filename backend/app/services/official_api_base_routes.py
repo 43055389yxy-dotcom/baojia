@@ -13,7 +13,7 @@ _SAFE_REGION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,79}$")
 def _catalog() -> dict[str, Any]:
     path = Path(__file__).resolve().parents[3] / "policies" / "official-api-base-routes.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != "astraquote-official-api-base-routes/1":
+    if payload.get("schema_version") != "astraquote-official-api-base-routes/2":
         raise RuntimeError("AstraQuote official API base-route catalog is invalid")
     return payload
 
@@ -24,12 +24,11 @@ def _service_key(value: str) -> str:
 
 def official_api_base_route(
     provider: str, service: str, region: str
-) -> dict[str, str] | None:
-    """Return only a verified official hostname for a provider service.
+) -> dict[str, Any] | None:
+    """Resolve a verified pricing capability for one provider/site/service.
 
-    Paths, actions, parameters, response shapes and rates deliberately remain
-    live-query inputs.  This prevents the old detailed-route cache from growing
-    back while still stopping callers from inventing provider hostnames.
+    Stable official endpoint and operation identities live in the registry.
+    Product configuration and business parameter values remain quote-local.
     """
 
     provider_key = str(provider).strip().casefold()
@@ -48,8 +47,8 @@ def official_api_base_route(
         if service_key in aliases:
             selected = candidate
             break
-    if selected is None and provider_routes.get("default_endpoint"):
-        selected = provider_routes
+    if selected is None and isinstance(provider_routes.get("default_route"), dict):
+        selected = provider_routes["default_route"]
     if selected is None:
         return None
     endpoint = str(
@@ -58,7 +57,10 @@ def official_api_base_route(
     endpoint_template = str(selected.get("endpoint_template") or "").strip().casefold()
     if not endpoint and endpoint_template:
         endpoint = endpoint_template.replace("{region}", region_value.casefold())
-    if not endpoint:
+    capability = str(selected.get("capability") or "quote_api").strip()
+    if capability not in {"quote_api", "official_page_only"}:
+        return None
+    if capability == "quote_api" and not endpoint:
         return None
     source_url = str(
         selected.get("official_source_url")
@@ -69,6 +71,12 @@ def official_api_base_route(
         "provider": provider_key,
         "service": service_key,
         "endpoint": endpoint,
+        "capability": capability,
+        "operations": [
+            str(operation)
+            for operation in (selected.get("operations") or [])
+            if str(operation).strip()
+        ],
         "official_source_url": source_url,
         "catalog_checked_at": str(_catalog().get("catalog_checked_at") or ""),
     }

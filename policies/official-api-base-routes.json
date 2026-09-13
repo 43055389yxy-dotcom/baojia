@@ -1,52 +1,80 @@
 {
-  "schema_version": "astraquote-official-api-base-routes/1",
+  "schema_version": "astraquote-official-api-base-routes/2",
   "catalog_checked_at": "2026-09-13",
   "providers": {
     "tencent": {
       "routes": [
-        {"services": ["cvm"], "endpoint": "cvm.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/213/15728"},
-        {"services": ["cbs"], "endpoint": "cbs.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/362/16311"},
-        {"services": ["redis", "tencentdbredis"], "endpoint": "redis.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/239/20026"},
-        {"services": ["cdb", "mysql"], "endpoint": "cdb.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/236/18576"},
-        {"services": ["postgres", "postgresql"], "endpoint": "postgres.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/409/16771"},
-        {"services": ["apigateway"], "endpoint": "apigateway.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/628/14893"},
-        {"services": ["es", "elasticsearch"], "endpoint": "es.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/845/30620"},
-        {"services": ["tdmq", "rocketmq"], "endpoint": "tdmq.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/1493/96013"},
-        {"services": ["scf", "function"], "endpoint": "scf.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/583/17234"},
-        {"services": ["clb"], "endpoint": "clb.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/214/30689"}
+        {"services": ["cvm", "ecs", "compute"], "capability": "quote_api", "endpoint": "cvm.tencentcloudapi.com", "operations": ["InquiryPriceRunInstances"], "official_source_url": "https://cloud.tencent.com/document/product/213/15728"},
+        {"services": ["cbs", "disk", "blockstorage"], "capability": "quote_api", "endpoint": "cbs.tencentcloudapi.com", "operations": ["InquiryPriceCreateDisks"], "official_source_url": "https://cloud.tencent.com/document/product/362/16311"},
+        {"services": ["redis", "tencentdbredis"], "capability": "quote_api", "endpoint": "redis.tencentcloudapi.com", "operations": ["InquiryPriceCreateInstance"], "official_source_url": "https://cloud.tencent.com/document/product/239/20026"},
+        {"services": ["cdb", "mysql", "tencentdbmysql"], "capability": "quote_api", "endpoint": "cdb.tencentcloudapi.com", "operations": ["InquiryPrice"], "official_source_url": "https://cloud.tencent.com/document/product/236/18576"},
+        {"services": ["postgres", "postgresql", "tencentdbpostgresql"], "capability": "quote_api", "endpoint": "postgres.tencentcloudapi.com", "operations": ["InquiryPriceCreateDBInstances"], "official_source_url": "https://cloud.tencent.com/document/product/409/16771"},
+        {"services": ["apigateway"], "capability": "official_page_only", "official_source_url": "https://buy.cloud.tencent.com/price"},
+        {"services": ["es", "elasticsearch"], "capability": "official_page_only", "official_source_url": "https://buy.cloud.tencent.com/price"},
+        {"services": ["tdmq", "rocketmq"], "capability": "quote_api", "endpoint": "tdmq.tencentcloudapi.com", "operations": ["DescribeRocketMQProductSKUs"], "official_source_url": "https://cloud.tencent.com/document/product/1493/96013"},
+        {"services": ["ckafka", "kafka"], "capability": "quote_api", "endpoint": "ckafka.tencentcloudapi.com", "operations": ["InquireCkafkaPrice"], "official_source_url": "https://cloud.tencent.com/document/product/597/52658"},
+        {"services": ["scf", "function", "serverless"], "capability": "official_page_only", "official_source_url": "https://buy.cloud.tencent.com/price"},
+        {"services": ["clb", "loadbalancer"], "capability": "quote_api", "endpoint": "clb.tencentcloudapi.com", "operations": ["InquiryPriceCreateLoadBalancer"], "official_source_url": "https://cloud.tencent.com/document/product/214/30689"},
+        {"services": ["eip", "nat", "natgateway", "vpc", "sharedbandwidth"], "capability": "quote_api", "endpoint": "vpc.tencentcloudapi.com", "operations": ["InquiryPriceAllocateAddresses"], "official_source_url": "https://cloud.tencent.com/document/product/215/67548"},
+        {"services": ["cos", "objectstorage"], "capability": "official_page_only", "official_source_url": "https://cloud.tencent.com/document/product/436/6239"},
+        {"services": ["cdn", "ecdn"], "capability": "official_page_only", "official_source_url": "https://cloud.tencent.com/document/product/228/2949"},
+        {"services": ["cfs", "filestorage"], "capability": "official_page_only", "official_source_url": "https://cloud.tencent.com/document/product/582/47382"},
+        {"services": ["tke", "kubernetes", "container"], "capability": "official_page_only", "official_source_url": "https://cloud.tencent.com/document/product/457/39806"},
+        {"services": ["waf", "cloudwaf"], "capability": "official_page_only", "official_source_url": "https://cloud.tencent.com/document/product/627/11730"},
+        {"services": ["tcr", "acr", "containerregistry", "cls", "log", "firewall"], "capability": "official_page_only", "official_source_url": "https://buy.cloud.tencent.com/price"}
       ]
     },
     "alibaba": {
+      "default_route": {"capability": "quote_api", "endpoint": "business.aliyuncs.com", "operations": ["QueryProductList", "DescribePricingModule", "GetPayAsYouGoPrice", "GetSubscriptionPrice"], "official_source_url": "https://api.aliyun.com/product/BssOpenApi"},
       "routes": [
-        {"services": ["bssopenapi", "business", "billing"], "endpoint": "business.aliyuncs.com", "official_source_url": "https://api.aliyun.com/product/BssOpenApi"},
-        {"services": ["ecs"], "endpoint_template": "ecs.{region}.aliyuncs.com", "official_source_url": "https://api.aliyun.com/product/Ecs"},
-        {"services": ["rds"], "endpoint_template": "rds.{region}.aliyuncs.com", "official_source_url": "https://api.aliyun.com/product/Rds"},
-        {"services": ["r-kvstore", "rkvstore", "redis"], "endpoint_template": "r-kvstore.{region}.aliyuncs.com", "official_source_url": "https://api.aliyun.com/product/R-kvstore"}
+        {"services": ["bssopenapi", "business", "billing"], "capability": "quote_api", "endpoint": "business.aliyuncs.com", "operations": ["QueryProductList", "DescribePricingModule", "GetPayAsYouGoPrice", "GetSubscriptionPrice"], "official_source_url": "https://api.aliyun.com/product/BssOpenApi"}
+      ]
+    },
+    "alibaba_intl": {
+      "default_route": {"capability": "quote_api", "endpoint": "business.ap-southeast-1.aliyuncs.com", "operations": ["QueryProductList", "DescribePricingModule", "GetPayAsYouGoPrice", "GetSubscriptionPrice"], "official_source_url": "https://www.alibabacloud.com/help/en/user-center/developer-reference/api-bssopenapi-2023-09-30-endpoint"},
+      "routes": [
+        {"services": ["bssopenapi", "business", "billing"], "capability": "quote_api", "endpoint": "business.ap-southeast-1.aliyuncs.com", "operations": ["QueryProductList", "DescribePricingModule", "GetPayAsYouGoPrice", "GetSubscriptionPrice"], "official_source_url": "https://www.alibabacloud.com/help/en/user-center/developer-reference/api-bssopenapi-2023-09-30-endpoint"}
       ]
     },
     "huawei": {
+      "default_route": {"capability": "quote_api", "endpoint": "bss.myhuaweicloud.com", "operations": ["list-rate", "on-demand-resources", "period-resources/subscribe-rate"], "official_source_url": "https://support.huaweicloud.com/api-bpconsole/zh-cn_topic_0079711804.html"},
       "routes": [
-        {"services": ["bss", "billing"], "endpoint": "bss.myhuaweicloud.com", "official_source_url": "https://support.huaweicloud.com/api-bpconsole/zh-cn_topic_0079711804.html"}
+        {"services": ["bss", "billing"], "capability": "quote_api", "endpoint": "bss.myhuaweicloud.com", "operations": ["list-rate", "on-demand-resources", "period-resources/subscribe-rate"], "official_source_url": "https://support.huaweicloud.com/api-bpconsole/zh-cn_topic_0079711804.html"}
+      ]
+    },
+    "huawei_intl": {
+      "default_route": {"capability": "quote_api", "endpoint": "bss-intl.myhuaweicloud.com", "operations": ["list-rate", "on-demand-resources", "period-resources/subscribe-rate"], "official_source_url": "https://support.huaweicloud.com/intl/en-us/api-bpconsole/bcloud_01001.html"},
+      "routes": [
+        {"services": ["bss", "billing"], "capability": "quote_api", "endpoint": "bss-intl.myhuaweicloud.com", "operations": ["list-rate", "on-demand-resources", "period-resources/subscribe-rate"], "official_source_url": "https://support.huaweicloud.com/intl/en-us/api-bpconsole/bcloud_01001.html"}
       ]
     },
     "baidu": {
       "routes": [
-        {"services": ["billing"], "endpoint": "billing.baidubce.com", "official_source_url": "https://cloud.baidu.com/doc/BILLING/index.html"},
-        {"services": ["bcc"], "endpoint_template": "bcc.{region}.baidubce.com", "official_source_url": "https://cloud.baidu.com/doc/BCC/index.html"}
+        {"services": ["billing"], "capability": "official_page_only", "official_source_url": "https://cloud.baidu.com/calculator.html"},
+        {"services": ["bcc", "ecs", "compute"], "capability": "quote_api", "endpoint_template": "bcc.{region}.baidubce.com", "operations": ["/v2/instance/price"], "official_source_url": "https://cloud.baidu.com/doc/BCC/index.html"},
+        {"services": ["tsdb"], "capability": "official_page_only", "official_source_url": "https://cloud.baidu.com/product-price/tsdb.html"},
+        {"services": ["vcr", "videoaudit", "imageaudit"], "capability": "official_page_only", "official_source_url": "https://cloud.baidu.com/product-price/vcr.html"},
+        {"services": ["rtc"], "capability": "official_page_only", "official_source_url": "https://cloud.baidu.com/product-price/rtc.html"},
+        {"services": ["doc", "documentservice"], "capability": "official_page_only", "official_source_url": "https://cloud.baidu.com/product-price/doc.html"},
+        {"services": ["speech", "asr", "tts"], "capability": "official_page_only", "official_source_url": "https://cloud.baidu.com/doc/AI_REFERENCE/s/Km3zhy4rj"},
+        {"services": ["bos", "objectstorage", "cdn", "cfs", "scs", "redis", "rds", "blb", "eip", "waf", "kafka"], "capability": "official_page_only", "official_source_url": "https://cloud.baidu.com/calculator.html"}
       ]
     },
     "volcengine": {
-      "default_endpoint": "open.volcengineapi.com",
-      "official_source_url": "https://www.volcengine.com/docs/6369/67269"
+      "routes": [
+        {"services": ["ecs", "compute", "ebs", "disk"], "capability": "quote_api", "endpoint": "open.volcengineapi.com", "operations": ["CalculatePriceV2"], "official_source_url": "https://www.volcengine.com/docs/6396/126164"},
+        {"services": ["rds", "mysql", "redis", "tos", "objectstorage", "cdn", "clb", "nat", "eip", "vke", "kafka", "waf", "es", "filestorage", "log"], "capability": "official_page_only", "official_source_url": "https://www.volcengine.com/pricing/calculator"}
+      ]
     },
     "ctyun": {
       "routes": [
-        {"services": ["ecs", "ctecs", "evs", "eip", "elb", "sbw"], "endpoint": "ctecs-global.ctapi.ctyun.cn", "official_source_url": "https://www.ctyun.cn/document/10026730/10044097"},
-        {"services": ["redis", "dcs", "dcs2"], "endpoint": "dcs2-global.ctapi.ctyun.cn", "official_source_url": "https://www.ctyun.cn/document/10029420/11030280"},
-        {"services": ["zos", "oss", "obs", "objectstorage"], "endpoint": "zos-global.ctapi.ctyun.cn", "official_source_url": "https://www.ctyun.cn/document/10026735/11093498"},
-        {"services": ["cbr", "backup"], "endpoint": "ctcbr-global.ctapi.ctyun.cn", "official_source_url": "https://www.ctyun.cn/document/10051003/10118058"},
-        {"services": ["cce", "ccse", "kubernetes"], "endpoint": "ccse-global.ctapi.ctyun.cn", "official_source_url": "https://www.ctyun.cn/document/10083472/11006032"},
-        {"services": ["lts", "log"], "endpoint": "ctlts-global.ctapi.ctyun.cn", "official_source_url": "https://www.ctyun.cn/document/10261471/11057680"}
+        {"services": ["ecs", "ctecs", "evs", "eip", "elb", "sbw"], "capability": "quote_api", "endpoint": "ctecs-global.ctapi.ctyun.cn", "operations": ["query-price"], "official_source_url": "https://www.ctyun.cn/document/10026730/10044097"},
+        {"services": ["redis", "dcs", "dcs2"], "capability": "quote_api", "endpoint": "dcs2-global.ctapi.ctyun.cn", "operations": ["query-price"], "official_source_url": "https://www.ctyun.cn/document/10029420/11030280"},
+        {"services": ["zos", "oss", "obs", "objectstorage"], "capability": "quote_api", "endpoint": "zos-global.ctapi.ctyun.cn", "operations": ["query-price"], "official_source_url": "https://www.ctyun.cn/document/10026735/11093498"},
+        {"services": ["cbr", "backup"], "capability": "quote_api", "endpoint": "ctcbr-global.ctapi.ctyun.cn", "operations": ["query-price"], "official_source_url": "https://www.ctyun.cn/document/10051003/10118058"},
+        {"services": ["cce", "ccse", "kubernetes"], "capability": "quote_api", "endpoint": "ccse-global.ctapi.ctyun.cn", "operations": ["query-price"], "official_source_url": "https://www.ctyun.cn/document/10083472/11006032"},
+        {"services": ["lts", "log"], "capability": "quote_api", "endpoint": "ctlts-global.ctapi.ctyun.cn", "operations": ["query-price"], "official_source_url": "https://www.ctyun.cn/document/10261471/11057680"},
+        {"services": ["rds", "mysql", "postgresql", "mongodb", "kafka", "rabbitmq", "rocketmq", "mqtt", "cdn", "waf", "security", "speech", "ai", "function", "crs", "registry"], "capability": "official_page_only", "official_source_url": "https://www.ctyun.cn/document/api"}
       ]
     }
   }

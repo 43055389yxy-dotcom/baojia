@@ -179,7 +179,7 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   assert.doesNotMatch(INSTRUCTIONS, /Calculator|import_estimate|模板映射/i);
 });
 
-test('get_prices accepts all ten provider-specific raw query shapes', async (t) => {
+test('get_prices accepts all twelve provider-site raw query shapes', async (t) => {
   const { client, server } = await connectedClient();
   t.after(async () => {
     await client.close();
@@ -217,10 +217,24 @@ test('get_prices accepts all ten provider-specific raw query shapes', async (t) 
           rate_fields: [{ unit_price_path: 'Price.TradePrice', currency_code: 'CNY' }],
         },
         {
+          provider: 'alibaba_intl', query_id: 'alibaba-intl-1',
+          service: 'ecs', action: 'QueryProductList', version: '2017-12-14',
+          region: 'ap-southeast-1', response_items_path: 'Data.ProductList.Product',
+          item_id_paths: ['ProductCode'],
+          rate_fields: [{ unit_price_path: 'TradePrice', currency_code: 'USD' }],
+        },
+        {
           provider: 'huawei', query_id: 'huawei-1', endpoint: 'bss.myhuaweicloud.com',
           service: 'bss', region: 'cn-north-4', path: '/v2/inquiry/price',
           response_items_path: 'official.items', item_id_paths: ['id'],
           rate_fields: [{ unit_price_path: 'amount', currency_code: 'CNY' }],
+        },
+        {
+          provider: 'huawei_intl', query_id: 'huawei-intl-1',
+          service: 'bss', region: 'ap-southeast-3', method: 'GET',
+          path: '/v2/bills/ratings/period-resources/subscribe-rate',
+          response_items_path: 'official.items', item_id_paths: ['id'],
+          rate_fields: [{ unit_price_path: 'amount', currency_code: 'USD' }],
         },
         {
           provider: 'baidu', query_id: 'baidu-1', endpoint: 'billing.baidubce.com',
@@ -244,7 +258,7 @@ test('get_prices accepts all ten provider-specific raw query shapes', async (t) 
     },
   });
   assert.equal(result.isError, undefined);
-  assert.equal(result.structuredContent.input.queries.length, 10);
+  assert.equal(result.structuredContent.input.queries.length, 12);
   assert.equal(result.structuredContent.input.queries[3].response_filters.displayName, 'Compute Engine');
 });
 

@@ -16,7 +16,8 @@ type ScenarioKey =
   | "three_year_commitment";
 type CloudProvider =
   | "aws" | "azure" | "oci" | "gcp"
-  | "tencent" | "alibaba" | "huawei" | "baidu" | "volcengine" | "ctyun";
+  | "tencent" | "alibaba" | "alibaba_intl" | "huawei" | "huawei_intl"
+  | "baidu" | "volcengine" | "ctyun";
 type QuoteEngine = "chatgpt";
 
 type PageScenarioCost = {
@@ -127,16 +128,18 @@ const PROVIDER_META: Record<CloudProvider, { label: string; mark: string; detail
   oci: { label: "Oracle Cloud", mark: "OCI", detail: "Oracle Infrastructure" },
   gcp: { label: "Google Cloud", mark: "GCP", detail: "Google Cloud Platform" },
   tencent: { label: "腾讯云", mark: "TC", detail: "Tencent Cloud" },
-  alibaba: { label: "阿里云", mark: "ALI", detail: "Alibaba Cloud" },
-  huawei: { label: "华为云", mark: "HW", detail: "Huawei Cloud" },
+  alibaba: { label: "阿里云中国站", mark: "ALI", detail: "Alibaba Cloud · 中国" },
+  alibaba_intl: { label: "阿里云国际站", mark: "ALI·G", detail: "Alibaba Cloud · Global" },
+  huawei: { label: "华为云中国站", mark: "HW", detail: "Huawei Cloud · 中国" },
+  huawei_intl: { label: "华为云国际站", mark: "HW·G", detail: "Huawei Cloud · Global" },
   baidu: { label: "百度智能云", mark: "BD", detail: "Baidu AI Cloud" },
   volcengine: { label: "火山引擎", mark: "VE", detail: "Volcengine" },
   ctyun: { label: "天翼云", mark: "CT", detail: "CTyun" },
 };
 
 const PROVIDER_ORDER: CloudProvider[] = [
-  "aws", "azure", "oci", "gcp", "tencent",
-  "alibaba", "huawei", "baidu", "volcengine", "ctyun",
+  "tencent", "alibaba", "huawei", "baidu", "volcengine", "ctyun",
+  "aws", "azure", "oci", "gcp", "alibaba_intl", "huawei_intl",
 ];
 
 function providerLabel(provider: CloudProvider | undefined) {
@@ -568,8 +571,8 @@ export default function SalesQuotePage() {
       </div>
       <header className="sales-portal-header">
         <a href="/sales" className="sales-portal-brand" aria-label="AstraQuote 云成本报价">
-          <span className="sales-brand-mark" aria-hidden="true"><i>A</i></span>
-          <div><strong>AstraQuote</strong><small>Multi-cloud pricing workspace</small></div>
+          <span className="sales-brand-mark" aria-hidden="true"><img src="/tontian-cloud-logo.png" alt="" /></span>
+          <div><strong>AstraQuote</strong><small>TONTIAN CLOUD</small></div>
         </a>
         <div className={`sales-portal-health ${ready ? "ready" : "waiting"}`}>
           <i aria-hidden="true" />
@@ -580,118 +583,119 @@ export default function SalesQuotePage() {
       {!job ? (
         <section className="sales-quote-workspace">
           <form className="sales-quote-form" onSubmit={submit}>
-            <fieldset className="sales-pricing-mode sales-provider-section">
-              <div className="sales-provider-heading">
-                <legend>选择云厂商</legend>
-                <span>01 / 04</span>
-              </div>
-              <div
-                className="sales-provider-select-wrap"
-                ref={providerPickerRef}
-                onMouseLeave={() => setProviderOpen(false)}
-              >
-                <button
-                  className="sales-provider-trigger"
-                  type="button"
-                  aria-controls="sales-provider-options"
-                  aria-expanded={providerOpen}
-                  aria-label={providerOpen ? "收起云厂商" : "展开云厂商"}
-                  onClick={() => setProviderOpen((current) => !current)}
+            <div className="sales-source-grid">
+              <fieldset className="sales-pricing-mode sales-provider-section">
+                <div className="sales-provider-heading">
+                  <legend>选择云厂商</legend>
+                  <span>01 / 04</span>
+                </div>
+                <div
+                  className="sales-provider-select-wrap"
+                  ref={providerPickerRef}
                 >
-                  <b className="sales-provider-mark" aria-hidden="true">{PROVIDER_META[cloudProvider].mark}</b>
-                  <span><strong>{PROVIDER_META[cloudProvider].label}</strong><small>{PROVIDER_META[cloudProvider].detail}</small></span>
-                  <i aria-hidden="true">⌄</i>
-                </button>
-                {providerOpen && <div className="sales-choice-row sales-provider-row" id="sales-provider-options" role="radiogroup">
-                  {PROVIDER_ORDER.map((value) => {
-                    const catalog = health?.provider_catalogs?.[value];
-                    const provider = PROVIDER_META[value];
-                    return (
-                      <label
-                        className={`${cloudProvider === value ? "selected" : ""} ${catalog?.available === false ? "unavailable" : ""}`}
-                        key={value}
-                      >
-                        <input
-                          type="radio"
-                          name="cloud-provider"
-                          value={value}
-                          checked={cloudProvider === value}
-                          onChange={() => chooseProvider(value)}
-                        />
-                        <b className="sales-provider-mark" aria-hidden="true">{provider.mark}</b>
-                        <span><strong>{provider.label}</strong><small>{provider.detail}</small></span>
-                        <i className="sales-choice-indicator" aria-hidden="true" />
-                        {catalog?.available === false && <em>待配置</em>}
-                      </label>
-                    );
-                  })}
-                </div>}
-              </div>
-            </fieldset>
+                  <button
+                    className="sales-provider-trigger"
+                    type="button"
+                    aria-controls="sales-provider-options"
+                    aria-expanded={providerOpen}
+                    aria-label={providerOpen ? "收起云厂商" : "展开云厂商"}
+                    onClick={() => setProviderOpen((current) => !current)}
+                  >
+                    <b className="sales-provider-mark" aria-hidden="true">{PROVIDER_META[cloudProvider].mark}</b>
+                    <span><strong>{PROVIDER_META[cloudProvider].label}</strong><small>{PROVIDER_META[cloudProvider].detail}</small></span>
+                    <i aria-hidden="true">⌄</i>
+                  </button>
+                  {providerOpen && <div className="sales-choice-row sales-provider-row" id="sales-provider-options" role="radiogroup">
+                    {PROVIDER_ORDER.map((value) => {
+                      const catalog = health?.provider_catalogs?.[value];
+                      const provider = PROVIDER_META[value];
+                      return (
+                        <label
+                          className={`${cloudProvider === value ? "selected" : ""} ${catalog?.available === false ? "unavailable" : ""}`}
+                          key={value}
+                        >
+                          <input
+                            type="radio"
+                            name="cloud-provider"
+                            value={value}
+                            checked={cloudProvider === value}
+                            onChange={() => chooseProvider(value)}
+                          />
+                          <b className="sales-provider-mark" aria-hidden="true">{provider.mark}</b>
+                          <span><strong>{provider.label}</strong><small>{provider.detail}</small></span>
+                          <i className="sales-choice-indicator" aria-hidden="true" />
+                          {catalog?.available === false && <em>待配置</em>}
+                        </label>
+                      );
+                    })}
+                  </div>}
+                </div>
+              </fieldset>
+
+              <section className="sales-region-section">
+                <div className="sales-section-heading">
+                  <div>
+                    <label htmlFor="sales-region">选择首选地域</label>
+                    <p>{regionCatalog?.site_label ?? "正在读取账号站点"} · 请选择业务部署地域</p>
+                  </div>
+                  <span>02 / 04</span>
+                </div>
+                <div className="sales-region-select-wrap" ref={regionPickerRef}>
+                  <input
+                    id="sales-region"
+                    value={selectedRegionLabel}
+                    readOnly
+                    onFocus={() => setRegionOpen(true)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") setRegionOpen(false);
+                      if (event.key === "ArrowDown") setRegionOpen(true);
+                    }}
+                    disabled={regionLoading}
+                    placeholder={regionLoading ? "正在加载官方地域…" : "请选择官方地域"}
+                    role="combobox"
+                    aria-autocomplete="none"
+                    aria-expanded={regionOpen}
+                    aria-controls="sales-region-options"
+                    required
+                  />
+                  <button
+                    className="sales-region-toggle"
+                    type="button"
+                    aria-label={regionOpen ? "收起地域" : "展开地域"}
+                    aria-expanded={regionOpen}
+                    onClick={() => setRegionOpen((current) => !current)}
+                    disabled={regionLoading}
+                  >⌄</button>
+                  {regionOpen && !regionLoading && (
+                    <div className="sales-region-options-panel" id="sales-region-options" role="listbox">
+                      {filteredRegions.length > 0 ? filteredRegions.map((item) => (
+                        <button
+                          type="button"
+                          role="option"
+                          aria-selected={preferredRegion === item.code}
+                          className={preferredRegion === item.code ? "selected" : ""}
+                          key={item.code}
+                          onClick={() => {
+                            setPreferredRegion(item.code);
+                            setRegionOpen(false);
+                          }}
+                        >
+                          <strong>{item.label}</strong>
+                        </button>
+                      )) : (
+                        <p>当前云厂商暂无可选官方地域，请联系管理员更新地域目录。</p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </section>
+            </div>
 
             {selectedCatalogUnavailable && (
               <p className="sales-catalog-note" role="status">
                 {selectedCatalog?.message ?? "所选云厂商的官方价格接口待配置。"}
               </p>
             )}
-
-            <section className="sales-region-section">
-              <div className="sales-section-heading">
-                <div>
-                  <label htmlFor="sales-region">选择首选地域</label>
-                  <p>{regionCatalog?.site_label ?? "正在读取账号站点"} · 请选择业务部署地域，系统会自动使用对应的官方地域编号</p>
-                </div>
-                <span>02 / 04</span>
-              </div>
-              <div className="sales-region-select-wrap" ref={regionPickerRef}>
-                <input
-                  id="sales-region"
-                  value={selectedRegionLabel}
-                  readOnly
-                  onFocus={() => setRegionOpen(true)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Escape") setRegionOpen(false);
-                    if (event.key === "ArrowDown") setRegionOpen(true);
-                  }}
-                  disabled={regionLoading}
-                  placeholder={regionLoading ? "正在加载官方地域…" : "请选择官方地域"}
-                  role="combobox"
-                  aria-autocomplete="none"
-                  aria-expanded={regionOpen}
-                  aria-controls="sales-region-options"
-                  required
-                />
-                <button
-                  className="sales-region-toggle"
-                  type="button"
-                  aria-label={regionOpen ? "收起地域" : "展开地域"}
-                  aria-expanded={regionOpen}
-                  onClick={() => setRegionOpen((current) => !current)}
-                  disabled={regionLoading}
-                >⌄</button>
-                {regionOpen && !regionLoading && (
-                  <div className="sales-region-options-panel" id="sales-region-options" role="listbox">
-                    {filteredRegions.length > 0 ? filteredRegions.map((item) => (
-                      <button
-                        type="button"
-                        role="option"
-                        aria-selected={preferredRegion === item.code}
-                        className={preferredRegion === item.code ? "selected" : ""}
-                        key={item.code}
-                        onClick={() => {
-                          setPreferredRegion(item.code);
-                          setRegionOpen(false);
-                        }}
-                      >
-                        <strong>{item.label}</strong>
-                      </button>
-                    )) : (
-                      <p>当前云厂商暂无可选官方地域，请联系管理员更新地域目录。</p>
-                    )}
-                  </div>
-                )}
-              </div>
-            </section>
 
             <div className="sales-form-grid">
               <section className="sales-requirement-panel">
@@ -708,10 +712,9 @@ export default function SalesQuotePage() {
                       setRequirement(event.target.value);
                       if (pageError) setPageError("");
                     }}
-                    placeholder={"1. Linux 云服务器 1 台，2 核 4GB\n2. 数据库 1 套，4 核 16GB"}
+                    placeholder={"每行一个组件，序号必须连续\n\n1. Linux 云服务器：3 台，每台 8 核 32 GiB，系统盘 100 GiB SSD，数据盘 500 GiB SSD，不配置快照。\n2. MySQL 数据库：1 套，16 核 64 GiB，主备高可用，2 TiB SSD 存储，备份保留 7 天。\n3. 对象存储：标准存储 10 TiB，每月 GET 请求 5000 万次、PUT 请求 500 万次，公网下行流量 1 TiB。"}
                   />
                   <div className="sales-field-foot">
-                    <span>每行一个组件，序号必须连续；每个对话最多 10 个，按 5 个一轮处理</span>
                     <b>{requirement.length.toLocaleString()} / 12,000</b>
                   </div>
                 </div>
@@ -753,17 +756,17 @@ export default function SalesQuotePage() {
                   <i aria-hidden="true">✓</i>
                   <span><strong>商业价格口径</strong><small>不抵扣免费额度、试用额度或账户赠送额度</small></span>
                 </div>
+
+                <div className="sales-form-submit-row">
+                  <button className="sales-button sales-button-primary sales-submit" type="submit" disabled={submitting || regionLoading || providerScenarios.length < 1 || !preferredRegion || selectedScenarios.size < 1 || requirement.trim().length < 3 || health?.status === "offline" || selectedCatalogUnavailable}>
+                    {submitting ? "正在提交…" : "提交报价"}
+                    <i aria-hidden="true">→</i>
+                  </button>
+                </div>
               </aside>
             </div>
 
             {pageError && <p className="sales-form-error" role="alert">{pageError}</p>}
-            <div className="sales-form-submit-row">
-              <span><i aria-hidden="true" /> 数据来自所选云厂商官方价格目录</span>
-              <button className="sales-button sales-button-primary sales-submit" type="submit" disabled={submitting || regionLoading || providerScenarios.length < 1 || !preferredRegion || selectedScenarios.size < 1 || requirement.trim().length < 3 || health?.status === "offline" || selectedCatalogUnavailable}>
-                {submitting ? "正在提交…" : "提交报价"}
-                <i aria-hidden="true">→</i>
-              </button>
-            </div>
           </form>
         </section>
       ) : (

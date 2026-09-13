@@ -26,7 +26,9 @@ test("sales portal keeps its internal job identity private and recovers active j
   assert.match(page, /Google Cloud/);
   assert.match(page, /腾讯云/);
   assert.match(page, /阿里云/);
+  assert.match(page, /阿里云国际站/);
   assert.match(page, /华为云/);
+  assert.match(page, /华为云国际站/);
   assert.match(page, /百度智能云/);
   assert.match(page, /火山引擎/);
   assert.match(page, /天翼云/);
@@ -67,7 +69,9 @@ test("sales portal requires consecutive numbered lines before submission", async
 
   assert.match(page, /validateNumberedComponentLines/);
   assert.match(page, /每行一个组件，序号必须连续/);
-  assert.match(page, /每个对话最多 10 个，按 5 个一轮处理/);
+  assert.match(page, /主备高可用/);
+  assert.match(page, /GET 请求 5000 万次/);
+  assert.doesNotMatch(page, /每个对话最多 10 个，按 5 个一轮处理/);
   assert.match(page, /1\. Linux 云服务器/);
   assert.match(validator, /split\("\\n"\)/);
   assert.match(validator, /第 \$\{lineNumber\} 行必须以连续序号/);
@@ -104,6 +108,7 @@ test("sales portal uses a structured workspace and grouped result actions", asyn
   const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
 
   assert.match(page, /sales-form-grid/);
+  assert.match(page, /<aside className="sales-options-panel">[\s\S]*?<div className="sales-form-submit-row">[\s\S]*?提交报价[\s\S]*?<\/aside>/s);
   assert.match(page, /sales-result-layout/);
   assert.match(page, /<table className="sales-result-table">/);
   assert.match(page, /sales-result-config/);
@@ -112,7 +117,19 @@ test("sales portal uses a structured workspace and grouped result actions", asyn
   assert.match(page, /sales-provider-mark/);
   assert.match(page, /providerOpen/);
   assert.match(page, /sales-provider-trigger/);
-  assert.match(page, /onMouseLeave=\{\(\) => setProviderOpen\(false\)\}/);
+  assert.match(page, /const PROVIDER_ORDER: CloudProvider\[\] = \[\s*"tencent", "alibaba", "huawei", "baidu", "volcengine", "ctyun",\s*"aws", "azure", "oci", "gcp", "alibaba_intl", "huawei_intl",\s*\]/s);
+  assert.match(page, /useState<CloudProvider>\("aws"\)/);
+  assert.doesNotMatch(page, /sales-provider-group|>国内云<|>国际云</);
+  assert.match(page, /sales-source-grid/);
+  assert.doesNotMatch(page, /sales-command-hero|sales-command-copy/);
+  assert.match(page, /TONTIAN CLOUD/);
+  assert.doesNotMatch(page, /TONTIAN CLOUD COMPUTING/);
+  assert.match(page, /\/tontian-cloud-logo\.png/);
+  assert.doesNotMatch(page, /ASTRAQUOTE INTELLIGENCE|官方多云价格工作台/);
+  assert.doesNotMatch(page, /云厂商与账号站点|官方价格实时核验|标准报价自动交付/);
+  assert.doesNotMatch(page, /数据来自所选云厂商官方价格目录/);
+  assert.doesNotMatch(page, /sales-command-metrics|sales-workflow-rail|sales-command-radar/);
+  assert.doesNotMatch(page, /onMouseLeave=\{\(\) => setProviderOpen\(false\)\}/);
   assert.match(page, /onClick=\{\(\) => setProviderOpen\(\(current\) => !current\)\}/);
   assert.doesNotMatch(page, /onPointerEnter/);
   assert.match(page, /aria-label=\{providerOpen \? "收起云厂商" : "展开云厂商"\}/);
@@ -144,13 +161,18 @@ test("sales portal uses a pale-blue glass theme and distinguishes queued work", 
   assert.match(page, /selectedRegionLabel/);
   assert.match(page, /value=\{selectedRegionLabel\}/);
   assert.doesNotMatch(page, /<small>\{item\.code\}<\/small>/);
-  assert.match(page, /系统会自动使用对应的官方地域编号/);
+  assert.doesNotMatch(page, /系统会自动使用对应的官方地域编号/);
   assert.doesNotMatch(page, /可保留当前输入/);
   assert.doesNotMatch(page, /<datalist/);
   assert.match(css, /grid-template-columns:\s*repeat\(4, minmax\(0, 1fr\)\)/);
-  assert.match(css, /\.sales-provider-row\s*\{[^}]*grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\)/s);
+  assert.match(css, /\.sales-provider-row\s*\{[^}]*position:\s*absolute[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/s);
+  assert.doesNotMatch(css, /\.sales-provider-row\s*\{[^}]*(?:max-height|overflow:\s*auto)/s);
   assert.match(css, /background:\s*rgba\(239, 249, 255, \.985\)/);
-  assert.match(css, /\.sales-region-options-panel\s*\{[^}]*position:\s*relative/s);
+  assert.match(css, /\.sales-source-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/s);
+  assert.match(css, /\.sales-region-options-panel\s*\{[^}]*position:\s*absolute/s);
+  assert.match(css, /@keyframes sales-dropdown-reveal/);
+  assert.match(css, /@keyframes sales-dropdown-option/);
+  assert.match(css, /\.sales-quote-form textarea::placeholder\s*\{[^}]*font-size:\s*13px/s);
   assert.match(css, /@keyframes sales-progress-indeterminate/);
   assert.match(css, /@keyframes sales-visual-breathe/);
   assert.match(css, /\.sales-job-progress-track\.is-indeterminate/);

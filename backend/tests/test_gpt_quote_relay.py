@@ -790,9 +790,7 @@ def test_sales_page_notice_is_fixed_and_never_forwards_internal_error_text() -> 
     )
 
     assert public_result is not None
-    assert public_result["pricing_notice"].startswith("销售提示：")
-    assert "internal-query-id" not in public_result["pricing_notice"]
-    assert "TooManyRequests" not in public_result["pricing_notice"]
+    assert "pricing_notice" not in public_result
 
 
 def test_retry_partial_rejects_non_partial_jobs(tmp_path: Path) -> None:
@@ -1148,7 +1146,8 @@ def test_continuation_prompt_reuses_identity_without_restoring_customer_text() -
     assert "build_estimate" not in prompt
 
 
-def test_partial_finalization_prompt_forces_official_page_completion_without_customer_text() -> None:
+def test_partial_finalization_prompt_forces_official_page_completion_without_customer_text(
+) -> None:
     prompt = build_quote_partial_finalization_prompt(
         relay_job_id="gpt-dddddddddddddddddddddddddddddddd",
         submission_code="6",

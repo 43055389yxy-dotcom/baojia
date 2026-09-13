@@ -128,8 +128,12 @@ class OfficialCloudApiClient:
                 code=f"{query.provider}_credentials_not_configured",
                 category="credentials",
             )
+        signer_provider = {
+            "alibaba_intl": "alibaba",
+            "huawei_intl": "huawei",
+        }.get(query.provider, query.provider)
         method, url, params, content, headers = getattr(
-            self, f"_prepare_{query.provider}"
+            self, f"_prepare_{signer_provider}"
         )(query, access_key, secret_key)
         request_options: dict[str, Any] = {
             "params": params or None,
@@ -137,6 +141,10 @@ class OfficialCloudApiClient:
             "headers": headers,
             "timeout": 30.0,
             "follow_redirects": False,
+            # The quote worker must reach official cloud endpoints directly.
+            # A malformed host proxy environment previously turned every
+            # provider into a false transport failure.
+            "trust_env": False,
         }
         if (
             query.provider == "baidu"

@@ -211,8 +211,16 @@ class AlibabaPriceQuery(AuthenticatedCatalogQuery):
     provider: Literal["alibaba"] = "alibaba"
 
 
+class AlibabaInternationalPriceQuery(AuthenticatedCatalogQuery):
+    provider: Literal["alibaba_intl"] = "alibaba_intl"
+
+
 class HuaweiPriceQuery(AuthenticatedCatalogQuery):
     provider: Literal["huawei"] = "huawei"
+
+
+class HuaweiInternationalPriceQuery(AuthenticatedCatalogQuery):
+    provider: Literal["huawei_intl"] = "huawei_intl"
 
 
 class BaiduPriceQuery(AuthenticatedCatalogQuery):
@@ -234,7 +242,9 @@ PriceQueryInput = Annotated[
     | GcpPriceQuery
     | TencentPriceQuery
     | AlibabaPriceQuery
+    | AlibabaInternationalPriceQuery
     | HuaweiPriceQuery
+    | HuaweiInternationalPriceQuery
     | BaiduPriceQuery
     | VolcenginePriceQuery
     | CtyunPriceQuery,
@@ -259,7 +269,9 @@ class GetPricesRequest(StrictModel):
 AUTHENTICATED_PROVIDERS = (
     "tencent",
     "alibaba",
+    "alibaba_intl",
     "huawei",
+    "huawei_intl",
     "baidu",
     "volcengine",
     "ctyun",
@@ -268,7 +280,9 @@ AUTHENTICATED_PROVIDERS = (
 PROVIDER_SOURCE_LABELS = {
     "tencent": "Tencent Cloud official API",
     "alibaba": "Alibaba Cloud official API",
+    "alibaba_intl": "Alibaba Cloud International official API",
     "huawei": "Huawei Cloud official API",
+    "huawei_intl": "Huawei Cloud International official API",
     "baidu": "Baidu AI Cloud official API",
     "volcengine": "Volcengine official API",
     "ctyun": "CTyun official API",
@@ -280,7 +294,15 @@ _PROVIDER_CREDENTIAL_ENV = {
         "ALIBABA_CLOUD_ACCESS_KEY_ID",
         "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
     ),
+    "alibaba_intl": (
+        "ALIBABA_INTL_ACCESS_KEY_ID",
+        "ALIBABA_INTL_ACCESS_KEY_SECRET",
+    ),
     "huawei": ("HUAWEICLOUD_ACCESS_KEY", "HUAWEICLOUD_SECRET_KEY"),
+    "huawei_intl": (
+        "HUAWEICLOUD_INTL_ACCESS_KEY",
+        "HUAWEICLOUD_INTL_SECRET_KEY",
+    ),
     "baidu": ("BAIDUCLOUD_ACCESS_KEY_ID", "BAIDUCLOUD_SECRET_ACCESS_KEY"),
     "volcengine": ("VOLCENGINE_ACCESS_KEY", "VOLCENGINE_SECRET_KEY"),
     "ctyun": ("CTYUN_ACCESS_KEY", "CTYUN_SECRET_KEY"),
@@ -289,7 +311,9 @@ _PROVIDER_CREDENTIAL_ENV = {
 _PROVIDER_OFFICIAL_SUFFIXES = {
     "tencent": (".tencentcloudapi.com",),
     "alibaba": (".aliyuncs.com",),
+    "alibaba_intl": (".aliyuncs.com",),
     "huawei": (".myhuaweicloud.com", ".huaweicloud.com"),
+    "huawei_intl": (".myhuaweicloud.com", ".huaweicloud.com"),
     "baidu": (".baidubce.com",),
     "volcengine": (".volcengineapi.com",),
     "ctyun": (".ctyun.cn",),
@@ -298,7 +322,9 @@ _PROVIDER_OFFICIAL_SUFFIXES = {
 _PROVIDER_OFFICIAL_SOURCE_SUFFIXES = {
     "tencent": (".tencentcloudapi.com", ".tencentcloud.com", ".tencent.com"),
     "alibaba": (".aliyuncs.com", ".aliyun.com"),
+    "alibaba_intl": (".aliyuncs.com", ".alibabacloud.com", ".aliyun.com"),
     "huawei": (".myhuaweicloud.com", ".huaweicloud.com"),
+    "huawei_intl": (".myhuaweicloud.com", ".huaweicloud.com"),
     "baidu": (".baidubce.com", ".baidu.com"),
     "volcengine": (".volcengineapi.com", ".volcengine.com"),
     "ctyun": (".ctyun.cn",),
@@ -843,6 +869,12 @@ class OfficialPricingService:
     def _get_authenticated_catalog(
         self, query: AuthenticatedCatalogQuery
     ) -> dict[str, Any]:
+        base_route = official_api_base_route(query.provider, query.service, query.region)
+        if base_route and base_route.get("capability") == "official_page_only":
+            raise OfficialCatalogQueryError(
+                "This service has no verified public quote API; use its official price page.",
+                code="official_price_page_required",
+            )
         if not query.endpoint:
             raise OfficialCatalogQueryError(
                 "No verified official API base route is configured for this service.",
@@ -973,6 +1005,8 @@ def _error_recovery_traits(exc: Exception) -> tuple[str, bool]:
     folded = f"{code} {message}"
     if code == "official_api_base_route_not_configured":
         return "route_not_found", True
+    if code == "official_price_page_required":
+        return "official_api_unavailable", False
     if any(token in folded for token in ("signaturedoesnotmatch", "invalidsignature")):
         return "request_signing", True
     if any(token in folded for token in ("timeout", "temporar", "connection", "tls", "ssl")):
@@ -1001,6 +1035,7 @@ def _recovery_plan(category: str, retryable: bool) -> dict[str, Any]:
         "request_signing": "revalidate_canonical_request_and_signing_contract",
         "authorization": "verify_cloud_read_and_billing_access",
         "credentials": "configure_official_api_credentials",
+        "official_api_unavailable": "use_verified_official_price_page",
         "official_api_error": "inspect_official_error_contract",
     }
     return {
