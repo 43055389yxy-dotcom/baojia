@@ -1008,13 +1008,12 @@ class CodexChatDesktop:
         quote.retry_visible_since = None
         messages = self._assistant_messages()
         generation_active = self._generation_active()
-        is_component_batch = quote.batch_count > 1 and quote.role != "merge"
         if len(messages) < quote.minimum_assistant_messages:
             if should_extend_quote_deadline(
                 deadline_reached=now >= quote.deadline,
                 generation_active=generation_active,
                 retry_visible=False,
-            ) and not quote.generation_grace_used and not is_component_batch:
+            ) and not quote.generation_grace_used:
                 quote.deadline = now + self.quote_timeout_seconds
                 quote.generation_grace_used = True
                 return None
@@ -1037,7 +1036,7 @@ class CodexChatDesktop:
             deadline_reached=now >= quote.deadline,
             generation_active=generation_active,
             retry_visible=False,
-        ) and not quote.generation_grace_used and not is_component_batch:
+        ) and not quote.generation_grace_used:
             quote.deadline = now + self.quote_timeout_seconds
             quote.generation_grace_used = True
             return None
@@ -1097,8 +1096,12 @@ class CodexChatDesktop:
 
     def cancel_quote(self, quote: Any) -> None:
         self._switch_to_quote(quote)
-        self._stop_generation()
-        self._click_text_control(("拒绝", "Deny", "取消", "Cancel"))
+        stopped = self._stop_generation()
+        denied = self._click_text_control(("拒绝", "Deny", "取消", "Cancel"))
+        if stopped or denied:
+            self._wait_until(lambda: not self._generation_active(), timeout=15)
+        elif self._generation_active():
+            raise RuntimeError("撤回报价后仍检测到生成任务，稍后继续停止。")
 
     def capture_debug(self, job_id: str) -> None:
         debug_directory = CODEX_STATE_PATH.parent / "debug"

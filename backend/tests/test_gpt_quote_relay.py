@@ -24,6 +24,7 @@ from app.services.gpt_quote_batches import (
     build_component_batch_continuation_prompt,
     build_component_batch_finalize_prompt,
     build_component_batch_prompt,
+    build_component_batches_deferred_retry_prompt,
     build_numbered_intake_batch_prompt,
     parse_numbered_component_lines,
     split_component_plan,
@@ -189,6 +190,8 @@ def test_component_batch_prompt_contains_only_that_batches_cleaned_sources() -> 
     assert "不要生成最终整单" in prompt
     assert "AWS 全球站" in prompt
     assert "ap-southeast-1" in prompt
+    assert "逐个组件" in prompt
+    assert "立即写入后台进度" in prompt
 
 
 def test_host_relay_uses_python39_compatible_datetime_api() -> None:
@@ -224,7 +227,7 @@ def test_relay_queues_and_hides_raw_customer_text(tmp_path: Path) -> None:
     internal = store.get(public["job_id"])
     assert internal["customer_request"] == "东京 EC2 两台，按需。"
     assert internal["continuation_attempts"] == 0
-    assert internal["policy_version"] == "2026-09-14-unified-v1"
+    assert internal["policy_version"] == "2026-09-14-unified-v2"
     assert internal["policy_snapshot"]["batching"]["components_per_wave"] == 5
     assert "prompt_directives" not in internal["policy_snapshot"]
     assert public["policy_version"] == internal["policy_version"]
@@ -930,7 +933,7 @@ def test_per_quote_prompt_contains_only_per_order_context() -> None:
     assert "quote_components" not in prompt
     assert "每 20 个组件" not in prompt
     assert "禁止为了满足目标而向上选择" not in prompt
-    assert "执行策略版本：2026-09-14-unified-v1" in prompt
+    assert "执行策略版本：2026-09-14-unified-v2" in prompt
 
     plugin_instructions = (
         Path(__file__).resolve().parents[2]
@@ -1189,12 +1192,20 @@ def test_every_automated_followup_explicitly_mentions_astraquote() -> None:
             batch_count=2,
             component_keys=["cmp_compute_0001"],
         ),
+        build_component_batches_deferred_retry_prompt(
+            **identity,
+            price_batch_id="aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            batch_count=2,
+            deferred_batches={0: ["cmp_compute_0001"], 1: ["cmp_database_0002"]},
+        ),
     ]
 
     assert all(prompt.startswith("@AstraQuote ") for prompt in prompts)
-    assert "relay_batch_index：1" in prompts[-1]
-    assert "relay_batch_count：2" in prompts[-1]
+    assert "relay_batch_index：1" in prompts[2]
+    assert "relay_batch_count：2" in prompts[2]
     assert "delivery_mode=save_component_batch" in prompts[1]
+    assert '"cmp_compute_0001"' in prompts[-1]
+    assert '"cmp_database_0002"' in prompts[-1]
 
 
 def test_codex_worker_keeps_continuation_and_receipt_integration() -> None:

@@ -27,9 +27,10 @@ from app.services.gpt_browser_navigation import (
 )
 from app.services.gpt_quote_batches import (
     WAVES_PER_CHAT,
-    build_component_batch_deferred_retry_prompt,
+    build_component_batch_continuation_prompt,
     build_component_batch_finalize_prompt,
     build_component_batch_prompt,
+    build_component_batches_deferred_retry_prompt,
     build_numbered_intake_batch_prompt,
 )
 from app.services.gpt_quote_prompt import (
@@ -183,6 +184,7 @@ class ActiveQuote:
     backend_settle_fingerprint: str = ""
     backend_settle_started_at: float = 0.0
     last_polled_at: float = 0.0
+    recovery_batch_indexes: tuple[int, ...] = ()
 
     @property
     def session_key(self) -> str:
@@ -363,6 +365,45 @@ def incomplete_component_keys(batch: dict[str, Any]) -> list[str]:
     ]
 
 
+def session_deferred_component_keys(
+    store: GptQuoteRelayStore,
+    active: ActiveQuote,
+) -> list[str]:
+    """Return only durable deferred keys that still belong to this wave."""
+
+    owned = set(active.component_keys)
+    if not owned:
+        batch = active_batch(store, active)
+        owned = set(batch.get("component_keys") or []) if batch else set()
+    record = store.get(active.job_id)
+    session = next(
+        (
+            item for item in (record.get("chat_sessions") or [])
+            if int(item.get("batch_index", -1)) == active.batch_index
+        ),
+        {},
+    )
+    return list(dict.fromkeys(
+        key for key in (session.get("deferred_component_keys") or [])
+        if key in owned
+    ))
+
+
+def component_recovery_plan(
+    batch: dict[str, Any],
+    deferred_component_keys: list[str],
+) -> tuple[list[str], str | None, list[str]]:
+    """Defer at most the current component and keep later components runnable."""
+
+    incomplete = incomplete_component_keys(batch)
+    deferred = [key for key in deferred_component_keys if key in incomplete]
+    fresh = [key for key in incomplete if key not in set(deferred)]
+    if not fresh:
+        return deferred, None, []
+    stalled_component = fresh[0]
+    return [*deferred, stalled_component], stalled_component, fresh[1:]
+
+
 def component_batch_state_fingerprint(
     batch: dict[str, Any],
     previous_progress: str = "",
@@ -406,13 +447,28 @@ def active_batch(
 def refresh_progress_deadline(store: GptQuoteRelayStore, active: ActiveQuote) -> None:
     """Only saved successful work extends the no-progress deadline."""
 
-    batch = active_batch(store, active) if active.batch_count > 1 else None
-    if batch is not None and active.role != "merge":
-        fingerprint = batch_progress_fingerprint(batch, active.machine_progress_fingerprint)
+    batches = store.quote_chat_batches(active.job_id) if active.batch_count > 1 else []
+    if active.role == "deferred_group":
+        fingerprint = active.machine_progress_fingerprint
+        indexes = set(active.recovery_batch_indexes)
+        for batch in batches:
+            if int(batch.get("batch_index", -1)) in indexes:
+                fingerprint = batch_progress_fingerprint(batch, fingerprint)
     else:
-        fingerprint = store._merge_progress(
-            active.machine_progress_fingerprint,
-            store.progress_fingerprint(active.job_id),
+        batch = next(
+            (
+                item for item in batches
+                if int(item.get("batch_index", -1)) == active.batch_index
+            ),
+            None,
+        )
+        fingerprint = (
+            batch_progress_fingerprint(batch, active.machine_progress_fingerprint)
+            if batch is not None and active.role != "merge"
+            else store._merge_progress(
+                active.machine_progress_fingerprint,
+                store.progress_fingerprint(active.job_id),
+            )
         )
     if fingerprint != active.machine_progress_fingerprint:
         active.machine_progress_fingerprint = fingerprint
@@ -535,14 +591,37 @@ def continue_component_batch(
             backend_settle_started_at_epoch=None,
         )
         return False
-    # Do not let one slow component monopolize its conversation. Persist the
-    # unfinished keys, continue all normal waves, then revisit this exact chat
-    # once after the rest of the job has settled.
+    deferred, stalled_component, normal_remaining = component_recovery_plan(
+        batch,
+        session_deferred_component_keys(store, active),
+    )
+    if stalled_component is None:
+        store.update_chat_session(
+            active.job_id,
+            active.batch_index,
+            status="deferred",
+            deferred_component_keys=deferred,
+            deferred_retry_sent=False,
+            progress_fingerprint=fingerprint,
+            backend_settle_fingerprint=None,
+            backend_settle_started_at_epoch=None,
+        )
+        active.backend_settle_fingerprint = ""
+        active.backend_settle_started_at = 0.0
+        return advance_to_next_wave(
+            store,
+            browser,
+            active,
+            completed_status="deferred",
+        )
+
+    # One slow component is isolated; every later component in this wave keeps
+    # running in the same conversation before the worker advances a wave.
     store.update_chat_session(
         active.job_id,
         active.batch_index,
-        status="deferred",
-        deferred_component_keys=remaining_component_keys,
+        status="running" if normal_remaining else "deferred",
+        deferred_component_keys=deferred,
         deferred_retry_sent=False,
         progress_fingerprint=fingerprint,
         backend_settle_fingerprint=None,
@@ -550,6 +629,20 @@ def continue_component_batch(
     )
     active.backend_settle_fingerprint = ""
     active.backend_settle_started_at = 0.0
+    if normal_remaining:
+        latest = store.get(active.job_id)
+        browser.continue_quote(
+            active,
+            build_component_batch_continuation_prompt(
+                relay_job_id=active.job_id,
+                submission_code=str(latest.get("submission_code") or ""),
+                price_batch_id=str(batch["price_batch_id"]),
+                batch_index=active.batch_index,
+                batch_count=int(batch["batch_count"]),
+                component_keys=normal_remaining,
+            ),
+        )
+        return True
     return advance_to_next_wave(
         store,
         browser,
@@ -658,7 +751,7 @@ def advance_machine_completed_wave(
         if (
             active is None
             or active.batch_count <= 1
-            or active.role == "merge"
+            or active.role in {"merge", "deferred_group"}
         ):
             continue
         batch = active_batch(store, active)
@@ -937,30 +1030,57 @@ def settle_programmatic_delivery(
     ):
         return
     batch_by_index = {int(item["batch_index"]): item for item in batches}
-    deferred_session = next(
-        (
-            item for _, item in sorted(sessions.items())
-            if item.get("status") == "deferred"
-            and item.get("deferred_retry_sent") is not True
-            and incomplete_component_keys(
-                batch_by_index.get(int(item.get("batch_index", -1)), {})
-            )
-        ),
-        None,
-    )
-    if deferred_session is not None:
-        batch_index = int(deferred_session["batch_index"])
+    deferred_sessions = [
+        item for _, item in sorted(sessions.items())
+        if item.get("status") == "deferred"
+        and item.get("deferred_retry_sent") is not True
+        and incomplete_component_keys(
+            batch_by_index.get(int(item.get("batch_index", -1)), {})
+        )
+    ]
+    if deferred_sessions:
+        deferred_session = deferred_sessions[0]
+        conversation_index = int(deferred_session.get(
+            "conversation_index",
+            int(deferred_session["batch_index"]) // WAVES_PER_CHAT,
+        ))
+        conversation_sessions = [
+            item for item in deferred_sessions
+            if int(item.get(
+                "conversation_index",
+                int(item["batch_index"]) // WAVES_PER_CHAT,
+            )) == conversation_index
+        ]
+        deferred_batches: dict[int, list[str]] = {}
+        for item in conversation_sessions:
+            item_batch_index = int(item["batch_index"])
+            incomplete = set(incomplete_component_keys(batch_by_index[item_batch_index]))
+            deferred_batches[item_batch_index] = [
+                key for key in (item.get("deferred_component_keys") or [])
+                if key in incomplete
+            ]
+        deferred_batches = {
+            batch_index: keys
+            for batch_index, keys in deferred_batches.items()
+            if keys
+        }
+        if not deferred_batches:
+            return
+        deferred_count = sum(len(keys) for keys in deferred_batches.values())
+        if deferred_count > MAX_DEFERRED_COMPONENTS_PER_RETRY:
+            raise RuntimeError("Deferred component group exceeds the configured chat limit.")
+        batch_index = min(deferred_batches)
         batch = batch_by_index[batch_index]
-        remaining = incomplete_component_keys(batch)[
-            :MAX_DEFERRED_COMPONENTS_PER_RETRY
+        combined_keys = [
+            key for keys in deferred_batches.values() for key in keys
         ]
         active = browser.resume_quote(
             job_id,
             str(deferred_session["chat_url"]),
             batch_index=batch_index,
             batch_count=int(deferred_session.get("batch_count") or len(batches)),
-            role=str(deferred_session.get("role") or "component_batch"),
-            component_keys=list(deferred_session.get("component_keys") or []),
+            role="deferred_group",
+            component_keys=combined_keys,
             previous_conversation_ids=list(
                 deferred_session.get("previous_conversation_ids") or []
             ),
@@ -972,28 +1092,32 @@ def settle_programmatic_delivery(
             ),
             wave_count=int(deferred_session.get("wave_count") or 1),
         )
-        prompt = build_component_batch_deferred_retry_prompt(
+        active.role = "deferred_group"
+        active.recovery_batch_indexes = tuple(sorted(deferred_batches))
+        prompt = build_component_batches_deferred_retry_prompt(
             relay_job_id=job_id,
             submission_code=str(record.get("submission_code") or ""),
             price_batch_id=str(batch["price_batch_id"]),
-            batch_index=batch_index,
             batch_count=int(batch["batch_count"]),
-            component_keys=remaining,
+            deferred_batches=deferred_batches,
         )
         browser.continue_quote(active, prompt)
         active.deferred_retry_sent = True
         active.batch_progress_fingerprint = batch_progress_fingerprint(batch)
         active_quotes[active.session_key] = active
-        store.update_chat_session(
-            job_id,
-            batch_index,
-            status="running",
-            deferred_component_keys=remaining,
-            deferred_retry_sent=True,
-            progress_fingerprint=active.batch_progress_fingerprint,
-            backend_settle_fingerprint=None,
-            backend_settle_started_at_epoch=None,
-        )
+        for item_batch_index, keys in deferred_batches.items():
+            store.update_chat_session(
+                job_id,
+                item_batch_index,
+                status="running",
+                deferred_component_keys=keys,
+                deferred_retry_sent=True,
+                progress_fingerprint=batch_progress_fingerprint(
+                    batch_by_index[item_batch_index]
+                ),
+                backend_settle_fingerprint=None,
+                backend_settle_started_at_epoch=None,
+            )
         return
     incomplete_results = [
         int(batch["batch_index"])
@@ -1023,6 +1147,32 @@ def settle_programmatic_delivery(
         stage="failed",
         message="组件结果保存或自动交付补发一次后仍未完成，任务已停止",
     )
+
+
+def finish_deferred_group_sessions(
+    store: GptQuoteRelayStore,
+    active: ActiveQuote,
+) -> bool:
+    """Seal bookkeeping for the one combined deferred retry response."""
+
+    batch_by_index = {
+        int(item["batch_index"]): item
+        for item in store.quote_chat_batches(active.job_id)
+    }
+    all_finished = True
+    for batch_index in active.recovery_batch_indexes:
+        batch = batch_by_index.get(batch_index, {})
+        finished = batch_is_finished(batch)
+        all_finished = all_finished and finished
+        store.update_chat_session(
+            active.job_id,
+            batch_index,
+            status="saved" if finished else "deferred_failed",
+            deferred_retry_sent=True,
+            backend_settle_fingerprint=None,
+            backend_settle_started_at_epoch=None,
+        )
+    return all_finished
 
 
 def complete_job(store: GptQuoteRelayStore, job_id: str, response: str) -> str:
@@ -1173,6 +1323,12 @@ def handle_no_progress_timeout(
         browser.close_quote(active)
         active_quotes.pop(active.session_key, None)
         return
+    if active.role == "deferred_group":
+        browser.close_quote(active)
+        finish_deferred_group_sessions(store, active)
+        active_quotes.pop(active.session_key, None)
+        settle_programmatic_delivery(store, browser, active_quotes, active.job_id)
+        return
     batch = active_batch(store, active)
     if batch is not None and batch.get("component_result_required") is True \
             and active.role != "merge":
@@ -1312,6 +1468,28 @@ def stop_terminal_job_chats(
         active_quotes.pop(session_key, None)
 
 
+def stop_cancelled_job_chats(
+    store: GptQuoteRelayStore,
+    browser: Any,
+    active_quotes: dict[str, ActiveQuote],
+) -> bool:
+    """Honor sales cancellation for every chat before scheduling more work."""
+
+    cancelled_job_ids = {
+        quote.job_id
+        for quote in active_quotes.values()
+        if store.get(quote.job_id).get("status") == "cancelled"
+    }
+    for job_id in cancelled_job_ids:
+        stop_terminal_job_chats(
+            browser,
+            active_quotes,
+            job_id,
+            cancelled=True,
+        )
+    return bool(cancelled_job_ids)
+
+
 def pending_active_quote(
     active_quotes: dict[str, ActiveQuote],
 ) -> ActiveQuote | None:
@@ -1391,6 +1569,7 @@ def main() -> int:
             )
             if logged_in:
                 recovery_failures = 0
+                stop_cancelled_job_chats(store, browser, active_quotes)
             if logged_in and not active_quotes:
                 for record in store.claim_submitted_for_monitoring(
                     WORKER_ID,
@@ -1524,6 +1703,13 @@ def main() -> int:
                             store, active, previous_reference,
                         )
                     if response is None:
+                        continue
+                    if active.role == "deferred_group":
+                        finish_deferred_group_sessions(store, active)
+                        active_quotes.pop(session_key, None)
+                        settle_programmatic_delivery(
+                            store, browser, active_quotes, job_id,
+                        )
                         continue
                     batch = active_batch(store, active)
                     if batch is not None and batch.get("component_result_required") is True \

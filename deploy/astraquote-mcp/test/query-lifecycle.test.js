@@ -655,6 +655,107 @@ test('pre-split relay chats append only their own component plan into one reserv
   }), (error) => error.code === 'relay_merge_not_authorized');
 });
 
+test('sales relay saves pricing progress for one top-level component per call', async (t) => {
+  const { workflow, calls } = fixture(t);
+  const relayJobId = `gpt-${'7'.repeat(32)}`;
+  const reservedBatchId = 'aqpb_77777777-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const relayDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'aq-component-checkpoint-'));
+  const previousRelayDirectory = process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+  process.env.ASTRAQUOTE_GPT_RELAY_DIR = relayDirectory;
+  fs.mkdirSync(path.join(relayDirectory, 'jobs'), { recursive: true });
+  fs.writeFileSync(path.join(relayDirectory, 'jobs', `${relayJobId}.json`), JSON.stringify({
+    job_id: relayJobId,
+    submission_code: '7',
+    status: 'processing',
+    reserved_price_batch_id: reservedBatchId,
+    intake_component_count: 2,
+    intake_batch_count: 1,
+    intake_batches: [{
+      batch_index: 0, batch_count: 1,
+      component_keys: ['cmp_intake_0001', 'cmp_intake_0002'], source_lines: [],
+    }],
+    quote_options: { cloud_provider: 'azure', pricing_scenarios: ['on_demand'] },
+  }));
+  t.after(() => {
+    fs.rmSync(relayDirectory, { recursive: true, force: true });
+    if (previousRelayDirectory === undefined) delete process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+    else process.env.ASTRAQUOTE_GPT_RELAY_DIR = previousRelayDirectory;
+  });
+
+  await assert.rejects(workflow.getPrices({
+    quote_mode: 'formal_quote', relay_job_id: relayJobId, submission_code: '7',
+    relay_batch_index: 0, relay_batch_count: 1, price_batch_id: reservedBatchId,
+    queries: [query('component-1', true), query('component-2', true)],
+    query_contexts: [
+      context('component-1', 'compute', 'cmp_intake_0001'),
+      context('component-2', 'compute', 'cmp_intake_0002'),
+    ],
+    quote_components: [{
+      component_key: 'cmp_intake_0001', customer_owned_source: '云服务器 1 台。',
+      billing_scopes: [{ billing_key: 'compute' }],
+    }, {
+      component_key: 'cmp_intake_0002', customer_owned_source: '数据库 1 套。',
+      billing_scopes: [{ billing_key: 'compute' }],
+    }],
+  }), (error) => error.code === 'relay_component_progress_scope_conflict');
+  assert.equal(calls.length, 0);
+});
+
+test('relay checkpoint guard ignores an already saved sibling query during resume', async (t) => {
+  const { workflow, calls } = fixture(t);
+  const relayJobId = `gpt-${'6'.repeat(32)}`;
+  const reservedBatchId = 'aqpb_66666666-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const relayDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'aq-component-resume-'));
+  const previousRelayDirectory = process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+  process.env.ASTRAQUOTE_GPT_RELAY_DIR = relayDirectory;
+  fs.mkdirSync(path.join(relayDirectory, 'jobs'), { recursive: true });
+  fs.writeFileSync(path.join(relayDirectory, 'jobs', `${relayJobId}.json`), JSON.stringify({
+    job_id: relayJobId,
+    submission_code: '6',
+    status: 'processing',
+    reserved_price_batch_id: reservedBatchId,
+    intake_component_count: 2,
+    intake_batch_count: 1,
+    intake_batches: [{
+      batch_index: 0, batch_count: 1,
+      component_keys: ['cmp_intake_0001', 'cmp_intake_0002'], source_lines: [],
+    }],
+    quote_options: { cloud_provider: 'azure', pricing_scenarios: ['on_demand'] },
+  }));
+  t.after(() => {
+    fs.rmSync(relayDirectory, { recursive: true, force: true });
+    if (previousRelayDirectory === undefined) delete process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+    else process.env.ASTRAQUOTE_GPT_RELAY_DIR = previousRelayDirectory;
+  });
+  const quoteComponents = [{
+    component_key: 'cmp_intake_0001', customer_owned_source: '云服务器 1 台。',
+    billing_scopes: [{ billing_key: 'compute' }],
+  }, {
+    component_key: 'cmp_intake_0002', customer_owned_source: '数据库 1 套。',
+    billing_scopes: [{ billing_key: 'compute' }],
+  }];
+  await workflow.getPrices({
+    quote_mode: 'formal_quote', relay_job_id: relayJobId, submission_code: '6',
+    relay_batch_index: 0, relay_batch_count: 1, price_batch_id: reservedBatchId,
+    queries: [query('component-1', true)],
+    query_contexts: [context('component-1', 'compute', 'cmp_intake_0001')],
+    quote_components: quoteComponents,
+  });
+  const resumed = await workflow.getPrices({
+    quote_mode: 'formal_quote', relay_job_id: relayJobId, submission_code: '6',
+    relay_batch_index: 0, relay_batch_count: 1, price_batch_id: reservedBatchId,
+    queries: [query('component-1', true), query('component-2', true)],
+    query_contexts: [
+      context('component-1', 'compute', 'cmp_intake_0001'),
+      context('component-2', 'compute', 'cmp_intake_0002'),
+    ],
+    quote_components: quoteComponents,
+  });
+  assert.deepEqual(resumed.reused_query_ids, ['component-1']);
+  assert.deepEqual(resumed.queried_query_ids, ['component-2']);
+  assert.equal(calls.length, 2);
+});
+
 test('pre-split relay batches save isolated quote fragments and the last fragment delivers once', async (t) => {
   const { workflow, store } = fixture(t);
   const displayed = [];

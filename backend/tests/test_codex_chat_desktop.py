@@ -381,6 +381,31 @@ def test_ready_for_next_turn_waits_after_approving_a_tool_card(
     assert not desktop.ready_for_next_turn(object())
 
 
+def test_cancel_quote_waits_until_generation_really_stops(
+    desktop_module,
+    monkeypatch,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=60,
+    )
+    quote = object()
+    waited = []
+    monkeypatch.setattr(desktop, "_switch_to_quote", lambda _quote: None)
+    monkeypatch.setattr(desktop, "_stop_generation", lambda: True)
+    monkeypatch.setattr(desktop, "_click_text_control", lambda _labels: False)
+    monkeypatch.setattr(
+        desktop,
+        "_wait_until",
+        lambda check, **kwargs: waited.append((check(), kwargs.get("timeout"))),
+    )
+    monkeypatch.setattr(desktop, "_generation_active", lambda: False)
+
+    desktop.cancel_quote(quote)
+
+    assert waited == [(True, 15)]
+
+
 def test_continue_quote_arms_new_response_boundary_before_uncertain_send(
     desktop_module, monkeypatch,
 ):

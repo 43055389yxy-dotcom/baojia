@@ -37,8 +37,8 @@ function validatePolicy(payload) {
     throw new Error('AstraQuote workflow policy API attempt budget is inconsistent.');
   }
   if (payload.batching.max_deferred_components_per_retry
-      > payload.batching.components_per_wave) {
-    throw new Error('AstraQuote workflow policy deferred batch exceeds one wave.');
+      > payload.batching.components_per_wave * payload.batching.waves_per_chat) {
+    throw new Error('AstraQuote workflow policy deferred group exceeds one chat.');
   }
   if (payload.recovery.deferred_retry_rounds !== 1) {
     throw new Error('AstraQuote worker supports exactly one deferred retry round.');

@@ -231,19 +231,53 @@ def build_component_batch_continuation_prompt(
     batch_count: int,
     component_keys: list[str],
 ) -> str:
-    """Continue only one saved child batch without restoring any source text."""
+    """Continue later normal components after one component was deferred."""
 
     return (
         f"{ASTRAQUOTE_MENTION} 这不是新报价。"
-        "请先读取后台组件状态，只处理本批尚未完成的组件，"
-        "已经成功的查询必须复用，不得处理其他批次，也不要生成最终整单。\n"
+        "当前组件已由程序暂存，不要再处理它。请立即继续下面列出的同批后续组件，"
+        "已经成功的查询必须复用，不得处理暂存组件或其他批次，也不要生成最终整单。\n"
         f"执行策略版本：{workflow_policy_version()}。\n"
-        f"{render_workflow_policy_slice('component_retry')}\n"
+        f"{render_workflow_policy_slice('component_continuation')}\n"
         f"当前为第 {batch_index + 1}/{batch_count} 批；"
         f"允许处理的 component_key：{json.dumps(component_keys, ensure_ascii=False)}。\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n"
         f"price_batch_id：{price_batch_id}\n"
         f"relay_batch_index：{batch_index}\n"
+        f"relay_batch_count：{batch_count}。"
+    )
+
+
+def build_component_batches_deferred_retry_prompt(
+    *,
+    relay_job_id: str,
+    submission_code: str,
+    price_batch_id: str,
+    batch_count: int,
+    deferred_batches: dict[int, list[str]],
+) -> str:
+    """Retry every deferred component from one conversation in one message."""
+
+    allowed = [
+        {
+            "relay_batch_index": int(batch_index),
+            "component_keys": list(component_keys),
+        }
+        for batch_index, component_keys in sorted(deferred_batches.items())
+        if component_keys
+    ]
+    return (
+        f"{ASTRAQUOTE_MENTION} 这不是新报价。当前对话的全部正常组件已经处理完，"
+        "现在把先前逐个暂存的组件合并补查，且这是本对话唯一一次集中补发。"
+        "严格按下面的原批次归属处理；每个原批次完成后分别调用 "
+        "build_estimate(delivery_mode=save_component_batch)，并传回该组原始 "
+        "relay_batch_index。不得重新查询任何已成功组件。\n"
+        f"执行策略版本：{workflow_policy_version()}。\n"
+        f"{render_workflow_policy_slice('component_retry')}\n"
+        f"允许补查的批次与 component_key："
+        f"{json.dumps(allowed, ensure_ascii=False, separators=(',', ':'))}。\n\n"
+        f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n"
+        f"price_batch_id：{price_batch_id}\n"
         f"relay_batch_count：{batch_count}。"
     )
 

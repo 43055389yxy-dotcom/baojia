@@ -176,7 +176,9 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   assert.equal(getPrices.inputSchema.properties.official_page_price_evidence.type, 'array');
   assert.match(buildEstimate.description, /official_page_price_evidence/i);
   assert.match(buildEstimate.description, /save_component_batch.*最后一批.*Excel/is);
-  assert.match(INSTRUCTIONS, /统一执行策略版本：`2026-09-14-unified-v1`/);
+  assert.match(INSTRUCTIONS, /统一执行策略版本：`2026-09-14-unified-v2`/);
+  assert.match(INSTRUCTIONS, /一个顶层组件为一次进度写入单位/);
+  assert.match(INSTRUCTIONS, /不得把多个顶层组件合并到同一次价格调用/);
   assert.match(INSTRUCTIONS, /每 5 个组件形成一轮.*每个对话最多 10 个组件/s);
   assert.match(INSTRUCTIONS, /全局最多同时运行 4 个.*同一销售最多同时占用 3 个/s);
   assert.doesNotMatch(INSTRUCTIONS, /\{\{[A-Z0-9_]+\}\}/);

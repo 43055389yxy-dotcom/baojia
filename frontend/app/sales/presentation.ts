@@ -29,6 +29,7 @@ export function progressPercent(job: ProgressJob): number | null {
   const total = job.progress?.total_component_count;
   const completed = job.progress?.completed_component_count;
   if (!Number.isFinite(total) || !total || total < 1 || !Number.isFinite(completed)) return null;
+  if (!completed || completed < 1) return null;
   return Math.max(0, Math.min(100, Math.round(((completed ?? 0) / total) * 100)));
 }
 

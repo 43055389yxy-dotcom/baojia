@@ -14,7 +14,7 @@ test("sales progress never invents completion or treats queue/login as running",
   assert.equal(progressPercent({ status: "processing" }), null);
   assert.equal(progressPercent({ status: "queued", progress: { total_component_count: 40, completed_component_count: 3 } }), null);
   assert.equal(progressPercent({ status: "needs_login", progress: { total_component_count: 40, completed_component_count: 3 } }), null);
-  assert.equal(progressPercent({ status: "processing", progress: { total_component_count: 40, completed_component_count: 0 } }), 0);
+  assert.equal(progressPercent({ status: "processing", progress: { total_component_count: 40, completed_component_count: 0 } }), null);
   assert.equal(progressPercent({ status: "processing", progress: { total_component_count: 40, completed_component_count: 38 } }), 95);
 });
 

@@ -35,10 +35,11 @@ def _validate_policy(payload: dict[str, Any]) -> None:
         1 + payload["pricing"]["corrected_api_attempt_limit_per_scope"]
     ):
         raise RuntimeError("AstraQuote workflow policy API attempt budget is inconsistent")
-    if payload["batching"]["max_deferred_components_per_retry"] > payload[
-        "batching"
-    ]["components_per_wave"]:
-        raise RuntimeError("AstraQuote workflow policy deferred batch exceeds one wave")
+    if payload["batching"]["max_deferred_components_per_retry"] > (
+        payload["batching"]["components_per_wave"]
+        * payload["batching"]["waves_per_chat"]
+    ):
+        raise RuntimeError("AstraQuote workflow policy deferred group exceeds one chat")
     if payload["recovery"]["deferred_retry_rounds"] != 1:
         raise RuntimeError("AstraQuote worker supports exactly one deferred retry round")
     if payload["recovery"].get("stalled_component_strategy") != "defer_then_retry_once":

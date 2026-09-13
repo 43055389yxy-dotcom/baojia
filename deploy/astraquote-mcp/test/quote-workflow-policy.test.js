@@ -16,7 +16,7 @@ test('workflow policy is one versioned machine-readable source', () => {
   const snapshot = workflowPolicySnapshot();
 
   assert.equal(policy.schema_version, 'astraquote-quote-workflow-policy/1');
-  assert.equal(workflowPolicyVersion(), '2026-09-14-unified-v1');
+  assert.equal(workflowPolicyVersion(), '2026-09-14-unified-v2');
   assert.equal(snapshot.policy_version, workflowPolicyVersion());
   assert.equal(snapshot.prompt_directives, undefined);
   assert.equal(snapshot.consumer_slices, undefined);
@@ -30,6 +30,7 @@ test('workflow policy projects a small stage-specific prompt instead of the whol
   assert.match(quoteContext, /on_demand_fallback/);
   assert.doesNotMatch(quoteContext, /回到原对话/);
   assert.match(componentBatch, /save_component_batch/);
+  assert.match(componentBatch, /逐个组件/);
   assert.doesNotMatch(componentBatch, /官方价格 API/);
 });
 
@@ -47,6 +48,7 @@ test('workflow policy shares batch and recovery limits with MCP', () => {
   );
   assert.ok(
     workflowPolicyValue('batching', 'max_deferred_components_per_retry')
-      <= workflowPolicyValue('batching', 'components_per_wave'),
+      <= workflowPolicyValue('batching', 'components_per_wave')
+        * workflowPolicyValue('batching', 'waves_per_chat'),
   );
 });

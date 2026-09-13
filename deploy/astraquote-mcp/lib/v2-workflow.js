@@ -302,6 +302,38 @@ function componentRootKey(componentKey, byKey) {
   return null;
 }
 
+function assertSingleRelayComponentProgressCall({
+  relayJobId, quoteComponents, queries, queryContexts, existing,
+}) {
+  if (!relayJobId) return;
+  const currentQueryIds = new Set((queries || []).map((query) => query.query_id));
+  const byKey = new Map(
+    (quoteComponents || []).map((component) => [component.component_key, component]),
+  );
+  const savedResults = new Map(
+    (existing?.result?.results || []).map((result) => [result.query_id, result]),
+  );
+  const roots = new Set(
+    (queryContexts || [])
+      .filter((context) => currentQueryIds.has(context.query_id)
+        && context.purpose === 'pricing' && context.component_key
+        && !reusableQueryResult(savedResults.get(context.query_id), context))
+      .map((context) => componentRootKey(context.component_key, byKey))
+      .filter(Boolean),
+  );
+  if (roots.size <= 1) return;
+  const error = new Error(
+    'A sales relay price call may advance only one top-level component checkpoint.',
+  );
+  error.code = 'relay_component_progress_scope_conflict';
+  error.retryable = true;
+  error.details = {
+    component_keys: [...roots],
+    next_action: 'Submit the same saved batch one top-level component at a time; sibling queries must use separate get_prices calls.',
+  };
+  throw error;
+}
+
 function relayBatchPlan({ existing, supplied, relayJob, input }) {
   const manifest = relayIntakeManifest(relayJob);
   if (!manifest) {
@@ -1793,6 +1825,14 @@ class AstraQuoteV2Workflow {
       quoteComponents,
       queries: materializedQueries,
       queryContexts: preliminaryContexts,
+      existing,
+    });
+    assertSingleRelayComponentProgressCall({
+      relayJobId,
+      quoteComponents,
+      queries: materializedQueries,
+      queryContexts: preliminaryContexts,
+      existing,
     });
     const queryIds = materializedQueries.map((query) => query.query_id);
     if (new Set(queryIds).size !== queryIds.length) {
