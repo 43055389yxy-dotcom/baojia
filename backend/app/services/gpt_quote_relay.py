@@ -1524,12 +1524,31 @@ class GptQuoteRelayStore:
     def authorize_merge(self, job_id: str) -> dict[str, Any]:
         """Allow one final build only after the desktop worker stops every batch."""
 
-        return self.update_if_not_cancelled(
-            job_id,
-            {"merge_authorized": True},
-            stage="merge",
-            message="所有组件批次已停止，正在统一合并报价",
-        )
+        with self._lock():
+            path = self._path(job_id)
+            if not path.exists():
+                raise GptRelayError(
+                    "GPT 报价任务不存在。", code="gpt_relay_job_not_found"
+                )
+            record = self._read(path)
+            if record.get("status") in {"cancelled", "completed", "partial"}:
+                return record
+            if record.get("merge_authorized") is True:
+                return record
+            record.update(
+                {
+                    "merge_authorized": True,
+                    "updated_at": utc_now(),
+                    "events": [
+                        *(record.get("events") or []),
+                        self._event(
+                            "merge", "所有组件批次已停止，正在统一合并报价"
+                        ),
+                    ][-100:],
+                }
+            )
+            self._write_atomic(path, record)
+            return record
 
     @staticmethod
     def _purged_intake_batches(record: dict[str, Any]) -> list[dict[str, Any]]:

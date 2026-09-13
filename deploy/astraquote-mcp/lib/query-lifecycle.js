@@ -32,11 +32,32 @@ function usable(result) {
     });
 }
 
+function usableCommercialRates(result) {
+  const candidates = Array.isArray(result?.official_rate_candidates)
+    ? result.official_rate_candidates
+    : [];
+  const itemIds = new Set(candidates.map((rate) => String(rate?.official_item_id || ''))
+    .filter(Boolean));
+  const positiveItems = new Set(candidates.filter((rate) => (
+    Number(rate?.unit_price) > 0
+      && /^[A-Z]{3}$/.test(String(rate?.currency || '').trim())
+      && String(rate?.rate_id || '').trim()
+      && String(rate?.official_item_id || '').trim()
+      && !/(?:configured[- ]?module|usage[- ]?period)/i.test(String(rate?.unit || ''))
+  )).map((rate) => String(rate.official_item_id)));
+  // Signed billing APIs often return zero-valued placeholder modules beside
+  // the real charge.  Treating that mixed envelope as complete caused quotes
+  // to omit compute while keeping only disk.  Every returned billing identity
+  // must therefore expose a positive commercial rate before the scope closes.
+  return positiveItems.size > 0
+    && [...itemIds].every((itemId) => positiveItems.has(itemId));
+}
+
 function reusableQueryResult(result, context) {
   // Legacy public clients did not submit query contexts or flattened rates.
   // Preserve their valid catalog results, but never a known API error envelope.
   return usable(result) && (!scope(context)
-    || (Array.isArray(result.official_rate_candidates) && result.official_rate_candidates.length > 0));
+    || usableCommercialRates(result));
 }
 
 // Context is task metadata and never an official API parameter.
@@ -93,11 +114,14 @@ function mergeQueryContexts(existing, updates, queries) {
   return [...contexts.values()];
 }
 
-function queryProgress(queries, results, contexts = []) {
+function queryProgress(queries, results, contexts = [], officialPageEvidence = []) {
   const byContext = new Map(contexts.map((item) => [item.query_id, item]));
   const byResult = new Map(results.map((item) => [item.query_id, item]));
   const byQuery = new Map(queries.map((item) => [item.query_id, item]));
   const positions = new Map(queries.map((item, index) => [item.query_id, index]));
+  const officialPageScopes = new Set((officialPageEvidence || []).map((item) => (
+    pricingScopeKey(item.component_key, item.billing_key, item.scenario_key || null)
+  )).filter(Boolean));
   const successes = new Map();
   function key(id) {
     const ownedScope = scope(byContext.get(id));
@@ -105,9 +129,9 @@ function queryProgress(queries, results, contexts = []) {
   }
   for (const q of queries) {
     // A directory envelope with an item ID but no rate must not close pricing.
-    if (key(q.query_id) && usable(byResult.get(q.query_id))
-      && Array.isArray(byResult.get(q.query_id).official_rate_candidates)
-      && byResult.get(q.query_id).official_rate_candidates.length > 0) {
+    if (key(q.query_id) && reusableQueryResult(
+      byResult.get(q.query_id), byContext.get(q.query_id),
+    )) {
       successes.set(key(q.query_id), q.query_id);
     }
   }
@@ -116,6 +140,7 @@ function queryProgress(queries, results, contexts = []) {
     const result = byResult.get(q.query_id);
     const purpose = context?.purpose || 'pricing';
     const completed = reusableQueryResult(result, context);
+    const completedByOfficialPage = !completed && officialPageScopes.has(scope(context));
     const candidate = !completed && key(q.query_id) ? successes.get(key(q.query_id)) : null;
     const successor = candidate && (
       positions.get(candidate) > positions.get(q.query_id)
@@ -124,12 +149,22 @@ function queryProgress(queries, results, contexts = []) {
     return {
       query_id: q.query_id, purpose,
       ...(context || {}),
-      state: purpose === 'discovery' ? 'discovery' : successor ? 'superseded' : completed ? 'completed' : 'pending',
+      state: purpose === 'discovery'
+        ? 'discovery'
+        : successor
+          ? 'superseded'
+          : completed
+            ? 'completed'
+            : completedByOfficialPage
+              ? 'completed_by_official_page'
+              : 'pending',
       ...(successor ? { superseded_by: successor } : {}),
     };
   });
   const pending = lifecycle.filter((item) => item.state === 'pending');
-  const priced = lifecycle.filter((item) => item.state === 'completed');
+  const priced = lifecycle.filter((item) => (
+    item.state === 'completed' || item.state === 'completed_by_official_page'
+  ));
   const completed = priced.length > 0 && pending.length === 0;
   return {
     status: completed ? 'completed' : 'needs_refinement',
@@ -175,7 +210,9 @@ function componentProgress(components = [], lifecycle = [], results = []) {
         billing.scenario_key || null,
       ]);
       const attempts = lifecycleByScope.get(key) || [];
-      if (attempts.some((item) => item.state === 'completed')) return 'completed';
+      if (attempts.some((item) => (
+        item.state === 'completed' || item.state === 'completed_by_official_page'
+      ))) return 'completed';
       const terminalFailures = attempts.filter((item) => {
         const result = resultById.get(item.query_id);
         return item.state === 'pending'
@@ -268,4 +305,5 @@ function contextEvidenceViolations(input, batch, refsOf, { additionalCoveredScop
 module.exports = {
   PROGRESS_GUIDANCE, mergeQueryContexts, queryProgress, componentProgress,
   assertQueryIdentity, contextEvidenceViolations, pricingScopeKey, reusableQueryResult,
+  usableCommercialRates,
 };

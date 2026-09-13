@@ -1246,12 +1246,16 @@ def _rate_candidate(
     source_identity: Any = None,
 ) -> dict[str, Any] | None:
     price = _price_text(unit_price)
-    if price is None:
+    normalized_currency = str(currency or "").strip().upper()
+    # A missing JSON path used to become the literal string "None" and was
+    # then persisted as if it were official currency evidence.  A price is
+    # not reusable evidence until the provider returned a real ISO currency.
+    if price is None or not re.fullmatch(r"[A-Z]{3}", normalized_currency):
         return None
     identity = {
         "provider": provider,
         "official_item_id": official_item_id,
-        "currency": str(currency),
+        "currency": normalized_currency,
         "unit_price": price,
         "unit": None if unit is None else str(unit),
         "pricing_model": None if pricing_model is None else str(pricing_model),
@@ -1266,7 +1270,7 @@ def _rate_candidate(
         "rate_id": f"{provider}:{official_item_id}:{digest}",
         "official_item_id": official_item_id,
         "unit_price": price,
-        "currency": str(currency),
+        "currency": normalized_currency,
         "unit": None if unit is None else str(unit),
         "pricing_model": None if pricing_model is None else str(pricing_model),
         "description": None if description is None else str(description),

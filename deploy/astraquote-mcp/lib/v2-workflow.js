@@ -32,6 +32,172 @@ function uniqueComponentKeys(entries) {
   }
 }
 
+function normalizedEvidenceText(value) {
+  return String(value || '').normalize('NFKC').replace(/[\s，,。；;：:、（）()\[\]【】]/gu, '');
+}
+
+function validateSealedCustomerFacts(input, priceBatch) {
+  const plans = new Map(
+    (priceBatch.quote_components || []).map((component) => [component.component_key, component]),
+  );
+  if (plans.size === 0) return input;
+  const factsByComponent = new Map();
+  const violations = [];
+  for (const fact of input.fact_ledger || []) {
+    const plan = plans.get(fact.component_key);
+    if (!plan) continue;
+    const source = normalizedEvidenceText(plan.customer_owned_source);
+    const evidence = normalizedEvidenceText(fact.cleaned_evidence);
+    if (!evidence || !source.includes(evidence)) {
+      violations.push(`fact_not_in_sealed_component:${fact.component_key}:${fact.fact_id}`);
+    }
+    const entries = factsByComponent.get(fact.component_key) || [];
+    entries.push(fact);
+    factsByComponent.set(fact.component_key, entries);
+  }
+  for (const plan of plans.values()) {
+    const facts = factsByComponent.get(plan.component_key) || [];
+    if (facts.length === 0) {
+      violations.push(`sealed_component_has_no_customer_facts:${plan.component_key}`);
+      continue;
+    }
+    const evidenceText = normalizedEvidenceText(
+      facts.map((fact) => fact.cleaned_evidence).join(''),
+    );
+    // The leading sales-list ordinal identifies the component; it is not a
+    // customer sizing fact that ResourceIR must consume.
+    const factBearingSource = String(plan.customer_owned_source || '')
+      .replace(/^\s*\d+[.、]\s*/u, '');
+    const sourceNumbers = factBearingSource.match(/\d+(?:\.\d+)?/g) || [];
+    for (const number of new Set(sourceNumbers)) {
+      if (!evidenceText.includes(number)) {
+        violations.push(`sealed_customer_number_unmapped:${plan.component_key}:${number}`);
+      }
+    }
+  }
+  if (violations.length > 0) {
+    const error = new Error('Customer facts must come from the sealed cleaned component configuration.');
+    error.code = 'sealed_customer_facts_invalid';
+    error.retryable = true;
+    error.details = {
+      violations,
+      next_action: 'Rebuild only the rejected component facts from its sealed customer_owned_source; never use backend plan text, price output, or sibling components as customer evidence.',
+    };
+    throw error;
+  }
+  return input;
+}
+
+function cleanedServiceName(source, componentKey) {
+  const value = String(source || '')
+    .replace(/^\s*\d+[.、]\s*/u, '')
+    .split(/[：:；;]/u, 1)[0]
+    .trim();
+  return value || componentKey;
+}
+
+function genericPresentation(value) {
+  const text = String(value || '').trim();
+  return !text
+    || /^(?:后台计划|官方方案|待定|[-—])$/u.test(text)
+    || /^(?:服务|组件)\s*0*\d+$/iu.test(text)
+    || /^(?:ECS|RDS)\s+0\d{2,}$/iu.test(text);
+}
+
+function presentationFromFacts(facts) {
+  const modelFact = facts.find((fact) => (
+    /(?:^|_)(?:requested_)?(?:instance_type|model|sku|edition|plan)$/i.test(String(fact.field || ''))
+      && ['string', 'number'].includes(typeof fact.value)
+  ));
+  const quantityFact = facts.find((fact) => (
+    /(?:^|_)(?:quantity|count|node_count|instance_count|server_count)$/i.test(
+      String(fact.field || ''),
+    ) && ['string', 'number'].includes(typeof fact.value)
+  ));
+  const unitLabels = {
+    count: '个', instance: '台', instances: '台', node: '个节点', nodes: '个节点',
+    set: '套', sets: '套', server: '台', servers: '台',
+  };
+  const unit = String(quantityFact?.unit || '').trim();
+  return {
+    model_or_plan: modelFact ? String(modelFact.value) : undefined,
+    quantity: quantityFact
+      ? `${quantityFact.value}${unitLabels[unit.toLowerCase()] || (unit ? ` ${unit}` : '')}`
+      : undefined,
+  };
+}
+
+function applySealedComponentPresentation(input, priceBatch) {
+  const plans = new Map(
+    (priceBatch.quote_components || []).map((component) => [component.component_key, component]),
+  );
+  const normalize = (component) => {
+    const plan = plans.get(component.component_key);
+    if (!plan) return component;
+    const source = String(plan.customer_owned_source || '').trim();
+    const current = component.customer_facing || {};
+    const inferred = presentationFromFacts(
+      (input.fact_ledger || []).filter((fact) => fact.component_key === component.component_key),
+    );
+    const serviceName = genericPresentation(current.service_name)
+      ? cleanedServiceName(source, component.component_key)
+      : current.service_name;
+    const modelOrPlan = genericPresentation(current.model_or_plan)
+      ? inferred.model_or_plan
+      : current.model_or_plan;
+    const quantity = genericPresentation(current.quantity) ? inferred.quantity : current.quantity;
+    const configuration = genericPresentation(current.configuration_summary)
+      ? source
+      : current.configuration_summary;
+    return {
+      ...component,
+      customer_facing: {
+        ...current,
+        service_name: serviceName,
+        model_or_plan: modelOrPlan,
+        quantity,
+        requirement_summary: source,
+        configuration_summary: configuration || source,
+      },
+    };
+  };
+  return {
+    ...input,
+    services: (input.services || []).map(normalize),
+    zero_cost_services: (input.zero_cost_services || []).map(normalize),
+    unpriced_services: (input.unpriced_services || []).map(normalize),
+  };
+}
+
+function sealedComponentOrder(priceBatch) {
+  const plans = priceBatch.quote_components || [];
+  const children = new Map();
+  for (const component of plans) {
+    if (!component.parent_component_key) continue;
+    const entries = children.get(component.parent_component_key) || [];
+    entries.push(component.component_key);
+    children.set(component.parent_component_key, entries);
+  }
+  const orderedRoots = (priceBatch.relay_component_batches || [])
+    .slice()
+    .sort((left, right) => Number(left.batch_index) - Number(right.batch_index))
+    .flatMap((batch) => batch.component_keys || []);
+  const fallbackRoots = plans.filter((component) => !component.parent_component_key)
+    .map((component) => component.component_key);
+  const roots = orderedRoots.length > 0 ? orderedRoots : fallbackRoots;
+  const result = [];
+  const seen = new Set();
+  const append = (key) => {
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    result.push(key);
+    for (const child of children.get(key) || []) append(child);
+  };
+  for (const root of roots) append(root);
+  for (const component of plans) append(component.component_key);
+  return result;
+}
+
 function sealedComponentPlan(existing, supplied) {
   const previous = Array.isArray(existing) ? existing : [];
   const incoming = Array.isArray(supplied) ? supplied : [];
@@ -379,7 +545,8 @@ function priceWorkflowGuard({ quoteMode, relayJobId, quoteComponents, componentL
       api_attempts_required: 1,
       same_component_billing_scenario_scope_required: true,
       disallowed_for: ['credentials', 'authorization'],
-      build_estimate_field: 'official_page_price_evidence',
+      save_tool: 'get_prices',
+      save_field: 'official_page_price_evidence',
     },
   };
 }
@@ -900,6 +1067,140 @@ function allOfficialPageEvidence(input) {
   ));
 }
 
+function officialPageEvidenceIdentity(evidence) {
+  return pricingScopeKey(
+    evidence.component_key, evidence.billing_key, evidence.scenario_key || null,
+  );
+}
+
+function mergeSavedOfficialPageEvidence({
+  existing = [], incoming = [], priceBatch, provider, marketProfile,
+}) {
+  if (!Array.isArray(incoming) || incoming.length === 0) return existing || [];
+  const components = new Map(
+    (priceBatch.quote_components || []).map((component) => [component.component_key, component]),
+  );
+  const contexts = new Map(
+    (priceBatch.query_contexts || []).map((context) => [context.query_id, context]),
+  );
+  const results = new Map(
+    (priceBatch.result?.results || []).map((result) => [result.query_id, result]),
+  );
+  const contextsByScope = new Map();
+  for (const context of contexts.values()) {
+    const key = pricingScopeKey(
+      context.component_key, context.billing_key, context.scenario_key || null,
+    );
+    if (!key || context.purpose !== 'pricing') continue;
+    const entries = contextsByScope.get(key) || [];
+    entries.push(context);
+    contextsByScope.set(key, entries);
+  }
+  const byIdentity = new Map((existing || []).map((item) => [
+    officialPageEvidenceIdentity(item), item,
+  ]));
+  const violations = [];
+  for (const evidence of incoming) {
+    const identity = officialPageEvidenceIdentity(evidence);
+    const component = components.get(evidence.component_key);
+    const planned = (component?.billing_scopes || []).some((scopeItem) => (
+      pricingScopeKey(
+        evidence.component_key, scopeItem.billing_key, scopeItem.scenario_key || null,
+      ) === identity
+    ));
+    if (!component || !planned) {
+      violations.push(`official_page_scope_not_planned:${evidence.component_key}:${evidence.billing_key}`);
+      continue;
+    }
+    if (!officialPricingPageUrlAllowed(provider, evidence.source_url, marketProfile)) {
+      violations.push(`official_page_host_not_allowed:${evidence.component_key}:${evidence.billing_key}`);
+    }
+    const observedAt = Date.parse(evidence.observed_at);
+    if (!Number.isFinite(observedAt) || observedAt > Date.now() + 5 * 60 * 1000) {
+      violations.push(`official_page_observed_at_invalid:${evidence.component_key}:${evidence.billing_key}`);
+    }
+    let qualifyingAttempts = 0;
+    for (const queryId of new Set(evidence.api_attempt_query_ids || [])) {
+      const context = contexts.get(queryId);
+      const result = results.get(queryId);
+      if (!context || officialPageEvidenceIdentity(context) !== identity) {
+        violations.push(`official_page_api_attempt_scope_mismatch:${evidence.component_key}:${evidence.billing_key}:${queryId}`);
+        continue;
+      }
+      if (!result || result.provider !== provider) {
+        violations.push(`official_page_api_attempt_missing_or_wrong_provider:${evidence.component_key}:${evidence.billing_key}:${queryId}`);
+        continue;
+      }
+      if (['credentials', 'authorization'].includes(result.error_category)
+        || result.capability_preflight === true) {
+        violations.push(`official_page_api_attempt_is_permission_blocker:${evidence.component_key}:${evidence.billing_key}:${queryId}`);
+        continue;
+      }
+      if (reusableQueryResult(result, context)) {
+        violations.push(`official_page_fallback_forbidden_when_api_price_exists:${evidence.component_key}:${evidence.billing_key}:${queryId}`);
+        continue;
+      }
+      qualifyingAttempts += 1;
+    }
+    if (qualifyingAttempts < 1) {
+      violations.push(`official_page_has_no_qualifying_api_failure:${evidence.component_key}:${evidence.billing_key}`);
+    }
+    if ((contextsByScope.get(identity) || []).some((context) => (
+      reusableQueryResult(results.get(context.query_id), context)
+    ))) {
+      violations.push(`official_page_fallback_forbidden_when_api_price_exists:${evidence.component_key}:${evidence.billing_key}`);
+    }
+    const previous = byIdentity.get(identity);
+    if (previous && !isDeepStrictEqual(previous, evidence)) {
+      violations.push(`official_page_evidence_immutable:${evidence.component_key}:${evidence.billing_key}`);
+    } else if (!previous) {
+      byIdentity.set(identity, evidence);
+    }
+  }
+  if (violations.length > 0) {
+    const error = new Error('Official pricing page evidence does not match the saved API attempt.');
+    error.code = 'official_page_price_evidence_invalid';
+    error.retryable = true;
+    error.details = { violations };
+    throw error;
+  }
+  return [...byIdentity.values()];
+}
+
+function attachSavedOfficialPageEvidence(input, priceBatch) {
+  const byScope = new Map((priceBatch.official_page_price_evidence || []).map((evidence) => [
+    officialPageEvidenceIdentity(evidence), evidence,
+  ]));
+  if (byScope.size === 0) return input;
+  const publicEvidence = (evidence) => {
+    const { component_key: _componentKey, ...rest } = evidence;
+    return rest;
+  };
+  return {
+    ...input,
+    services: (input.services || []).map((component) => {
+      const baseEvidence = [...byScope.values()].filter((evidence) => (
+        evidence.component_key === component.component_key && !evidence.scenario_key
+      ));
+      return {
+        ...component,
+        ...(baseEvidence.length > 0 && !(component.official_page_price_evidence || []).length
+          ? { official_page_price_evidence: baseEvidence.map(publicEvidence) }
+          : {}),
+        scenario_costs: (component.scenario_costs || []).map((scenario) => {
+          const matching = [...byScope.values()].filter((evidence) => (
+            evidence.component_key === component.component_key
+              && evidence.scenario_key === scenario.scenario_key
+          ));
+          return matching.length > 0 && !(scenario.official_page_price_evidence || []).length
+            ? { ...scenario, official_page_price_evidence: matching.map(publicEvidence) }
+            : scenario;
+        }),
+      };
+    }),
+  };
+}
+
 
 function cachedOfficialPriceDisclosure(input, priceBatch) {
   const results = new Map(
@@ -1195,12 +1496,18 @@ class AstraQuoteV2Workflow {
       priceBatch.query_lifecycle || [],
       priceBatch.result?.results || [],
     );
+    const requestedComponents = new Set((priceBatch.query_contexts || [])
+      .filter((context) => input.query_ids.includes(context.query_id))
+      .map((context) => context.component_key)
+      .filter(Boolean));
     return {
       status: priceBatch.result?.status || 'needs_refinement',
       price_batch_id: priceBatch.price_batch_id,
       result_count: input.query_ids.length,
       batch_result_count: byId.size,
       results,
+      official_page_price_evidence: (priceBatch.official_page_price_evidence || [])
+        .filter((evidence) => requestedComponents.has(evidence.component_key)),
       result_access: {
         tool: 'get_price_results',
         instruction: 'Read next_offset with the same price_batch_id and query_ids until it is null. Saved official evidence is never truncated.',
@@ -1277,6 +1584,11 @@ class AstraQuoteV2Workflow {
     const existingQueries = new Map(
       (existing?.request?.queries || []).map((item) => [item.query_id, item]),
     );
+    const suppliedPageAttemptIds = new Set(
+      (input.official_page_price_evidence || []).flatMap(
+        (evidence) => evidence.api_attempt_query_ids || [],
+      ),
+    );
     assertQueryIdentity(existingQueries, materializedQueries);
     const mergedQueries = new Map(existingQueries);
     for (const query of materializedQueries) mergedQueries.set(query.query_id, query);
@@ -1299,6 +1611,10 @@ class AstraQuoteV2Workflow {
         }
         continue;
       }
+      // The caller has already observed this saved API attempt and is now
+      // returning official-page evidence for the same scope. Do not hit the
+      // same unusable API path a second time merely to save that fallback.
+      if (priorResult && suppliedPageAttemptIds.has(query.query_id)) continue;
       const blocker = forceCapabilityRecheck
         ? null
         : this.capabilityStore.capabilityBlocker(query);
@@ -1415,8 +1731,28 @@ class AstraQuoteV2Workflow {
       mergedResults.set(item.query_id, item);
       return item;
     }) };
+    const provisionalBatch = {
+      ...(latest || {}),
+      quote_components: finalQuoteComponents,
+      query_contexts: finalQueryContexts,
+      result: { results: [...mergedResults.values()] },
+    };
+    const savedOfficialPageEvidence = mergeSavedOfficialPageEvidence({
+      existing: latest?.official_page_price_evidence || [],
+      incoming: input.official_page_price_evidence || [],
+      priceBatch: provisionalBatch,
+      provider: relayJob?.quote_options?.cloud_provider
+        || materializedQueries[0]?.provider
+        || finalQueries.values().next().value?.provider,
+      marketProfile: this.capabilityStore.marketProfile(
+        relayJob?.quote_options?.cloud_provider
+          || materializedQueries[0]?.provider
+          || finalQueries.values().next().value?.provider,
+      ),
+    });
     const progress = queryProgress(
       [...finalQueries.values()], [...mergedResults.values()], finalQueryContexts,
+      savedOfficialPageEvidence,
     );
     const componentStatus = componentProgress(
       finalQuoteComponents,
@@ -1469,6 +1805,7 @@ class AstraQuoteV2Workflow {
       query_contexts: finalQueryContexts,
       query_lifecycle: progress.query_lifecycle,
       component_lifecycle: componentStatus.component_lifecycle,
+      official_page_price_evidence: savedOfficialPageEvidence,
       result: mergedResult,
     });
     if (relayJobId) {
@@ -1522,6 +1859,9 @@ class AstraQuoteV2Workflow {
       queried_query_ids: pendingQueries.map((query) => query.query_id),
       price_cache_hit_query_ids: [],
       stale_price_fallback_query_ids: [],
+      official_page_price_evidence: savedOfficialPageEvidence.filter((evidence) => (
+        finalQuoteComponents.some((component) => component.component_key === evidence.component_key)
+      )),
       capability_preflight_query_ids: capabilityPreflightResults
         .map((item) => item.query_id),
       total_component_count: totalComponentCount,
@@ -1571,6 +1911,9 @@ class AstraQuoteV2Workflow {
         must_continue: true,
       };
     }
+    const savedBatch = checkpoint.price_batch_id
+      ? tryGetPriceBatch(this.store, checkpoint.price_batch_id)
+      : null;
     return {
       relay_job_id: input.relay_job_id,
       relay_status: job.status,
@@ -1591,6 +1934,7 @@ class AstraQuoteV2Workflow {
       superseded_query_ids: checkpoint.superseded_query_ids || [],
       discovery_query_count: checkpoint.discovery_query_count,
       progress_guidance: PROGRESS_GUIDANCE,
+      official_page_price_evidence: savedBatch?.official_page_price_evidence || [],
       quote_id: checkpoint.quote_id || null,
       failed_stage: checkpoint.failed_stage || null,
       error: checkpoint.error || undefined,
@@ -1720,9 +2064,9 @@ class AstraQuoteV2Workflow {
               );
               continue;
             }
-            if (!['not_found', 'query_failed'].includes(result.status)) {
+            if (reusableQueryResult(result, context)) {
               violations.push(
-                `official_page_api_attempt_not_failed:${component.component_key}:${evidence.billing_key}:${queryId}:${result.status}`,
+                `official_page_api_attempt_has_complete_price:${component.component_key}:${evidence.billing_key}:${queryId}:${result.status}`,
               );
               continue;
             }
@@ -1949,6 +2293,9 @@ class AstraQuoteV2Workflow {
       (priceBatch.result.results || []).map((result) => [result.query_id, result]),
     );
     const violations = [];
+    const signedCatalogProviders = new Set([
+      'tencent', 'alibaba', 'huawei', 'baidu', 'volcengine', 'ctyun',
+    ]);
     for (const component of input.zero_cost_services || []) {
       const source = component.official_evidence?.source;
       const reference = String(component.official_evidence?.reference || '');
@@ -1956,6 +2303,13 @@ class AstraQuoteV2Workflow {
         violations.push(`free_allowance_documentation_forbidden:${component.component_key}`);
       }
       if (source !== 'official_price_catalog') continue;
+      // Generic signed billing APIs frequently expose zero-valued placeholder
+      // modules when required commercial parameters are absent.  They are not
+      // authoritative proof that a metered customer component is free.
+      if (signedCatalogProviders.has(input.cloud_provider)) {
+        violations.push(`signed_catalog_zero_rate_not_authoritative:${component.component_key}`);
+        continue;
+      }
 
       const refs = evidenceReferences(component);
       if (refs.length === 0) {
@@ -2108,9 +2462,11 @@ class AstraQuoteV2Workflow {
         priceBatch,
       );
     }
-    const normalizedInput = validateScenarioSemantics(
-      normalizeScenarioCosts(normalizeComponentCosts(relayBoundInput)),
-    );
+    const evidenceBoundInput = attachSavedOfficialPageEvidence(relayBoundInput, priceBatch);
+    validateSealedCustomerFacts(evidenceBoundInput, priceBatch);
+    const normalizedInput = applySealedComponentPresentation(validateScenarioSemantics(
+      normalizeScenarioCosts(normalizeComponentCosts(evidenceBoundInput)),
+    ), priceBatch);
     const marketProfile = this.capabilityStore.marketProfile(normalizedInput.cloud_provider);
     const regionScopes = [
       { region: normalizedInput.default_region, scope: 'quote' },
@@ -2175,6 +2531,7 @@ class AstraQuoteV2Workflow {
       fact_coverage: compiled.fact_coverage,
       transformation_trace: compiled.transformation_trace,
       requirement_ir: normalizedInput.fact_ledger,
+      component_order: sealedComponentOrder(priceBatch),
       resource_ir: normalizedInput.services,
       zero_cost_ir: normalizedInput.zero_cost_services || [],
       unpriced_ir: normalizedInput.unpriced_services || [],
@@ -2255,5 +2612,8 @@ module.exports = {
   enrichUnpricedServices,
   prepareOfficialApiSubmission,
   validateCustomerDocumentMetadata,
+  validateSealedCustomerFacts,
+  applySealedComponentPresentation,
+  sealedComponentOrder,
   validateScenarioSemantics,
 };

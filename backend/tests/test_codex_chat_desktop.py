@@ -381,6 +381,41 @@ def test_ready_for_next_turn_waits_after_approving_a_tool_card(
     assert not desktop.ready_for_next_turn(object())
 
 
+def test_continue_quote_arms_new_response_boundary_before_uncertain_send(
+    desktop_module, monkeypatch,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=60,
+    )
+    quote = type("Quote", (), {})()
+    quote.minimum_assistant_messages = 1
+    quote.last_text = "上一轮已完成"
+    quote.stable_since = 0.0
+    quote.deadline = 0.0
+    quote.saw_assistant = True
+    quote.retry_visible_since = 1.0
+    quote.retry_clicked = True
+    quote.generation_grace_used = True
+    monkeypatch.setattr(desktop, "_switch_to_quote", lambda _quote: None)
+    monkeypatch.setattr(desktop, "_assistant_messages", lambda: ["旧回答一", "旧回答二"])
+
+    def uncertain_send(_prompt):
+        raise desktop_module.PendingPromptSubmissionError("send confirmation timed out")
+
+    monkeypatch.setattr(desktop, "_send_prompt", uncertain_send)
+
+    with pytest.raises(desktop_module.PendingPromptSubmissionError):
+        desktop.continue_quote(quote, "第二轮")
+
+    assert quote.minimum_assistant_messages == 3
+    assert quote.last_text == ""
+    assert quote.saw_assistant is False
+    assert quote.retry_visible_since is None
+    assert quote.retry_clicked is False
+    assert quote.generation_grace_used is False
+
+
 def test_new_chat_clears_a_stale_unsent_draft(desktop_module, monkeypatch):
     desktop = desktop_module.CodexChatDesktop(
         active_quote_factory=dict,

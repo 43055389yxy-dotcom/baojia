@@ -14,9 +14,40 @@ class QuoteStoreError extends Error {
 }
 
 class V2QuoteStore {
-  constructor({ directory = process.env.ASTRAQUOTE_V2_STATE_DIR || '/data/v2-quotes' } = {}) {
+  constructor({
+    directory = process.env.ASTRAQUOTE_V2_STATE_DIR || '/data/v2-quotes',
+    ownerUid = process.env.ASTRAQUOTE_GPT_RELAY_UID,
+    ownerGid = process.env.ASTRAQUOTE_GPT_RELAY_GID,
+  } = {}) {
     this.directory = directory;
+    this.ownerUid = this.parseOwnerId(ownerUid);
+    this.ownerGid = this.parseOwnerId(ownerGid);
     fs.mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+    this.setOwner(this.directory);
+    // The MCP normally creates these files as root while the desktop relay
+    // intentionally runs as an unprivileged host user. Repair old state on
+    // startup so the relay can read durable component progress after an
+    // upgrade instead of treating every component as pending.
+    for (const entry of fs.readdirSync(this.directory, { withFileTypes: true })) {
+      if (entry.isFile() && entry.name.endsWith('.json')) {
+        this.setOwner(path.join(this.directory, entry.name));
+      }
+    }
+  }
+
+  parseOwnerId(value) {
+    if (value === undefined || value === null || value === '') return null;
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+  }
+
+  setOwner(target) {
+    if (this.ownerUid === null && this.ownerGid === null) return;
+    fs.chownSync(
+      target,
+      this.ownerUid === null ? fs.statSync(target).uid : this.ownerUid,
+      this.ownerGid === null ? fs.statSync(target).gid : this.ownerGid,
+    );
   }
 
   idempotencyPath(key) {
@@ -126,6 +157,7 @@ class V2QuoteStore {
   writeAtomic(target, value) {
     const temporary = `${target}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
     fs.writeFileSync(temporary, `${JSON.stringify(value)}\n`, { encoding: 'utf8', mode: 0o600 });
+    this.setOwner(temporary);
     fs.renameSync(temporary, target);
   }
 }

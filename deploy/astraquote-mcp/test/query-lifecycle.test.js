@@ -7,6 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { AstraQuoteV2Workflow } = require('../lib/v2-workflow');
 const { V2QuoteStore } = require('../lib/v2-quote-store');
+const { reusableQueryResult } = require('../lib/query-lifecycle');
 
 function fixture(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'aq-query-lifecycle-'));
@@ -40,6 +41,89 @@ const query = (id, valid = false, provider = 'azure') => ({
 });
 const context = (id, billing = 'compute', component = 'cmp_resource_0001') => ({
   query_id: id, purpose: 'pricing', component_key: component, billing_key: billing,
+});
+
+test('formal pricing does not complete on missing currency, zero placeholders, or partial modules', () => {
+  const owned = context('price');
+  const base = {
+    query_id: 'price', provider: 'alibaba', status: 'ambiguous',
+    official_item_ids: ['NodeAmount', 'Disk'],
+  };
+  assert.equal(reusableQueryResult({
+    ...base,
+    official_rate_candidates: [
+      { rate_id: 'node', official_item_id: 'NodeAmount', unit_price: '1.72', currency: 'CNY' },
+      { rate_id: 'disk', official_item_id: 'Disk', unit_price: '14', currency: 'None' },
+    ],
+  }, owned), false);
+  assert.equal(reusableQueryResult({
+    ...base,
+    official_rate_candidates: [
+      { rate_id: 'node', official_item_id: 'NodeAmount', unit_price: '0', currency: 'CNY' },
+      { rate_id: 'disk', official_item_id: 'Disk', unit_price: '14', currency: 'CNY' },
+    ],
+  }, owned), false);
+  assert.equal(reusableQueryResult({
+    ...base,
+    official_rate_candidates: [
+      { rate_id: 'node', official_item_id: 'NodeAmount', unit_price: '1200', currency: 'CNY' },
+      { rate_id: 'disk', official_item_id: 'Disk', unit_price: '14', currency: 'CNY' },
+    ],
+  }, owned), true);
+  assert.equal(reusableQueryResult({
+    ...base,
+    official_item_ids: ['Enterprise_Instance_Postpaid'],
+    official_rate_candidates: [{
+      rate_id: 'opaque', official_item_id: 'Enterprise_Instance_Postpaid',
+      unit_price: '0.000954866', currency: 'CNY',
+      unit: 'CNY/usage-period-configured-module',
+    }],
+  }, owned), false);
+});
+
+test('one failed API attempt can be completed by persisted official-page evidence without requerying', async (t) => {
+  const { workflow, store, calls } = fixture(t);
+  const first = await workflow.getPrices({
+    quote_mode: 'formal_quote',
+    queries: [query('page-fallback')],
+    query_contexts: [context('page-fallback')],
+    quote_components: [{
+      component_key: 'cmp_resource_0001',
+      customer_owned_source: '云服务器数量：1。',
+      billing_scopes: [{ billing_key: 'compute' }],
+    }],
+  });
+  assert.equal(first.completed_component_count, 0);
+
+  const second = await workflow.getPrices({
+    quote_mode: 'formal_quote',
+    price_batch_id: first.price_batch_id,
+    queries: [query('page-fallback')],
+    query_contexts: [context('page-fallback')],
+    official_page_price_evidence: [{
+      component_key: 'cmp_resource_0001',
+      billing_key: 'compute',
+      source_url: 'https://azure.microsoft.com/en-us/pricing/details/virtual-machines/',
+      source_title: 'Azure Virtual Machines pricing',
+      price_item: 'Linux pay as you go',
+      region: 'eastasia',
+      currency: 'USD',
+      unit_price: '0.12',
+      unit: 'instance hour',
+      observed_at: new Date().toISOString(),
+      source_excerpt: 'East Asia Linux pay as you go: USD 0.12 per instance hour.',
+      api_attempt_query_ids: ['page-fallback'],
+    }],
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(second.completed_component_count, 1);
+  assert.deepEqual(second.incomplete_query_ids, []);
+  assert.equal(second.official_page_price_evidence.length, 1);
+  assert.equal(
+    store.getPriceBatch(first.price_batch_id).official_page_price_evidence[0].unit_price,
+    '0.12',
+  );
 });
 
 test('new successful attempt retires old failure in the same billing scope, not other costs', async (t) => {

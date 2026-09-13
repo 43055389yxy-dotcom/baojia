@@ -301,6 +301,59 @@ def test_final_merge_is_authorized_only_when_every_batch_chat_has_stopped(
     browser.continue_quote.assert_called_once()
 
 
+def test_final_merge_keeps_coordinator_reserved_when_ui_send_is_pending(
+    worker, running_job, monkeypatch,
+):
+    store, job_id, _ = running_job
+    for index in range(2):
+        store.record_chat_session(
+            job_id, batch_index=index, batch_count=2,
+            chat_url=codex_chat(index),
+            role="coordinator" if index == 0 else "component_batch",
+            component_keys=[str(index)],
+        )
+        store.update_chat_session(job_id, index, status="stalled")
+    batches = [
+        {
+            "batch_index": index,
+            "batch_count": 2,
+            "price_batch_id": "aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "component_keys": [str(index)],
+            "component_states": {str(index): "pending"},
+        }
+        for index in range(2)
+    ]
+    monkeypatch.setattr(store, "quote_chat_batches", lambda *_: batches)
+    browser = Mock()
+    browser.resume_quote.side_effect = lambda job, url, **kwargs: worker.ActiveQuote(
+        job, url, 100, **kwargs,
+    )
+    browser.continue_quote.side_effect = worker.PendingPromptSubmissionError("draft")
+    active = {}
+
+    with pytest.raises(worker.PendingPromptSubmissionError):
+        worker.maybe_start_final_merge(store, browser, active, job_id)
+
+    assert list(active) == [f"{job_id}:0"]
+    assert active[f"{job_id}:0"].role == "merge"
+    session = store.get(job_id)["chat_sessions"][0]
+    assert session["status"] == "merging"
+    assert [event["stage"] for event in store.get(job_id)["events"]].count("merge") == 1
+
+    worker.maybe_start_final_merge(store, browser, active, job_id)
+    assert browser.continue_quote.call_count == 1
+    assert [event["stage"] for event in store.get(job_id)["events"]].count("merge") == 1
+
+
+def test_authorize_merge_is_idempotent(running_job):
+    store, job_id, _ = running_job
+
+    store.authorize_merge(job_id)
+    store.authorize_merge(job_id)
+
+    assert [event["stage"] for event in store.get(job_id)["events"]].count("merge") == 1
+
+
 @pytest.mark.parametrize("status", ["partial", "completed", "cancelled"])
 def test_late_worker_failure_cannot_overwrite_delivery_or_cancellation(worker, running_job, status):
     store, job_id, _ = running_job

@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.15.0';
+const VERSION = '3.16.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -232,6 +232,28 @@ const quoteComponentPlan = z.object({
   ),
 }).strict();
 
+const savedOfficialPagePriceEvidence = z.object({
+  component_key: componentKey,
+  billing_key: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/),
+  scenario_key: z.enum([
+    'on_demand',
+    'one_month_subscription',
+    'one_year_subscription',
+    'one_year_commitment',
+    'three_year_commitment',
+  ]).optional(),
+  source_url: z.string().url().max(2000),
+  source_title: z.string().min(1).max(300),
+  price_item: z.string().min(1).max(500),
+  region,
+  currency: z.string().regex(/^[A-Z]{3}$/),
+  unit_price: z.string().regex(/^(?:0*[1-9]\d*(?:\.\d{1,12})?|0*\.\d*[1-9]\d*)$/),
+  unit: z.string().min(1).max(120),
+  observed_at: z.string().datetime({ offset: true }),
+  source_excerpt: z.string().min(1).max(1000),
+  api_attempt_query_ids: z.array(z.string().min(1).max(100)).min(1).max(30),
+}).strict();
+
 const getPricesInputSchema = z.object({
   quote_mode: z.enum(['price_lookup', 'formal_quote']).describe(
     'Required intent. Use formal_quote whenever the user asks for a formal quote, Excel, sales-page delivery, or a multi-component customer quote. Use price_lookup only when the user wants price facts without formal delivery. Never downgrade a formal quote because some prices are missing.',
@@ -258,6 +280,9 @@ const getPricesInputSchema = z.object({
   ),
   force_capability_recheck: z.boolean().optional().describe(
     'Use only after an administrator has repaired cloud API permissions. It bypasses a recent scoped authorization-denial memory once; it never bypasses provider authorization.',
+  ),
+  official_page_price_evidence: z.array(savedOfficialPagePriceEvidence).min(1).max(100).optional().describe(
+    'When one official API attempt for the same component billing scope returned no complete usable commercial rate, save the price selected from the same provider and account site official pricing page. Resubmit the existing failed query identity; it will not be called again.',
   ),
 }).strict();
 
@@ -676,7 +701,7 @@ function buildServer(workflow) {
 
   server.registerTool('get_prices', {
     title: 'Batch query official cloud prices',
-    description: 'Always set quote_mode: a request for a formal quote, Excel or sales-page delivery MUST use formal_quote; never downgrade it to price_lookup because some prices are missing. Requires a non-empty incremental queries array. For a formal quote, every query MUST have a query_contexts entry. A pre-split sales relay call MUST preserve relay_batch_index, relay_batch_count and the reserved price_batch_id from its prompt, and quote_components MUST contain only that batch; the backend appends and seals each batch. A legacy formal quote registers the complete plan on its first call. Submit as many prepared scopes as fit this call so independent official requests can run in parallel. Each authenticated-cloud query must contain the complete official endpoint, service, region and current response contract chosen by GPT for that live call; the MCP does not learn or reuse product, country or region API routes. Full official results are persisted. If response_compacted=true, read only required details with get_price_results. Invalid or unsupported parameter values are correctable: repair only the rejected fields and retry. needs_refinement, terminal=false, or must_continue=true means do not give the user a final answer. After one effective official API failure for the same component/billing/scenario scope, use that provider and account-site official pricing page through build_estimate. GPT chooses products, required minimum parameter values and quote totals; program-assigned sales batches are immutable.',
+    description: 'Always set quote_mode: a request for a formal quote, Excel or sales-page delivery MUST use formal_quote; never downgrade it to price_lookup because some prices are missing. Requires a non-empty incremental queries array. For a formal quote, every query MUST have a query_contexts entry. A pre-split sales relay call MUST preserve relay_batch_index, relay_batch_count and the reserved price_batch_id from its prompt, and quote_components MUST contain only that batch; the backend appends and seals each batch. A legacy formal quote registers the complete plan on its first call. Submit as many prepared scopes as fit this call so independent official requests can run in parallel. Each authenticated-cloud query must contain the complete official endpoint, service, region and current response contract chosen by GPT for that live call; the MCP does not learn or reuse product, country or region API routes. Full official results are persisted. If response_compacted=true, read only required details with get_price_results. Invalid or unsupported parameter values are correctable: repair only the rejected fields and retry. needs_refinement, terminal=false, or must_continue=true means do not give the user a final answer. After one incomplete official API result for the same component/billing/scenario scope, read the provider official pricing page and call get_prices again with the saved query plus top-level official_page_price_evidence; the saved API is not called twice and the fallback becomes available to final merge. GPT chooses products, required minimum parameter values and quote totals; program-assigned sales batches are immutable.',
     // Keep the JSON Schema visible to MCP clients. ZodEffects produced by
     // superRefine serializes as an empty object in the MCP SDK, so cross-field
     // checks run inside the guarded handler instead.

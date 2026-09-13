@@ -1033,7 +1033,9 @@ class CodexChatDesktop:
     def continue_quote(self, quote: Any, prompt: str) -> None:
         self._switch_to_quote(quote)
         assistant_count = len(self._assistant_messages())
-        self._send_prompt(prompt)
+        # Arm the next-turn boundary before clicking Send. If the renderer
+        # accepts the draft but confirmation times out, polling must not treat
+        # the previous assistant message as the response to this new prompt.
         quote.minimum_assistant_messages = assistant_count + 1
         quote.last_text = ""
         quote.stable_since = time.monotonic()
@@ -1042,6 +1044,7 @@ class CodexChatDesktop:
         quote.retry_visible_since = None
         quote.retry_clicked = False
         quote.generation_grace_used = False
+        self._send_prompt(prompt)
 
     def _stop_generation(self) -> bool:
         return bool(

@@ -36,7 +36,7 @@ MCP 只做这些机械动作：调用官方价目 API、保存并返回候选和
 
 `not_found` 只说明当前请求没有提取到匹配项，不能据此宣称产品不存在或接口永久不可用。读取 `not_found_reason`、`raw_item_count`、`filtered_item_count` 和 `recovery`：`response_filters_no_match` 表示官方有返回但被筛选掉，结合 `refinement_fields` 检查字段、值和分页；`official_empty_result` 表示这组请求条件返回空列表，检查本次产品代码、站点、区域、购买方式和必填参数，必要时由 GPT 找另一条官方路线。字段路径不存在或返回类型不符会明确返回可修正的 `query_failed / response_schema`；按保存的 `raw_response` 核对真实结构，不可当成无 SKU。所有选型、参数修正及替代路线继续由 GPT 判断。
 
-同一正式计费项现场调用一次官方 API 后仍只有 `not_found` 或非权限类 `query_failed`，且该归属下没有任何可用 API 费率时，不要重复撞同一路径。GPT 立即读取对应云厂商当前账号站点的官方价格页，选择具体计费项目、地区、币种、单位和正数单价并自行计算，然后在 `official_page_price_evidence` 中提交：稳定 `billing_key`、可选 `scenario_key`、官方 HTTPS URL、页面标题、计费项目、地区、币种、单位价格、单位、读取时间、简短原文摘录，以及前面失败的 API `query_id`。MCP 只机械验证失败尝试属于同一组件/计费项/方案、页面域名属于当前云厂商与账号站点、地区和币种一致、单价为正数；不会替 GPT 选价格或算钱。权限或凭据失败仍需修复权限，不能用网页证据掩盖。只要同一计费项取得可用 API 费率，就必须使用 API 证据，网页证据不得覆盖。
+同一正式计费项现场调用一次官方 API 后仍没有完整的正数商业费率（包括 `not_found`、非权限类 `query_failed`、币种缺失、全零占位模块或部分模块为零），且该归属下没有其他可用 API 费率时，不要重复撞同一路径。GPT 立即读取对应云厂商当前账号站点的官方价格页，选择具体计费项目、地区、币种、单位和正数单价并自行计算，然后再次调用 `get_prices`，复用原查询并在顶层 `official_page_price_evidence` 中提交：`component_key`、稳定 `billing_key`、可选 `scenario_key`、官方 HTTPS URL、页面标题、计费项目、地区、币种、单位价格、单位、读取时间、简短原文摘录，以及前面失败的 API `query_id`。该调用只保存网页证据，不会再次请求已经失败的 API；证据立即进入组件完成状态，供其他对话的最终合并直接读取。MCP 只机械验证失败尝试属于同一组件/计费项/方案、页面域名属于当前云厂商与账号站点、地区和币种一致、单价为正数；不会替 GPT 选价格或算钱。权限或凭据失败仍需修复权限，不能用网页证据掩盖。只要同一计费项取得完整可用 API 费率，就必须使用 API 证据，网页证据不得覆盖。
 
 探索过程中已经取得真实费率时，GPT 可把该查询从 discovery 补充为带归属的 pricing 并直接复用，避免重复请求。尚未分类的旧失败查询不能自动证明整单永久阻塞，应先由 GPT 核对它是否仍是必要计费项。
 
@@ -76,7 +76,7 @@ MCP 返回原始官方候选、`official_item_ids`，并把候选中的官方费
 
 ## 核验与交付
 
-`build_estimate` 接收销售已选厂商、`price_batch_id`、GPT 明确选中的 `price_evidence` 或一次 API 未取得可用费率后的 `official_page_price_evidence`、Fact Ledger、逐组件费用和整单合计。MCP 只检查：价格批次和厂商一致；API 证据中的官方 SKU 与费率身份存在且没有使用零价额度段；网页证据满足同计费归属、官方站点、地区、币种和正数单价约束；事实没有遗漏、重复或跨组件引用；逐项金额之和等于总额。不重算业务价格，不修改 GPT 提交的配置或金额。
+`build_estimate` 接收销售已选厂商、`price_batch_id`、GPT 明确选中的 `price_evidence`、Fact Ledger、逐组件费用和整单合计；前面通过 `get_prices` 保存的官方网页证据会按组件和方案自动并入。Fact Ledger 的 `cleaned_evidence` 必须逐字来自本组件已经封存的 `customer_owned_source`，禁止写“后台计划”、价格结果、兄弟组件或系统推导值冒充客户事实。MCP 检查：价格批次和厂商一致；API 证据中的官方 SKU 与费率身份存在且没有使用零价占位模块；网页证据满足同计费归属、官方站点、地区、币种和正数单价约束；事实没有遗漏、重复或跨组件引用；逐项金额之和等于总额。客户文档中的服务名称、需求摘要和组件顺序以封存的清洗组件为准，不允许“服务0024”“官方方案”“后台计划”等占位文字进入销售页或 Excel。
 
 不收费的资源由 GPT 根据官方依据放入 `zero_cost_services`，使用 `pricing_basis=official_no_additional_charge`，并提供官方文档或官方价目证据。Free Tier、Always Free、免费试用、促销赠送或账户信用额度不能作为零元依据。若依据来自官方价目，必须同时提交 `price_evidence`；MCP 将确认所选 SKU 只有真正的零费率且不存在同 SKU 正常商业费率。凡同时含零价额度段和正价商业段的 SKU 都是可计费资源，必须移入 `services` 并采用正价商业费率。
 

@@ -852,6 +852,13 @@ def maybe_start_final_merge(
         )
     else:
         active.role = "merge"
+    # Persist the merge reservation and keep the resumed coordinator visible
+    # before touching the renderer.  A send-button race may leave a valid
+    # draft in the composer; without this ordering the next loop re-authorizes
+    # and recreates the same merge over and over.
+    active.role = "merge"
+    active_quotes[active.session_key] = active
+    store.update_chat_session(job_id, 0, status="merging")
     store.authorize_merge(job_id)
     browser.continue_quote(
         active,
@@ -861,8 +868,6 @@ def maybe_start_final_merge(
             price_batch_id=str(batches[0]["price_batch_id"]),
         ),
     )
-    store.update_chat_session(job_id, 0, status="merging")
-    active_quotes[active.session_key] = active
 
 
 def complete_job(store: GptQuoteRelayStore, job_id: str, response: str) -> str:

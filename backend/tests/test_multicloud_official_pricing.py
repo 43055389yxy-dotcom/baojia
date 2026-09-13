@@ -17,6 +17,7 @@ from app.services.mcp_v2_pricing import (
     OfficialPricingService,
     TencentPriceQuery,
     VolcenginePriceQuery,
+    _rate_candidate,
 )
 from app.services.official_cloud_clients import OfficialCloudClientError
 
@@ -55,6 +56,21 @@ class _AuthenticatedRecorder:
     def __call__(self, query: Any) -> dict[str, Any]:
         self.calls.append(query)
         return next(self.payloads)
+
+
+def test_rate_candidate_rejects_missing_or_non_iso_currency() -> None:
+    assert _rate_candidate(
+        "alibaba", "ModuleDetail", unit_price="1.23", currency=None
+    ) is None
+    assert _rate_candidate(
+        "alibaba", "ModuleDetail", unit_price="1.23", currency="None"
+    ) is None
+
+    candidate = _rate_candidate(
+        "alibaba", "ModuleDetail", unit_price="1.23", currency="cny"
+    )
+    assert candidate is not None
+    assert candidate["currency"] == "CNY"
 
 
 @pytest.mark.parametrize(

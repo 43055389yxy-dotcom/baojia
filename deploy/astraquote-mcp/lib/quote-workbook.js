@@ -187,12 +187,23 @@ function materialAdjustment(item) {
   return `${requirement} → ${configuration}${reason ? `（${reason}）` : ''}`;
 }
 
-function componentDetails(record) {
-  const components = [
-    ...(record.resource_ir || []),
-    ...(record.zero_cost_ir || []),
-    ...(record.unpriced_ir || []),
+function orderedComponentEntries(record) {
+  const grouped = [
+    ...(record.resource_ir || []).map((component) => ({ component, kind: 'priced' })),
+    ...(record.zero_cost_ir || []).map((component) => ({ component, kind: 'zero' })),
+    ...(record.unpriced_ir || []).map((component) => ({ component, kind: 'unpriced' })),
   ];
+  const byKey = new Map(grouped.map((entry) => [entry.component.component_key, entry]));
+  const requestedOrder = Array.isArray(record.component_order) && record.component_order.length > 0
+    ? record.component_order
+    : [...new Set((record.requirement_ir || []).map((fact) => fact.component_key).filter(Boolean))];
+  const ordered = requestedOrder.map((key) => byKey.get(key)).filter(Boolean);
+  const included = new Set(ordered.map((entry) => entry.component.component_key));
+  return ordered.concat(grouped.filter((entry) => !included.has(entry.component.component_key)));
+}
+
+function componentDetails(record) {
+  const entries = orderedComponentEntries(record);
   const unpricedKeys = new Set(
     (record.unpriced_ir || []).map((component) => component.component_key),
   );
@@ -212,7 +223,7 @@ function componentDetails(record) {
   const scenarios = Array.isArray(record.pricing_scenarios)
     ? record.pricing_scenarios.filter((scenario) => scenarioLabel(record, scenario))
     : [];
-  return components.map((component, index) => {
+  return entries.map(({ component }, index) => {
     const display = component.customer_facing || {};
     const directMonthly = Number(
       component.expected_monthly_cost ?? component.monthly_cost,
@@ -242,9 +253,9 @@ function componentDetails(record) {
         record.cloud_provider,
         record.market_profile,
       ),
-      simplifyCustomerText(display.model_or_plan || component.instance || '官方方案'),
-      simplifyCustomerText(display.quantity || '-'),
-      simplifyCustomerText(display.configuration_summary || '-'),
+      simplifyCustomerText(display.model_or_plan || component.instance || ''),
+      simplifyCustomerText(display.quantity || ''),
+      simplifyCustomerText(display.configuration_summary || display.requirement_summary || ''),
       ...priceCells.map((value) => (Number.isFinite(value) ? value : null)),
       simplifyCustomerText(display.reference_unit_price || ''),
       [
@@ -277,11 +288,12 @@ async function buildQuoteWorkbook(record) {
     ? record.pricing_scenarios.filter((scenario) => scenarioLabel(record, scenario))
     : [];
   const rows = componentDetails(record);
+  const componentEntries = orderedComponentEntries(record);
   const priceColumnCount = scenarios.length || 1;
   const moneyFormat = currencyNumberFormat(record.currency);
-  const pricedRowCount = (record.resource_ir || []).length + (record.zero_cost_ir || []).length;
-  if (rows.slice(0, pricedRowCount).some(
-    (row) => row.slice(6, 6 + priceColumnCount).some((value) => !Number.isFinite(value)),
+  if (rows.some(
+    (row, index) => componentEntries[index]?.kind !== 'unpriced'
+      && row.slice(6, 6 + priceColumnCount).some((value) => !Number.isFinite(value)),
   )) {
     const error = new Error('Every quote component must have a verified monthly cost.');
     error.code = 'component_monthly_cost_required';
@@ -434,5 +446,6 @@ module.exports = {
   conciseReason,
   friendlyRegion,
   materialAdjustment,
+  orderedComponentEntries,
   simplifyCustomerText,
 };

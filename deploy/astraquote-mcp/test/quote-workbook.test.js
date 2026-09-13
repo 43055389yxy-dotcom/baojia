@@ -149,6 +149,46 @@ test('partial workbook keeps successful totals and marks unpriced components wit
   assert.equal(sheet.getCell('G4').value.result, 245.67);
 });
 
+test('partial workbook preserves the sealed customer component order', async () => {
+  const record = verifiedRecord();
+  record.is_partial = true;
+  record.verification.status = 'official_price_partial';
+  record.component_order = ['cmp_s3_0002', 'cmp_ec2_0001'];
+  record.unpriced_ir = [{
+    component_key: 'cmp_s3_0002',
+    region: 'ap-northeast-1',
+    failure_code: 'official_price_unavailable',
+    retryable: false,
+    customer_facing: {
+      service_name: 'Amazon S3', quantity: '2 TiB',
+      requirement_summary: 'Amazon S3 Standard 2 TiB。',
+      configuration_summary: 'Amazon S3 Standard 2 TiB。',
+    },
+  }];
+
+  const { sheet } = await readWorkbook(record);
+  assert.equal(sheet.getCell('B2').value, 'Amazon S3');
+  assert.equal(sheet.getCell('G2').value, null);
+  assert.equal(sheet.getCell('B3').value, 'Amazon EC2 云服务器');
+  assert.equal(sheet.getCell('G3').value, 245.67);
+});
+
+test('workbook never invents official plan, dash quantity, or backend-plan configuration', () => {
+  const record = verifiedRecord();
+  record.resource_ir[0].instance = undefined;
+  record.resource_ir[0].customer_facing = {
+    service_name: '云服务器',
+    requirement_summary: '8 核 32 GiB，2 台。',
+    configuration_summary: '',
+  };
+
+  const rows = componentDetails(record);
+  assert.equal(rows[0][3], '');
+  assert.equal(rows[0][4], '');
+  assert.equal(rows[0][5], '8 核 32 GiB，2 台。');
+  assert.doesNotMatch(rows[0].join('|'), /官方方案|后台计划/);
+});
+
 test('keeps provider maintenance, rate limits and cache fallback details out of customer Excel', async () => {
   const record = verifiedRecord();
   record.is_partial = true;

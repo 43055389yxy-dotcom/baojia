@@ -6,7 +6,13 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { AstraQuoteV2Workflow, enrichUnpricedServices } = require('../lib/v2-workflow');
+const {
+  AstraQuoteV2Workflow,
+  applySealedComponentPresentation,
+  enrichUnpricedServices,
+  sealedComponentOrder,
+  validateSealedCustomerFacts,
+} = require('../lib/v2-workflow');
 const { V2QuoteStore } = require('../lib/v2-quote-store');
 const { providerRegionMismatch } = require('../lib/cloud-market-profiles');
 
@@ -164,6 +170,73 @@ function officialPageEvidence(attemptIds, overrides = {}) {
     ...overrides,
   };
 }
+
+test('sealed cleaned components reject fabricated backend-plan and price facts', () => {
+  const priceBatch = {
+    quote_components: [{
+      component_key: 'cmp_intake_0024',
+      customer_owned_source: '云安全中心；地域 cn-hangzhou；96核；数量11。',
+    }],
+  };
+  assert.throws(() => validateSealedCustomerFacts({
+    fact_ledger: [{
+      fact_id: 'f24', component_key: 'cmp_intake_0024', field: 'usage', value: 730,
+      unit: 'h/month', scope: 'per_month', cleaned_evidence: '后台计划', disposition: 'billable',
+    }],
+  }, priceBatch), (error) => error.code === 'sealed_customer_facts_invalid'
+    && error.details.violations.includes('fact_not_in_sealed_component:cmp_intake_0024:f24'));
+});
+
+test('sales list ordinals are not treated as customer sizing facts', () => {
+  assert.doesNotThrow(() => validateSealedCustomerFacts({
+    fact_ledger: [{
+      fact_id: 'f-service', component_key: 'cmp_intake_0043', field: 'service',
+      value: '运维服务', unit: 'service', scope: 'per_component',
+      cleaned_evidence: '运维服务：杭州，经济版。', disposition: 'non_billing_context',
+    }],
+  }, {
+    quote_components: [{
+      component_key: 'cmp_intake_0043',
+      customer_owned_source: '43. 运维服务：杭州，经济版。',
+    }],
+  }));
+});
+
+test('sealed component text repairs generic customer-facing placeholders without inventing values', () => {
+  const normalized = applySealedComponentPresentation({
+    services: [{
+      component_key: 'cmp_intake_0032',
+      customer_facing: {
+        service_name: '服务0032', model_or_plan: '官方方案', quantity: '-',
+        requirement_summary: '后台计划', configuration_summary: '后台计划',
+      },
+    }],
+  }, {
+    quote_components: [{
+      component_key: 'cmp_intake_0032',
+      customer_owned_source: 'Elasticsearch：杭州，具体规格未注明。',
+    }],
+  });
+  assert.equal(normalized.services[0].customer_facing.service_name, 'Elasticsearch');
+  assert.equal(normalized.services[0].customer_facing.requirement_summary, 'Elasticsearch：杭州，具体规格未注明。');
+  assert.equal(normalized.services[0].customer_facing.configuration_summary, 'Elasticsearch：杭州，具体规格未注明。');
+  assert.equal(normalized.services[0].customer_facing.model_or_plan, undefined);
+  assert.equal(normalized.services[0].customer_facing.quantity, undefined);
+});
+
+test('final component order follows relay batch order rather than chat completion order', () => {
+  assert.deepEqual(sealedComponentOrder({
+    quote_components: [
+      { component_key: 'cmp_intake_0006' },
+      { component_key: 'cmp_intake_0001' },
+      { component_key: 'cmp_disk_0001', parent_component_key: 'cmp_intake_0001' },
+    ],
+    relay_component_batches: [
+      { batch_index: 1, component_keys: ['cmp_intake_0006'] },
+      { batch_index: 0, component_keys: ['cmp_intake_0001'] },
+    ],
+  }), ['cmp_intake_0001', 'cmp_disk_0001', 'cmp_intake_0006']);
+});
 
 test('unpriced components inherit the authoritative provider failure without leaking raw messages', () => {
   const enriched = enrichUnpricedServices({
@@ -426,7 +499,7 @@ test('a partial quote delivers verified components and preserves failed componen
     quote_components: [
       {
         component_key: 'cmp_compute_0001',
-        customer_owned_source: '云服务器：1 台。',
+        customer_owned_source: '云服务器数量：1。',
         billing_scopes: [{ billing_key: 'compute' }],
       },
       {
@@ -512,7 +585,7 @@ test('retrying a delivered partial quote creates a newer complete quote instead 
 
   const plan = [
     {
-      component_key: 'cmp_compute_0001', customer_owned_source: '云服务器：1 台。',
+      component_key: 'cmp_compute_0001', customer_owned_source: '云服务器数量：1。',
       billing_scopes: [{ billing_key: 'compute' }],
     },
     {
@@ -942,6 +1015,41 @@ test('a mixed free-tier catalog SKU cannot be disguised as a zero-cost service',
         'free_allowance_not_zero_cost:cmp_oci_a1_0002:price-1:item-1',
       ),
   );
+});
+
+test('a signed-cloud zero placeholder cannot make a metered component free', () => {
+  const { workflow, directory } = fixture({ provider: 'alibaba' });
+  try {
+    assert.throws(() => workflow.validateZeroCostEvidence({
+      cloud_provider: 'alibaba',
+      zero_cost_services: [{
+        component_key: 'cmp_cdn_0033',
+        pricing_basis: 'official_no_additional_charge',
+        official_evidence: {
+          source: 'official_price_catalog',
+          reference: 'CdnTrafficChina returned 0 CNY/GB.',
+        },
+        price_evidence: [{
+          query_id: 'cdn-price', official_item_ids: ['CdnTrafficChina'],
+          official_rate_ids: ['alibaba:cdn:zero'],
+        }],
+      }],
+    }, {
+      result: { results: [{
+        query_id: 'cdn-price', provider: 'alibaba', status: 'exact',
+        official_item_ids: ['CdnTrafficChina'],
+        official_rate_candidates: [{
+          rate_id: 'alibaba:cdn:zero', official_item_id: 'CdnTrafficChina',
+          unit_price: '0', currency: 'CNY', unit: 'CNY/GB', is_zero_rate: true,
+        }],
+      }] },
+    }), (error) => error.code === 'official_zero_cost_evidence_invalid'
+      && error.details.violations.includes(
+        'signed_catalog_zero_rate_not_authoritative:cmp_cdn_0033',
+      ));
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('free-tier documentation cannot justify a commercial zero-cost line', async (t) => {
