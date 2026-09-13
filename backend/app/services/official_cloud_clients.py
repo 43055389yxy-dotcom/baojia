@@ -506,6 +506,18 @@ def _has_official_error_envelope(payload: dict[str, Any]) -> bool:
         for candidate in candidates
     ):
         return True
+    top_level_code = _first_text(payload, (("Code",), ("code",), ("statusCode",)))
+    top_level_message = _first_text(
+        payload,
+        (("Message",), ("message",), ("error_msg",)),
+    )
+    success_codes = {"0", "200", "ok", "success", "succeeded"}
+    if (
+        top_level_code
+        and top_level_message
+        and top_level_code.strip().casefold() not in success_codes
+    ):
+        return True
     success = payload.get("Success", payload.get("success"))
     return success is False and bool(
         _first_text(

@@ -232,12 +232,46 @@ def build_component_batch_continuation_prompt(
 
     return (
         f"{ASTRAQUOTE_MENTION} 这不是新报价。"
-        "请先读取后台组件状态，只把本批尚未完成的组件重新组织后补查一次，"
+        "请先读取后台组件状态，只处理本批尚未完成的组件，"
         "已经成功的查询必须复用，不得处理其他批次，也不要生成最终整单。"
+        "只有官方错误明确给出可修正字段、操作或响应路径时，才允许发出一次"
+        "实质不同的修正 API 请求；否则直接查同厂商、同账号站点的官方价格页。"
+        "不得只更换 query_id 重复相同请求，不得生成部分报价或销售手填项。"
         "补查结束后必须调用 build_estimate，设置 delivery_mode=save_component_batch，"
         "只保存本批最终组件结果；最后一批由程序自动合并并生成 Excel。"
         f"当前为第 {batch_index + 1}/{batch_count} 批；"
         f"允许处理的 component_key：{json.dumps(component_keys, ensure_ascii=False)}。\n\n"
+        f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n"
+        f"price_batch_id：{price_batch_id}\n"
+        f"relay_batch_index：{batch_index}\n"
+        f"relay_batch_count：{batch_count}。"
+    )
+
+
+def build_component_batch_deferred_retry_prompt(
+    *,
+    relay_job_id: str,
+    submission_code: str,
+    price_batch_id: str,
+    batch_index: int,
+    batch_count: int,
+    component_keys: list[str],
+) -> str:
+    """Retry the deferred components once in their original conversation."""
+
+    return (
+        f"{ASTRAQUOTE_MENTION} 这不是新报价。其他正常组件已经处理完，"
+        "现在只补本对话先前暂存的未完成组件，且这是唯一一次集中补发。"
+        "先读取后台真实组件状态，所有已经成功的组件、计费项和官方证据必须直接复用，"
+        "严禁重新查询。对仍未完成的计费项：只有现有官方错误明确给出了可修正字段、"
+        "操作或响应路径时，才允许发出一次实质不同的修正 API 请求；"
+        "禁止仅更换 query_id 后重复相同主机、操作、路径和业务参数。"
+        "修正请求仍没有完整可用费率，或该产品登记为 official_page_only 时，"
+        "必须立即查询同一云厂商、同一账号站点的官方价格页并保存 PriceIR 证据。"
+        "不得生成 unpriced_services、部分报价或销售手填项。"
+        "完成后调用 build_estimate，设置 delivery_mode=save_component_batch，"
+        "提交本批全部最终组件结果；已成功组件只随结构化结果一起复用，不得重新查价。"
+        f"允许补查的 component_key：{json.dumps(component_keys, ensure_ascii=False)}。\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n"
         f"price_batch_id：{price_batch_id}\n"
         f"relay_batch_index：{batch_index}\n"

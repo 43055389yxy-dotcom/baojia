@@ -83,6 +83,32 @@ function withOfficialApiBaseRoute(query) {
   if (!materialized.official_source_url && route.official_source_url) {
     materialized.official_source_url = route.official_source_url;
   }
+  if (route.capability === 'quote_api' && route.operations.length > 0) {
+    if (!materialized.action && (!materialized.path || materialized.path === '/')
+      && route.operations.length === 1) {
+      const operation = route.operations[0];
+      if (operation.startsWith('/')) materialized.path = operation;
+      else materialized.action = operation;
+    }
+    const supplied = String(materialized.action || materialized.path || '/').toLowerCase()
+      .replace(/\/$/u, '');
+    const allowed = route.operations.some((operation) => {
+      const expected = operation.toLowerCase().replace(/\/$/u, '');
+      return supplied === expected
+        || (!materialized.action && !operation.startsWith('/') && supplied.endsWith(expected));
+    });
+    if (!allowed) {
+      const error = new Error('The request must use a registered official pricing operation.');
+      error.code = 'official_api_operation_not_registered';
+      error.retryable = true;
+      error.details = {
+        provider: route.provider,
+        service: route.service,
+        allowed_operations: route.operations,
+      };
+      throw error;
+    }
+  }
   return {
     ...materialized,
   };

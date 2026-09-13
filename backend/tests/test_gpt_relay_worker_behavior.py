@@ -135,7 +135,9 @@ def test_partial_retry_reuses_only_coordinator_after_queue_claim(worker, running
     assert browser.continue_quote.call_count == 1
 
 
-def test_batch_failure_state_churn_is_not_real_progress(worker, running_job, monkeypatch):
+def test_incomplete_batch_is_deferred_instead_of_immediately_retried(
+    worker, running_job, monkeypatch,
+):
     store, job_id, _ = running_job
     store.record_chat_session(
         job_id, batch_index=1, batch_count=2,
@@ -149,14 +151,12 @@ def test_batch_failure_state_churn_is_not_real_progress(worker, running_job, mon
     }
     monkeypatch.setattr(worker, "active_batch", lambda *_: batch)
     browser = Mock()
-    assert worker.continue_component_batch(store, browser, active)
-    prompt = browser.continue_quote.call_args.args[1]
-    assert '"b"' in prompt
-    assert '"a"' not in prompt
     assert not worker.continue_component_batch(store, browser, active)
-    batch["component_states"]["a"] = "pending"
-    assert not worker.continue_component_batch(store, browser, active)
-    assert browser.continue_quote.call_count == 1
+    browser.continue_quote.assert_not_called()
+    session = store.get(job_id)["chat_sessions"][0]
+    assert session["status"] == "deferred"
+    assert session["deferred_component_keys"] == ["b"]
+    assert session["deferred_retry_sent"] is False
 
 
 def test_single_chat_retries_only_incomplete_components_once_then_forces_official_page(
@@ -218,7 +218,9 @@ def test_failed_component_is_not_treated_as_completed_before_its_one_retry(worke
     })
 
 
-def test_unconfirmed_ui_send_does_not_consume_component_retry(worker, running_job, monkeypatch):
+def test_deferring_an_incomplete_component_does_not_consume_a_retry_send(
+    worker, running_job, monkeypatch,
+):
     store, job_id, _ = running_job
     store.record_chat_session(
         job_id, batch_index=1, batch_count=2,
@@ -229,9 +231,8 @@ def test_unconfirmed_ui_send_does_not_consume_component_retry(worker, running_jo
              "batch_count": 2, "component_keys": ["a"]}
     monkeypatch.setattr(worker, "active_batch", lambda *_: batch)
     browser = Mock()
-    browser.continue_quote.side_effect = RuntimeError("delivery was uncertain")
-    with pytest.raises(RuntimeError):
-        worker.continue_component_batch(store, browser, active)
+    assert not worker.continue_component_batch(store, browser, active)
+    browser.continue_quote.assert_not_called()
     assert store.get(job_id)["chat_sessions"][0].get("stalled_attempts", 0) == 0
 
 
@@ -394,6 +395,8 @@ def test_second_batch_timeout_stops_only_that_batch_and_leaves_other_batches_run
         "price_batch_id": "aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
         "component_keys": [f"cmp-{index}"],
         "component_states": {f"cmp-{index}": "pending"},
+        "component_result_required": True,
+        "component_result_saved": False,
     } for index in range(2)]
     monkeypatch.setattr(store, "quote_chat_batches", lambda *_: batches)
     active = {
@@ -407,6 +410,124 @@ def test_second_batch_timeout_stops_only_that_batch_and_leaves_other_batches_run
     assert timed_out.session_key not in active
     assert still_running.session_key in active
     browser.continue_quote.assert_not_called()
+
+
+def test_deferred_first_wave_continues_with_second_wave_in_the_same_chat(
+    worker,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = GptQuoteRelayStore(tmp_path / "relay", max_concurrent_quotes=4)
+    text = "\n".join(f"{index}. 组件 {index}：配置。" for index in range(1, 11))
+    job = store.create(text, {}, numbered_components=parse_numbered_component_lines(text))
+    record = store.claim_next("test-worker")
+    browser = Mock()
+    browser.logged_in.return_value = True
+    browser.start_quote.return_value = worker.ActiveQuote(job["job_id"], codex_chat(0), 100)
+    active = worker.submit_job(store, browser, record)
+    assert active is not None
+    first_batch = {
+        "batch_index": 0,
+        "batch_count": 2,
+        "price_batch_id": store.get(job["job_id"])["reserved_price_batch_id"],
+        "component_keys": [f"cmp_intake_{index:04d}" for index in range(1, 6)],
+        "component_states": {
+            "cmp_intake_0001": "completed",
+            "cmp_intake_0002": "completed",
+            "cmp_intake_0003": "pending",
+            "cmp_intake_0004": "completed",
+            "cmp_intake_0005": "pending",
+        },
+    }
+    monkeypatch.setattr(worker, "active_batch", lambda *_: first_batch)
+
+    assert worker.continue_component_batch(store, browser, active)
+
+    assert active.batch_index == 1
+    prompt = browser.continue_quote.call_args.args[1]
+    assert "cmp_intake_0006" in prompt
+    assert "cmp_intake_0003" not in prompt
+    sessions = store.get(job["job_id"])["chat_sessions"]
+    assert sessions[0]["status"] == "deferred"
+    assert sessions[0]["deferred_component_keys"] == [
+        "cmp_intake_0003", "cmp_intake_0005",
+    ]
+    assert sessions[1]["status"] == "running"
+    assert sessions[0]["chat_url"] == sessions[1]["chat_url"]
+
+
+def test_programmatic_settlement_resumes_deferred_components_once_in_original_chat(
+    worker, running_job, monkeypatch,
+) -> None:
+    store, job_id, _ = running_job
+    for index, status in enumerate(("deferred", "saved")):
+        store.record_chat_session(
+            job_id, batch_index=index, batch_count=2,
+            chat_url=codex_chat(0 if index == 0 else 1),
+            role="coordinator" if index == 0 else "component_batch",
+            component_keys=[f"cmp-{index}"],
+            conversation_index=index,
+        )
+        store.update_chat_session(job_id, index, status=status)
+    store.update_chat_session(
+        job_id, 0,
+        deferred_component_keys=["cmp-0"],
+        deferred_retry_sent=False,
+    )
+    batches = [{
+        "batch_index": 0, "batch_count": 2,
+        "price_batch_id": "aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "component_keys": ["cmp-0"], "component_states": {"cmp-0": "pending"},
+        "component_result_required": True, "component_result_saved": False,
+    }, {
+        "batch_index": 1, "batch_count": 2,
+        "price_batch_id": "aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "component_keys": ["cmp-1"], "component_states": {"cmp-1": "completed"},
+        "component_result_required": True, "component_result_saved": True,
+    }]
+    monkeypatch.setattr(store, "quote_chat_batches", lambda *_: batches)
+    browser = Mock()
+    browser.resume_quote.side_effect = lambda current_job, url, **kwargs: worker.ActiveQuote(
+        current_job, url, 100, **kwargs,
+    )
+    active_quotes = {}
+
+    worker.settle_programmatic_delivery(store, browser, active_quotes, job_id)
+
+    assert list(active_quotes) == [f"{job_id}:0"]
+    active = active_quotes[f"{job_id}:0"]
+    assert active.chat_url == codex_chat(0)
+    assert active.deferred_retry_sent is True
+    prompt = browser.continue_quote.call_args.args[1]
+    assert '"cmp-0"' in prompt
+    assert "官方价格页" in prompt
+    assert "实质不同" in prompt
+    session = store.get(job_id)["chat_sessions"][0]
+    assert session["status"] == "running"
+    assert session["deferred_retry_sent"] is True
+
+
+def test_deferred_retry_is_never_sent_twice(worker, running_job, monkeypatch) -> None:
+    store, job_id, _ = running_job
+    store.record_chat_session(
+        job_id, batch_index=0, batch_count=2,
+        chat_url=codex_chat(0), role="coordinator", component_keys=["cmp-0"],
+    )
+    active = worker.ActiveQuote(
+        job_id, codex_chat(0), 100, batch_count=2,
+        component_keys=("cmp-0",), deferred_retry_sent=True,
+    )
+    monkeypatch.setattr(worker, "active_batch", lambda *_: {
+        "batch_index": 0, "batch_count": 2,
+        "price_batch_id": "aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "component_keys": ["cmp-0"], "component_states": {"cmp-0": "pending"},
+        "component_result_required": True, "component_result_saved": False,
+    })
+    browser = Mock()
+
+    assert not worker.continue_component_batch(store, browser, active)
+    browser.continue_quote.assert_not_called()
+    assert store.get(job_id)["chat_sessions"][0]["status"] == "deferred_failed"
 
 
 def test_production_worker_constructs_codex_chat_adapter_not_firefox(worker):

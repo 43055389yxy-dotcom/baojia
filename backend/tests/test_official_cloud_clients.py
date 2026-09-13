@@ -273,6 +273,54 @@ def test_successful_http_with_provider_error_envelope_is_not_a_price_result(
     }
 
 
+def test_alibaba_top_level_business_error_in_http_200_is_not_parsed_as_a_price() -> None:
+    recorder = _RequestRecorder(
+        _Response(
+            {
+                "Code": "InternalError",
+                "Message": "commodity is not spu object",
+                "RequestId": "request-alibaba-spu-123",
+            },
+            status_code=200,
+        )
+    )
+    client = OfficialCloudApiClient(_credentials("alibaba_intl"), request=recorder)
+    query = AlibabaInternationalPriceQuery(
+        query_id="intl-rocketmq-price",
+        service="bssopenapi",
+        action="GetPayAsYouGoPrice",
+        version="2017-12-14",
+        region="ap-southeast-1",
+    )
+
+    with pytest.raises(OfficialCloudClientError) as captured:
+        client.execute(query)
+
+    assert captured.value.code == "alibaba_intl_internal_error"
+    assert captured.value.category == "provider_unavailable"
+    assert captured.value.retryable is True
+    assert captured.value.details == {
+        "http_status": 200,
+        "provider_code": "InternalError",
+        "request_id": "request-alibaba-spu-123",
+    }
+
+
+@pytest.mark.parametrize("code", ["Success", "OK", "200", "0"])
+def test_top_level_success_codes_are_not_mistaken_for_business_errors(code: str) -> None:
+    recorder = _RequestRecorder(_Response({"Code": code, "Message": "success"}))
+    client = OfficialCloudApiClient(_credentials("alibaba"), request=recorder)
+    query = AlibabaPriceQuery(
+        query_id=f"success-{code}",
+        service="bssopenapi",
+        action="QueryProductList",
+        version="2017-12-14",
+        region="cn-hangzhou",
+    )
+
+    assert client.execute(query)["Code"] == code
+
+
 def test_official_maintenance_redirect_is_a_retryable_provider_outage() -> None:
     redirect = type("Redirect", (), {"status_code": 302})()
     recorder = _RequestRecorder(

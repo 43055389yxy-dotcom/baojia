@@ -27,7 +27,7 @@ from app.services.gpt_browser_navigation import (
 )
 from app.services.gpt_quote_batches import (
     WAVES_PER_CHAT,
-    build_component_batch_continuation_prompt,
+    build_component_batch_deferred_retry_prompt,
     build_component_batch_finalize_prompt,
     build_component_batch_prompt,
     build_numbered_intake_batch_prompt,
@@ -165,6 +165,7 @@ class ActiveQuote:
     batch_progress_fingerprint: str = ""
     machine_progress_fingerprint: str = ""
     stalled_attempts: int = 0
+    deferred_retry_sent: bool = False
     finalize_attempts: int = 0
     previous_conversation_ids: tuple[str, ...] = ()
     backend_settle_fingerprint: str = ""
@@ -499,14 +500,6 @@ def continue_component_batch(
         active.backend_settle_fingerprint = ""
         active.backend_settle_started_at = 0.0
         return True
-    if active.stalled_attempts >= MAX_CONTINUATION_ATTEMPTS:
-        return advance_to_next_wave(
-            store,
-            browser,
-            active,
-            completed_status="stalled",
-        )
-    latest = store.get(active.job_id)
     completed_component_keys = set(json.loads(fingerprint))
     remaining_component_keys = [
         key for key in batch.get("component_keys") or []
@@ -519,33 +512,38 @@ def continue_component_batch(
             active,
             completed_status="saved",
         )
-    browser.continue_quote(
-        active,
-        build_component_batch_continuation_prompt(
-            relay_job_id=active.job_id,
-            submission_code=str(latest.get("submission_code") or ""),
-            price_batch_id=str(batch["price_batch_id"]),
-            batch_index=active.batch_index,
-            batch_count=int(batch["batch_count"]),
-            component_keys=remaining_component_keys,
-        ),
-    )
-    # The desktop adapter returns only after it sees the new user turn. A UI
-    # draft that was not submitted therefore never consumes the one content
-    # retry allowed for this five-component wave.
-    active.stalled_attempts += 1
+    if active.deferred_retry_sent:
+        store.update_chat_session(
+            active.job_id,
+            active.batch_index,
+            status="deferred_failed",
+            deferred_component_keys=remaining_component_keys,
+            deferred_retry_sent=True,
+            backend_settle_fingerprint=None,
+            backend_settle_started_at_epoch=None,
+        )
+        return False
+    # Do not let one slow component monopolize its conversation. Persist the
+    # unfinished keys, continue all normal waves, then revisit this exact chat
+    # once after the rest of the job has settled.
     store.update_chat_session(
         active.job_id,
         active.batch_index,
-        status="running",
-        stalled_attempts=active.stalled_attempts,
+        status="deferred",
+        deferred_component_keys=remaining_component_keys,
+        deferred_retry_sent=False,
         progress_fingerprint=fingerprint,
         backend_settle_fingerprint=None,
         backend_settle_started_at_epoch=None,
     )
     active.backend_settle_fingerprint = ""
     active.backend_settle_started_at = 0.0
-    return True
+    return advance_to_next_wave(
+        store,
+        browser,
+        active,
+        completed_status="deferred",
+    )
 
 
 def advance_to_next_wave(
@@ -619,6 +617,7 @@ def advance_to_next_wave(
     active.role = "component_batch"
     active.component_keys = tuple(next_batch.get("component_keys") or [])
     active.stalled_attempts = 0
+    active.deferred_retry_sent = False
     active.finalize_attempts = 0
     active.batch_progress_fingerprint = ""
     active.machine_progress_fingerprint = ""
@@ -730,7 +729,7 @@ def create_missing_component_chats(
             if not (intake_batch.get("source_lines") or []):
                 continue
             previous = sessions.get(batch_index - 1)
-            if not previous or previous.get("status") not in {"saved", "stalled"}:
+            if not previous or previous.get("status") not in {"saved", "stalled", "deferred"}:
                 continue
             if any(
                 quote.job_id == job_id
@@ -897,7 +896,7 @@ def settle_programmatic_delivery(
     """Reconcile automatic delivery without opening a final AI merge turn."""
 
     batches = store.quote_chat_batches(job_id)
-    if len(batches) <= 1:
+    if not batches:
         return
     current = store.reconcile_delivery_receipt(job_id)
     if current.get("status") in {"completed", "partial", "failed", "cancelled"}:
@@ -916,6 +915,71 @@ def settle_programmatic_delivery(
         for item in (record.get("chat_sessions") or [])
     }
     if any(item.get("status") == "running" for item in sessions.values()):
+        return
+    # Deferred retries run only after every normal source wave has actually
+    # been submitted. Otherwise a quiet gap between chat creation rounds could
+    # pull an old slow component forward and starve untouched components.
+    if any(
+        item.get("source_lines")
+        for item in store.intake_chat_batches(job_id)
+    ):
+        return
+    batch_by_index = {int(item["batch_index"]): item for item in batches}
+    deferred_session = next(
+        (
+            item for _, item in sorted(sessions.items())
+            if item.get("status") == "deferred"
+            and item.get("deferred_retry_sent") is not True
+            and incomplete_component_keys(
+                batch_by_index.get(int(item.get("batch_index", -1)), {})
+            )
+        ),
+        None,
+    )
+    if deferred_session is not None:
+        batch_index = int(deferred_session["batch_index"])
+        batch = batch_by_index[batch_index]
+        remaining = incomplete_component_keys(batch)[:5]
+        active = browser.resume_quote(
+            job_id,
+            str(deferred_session["chat_url"]),
+            batch_index=batch_index,
+            batch_count=int(deferred_session.get("batch_count") or len(batches)),
+            role=str(deferred_session.get("role") or "component_batch"),
+            component_keys=list(deferred_session.get("component_keys") or []),
+            previous_conversation_ids=list(
+                deferred_session.get("previous_conversation_ids") or []
+            ),
+            conversation_index=int(
+                deferred_session.get("conversation_index", batch_index // WAVES_PER_CHAT)
+            ),
+            wave_index=int(
+                deferred_session.get("wave_index", batch_index % WAVES_PER_CHAT)
+            ),
+            wave_count=int(deferred_session.get("wave_count") or 1),
+        )
+        prompt = build_component_batch_deferred_retry_prompt(
+            relay_job_id=job_id,
+            submission_code=str(record.get("submission_code") or ""),
+            price_batch_id=str(batch["price_batch_id"]),
+            batch_index=batch_index,
+            batch_count=int(batch["batch_count"]),
+            component_keys=remaining,
+        )
+        browser.continue_quote(active, prompt)
+        active.deferred_retry_sent = True
+        active.batch_progress_fingerprint = batch_progress_fingerprint(batch)
+        active_quotes[active.session_key] = active
+        store.update_chat_session(
+            job_id,
+            batch_index,
+            status="running",
+            deferred_component_keys=remaining,
+            deferred_retry_sent=True,
+            progress_fingerprint=active.batch_progress_fingerprint,
+            backend_settle_fingerprint=None,
+            backend_settle_started_at_epoch=None,
+        )
         return
     incomplete_results = [
         int(batch["batch_index"])
@@ -955,7 +1019,7 @@ def complete_job(store: GptQuoteRelayStore, job_id: str, response: str) -> str:
     # A completion sentence is not delivery evidence. Only the receipt above
     # may complete the job. A confirmed blocker skips futile retry messages.
     if current.get("partial_finalization_requested"):
-        summary = "部分报价收口仍未产生可用交付回执。"
+        summary = "官方价格页收口仍未产生完整交付回执。"
     elif store.has_unrecoverable_failure(job_id):
         batches = store.quote_chat_batches(job_id)
         can_retry_single_batch = (
@@ -1095,8 +1159,9 @@ def handle_no_progress_timeout(
         browser.close_quote(active)
         active_quotes.pop(active.session_key, None)
         return
-    batches = store.quote_chat_batches(active.job_id)
-    if len(batches) > 1 and active.role != "merge":
+    batch = active_batch(store, active)
+    if batch is not None and batch.get("component_result_required") is True \
+            and active.role != "merge":
         browser.close_quote(active)
         if not continue_component_batch(store, browser, active):
             active_quotes.pop(active.session_key, None)
@@ -1156,6 +1221,7 @@ def reattach_job_chats(
             wave_count=int(session.get("wave_count") or 1),
         )
         active.stalled_attempts = int(session.get("stalled_attempts") or 0)
+        active.deferred_retry_sent = bool(session.get("deferred_retry_sent"))
         active.finalize_attempts = int(session.get("finalize_attempts") or 0)
         active.batch_progress_fingerprint = str(
             session.get("progress_fingerprint") or ""
@@ -1204,7 +1270,7 @@ def reattach_job_chats(
                 record["job_id"],
                 {"partial_retry_pending": False},
                 stage="retry",
-                message="已在总控对话中仅重试未完成组件",
+                message="已在原任务中仅恢复未完成组件",
             )
 
 
@@ -1445,8 +1511,9 @@ def main() -> int:
                         )
                     if response is None:
                         continue
-                    batches = store.quote_chat_batches(job_id)
-                    if len(batches) > 1 and active.role != "merge":
+                    batch = active_batch(store, active)
+                    if batch is not None and batch.get("component_result_required") is True \
+                            and active.role != "merge":
                         if not component_batch_state_settled(store, active):
                             continue
                         if not continue_component_batch(store, browser, active):

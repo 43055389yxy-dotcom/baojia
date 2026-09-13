@@ -181,14 +181,15 @@ def build_quote_failed_components_retry_prompt(
     relay_job_id: str,
     submission_code: str,
 ) -> str:
-    """Resume a partial quote without repeating successful component work."""
+    """Recover a legacy unfinished quote without repeating successful work."""
 
     return (
-        f"{ASTRAQUOTE_MENTION} 销售已选择重试部分报价中的未完成组件。这不是新报价。"
-        "请读取 AstraQuote 保存的组件计划、价格批次和部分报价，只处理 unpriced_services；"
+        f"{ASTRAQUOTE_MENTION} 这是一条历史未完整交付任务的恢复，不是新报价。"
+        "请读取 AstraQuote 保存的组件计划、价格批次和真实组件状态，"
+        "只处理后台仍未完成的组件；"
         "已经核价成功的组件、官方证据和 Excel 数据必须直接复用，不得重新查询。"
         "API 未取得完整价格时必须转同厂商、同账号站点官网价格页并保存证据；"
-        "不得再次交付销售手填项。全部成功后交付完整报价。\n\n"
+        "不得交付部分报价或销售手填项。全部成功后交付完整报价。\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。"
     )
 

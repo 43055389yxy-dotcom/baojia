@@ -541,6 +541,27 @@ def test_authenticated_cloud_query_uses_cataloged_base_route_over_a_guessed_host
     assert query.endpoint == "ctecs-global.ctapi.ctyun.cn"
 
 
+def test_cataloged_route_exposes_the_registered_operation_to_the_mcp_boundary() -> None:
+    from app.services.official_api_base_routes import official_api_base_route
+
+    route = official_api_base_route("ctyun", "ecs", "200000001790")
+
+    assert route is not None
+    assert route["operations"] == ["query-price"]
+
+
+def test_single_cataloged_action_is_filled_when_the_caller_omits_it() -> None:
+    from app.services.mcp_v2_pricing import TencentPriceQuery
+
+    query = TencentPriceQuery(
+        query_id="tencent-cvm-price",
+        service="cvm",
+        region="ap-shanghai",
+    )
+
+    assert query.action == "InquiryPriceRunInstances"
+
+
 def test_authenticated_cloud_query_can_omit_a_cataloged_base_route() -> None:
     query = AlibabaPriceQuery(
         query_id="alibaba-ecs-price",

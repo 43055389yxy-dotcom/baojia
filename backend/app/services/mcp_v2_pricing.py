@@ -418,6 +418,18 @@ def _validate_authenticated_catalog_query(query: AuthenticatedCatalogQuery) -> N
         query.endpoint = base_route["endpoint"]
         if not query.official_source_url and base_route.get("official_source_url"):
             query.official_source_url = base_route["official_source_url"]
+        operations = [
+            str(value).strip()
+            for value in (base_route.get("operations") or [])
+            if str(value).strip()
+        ]
+        if base_route.get("capability") == "quote_api" and operations:
+            if not query.action and query.path == "/" and len(operations) == 1:
+                operation = operations[0]
+                if operation.startswith("/"):
+                    query.path = operation
+                else:
+                    query.action = operation
     if (
         not query.path.startswith("/")
         or ".." in query.path

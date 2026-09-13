@@ -395,7 +395,7 @@ test('official pricing page fallback rejects third-party hosts and accepts unusa
 test('a usable API rate remains preferred over an official pricing page fallback', async (t) => {
   const context = fixture({ status: 'not_found', itemIds: [] });
   t.after(() => fs.rmSync(context.directory, { recursive: true, force: true }));
-  const batchId = await failedPricingAttempts(context.workflow);
+  const batchId = await failedPricingAttempts(context.workflow, 1);
   context.backend.getPrices = async (input) => ({
     status: 'completed',
     results: input.queries.map((query) => ({
@@ -416,7 +416,7 @@ test('a usable API rate remains preferred over an official pricing page fallback
   });
   const input = quoteInput(batchId, { evidence: [] });
   input.services[0].official_page_price_evidence = [officialPageEvidence([
-    'page-attempt-1', 'page-attempt-2', 'page-attempt-3',
+    'page-attempt-1',
   ])];
 
   await assert.rejects(
@@ -660,7 +660,7 @@ test('sales relay cannot deliver missing components as manual-price placeholders
   assert.equal(workflow.store.findByRelayJobId(relayJobId), null);
 });
 
-test('resuming a price batch queries only unfinished ids and reuses successful results', async (t) => {
+test('resuming a price batch accepts one materially refined request and then reuses it', async (t) => {
   const { workflow, directory, backend } = fixture({ status: 'needs_refinement', itemIds: [] });
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const query = { provider: 'azure', query_id: 'price-1', filter: 'caller supplied query' };
@@ -684,25 +684,29 @@ test('resuming a price batch queries only unfinished ids and reuses successful r
       }],
     };
   };
+  const refinedQuery = {
+    provider: 'azure', query_id: 'price-2',
+    filter: "caller supplied query and armRegionName eq 'eastus'",
+  };
   const resumed = await workflow.getPrices({
     price_batch_id: first.price_batch_id,
-    queries: [query],
+    queries: [refinedQuery],
   });
   assert.equal(resumed.price_batch_id, first.price_batch_id);
-  assert.deepEqual(resumed.queried_query_ids, ['price-1']);
+  assert.deepEqual(resumed.queried_query_ids, ['price-2']);
   assert.equal(resumed.results[0].status, 'exact');
 
   const replayed = await workflow.getPrices({
     price_batch_id: first.price_batch_id,
-    queries: [query],
+    queries: [refinedQuery],
   });
   assert.equal(calls, 2);
-  assert.deepEqual(replayed.reused_query_ids, ['price-1']);
+  assert.deepEqual(replayed.reused_query_ids, ['price-2']);
   assert.deepEqual(replayed.queried_query_ids, []);
   assert.deepEqual(replayed.results, []);
   const saved = workflow.getPriceResults({
     price_batch_id: first.price_batch_id,
-    query_ids: ['price-1'],
+    query_ids: ['price-2'],
   });
   assert.equal(saved.results[0].status, 'exact');
 });
@@ -800,7 +804,7 @@ test('saved details page all official rates with complete counts and never modif
   assert.equal(workflow.store.getPriceBatch(batch.price_batch_id).result.results[0].official_rate_candidates.length, 45);
 });
 
-test('authenticated pricing keeps live request details without learning fine-grained routes', async (t) => {
+test('authenticated pricing keeps business parameters while enforcing registered operations', async (t) => {
   const { workflow, directory, backend } = fixture({ provider: 'alibaba' });
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const received = [];
@@ -816,13 +820,13 @@ test('authenticated pricing keeps live request details without learning fine-gra
 
   const first = await workflow.getPrices({ queries: [{
     provider: 'alibaba', query_id: 'live-first', endpoint: 'business.aliyuncs.com',
-    service: 'bssopenapi', action: 'QueryPrice', version: '2017-12-14',
+    service: 'bssopenapi', action: 'GetPayAsYouGoPrice', version: '2017-12-14',
     region: 'ap-southeast-1', region_parameter: 'Region', method: 'POST', path: '/',
     query_parameters: { ProductCode: 'ecs' }, body: {}, response_filters: {},
   }] });
   const second = await workflow.getPrices({ queries: [{
     provider: 'alibaba', query_id: 'live-second', endpoint: 'business.aliyuncs.com',
-    service: 'bssopenapi', action: 'QueryPrice', version: '2017-12-14',
+    service: 'bssopenapi', action: 'GetPayAsYouGoPrice', version: '2017-12-14',
     region: 'ap-southeast-1', region_parameter: 'Region', method: 'POST', path: '/',
     query_parameters: { ProductCode: 'rds' }, body: {}, response_filters: {},
   }] });
@@ -831,7 +835,7 @@ test('authenticated pricing keeps live request details without learning fine-gra
   assert.equal(second.learned_routes, undefined);
   assert.equal(received.length, 2);
   assert.equal(received[1].endpoint, 'business.aliyuncs.com');
-  assert.equal(received[1].action, 'QueryPrice');
+  assert.equal(received[1].action, 'GetPayAsYouGoPrice');
   assert.deepEqual(received[1].query_parameters, { ProductCode: 'rds' });
 });
 

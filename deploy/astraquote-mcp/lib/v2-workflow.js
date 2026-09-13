@@ -16,6 +16,7 @@ const { withOfficialApiBaseRoute } = require('./official-api-base-routes');
 const {
   PROGRESS_GUIDANCE, mergeQueryContexts, queryProgress, componentProgress,
   assertQueryIdentity, contextEvidenceViolations, pricingScopeKey, reusableQueryResult,
+  officialAttemptFingerprint,
 } = require('./query-lifecycle');
 
 function uniqueComponentKeys(entries) {
@@ -31,6 +32,17 @@ function uniqueComponentKeys(entries) {
     error.details = { component_keys: [...new Set(duplicates)] };
     throw error;
   }
+}
+
+function sealedComponentKeys(priceBatch) {
+  return (priceBatch?.component_result_fragments || []).flatMap((fragment) => {
+    const input = fragment?.input || {};
+    return [
+      ...(input.services || []),
+      ...(input.zero_cost_services || []),
+      ...(input.unpriced_services || []),
+    ].map((component) => component?.component_key).filter(Boolean);
+  });
 }
 
 function normalizedEvidenceText(value) {
@@ -1687,6 +1699,7 @@ class AstraQuoteV2Workflow {
       priceBatch.quote_components || [],
       priceBatch.query_lifecycle || [],
       priceBatch.result?.results || [],
+      sealedComponentKeys(priceBatch),
     );
     const requestedComponents = new Set((priceBatch.query_contexts || [])
       .filter((context) => input.query_ids.includes(context.query_id))
@@ -1790,6 +1803,28 @@ class AstraQuoteV2Workflow {
     const pendingQueries = [];
     const capabilityPreflightResults = [];
     const contextById = new Map(queryContexts.map((context) => [context.query_id, context]));
+    const priorFailedAttempts = new Map();
+    const priorNetworkAttemptCounts = new Map();
+    for (const [priorQueryId, priorQuery] of existingQueries) {
+      const priorContext = contextById.get(priorQueryId);
+      const priorScope = pricingScopeKey(
+        priorContext?.component_key,
+        priorContext?.billing_key,
+        priorContext?.scenario_key || null,
+      );
+      const priorResult = existingResults.get(priorQueryId);
+      if (!priorScope || !priorResult || reusableQueryResult(priorResult, priorContext)) continue;
+      priorFailedAttempts.set(
+        JSON.stringify([priorScope, officialAttemptFingerprint(priorQuery)]),
+        priorQueryId,
+      );
+      if (priorResult.capability_preflight !== true) {
+        priorNetworkAttemptCounts.set(
+          priorScope,
+          Number(priorNetworkAttemptCounts.get(priorScope) || 0) + 1,
+        );
+      }
+    }
     const forceCapabilityRecheck = input.force_capability_recheck === true
       || Number(relayJob?.partial_retry_generation || 0) > 0;
     for (const query of materializedQueries) {
@@ -1807,6 +1842,53 @@ class AstraQuoteV2Workflow {
       // returning official-page evidence for the same scope. Do not hit the
       // same unusable API path a second time merely to save that fallback.
       if (priorResult && suppliedPageAttemptIds.has(query.query_id)) continue;
+      // A failed query identity is immutable evidence that this exact request
+      // has already been tried. A correction must use a materially different
+      // operation, path, response contract or business payload; changing only
+      // query_id never spends a second network request.
+      if (priorResult) continue;
+      const currentContext = contextById.get(query.query_id);
+      const currentScope = pricingScopeKey(
+        currentContext?.component_key,
+        currentContext?.billing_key,
+        currentContext?.scenario_key || null,
+      );
+      const duplicateOf = currentScope && priorFailedAttempts.get(
+        JSON.stringify([currentScope, officialAttemptFingerprint(query)]),
+      );
+      if (duplicateOf) {
+        capabilityPreflightResults.push({
+          query_id: query.query_id,
+          provider: query.provider,
+          status: 'query_failed',
+          terminal: true,
+          retryable: false,
+          error_category: 'duplicate_request',
+          code: 'duplicate_official_api_attempt',
+          message: 'This exact official pricing request already failed in the current quote.',
+          details: { duplicate_of_query_id: duplicateOf },
+          recovery: { retryable: false, next_action: 'use_official_price_page' },
+          capability_preflight: true,
+          official_item_ids: [],
+        });
+        continue;
+      }
+      if (currentScope && Number(priorNetworkAttemptCounts.get(currentScope) || 0) >= 2) {
+        capabilityPreflightResults.push({
+          query_id: query.query_id,
+          provider: query.provider,
+          status: 'query_failed',
+          terminal: true,
+          retryable: false,
+          error_category: 'attempt_limit',
+          code: 'official_api_attempt_limit_reached',
+          message: 'The initial official request and its one corrected request are already saved.',
+          recovery: { retryable: false, next_action: 'use_official_price_page' },
+          capability_preflight: true,
+          official_item_ids: [],
+        });
+        continue;
+      }
       const blocker = forceCapabilityRecheck
         ? null
         : this.capabilityStore.capabilityBlocker(query);
@@ -1950,6 +2032,7 @@ class AstraQuoteV2Workflow {
       finalQuoteComponents,
       progress.query_lifecycle,
       [...mergedResults.values()],
+      sealedComponentKeys(latest),
     );
     const incompleteQueryIds = progress.incomplete_query_ids;
     const missingRegisteredRoots = finalRelayPlan.manifest
@@ -2689,7 +2772,44 @@ class AstraQuoteV2Workflow {
         ? (latest.automatic_delivery_owner_batch_index ?? batchIndex)
         : (latest.automatic_delivery_owner_batch_index ?? null),
     };
+    const fragmentComponentStatus = componentProgress(
+      updatedBatch.quote_components || [],
+      updatedBatch.query_lifecycle || [],
+      updatedBatch.result?.results || [],
+      sealedComponentKeys(updatedBatch),
+    );
+    updatedBatch.component_lifecycle = fragmentComponentStatus.component_lifecycle;
+    if (fragmentComponentStatus.total_component_count > 0
+      && fragmentComponentStatus.completed_component_count
+        === fragmentComponentStatus.total_component_count) {
+      updatedBatch.result = {
+        ...(updatedBatch.result || {}),
+        status: 'completed',
+        terminal: true,
+        next_action: 'build_estimate',
+      };
+    }
     this.store.putPriceBatch(updatedBatch);
+    if (updatedBatch.relay_job_id) {
+      const checkpoint = this.store.getCheckpoint(updatedBatch.relay_job_id) || {};
+      this.store.putCheckpoint(updatedBatch.relay_job_id, {
+        stage: allSaved ? checkpoint.stage : 'pricing_partial',
+        price_batch_id: updatedBatch.price_batch_id,
+        total_component_count: Math.max(
+          Number(checkpoint.total_component_count || 0),
+          fragmentComponentStatus.total_component_count,
+        ),
+        completed_component_count: fragmentComponentStatus.completed_component_count,
+        failed_component_count: fragmentComponentStatus.failed_component_count,
+        pending_component_count: fragmentComponentStatus.pending_component_count,
+        completed_component_keys: fragmentComponentStatus.component_lifecycle
+          .filter((item) => item.state === 'completed')
+          .map((item) => item.component_key),
+        failed_component_keys: fragmentComponentStatus.component_lifecycle
+          .filter((item) => item.state === 'failed')
+          .map((item) => item.component_key),
+      });
+    }
     if (!allSaved) {
       return {
         status: 'component_batch_saved',

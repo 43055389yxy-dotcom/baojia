@@ -22,6 +22,29 @@ function pricingScopeKey(componentKey, billingKey, scenarioKey = null) {
     : null;
 }
 
+function stableObject(value) {
+  if (Array.isArray(value)) return value.map(stableObject);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableObject(value[key])]));
+}
+
+function officialAttemptFingerprint(query) {
+  const {
+    query_id: _queryId,
+    official_source_url: _OfficialSourceUrl,
+    ...identity
+  } = query || {};
+  if (Array.isArray(identity.item_id_paths)) {
+    identity.item_id_paths = [...identity.item_id_paths].sort();
+  }
+  if (Array.isArray(identity.rate_fields)) {
+    identity.rate_fields = [...identity.rate_fields]
+      .map(stableObject)
+      .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+  }
+  return JSON.stringify(stableObject(identity));
+}
+
 function usable(result) {
   return ['exact', 'ambiguous'].includes(result?.status)
     && Array.isArray(result.official_item_ids) && result.official_item_ids.length > 0
@@ -186,8 +209,11 @@ function queryProgress(queries, results, contexts = [], officialPageEvidence = [
   };
 }
 
-function componentProgress(components = [], lifecycle = [], results = []) {
+function componentProgress(
+  components = [], lifecycle = [], results = [], sealedComponentKeys = [],
+) {
   const resultById = new Map(results.map((item) => [item.query_id, item]));
+  const sealed = new Set(sealedComponentKeys);
   const lifecycleByScope = new Map();
   for (const item of lifecycle) {
     const ownedScope = scope(item);
@@ -203,6 +229,9 @@ function componentProgress(components = [], lifecycle = [], results = []) {
   }
 
   const states = components.map((component) => {
+    if (sealed.has(component.component_key)) {
+      return { component_key: component.component_key, state: 'completed' };
+    }
     const scopeStates = (component.billing_scopes || []).map((billing) => {
       const key = JSON.stringify([
         component.component_key,
@@ -306,4 +335,5 @@ module.exports = {
   PROGRESS_GUIDANCE, mergeQueryContexts, queryProgress, componentProgress,
   assertQueryIdentity, contextEvidenceViolations, pricingScopeKey, reusableQueryResult,
   usableCommercialRates,
+  officialAttemptFingerprint,
 };

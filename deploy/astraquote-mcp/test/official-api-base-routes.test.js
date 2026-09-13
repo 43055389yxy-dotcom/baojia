@@ -10,7 +10,7 @@ const {
   withOfficialApiBaseRoute,
 } = require('../lib/official-api-base-routes');
 
-test('basic official API routes replace a caller-guessed host without fixing request details', () => {
+test('basic official API routes replace a caller-guessed host and preserve allowed request details', () => {
   const query = withOfficialApiBaseRoute({
     provider: 'ctyun', service: 'ecs', region: '200000001790',
     endpoint: 'ctapi.ctyun.cn', path: '/v4/order/new-query-price',
@@ -20,6 +20,26 @@ test('basic official API routes replace a caller-guessed host without fixing req
   assert.equal(query.endpoint, 'ctecs-global.ctapi.ctyun.cn');
   assert.equal(query.path, '/v4/order/new-query-price');
   assert.deepEqual(query.body, { flavorId: 's7.large.4' });
+});
+
+test('a single registered operation is filled when the caller omits it', () => {
+  const query = withOfficialApiBaseRoute({
+    provider: 'tencent', service: 'cvm', region: 'ap-shanghai',
+    action: '', path: '/', body: { InstanceChargeType: 'POSTPAID_BY_HOUR' },
+  });
+
+  assert.equal(query.endpoint, 'cvm.tencentcloudapi.com');
+  assert.equal(query.action, 'InquiryPriceRunInstances');
+});
+
+test('registered routes reject an operation invented by the caller', () => {
+  assert.throws(
+    () => withOfficialApiBaseRoute({
+      provider: 'tencent', service: 'cvm', region: 'ap-shanghai',
+      action: 'RunInstances', path: '/',
+    }),
+    (error) => error.code === 'official_api_operation_not_registered',
+  );
 });
 
 test('basic routes support fixed and region-scoped official hosts', () => {

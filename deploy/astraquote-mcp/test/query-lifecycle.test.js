@@ -7,7 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { AstraQuoteV2Workflow } = require('../lib/v2-workflow');
 const { V2QuoteStore } = require('../lib/v2-quote-store');
-const { reusableQueryResult } = require('../lib/query-lifecycle');
+const { componentProgress, reusableQueryResult } = require('../lib/query-lifecycle');
 
 function fixture(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'aq-query-lifecycle-'));
@@ -81,6 +81,37 @@ test('formal pricing does not complete on missing currency, zero placeholders, o
   }, owned), false);
 });
 
+test('a validated sealed component fragment overrides stale pending query lifecycle', () => {
+  const progress = componentProgress(
+    [{
+      component_key: 'cmp_resource_0001',
+      billing_scopes: [
+        { billing_key: 'compute', scenario_key: 'on_demand' },
+        { billing_key: 'compute', scenario_key: 'one_year_commitment' },
+      ],
+    }],
+    [{
+      query_id: 'on-demand', purpose: 'pricing', component_key: 'cmp_resource_0001',
+      billing_key: 'compute', scenario_key: 'on_demand', state: 'completed',
+    }, {
+      query_id: 'reserved-missing', purpose: 'pricing', component_key: 'cmp_resource_0001',
+      billing_key: 'compute', scenario_key: 'one_year_commitment', state: 'pending',
+    }],
+    [{
+      query_id: 'on-demand', status: 'exact', official_item_ids: ['sku'],
+    }, {
+      query_id: 'reserved-missing', status: 'not_found', official_item_ids: [],
+    }],
+    ['cmp_resource_0001'],
+  );
+
+  assert.equal(progress.completed_component_count, 1);
+  assert.equal(progress.pending_component_count, 0);
+  assert.deepEqual(progress.component_lifecycle, [{
+    component_key: 'cmp_resource_0001', state: 'completed',
+  }]);
+});
+
 test('one failed API attempt can be completed by persisted official-page evidence without requerying', async (t) => {
   const { workflow, store, calls } = fixture(t);
   const first = await workflow.getPrices({
@@ -124,6 +155,77 @@ test('one failed API attempt can be completed by persisted official-page evidenc
     store.getPriceBatch(first.price_batch_id).official_page_price_evidence[0].unit_price,
     '0.12',
   );
+});
+
+test('a new query id cannot repeat the same failed official request for one billing scope', async (t) => {
+  const { workflow, calls } = fixture(t);
+  const first = await workflow.getPrices({
+    quote_mode: 'formal_quote',
+    queries: [query('failed-once')],
+    query_contexts: [context('failed-once')],
+    quote_components: [{
+      component_key: 'cmp_resource_0001',
+      customer_owned_source: '云服务器数量：1。',
+      billing_scopes: [{ billing_key: 'compute' }],
+    }],
+  });
+
+  const second = await workflow.getPrices({
+    quote_mode: 'formal_quote',
+    price_batch_id: first.price_batch_id,
+    queries: [query('same-request-new-id')],
+    query_contexts: [context('same-request-new-id')],
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(second.results[0].code, 'duplicate_official_api_attempt');
+  assert.equal(second.results[0].recovery.next_action, 'use_official_price_page');
+});
+
+test('one billing scope permits only an initial request and one materially corrected request', async (t) => {
+  let networkCalls = 0;
+  const { workflow, backend } = fixture(t);
+  backend.getPrices = async (input) => {
+    networkCalls += 1;
+    return {
+      status: 'needs_refinement', terminal: false,
+      results: input.queries.map((item) => ({
+        query_id: item.query_id, provider: item.provider,
+        status: 'query_failed', terminal: false, retryable: true,
+        error_category: 'invalid_request', official_item_ids: [],
+      })),
+    };
+  };
+  const component = {
+    component_key: 'cmp_retry_budget',
+    customer_owned_source: '云服务器数量：1。',
+    billing_scopes: [{ billing_key: 'compute', scenario_key: 'on_demand' }],
+  };
+  const scope = (queryId) => ({
+    query_id: queryId, purpose: 'pricing', component_key: component.component_key,
+    billing_key: component.billing_scopes[0].billing_key, scenario_key: 'on_demand',
+  });
+  const first = await workflow.getPrices({
+    quote_mode: 'formal_quote', quote_components: [component],
+    queries: [{ provider: 'azure', query_id: 'initial', filter: "serviceName eq 'Compute'" }],
+    query_contexts: [scope('initial')],
+  });
+  const second = await workflow.getPrices({
+    quote_mode: 'formal_quote', price_batch_id: first.price_batch_id,
+    queries: [{ provider: 'azure', query_id: 'corrected', filter: "serviceName eq 'Compute' and armRegionName eq 'eastus'" }],
+    query_contexts: [scope('corrected')],
+  });
+  const third = await workflow.getPrices({
+    quote_mode: 'formal_quote', price_batch_id: first.price_batch_id,
+    queries: [{ provider: 'azure', query_id: 'third', filter: "serviceName eq 'Compute' and armRegionName eq 'westus'" }],
+    query_contexts: [scope('third')],
+  });
+
+  assert.equal(networkCalls, 2);
+  assert.deepEqual(second.queried_query_ids, ['corrected']);
+  assert.deepEqual(third.queried_query_ids, []);
+  assert.equal(third.results[0].code, 'official_api_attempt_limit_reached');
+  assert.equal(third.results[0].recovery.next_action, 'use_official_price_page');
 });
 
 test('new successful attempt retires old failure in the same billing scope, not other costs', async (t) => {
@@ -645,6 +747,13 @@ test('pre-split relay batches save isolated quote fragments and the last fragmen
   assert.equal(first.status, 'component_batch_saved');
   assert.deepEqual(first.pending_batch_indexes, [1]);
   assert.equal(displayed.length, 0);
+  assert.deepEqual(
+    store.getPriceBatch(reservedBatchId).component_lifecycle,
+    [
+      { component_key: 'cmp_intake_0001', state: 'completed' },
+      { component_key: 'cmp_intake_0002', state: 'completed' },
+    ],
+  );
   await assert.rejects(workflow.buildEstimate({
     ...fragmentInput(0, 'cmp_intake_0001', '13.00'),
     idempotency_key: 'relay-fragment-0-conflicting-attempt',
@@ -723,7 +832,7 @@ test('a saved relay quote fragment cannot contain or overwrite another batch', a
   }), (error) => error.code === 'relay_component_result_batch_mismatch');
 });
 
-test('an old exact error envelope is re-queried and cannot count as completed evidence', async (t) => {
+test('an old exact error envelope cannot count as evidence or trigger the same request again', async (t) => {
   const { workflow, store, calls } = fixture(t);
   const first = await workflow.getPrices({ queries: [query('price', true)] });
   const saved = store.getPriceBatch(first.price_batch_id);
@@ -734,12 +843,12 @@ test('an old exact error envelope is re-queried and cannot count as completed ev
   };
   store.putPriceBatch(saved);
   const result = await workflow.getPrices({ price_batch_id: first.price_batch_id, queries: [query('price', true)] });
-  assert.equal(calls.length, 2);
-  assert.deepEqual(result.queried_query_ids, ['price']);
-  assert.deepEqual(result.results[0].official_item_ids, ['item-1']);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(result.queried_query_ids, []);
+  assert.equal(result.status, 'needs_refinement');
 });
 
-test('explicit pricing without rates is retried while legacy unscoped successful results remain reusable', async (t) => {
+test('explicit pricing without rates requires a changed request or official page', async (t) => {
   const { workflow, store, calls } = fixture(t);
   const first = await workflow.getPrices({ queries: [query('price', true)] });
   const saved = store.getPriceBatch(first.price_batch_id);
@@ -751,8 +860,8 @@ test('explicit pricing without rates is retried while legacy unscoped successful
   const scoped = await workflow.getPrices({ price_batch_id: first.price_batch_id, queries: [query('price', true)],
     query_contexts: [context('price')],
   });
-  assert.deepEqual(scoped.queried_query_ids, ['price']);
-  assert.equal(calls.length, 2);
+  assert.deepEqual(scoped.queried_query_ids, []);
+  assert.equal(calls.length, 1);
 });
 
 test('a late failure cannot overwrite a concurrently completed identical query', async (t) => {
