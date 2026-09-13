@@ -14,6 +14,11 @@ const { PricingCapabilityStore } = require('./pricing-capability-store');
 const { canFinalizeRelayJob } = require('./relay-job-state');
 const { withOfficialApiBaseRoute } = require('./official-api-base-routes');
 const {
+  renderWorkflowPolicySlice,
+  workflowPolicyValue,
+  workflowPolicyVersion,
+} = require('./quote-workflow-policy');
+const {
   PROGRESS_GUIDANCE, mergeQueryContexts, queryProgress, componentProgress,
   assertQueryIdentity, contextEvidenceViolations, pricingScopeKey, reusableQueryResult,
   officialAttemptFingerprint,
@@ -710,13 +715,14 @@ function priceWorkflowGuard({ quoteMode, relayJobId, quoteComponents, componentL
   const formalQuote = quoteMode === 'formal_quote'
     || Boolean(relayJobId) || quoteComponents.length > 0;
   return {
+    policy_version: workflowPolicyVersion(),
     mode: formalQuote ? 'formal_quote' : 'price_lookup',
     quote_plan_registered: quoteComponents.length > 0,
     quote_coverage_known: quoteComponents.length > 0,
     formal_quote_final_response_allowed: false,
     ...(formalQuote ? {
       required_delivery_tool: 'build_estimate',
-      instruction: 'Do not end with a prose-only failure. Continue to official page fallback or deliver a verified partial/complete quote with build_estimate.',
+      instruction: renderWorkflowPolicySlice('official_page_finalize'),
       completed_component_keys: componentLifecycle
         .filter((item) => item.state === 'completed').map((item) => item.component_key),
       failed_component_keys: componentLifecycle
@@ -729,8 +735,12 @@ function priceWorkflowGuard({ quoteMode, relayJobId, quoteComponents, componentL
       instruction: 'This batch is only a price lookup. If the user requested a formal quote or Excel, do not give a final quote answer because component coverage is unknown.',
     }),
     official_page_fallback: {
-      supported: true,
-      api_attempts_required: 1,
+      supported: workflowPolicyValue(
+        'pricing', 'official_page_evidence_completes_scope',
+      ) === true,
+      api_attempts_required: workflowPolicyValue(
+        'pricing', 'official_page_min_api_attempts',
+      ),
       same_component_billing_scenario_scope_required: true,
       disallowed_for: [],
       save_tool: 'get_prices',
@@ -1220,7 +1230,14 @@ function validatePartialQuoteContract(input, priceBatch) {
 
 function validateSalesRelayCompleteness(input, priceBatch) {
   const unpriced = input.unpriced_services || [];
-  if (!priceBatch.relay_job_id || unpriced.length === 0) return;
+  if (!priceBatch.relay_job_id) return;
+  const partialForbidden = input.is_partial === true && workflowPolicyValue(
+    'delivery', 'allow_partial_sales_quote',
+  ) !== true;
+  const manualPriceForbidden = unpriced.length > 0 && workflowPolicyValue(
+    'delivery', 'allow_sales_manual_price',
+  ) !== true;
+  if (!partialForbidden && !manualPriceForbidden) return;
   const unpricedKeys = new Set(unpriced.map((component) => component.component_key));
   const attempts = (priceBatch.query_contexts || []).filter((context) => (
     unpricedKeys.has(context.component_key) && context.purpose === 'pricing'
@@ -1873,7 +1890,10 @@ class AstraQuoteV2Workflow {
         });
         continue;
       }
-      if (currentScope && Number(priorNetworkAttemptCounts.get(currentScope) || 0) >= 2) {
+      if (currentScope && Number(priorNetworkAttemptCounts.get(currentScope) || 0)
+        >= workflowPolicyValue(
+          'pricing', 'official_api_network_attempt_limit_per_scope',
+        )) {
         capabilityPreflightResults.push({
           query_id: query.query_id,
           provider: query.provider,
@@ -2068,6 +2088,7 @@ class AstraQuoteV2Workflow {
     };
     this.store.putPriceBatch({
       schema_version: 'astraquote-v3-price-batch/1',
+      policy_version: latest?.policy_version || workflowPolicyVersion(),
       price_batch_id: priceBatchId,
       created_at: latest?.created_at || new Date().toISOString(),
       updated_at: new Date().toISOString(),
@@ -2088,6 +2109,7 @@ class AstraQuoteV2Workflow {
     });
     if (relayJobId) {
       this.store.putCheckpoint(relayJobId, {
+        policy_version: latest?.policy_version || workflowPolicyVersion(),
         stage: completed ? 'pricing_completed' : 'pricing_partial',
         price_batch_id: priceBatchId,
         incomplete_query_ids: incompleteQueryIds,
@@ -2989,6 +3011,7 @@ class AstraQuoteV2Workflow {
       relay_job_id: normalizedInput.relay_job_id || null,
       price_batch_id: normalizedInput.price_batch_id,
       default_region: normalizedInput.default_region,
+      policy_version: priceBatch.policy_version || workflowPolicyVersion(),
       preferred_region: normalizedInput.preferred_region || normalizedInput.default_region,
       region_adjustment_reason: normalizedInput.region_adjustment_reason || '',
       cloud_provider: normalizedInput.cloud_provider,

@@ -172,10 +172,14 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   assert.match(INSTRUCTIONS, /created.*立即执行.*不得只汇报/s);
   assert.match(getPrices.description, /formal quote.*relay_batch_index.*quote_components/is);
   assert.match(getPrices.description, /must_continue.*final answer/is);
-  assert.match(getPrices.description, /one incomplete official API result.*official pricing page/is);
-  assert.match(getPrices.description, /official_page_price_evidence/is);
+  assert.match(getPrices.description, /官方错误.*修正请求.*官方价格页/is);
+  assert.equal(getPrices.inputSchema.properties.official_page_price_evidence.type, 'array');
   assert.match(buildEstimate.description, /official_page_price_evidence/i);
-  assert.match(buildEstimate.description, /save_component_batch.*last.*Excel/is);
+  assert.match(buildEstimate.description, /save_component_batch.*最后一批.*Excel/is);
+  assert.match(INSTRUCTIONS, /统一执行策略版本：`2026-09-14-unified-v1`/);
+  assert.match(INSTRUCTIONS, /每 5 个组件形成一轮.*每个对话最多 10 个组件/s);
+  assert.match(INSTRUCTIONS, /全局最多同时运行 4 个.*同一销售最多同时占用 3 个/s);
+  assert.doesNotMatch(INSTRUCTIONS, /\{\{[A-Z0-9_]+\}\}/);
   assert.doesNotMatch(INSTRUCTIONS, /Calculator|import_estimate|模板映射/i);
 });
 

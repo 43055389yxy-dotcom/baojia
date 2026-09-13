@@ -45,6 +45,7 @@ from app.services.gpt_quote_relay import (
     GptQuoteRelayStore,
     utc_now,
 )
+from app.services.quote_workflow_policy import workflow_policy_int
 
 RELAY_ENGINE = os.environ.get("ASTRAQUOTE_RELAY_ENGINE", "chatgpt").strip().lower()
 if RELAY_ENGINE not in {"chatgpt", "gemini"}:
@@ -69,7 +70,12 @@ else:
     PendingPromptSubmissionError = CodexPendingPromptSubmissionError
 
 POLL_SECONDS = float(os.environ.get("ASTRAQUOTE_GPT_RELAY_POLL_SECONDS", "4"))
-QUOTE_TIMEOUT_SECONDS = int(os.environ.get("ASTRAQUOTE_GPT_QUOTE_TIMEOUT", "600"))
+QUOTE_TIMEOUT_SECONDS = int(
+    os.environ.get(
+        "ASTRAQUOTE_GPT_QUOTE_TIMEOUT",
+        str(workflow_policy_int("timing", "default_quote_seconds")),
+    )
+)
 BATCH_STATE_SETTLE_SECONDS = max(
     POLL_SECONDS * 2,
     float(os.environ.get("ASTRAQUOTE_GPT_BATCH_STATE_SETTLE_SECONDS", "12")),
@@ -80,6 +86,12 @@ BROWSER_RECOVERY_COOLDOWN_SECONDS = max(
 )
 MAX_CONTINUATION_ATTEMPTS = bounded_continuation_attempts(
     os.environ.get("ASTRAQUOTE_GPT_MAX_CONTINUATIONS")
+)
+MAX_DEFERRED_COMPONENTS_PER_RETRY = workflow_policy_int(
+    "batching", "max_deferred_components_per_retry"
+)
+MAX_DEFERRED_RETRY_ROUNDS = workflow_policy_int(
+    "recovery", "deferred_retry_rounds"
 )
 WORKER_ID = f"{RELAY_ENGINE}-{socket.gethostname()}-{os.getpid()}"
 
@@ -512,7 +524,7 @@ def continue_component_batch(
             active,
             completed_status="saved",
         )
-    if active.deferred_retry_sent:
+    if int(active.deferred_retry_sent) >= MAX_DEFERRED_RETRY_ROUNDS:
         store.update_chat_session(
             active.job_id,
             active.batch_index,
@@ -939,7 +951,9 @@ def settle_programmatic_delivery(
     if deferred_session is not None:
         batch_index = int(deferred_session["batch_index"])
         batch = batch_by_index[batch_index]
-        remaining = incomplete_component_keys(batch)[:5]
+        remaining = incomplete_component_keys(batch)[
+            :MAX_DEFERRED_COMPONENTS_PER_RETRY
+        ]
         active = browser.resume_quote(
             job_id,
             str(deferred_session["chat_url"]),

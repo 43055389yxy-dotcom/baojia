@@ -1,5 +1,7 @@
 'use strict';
 
+const { workflowPolicyValue } = require('./quote-workflow-policy');
+
 const PROGRESS_GUIDANCE = 'Query progress is not quote coverage. Discovery and superseded attempts are not missing components. Once every required component and purchase option has verified evidence, call build_estimate with the selected query IDs even if unused legacy attempts remain incomplete.';
 
 function invalid(reason, queryId) {
@@ -29,11 +31,12 @@ function stableObject(value) {
 }
 
 function officialAttemptFingerprint(query) {
-  const {
-    query_id: _queryId,
-    official_source_url: _OfficialSourceUrl,
-    ...identity
-  } = query || {};
+  const ignored = new Set(workflowPolicyValue(
+    'pricing', 'duplicate_attempt_ignored_fields',
+  ));
+  const identity = Object.fromEntries(Object.entries(query || {}).filter(
+    ([key]) => !ignored.has(key),
+  ));
   if (Array.isArray(identity.item_id_paths)) {
     identity.item_id_paths = [...identity.item_id_paths].sort();
   }
@@ -163,7 +166,9 @@ function queryProgress(queries, results, contexts = [], officialPageEvidence = [
     const result = byResult.get(q.query_id);
     const purpose = context?.purpose || 'pricing';
     const completed = reusableQueryResult(result, context);
-    const completedByOfficialPage = !completed && officialPageScopes.has(scope(context));
+    const completedByOfficialPage = workflowPolicyValue(
+      'pricing', 'official_page_evidence_completes_scope',
+    ) === true && !completed && officialPageScopes.has(scope(context));
     const candidate = !completed && key(q.query_id) ? successes.get(key(q.query_id)) : null;
     const successor = candidate && (
       positions.get(candidate) > positions.get(q.query_id)
@@ -213,7 +218,8 @@ function componentProgress(
   components = [], lifecycle = [], results = [], sealedComponentKeys = [],
 ) {
   const resultById = new Map(results.map((item) => [item.query_id, item]));
-  const sealed = new Set(sealedComponentKeys);
+  const sealed = workflowPolicyValue('completion', 'authority') === 'sealed_component_fragment'
+    ? new Set(sealedComponentKeys) : new Set();
   const lifecycleByScope = new Map();
   for (const item of lifecycle) {
     const ownedScope = scope(item);
@@ -263,9 +269,11 @@ function componentProgress(
   const topLevelComponentCount = components.filter(
     (component) => !component.parent_component_key,
   ).length;
+  const componentsPerChat = workflowPolicyValue('batching', 'components_per_wave')
+    * workflowPolicyValue('batching', 'waves_per_chat');
   return {
     top_level_component_count: topLevelComponentCount,
-    component_chat_count: Math.ceil(topLevelComponentCount / 10),
+    component_chat_count: Math.ceil(topLevelComponentCount / componentsPerChat),
     total_component_count: states.length,
     completed_component_count: states.filter((item) => item.state === 'completed').length,
     failed_component_count: states.filter((item) => item.state === 'failed').length,

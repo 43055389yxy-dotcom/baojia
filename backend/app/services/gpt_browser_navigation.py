@@ -5,6 +5,8 @@ from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
+from app.services.quote_workflow_policy import workflow_policy_int
+
 _PROJECT_ID_PATTERN = re.compile(
     r"/g/(g-p-[0-9a-z]+)(?:-[^/]+)?/",
     re.IGNORECASE,
@@ -19,11 +21,12 @@ def bounded_continuation_attempts(value: str | None) -> int:
     machine checkpoint has not changed.
     """
 
+    maximum = workflow_policy_int("timing", "max_continuations_without_progress")
     try:
-        requested = int(value or "1")
+        requested = int(value or str(maximum))
     except (TypeError, ValueError):
-        requested = 1
-    return min(1, max(1, requested))
+        requested = maximum
+    return min(maximum, max(1, requested))
 
 
 def active_quote_poll_order(

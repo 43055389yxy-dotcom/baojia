@@ -5,6 +5,10 @@ import re
 from typing import Any
 
 from app.services.cloud_quote_profiles import active_market_profile
+from app.services.quote_workflow_policy import (
+    render_workflow_policy_slice,
+    workflow_policy_version,
+)
 
 FINAL_STATUS_PATTERN = re.compile(
     r"ASTRAQUOTE_STATUS\s*[:：]\s*(displayed_on_page|delivered|blocked)",
@@ -96,16 +100,8 @@ def build_quote_context_prompt(options: dict[str, Any]) -> str:
         "以上是销售已选中的全部计价方式，任何一种都不得遗漏；"
         "查价、汇总、报价页和 Excel 必须逐项保留，"
         "不得自行替换成其他期限或计价方式。\n"
-        "客户未提供的参数，可省略且不影响正式查价时必须省略；"
-        "缺少后无法正式查价时，必须由 GPT 从本次官方允许值中选择最小刚需、"
-        "最低价的可计值继续，并在该组件中简短说明。"
-        "不得因为缺少参数停止组件或整张报价，程序不得替 GPT 写死业务参数。\n"
-        "每个计费项先现场调用一次官方价格 API；未取得完整可用费率时，"
-        "立即改查同一云厂商、同一账号站点的官方价格页并保存证据，不要重复撞同一路径。"
-        "API 未取到价格不能转成销售手填，也不得复用其他报价的历史单价。\n"
-        "某组件官方没有销售所选的长期购买方式时，不要把整单判失败，也不要显示不适用；"
-        "在该长期方案中使用此组件的按量月费，pricing_basis 标为 on_demand_fallback，"
-        "月费与按量相同、预付为 0，其他确有长期价格的组件仍按真实长期价格计算。"
+        f"执行策略版本：{workflow_policy_version()}。\n"
+        f"{render_workflow_policy_slice('quote_context')}"
     )
 
 
@@ -142,16 +138,17 @@ def build_quote_continuation_prompt(
         component_scope = (
             "后台已核对真实组件状态。本次只重新组织并补查以下尚未完成的组件一次："
             f"{json.dumps(component_keys, ensure_ascii=False)}。"
-            "已经成功的组件及证据必须直接复用，严禁重新查询。API 未取得完整价格的组件"
-            "必须改用同厂商、同账号站点的官网价格页并把证据保存回当前批次；"
-            "不得转成销售手填。全部组件核价后再生成完整报价。\n\n"
+            "已经成功的组件及证据必须直接复用，严禁重新查询。\n\n"
         )
+    policy_slice = "component_retry" if component_keys else "official_page_finalize"
     return (
         f"{ASTRAQUOTE_MENTION} 这不是新报价，当前 AstraQuote 报价尚未产生最终结果。"
         "请在本对话中从已保存阶段继续完成，不要只汇报剩余待办，"
         "也不要重复已经成功的查价、文件或交付步骤。"
         "收到后立即继续实际执行，禁止再次只输出状态、计划或待办清单。\n\n"
         f"{component_scope}"
+        f"执行策略版本：{workflow_policy_version()}。\n"
+        f"{render_workflow_policy_slice(policy_slice)}\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n\n"
         "只有报价与 Excel 下载链接已经在销售页面就绪，或者存在确实无法继续处理的"
         "单一阻塞原因时，才结束本次回复。"
@@ -167,10 +164,9 @@ def build_quote_partial_finalization_prompt(
 
     return (
         f"{ASTRAQUOTE_MENTION} 后台已确认补发一次后仍没有真实进展。"
-        "现在停止重复调用已经失败的 API，并复用所有成功证据。"
-        "对仍未取得完整价格的组件，必须改查同一云厂商、同一账号站点的官方价格页，"
-        "把官网单价证据保存回当前批次后生成完整报价和 Excel。"
-        "不得生成 unpriced_services，不得标注销售手填，也不得把占位 0 元当价格。\n\n"
+        "现在停止重复调用已经失败的 API，并复用所有成功证据。\n"
+        f"执行策略版本：{workflow_policy_version()}。\n"
+        f"{render_workflow_policy_slice('official_page_finalize')}\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n\n"
         "完成后按正常最终状态协议结束；不得再输出计划或重新查询已经成功的组件。"
     )
@@ -187,9 +183,9 @@ def build_quote_failed_components_retry_prompt(
         f"{ASTRAQUOTE_MENTION} 这是一条历史未完整交付任务的恢复，不是新报价。"
         "请读取 AstraQuote 保存的组件计划、价格批次和真实组件状态，"
         "只处理后台仍未完成的组件；"
-        "已经核价成功的组件、官方证据和 Excel 数据必须直接复用，不得重新查询。"
-        "API 未取得完整价格时必须转同厂商、同账号站点官网价格页并保存证据；"
-        "不得交付部分报价或销售手填项。全部成功后交付完整报价。\n\n"
+        "已经核价成功的组件、官方证据和 Excel 数据必须直接复用，不得重新查询。\n"
+        f"执行策略版本：{workflow_policy_version()}。\n"
+        f"{render_workflow_policy_slice('component_retry')}\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。"
     )
 

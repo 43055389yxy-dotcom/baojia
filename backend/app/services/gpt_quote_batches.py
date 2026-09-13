@@ -13,11 +13,19 @@ import re
 from collections import defaultdict
 from typing import Any
 
-COMPONENTS_PER_WAVE = 5
-WAVES_PER_CHAT = 2
+from app.services.quote_workflow_policy import (
+    render_workflow_policy_slice,
+    workflow_policy_int,
+    workflow_policy_version,
+)
+
+COMPONENTS_PER_WAVE = workflow_policy_int("batching", "components_per_wave")
+WAVES_PER_CHAT = workflow_policy_int("batching", "waves_per_chat")
 COMPONENTS_PER_CHAT = COMPONENTS_PER_WAVE * WAVES_PER_CHAT
 ASTRAQUOTE_MENTION = "@AstraQuote"
-MAX_NUMBERED_COMPONENTS = 200
+MAX_NUMBERED_COMPONENTS = workflow_policy_int(
+    "batching", "max_numbered_components"
+)
 _NUMBERED_COMPONENT_LINE = re.compile(
     r"^\s*(?:需求\s*)?(?:[（(]\s*)?(?P<number>\d{1,3})(?:\s*[)）])?"
     r"\s*[、,，.．。:：;；\-—]\s*(?P<body>\S.*)$"
@@ -117,11 +125,8 @@ def build_numbered_intake_batch_prompt(
         f"{quote_context.strip()}\n\n"
         "本批客户需求（每个实际换行是一项独立顶层组件）：\n"
         f"{owned_lines}\n\n"
-        "本批全部组件完成选型、核价和金额计算后，必须调用 build_estimate，"
-        "设置 delivery_mode=save_component_batch，并原样传入本提示中的 "
-        "relay_batch_index、relay_batch_count 和 price_batch_id；只提交本批结果。"
-        "工具返回 component_batch_saved 时立即结束本轮；最后一批会由程序自动合并、"
-        "校验并生成销售页和 Excel，不要再由 AI 整理整单。"
+        f"执行策略版本：{workflow_policy_version()}。\n"
+        f"{render_workflow_policy_slice('component_batch')}"
     )
 
 
@@ -203,11 +208,9 @@ def build_component_batch_prompt(
         f"当前为第 {batch_index + 1}/{batch_count} 批。只处理下面列出的组件，"
         "不得读取、猜测或修改其他批次。使用已经封存的 price_batch_id，"
         "逐组件查询并保存官方价格证据；已经成功的计费项直接复用，只补未完成项。"
-        "本批全部组件完成选型、核价和金额计算后，必须调用 build_estimate，"
-        "设置 delivery_mode=save_component_batch，并原样传入本提示中的批次编号；"
-        "只提交本批 Fact Ledger、组件结果、方案费用和本批小计。"
-        "工具返回 component_batch_saved 时结束本轮；最后一批由程序自动合并、"
-        "核对并生成 Excel。不要生成最终整单，也不要自行整理跨批次内容。\n\n"
+        "不要生成最终整单，也不要自行整理跨批次内容。\n"
+        f"执行策略版本：{workflow_policy_version()}。\n"
+        f"{render_workflow_policy_slice('component_batch')}\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n"
         f"price_batch_id：{price_batch_id}\n"
         f"relay_batch_index：{batch_index}\n"
@@ -233,12 +236,9 @@ def build_component_batch_continuation_prompt(
     return (
         f"{ASTRAQUOTE_MENTION} 这不是新报价。"
         "请先读取后台组件状态，只处理本批尚未完成的组件，"
-        "已经成功的查询必须复用，不得处理其他批次，也不要生成最终整单。"
-        "只有官方错误明确给出可修正字段、操作或响应路径时，才允许发出一次"
-        "实质不同的修正 API 请求；否则直接查同厂商、同账号站点的官方价格页。"
-        "不得只更换 query_id 重复相同请求，不得生成部分报价或销售手填项。"
-        "补查结束后必须调用 build_estimate，设置 delivery_mode=save_component_batch，"
-        "只保存本批最终组件结果；最后一批由程序自动合并并生成 Excel。"
+        "已经成功的查询必须复用，不得处理其他批次，也不要生成最终整单。\n"
+        f"执行策略版本：{workflow_policy_version()}。\n"
+        f"{render_workflow_policy_slice('component_retry')}\n"
         f"当前为第 {batch_index + 1}/{batch_count} 批；"
         f"允许处理的 component_key：{json.dumps(component_keys, ensure_ascii=False)}。\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n"
@@ -261,16 +261,9 @@ def build_component_batch_deferred_retry_prompt(
 
     return (
         f"{ASTRAQUOTE_MENTION} 这不是新报价。其他正常组件已经处理完，"
-        "现在只补本对话先前暂存的未完成组件，且这是唯一一次集中补发。"
-        "先读取后台真实组件状态，所有已经成功的组件、计费项和官方证据必须直接复用，"
-        "严禁重新查询。对仍未完成的计费项：只有现有官方错误明确给出了可修正字段、"
-        "操作或响应路径时，才允许发出一次实质不同的修正 API 请求；"
-        "禁止仅更换 query_id 后重复相同主机、操作、路径和业务参数。"
-        "修正请求仍没有完整可用费率，或该产品登记为 official_page_only 时，"
-        "必须立即查询同一云厂商、同一账号站点的官方价格页并保存 PriceIR 证据。"
-        "不得生成 unpriced_services、部分报价或销售手填项。"
-        "完成后调用 build_estimate，设置 delivery_mode=save_component_batch，"
-        "提交本批全部最终组件结果；已成功组件只随结构化结果一起复用，不得重新查价。"
+        "现在只补本对话先前暂存的未完成组件，且这是唯一一次集中补发。\n"
+        f"执行策略版本：{workflow_policy_version()}。\n"
+        f"{render_workflow_policy_slice('component_retry')}\n"
         f"允许补查的 component_key：{json.dumps(component_keys, ensure_ascii=False)}。\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n"
         f"price_batch_id：{price_batch_id}\n"
@@ -292,9 +285,10 @@ def build_component_batch_finalize_prompt(
 
     return (
         f"{ASTRAQUOTE_MENTION} 本批价格证据已经全部保存，不要重新查价。"
-        "现在只完成本批结构化收口：调用 build_estimate，"
-        "设置 delivery_mode=save_component_batch，只提交本批 Fact Ledger、组件结果、"
-        "销售所选全部方案费用和本批小计。不要读取其他批次，不要由 AI 合并整单。"
+        "现在只完成本批结构化收口，只提交本批 Fact Ledger、组件结果、"
+        "销售所选全部方案费用和本批小计。不要读取其他批次。\n"
+        f"执行策略版本：{workflow_policy_version()}。\n"
+        f"{render_workflow_policy_slice('component_batch')}\n"
         f"允许提交的 component_key：{json.dumps(component_keys, ensure_ascii=False)}。\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n"
         f"price_batch_id：{price_batch_id}\n"

@@ -1,0 +1,84 @@
+{
+  "schema_version": "astraquote-quote-workflow-policy/1",
+  "policy_version": "2026-09-14-unified-v1",
+  "batching": {
+    "components_per_wave": 5,
+    "waves_per_chat": 2,
+    "max_active_chats_per_sales_job": 3,
+    "global_active_chat_limit": 4,
+    "max_numbered_components": 200,
+    "max_deferred_components_per_retry": 5
+  },
+  "timing": {
+    "default_quote_seconds": 600,
+    "max_continuations_without_progress": 1
+  },
+  "pricing": {
+    "official_api_network_attempt_limit_per_scope": 2,
+    "corrected_api_attempt_limit_per_scope": 1,
+    "official_page_min_api_attempts": 1,
+    "official_page_evidence_completes_scope": true,
+    "reuse_successful_evidence_within_quote": true,
+    "reuse_historical_prices_across_quotes": false,
+    "duplicate_attempt_ignored_fields": [
+      "query_id",
+      "official_source_url"
+    ],
+    "use_on_demand_fallback_for_missing_long_term_price": true
+  },
+  "recovery": {
+    "stalled_component_strategy": "defer_then_retry_once",
+    "deferred_retry_rounds": 1,
+    "retry_in_original_conversation": true,
+    "continue_other_components": true
+  },
+  "completion": {
+    "authority": "sealed_component_fragment",
+    "ai_text_is_authoritative": false,
+    "official_page_evidence_is_authoritative": true
+  },
+  "delivery": {
+    "owner": "program",
+    "allow_partial_sales_quote": false,
+    "allow_sales_manual_price": false,
+    "excel_after_all_component_batches": true
+  },
+  "prompt_directives": {
+    "missing_parameters": "客户未提供的参数，可省略且不影响正式查价时必须省略；缺少后无法正式查价时，由 GPT 从本次官方允许值中选择最小刚需、最低价的可计值继续并简短说明，不得因为缺少参数停止组件或整张报价。",
+    "official_pricing": "每个计费项先现场调用一次官方价格 API。只有官方错误明确给出可修正字段、操作或响应路径时，才允许再发出一次实质不同的修正请求；不得只更换 query_id 重复相同请求。仍未取得完整费率时，立即查询同一云厂商、同一账号站点的官方价格页并保存证据。官网证据按正式价格完成计费项；不得复用其他报价的历史单价。",
+    "long_term_fallback": "某组件没有销售所选的长期购买价格时，不判整单失败，也不显示不适用；该长期方案使用组件按量月费，pricing_basis 标为 on_demand_fallback，月费与按量相同、预付为 0。",
+    "component_batch_save": "当前小批完成后必须调用 build_estimate，设置 delivery_mode=save_component_batch，并原样提交当前批次编号和 price_batch_id；只保存本批结果。最后一批由程序自动合并、校验并生成销售页和 Excel，AI 不得再次整理整单。",
+    "deferred_retry": "一个组件长时间无真实进展或回复结束后仍未完成时，先封存成功组件并暂存未完成键，继续后续组件和对话。全部正常批次处理后回到原对话，只对暂存组件集中补发一次；成功组件及证据必须复用，严禁重新查价。",
+    "complete_sales_delivery": "销售任务不得生成 unpriced_services 或部分报价，不得标注销售手填，也不得使用假零价。官网证据也确实无法取得或校验时，保存其他成功组件并停止任务，只返回一个明确阻塞。",
+    "authoritative_status": "组件、批次和交付状态只以后端封存状态与交付回执为准；GPT 回复文字、页面动画或旧查询状态都不能单独判定成功。"
+  },
+  "consumer_slices": {
+    "quote_context": [
+      "missing_parameters",
+      "official_pricing",
+      "long_term_fallback"
+    ],
+    "component_batch": [
+      "component_batch_save"
+    ],
+    "component_retry": [
+      "deferred_retry",
+      "official_pricing",
+      "component_batch_save",
+      "complete_sales_delivery"
+    ],
+    "official_page_finalize": [
+      "official_pricing",
+      "complete_sales_delivery"
+    ],
+    "mcp_instructions": [
+      "missing_parameters",
+      "official_pricing",
+      "long_term_fallback",
+      "component_batch_save",
+      "deferred_retry",
+      "complete_sales_delivery",
+      "authoritative_status"
+    ]
+  }
+}

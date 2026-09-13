@@ -1454,6 +1454,7 @@ test('price lookup responses tell weaker clients that quote coverage is unknown 
   });
 
   assert.equal(result.workflow_guard.mode, 'price_lookup');
+  assert.equal(result.workflow_guard.policy_version, '2026-09-14-unified-v1');
   assert.equal(result.workflow_guard.quote_plan_registered, false);
   assert.equal(result.workflow_guard.quote_coverage_known, false);
   assert.equal(result.workflow_guard.formal_quote_final_response_allowed, false);

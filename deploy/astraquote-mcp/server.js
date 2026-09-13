@@ -14,15 +14,49 @@ const { AstraQuoteBackendClient, BackendError } = require('./lib/backend-client'
 const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delivery');
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
+const {
+  renderWorkflowPolicySlice,
+  workflowPolicyValue,
+  workflowPolicyVersion,
+} = require('./lib/quote-workflow-policy');
 
-const VERSION = '3.19.0';
+const VERSION = '3.20.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
-const INSTRUCTIONS = fs.readFileSync(
+function renderInstructionsTemplate(template) {
+  const componentsPerWave = workflowPolicyValue('batching', 'components_per_wave');
+  const wavesPerChat = workflowPolicyValue('batching', 'waves_per_chat');
+  const salesChatLimit = workflowPolicyValue(
+    'batching', 'max_active_chats_per_sales_job',
+  );
+  const replacements = {
+    '{{QUOTE_WORKFLOW_POLICY_VERSION}}': workflowPolicyVersion(),
+    '{{QUOTE_WORKFLOW_POLICY}}': renderWorkflowPolicySlice('mcp_instructions'),
+    '{{COMPONENTS_PER_WAVE}}': componentsPerWave,
+    '{{WAVES_PER_CHAT}}': wavesPerChat,
+    '{{COMPONENTS_PER_CHAT}}': componentsPerWave * wavesPerChat,
+    '{{GLOBAL_ACTIVE_CHAT_LIMIT}}': workflowPolicyValue(
+      'batching', 'global_active_chat_limit',
+    ),
+    '{{MAX_ACTIVE_CHATS_PER_SALES_JOB}}': salesChatLimit,
+    '{{MAX_ACTIVE_COMPONENTS_PER_SALES_JOB}}': (
+      componentsPerWave * wavesPerChat * salesChatLimit
+    ),
+    '{{MAX_DEFERRED_COMPONENTS_PER_RETRY}}': workflowPolicyValue(
+      'batching', 'max_deferred_components_per_retry',
+    ),
+  };
+  return Object.entries(replacements).reduce(
+    (rendered, [placeholder, value]) => rendered.replaceAll(placeholder, String(value)),
+    template,
+  ).trim();
+}
+
+const INSTRUCTIONS = renderInstructionsTemplate(fs.readFileSync(
   path.join(__dirname, 'instructions.zh-CN.md'),
   'utf8',
-).trim();
+));
 
 const jsonValue = z.union([
   z.string(), z.number(), z.boolean(), z.null(), z.array(z.unknown()), z.record(z.unknown()),
@@ -715,7 +749,7 @@ function buildServer(workflow) {
 
   server.registerTool('get_prices', {
     title: 'Batch query official cloud prices',
-    description: 'Always set quote_mode: a request for a formal quote, Excel or sales-page delivery MUST use formal_quote; never downgrade it to price_lookup because some prices are missing. Requires a non-empty incremental queries array. For a formal quote, every query MUST have a query_contexts entry. A pre-split sales relay call MUST preserve relay_batch_index, relay_batch_count and the reserved price_batch_id from its prompt, and quote_components MUST contain only that batch; the backend appends and seals each batch. A legacy formal quote registers the complete plan on its first call. Submit as many prepared scopes as fit this call so independent official requests can run in parallel. For authenticated clouds, supply provider, service, region and the current read-only request/response contract; AstraQuote selects a verified basic official hostname for cataloged services and never caches paths, parameters, response fields or rates. Full official results are persisted. If response_compacted=true, read only required details with get_price_results. Invalid or unsupported parameter values are correctable: repair only the rejected fields and retry. needs_refinement, terminal=false, or must_continue=true means do not give the user a final answer. After one incomplete official API result for the same component/billing/scenario scope, read the provider official pricing page and call get_prices again with the saved query plus top-level official_page_price_evidence; the saved API is not called twice and the fallback becomes available to final merge. GPT chooses products, required minimum parameter values and quote totals; program-assigned sales batches are immutable.',
+    description: `Always set quote_mode; formal quotes, Excel and sales-page delivery use formal_quote. Requires non-empty incremental queries and one query_contexts entry for each formal pricing query. Preserve relay_batch_index, relay_batch_count, price_batch_id and the current quote_components batch. Full official results are persisted; use get_price_results only for required compacted details. needs_refinement, terminal=false or must_continue means continue the required action and do not give a final answer. GPT supplies current product parameters and response paths while AstraQuote enforces registered hosts and read-only operations. ${renderWorkflowPolicySlice('quote_context')}`,
     // Keep the JSON Schema visible to MCP clients. ZodEffects produced by
     // superRefine serializes as an empty object in the MCP SDK, so cross-field
     // checks run inside the guarded handler instead.
@@ -746,7 +780,7 @@ function buildServer(workflow) {
 
   server.registerTool('build_estimate', {
     title: 'Validate and deliver an official quote',
-    description: 'For a program-split sales relay batch, use delivery_mode=save_component_batch with the exact relay_batch_index and relay_batch_count and submit only that batch. It validates and seals GPT-selected official evidence, facts and component totals. The last saved batch is mechanically merged by the program, revalidated, and delivered with one Excel link; no final AI merge is needed. Legacy non-batch calls use deliver_quote. After one incomplete official API attempt in one declared scope, save official_page_price_evidence from the same provider and account site. Sales relay quotes cannot finish with unpriced services or sales-manual placeholders.',
+    description: `Submit selected official evidence, official_page_price_evidence, Fact Ledger, component totals and all sales-selected scenarios. ${renderWorkflowPolicySlice('component_batch')} ${renderWorkflowPolicySlice('official_page_finalize')}`,
     inputSchema: buildEstimateInput,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, guarded((args) => workflow.buildEstimate(normalizeBuildEstimateInput(args))));

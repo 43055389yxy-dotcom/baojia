@@ -60,6 +60,7 @@ type QuickQuoteResult = {
 
 type RelayJob = {
   job_id: string;
+  policy_version?: string;
   submission_code: string;
   status: "queued" | "processing" | "needs_login" | "completed" | "partial" | "failed" | "cancelled";
   created_at?: string;
@@ -101,6 +102,7 @@ type RegionCatalog = {
 
 type RelayHealth = {
   status: "ready" | "starting" | "offline";
+  policy_version?: string;
   message?: string;
   provider_catalogs?: Partial<Record<CloudProvider, {
     available: boolean;

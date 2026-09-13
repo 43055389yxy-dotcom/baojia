@@ -31,9 +31,15 @@ from app.services.codex_chat_references import (
 from app.services.gemini_chat_references import is_gemini_chat_reference
 from app.services.gpt_quote_batches import (
     COMPONENTS_PER_CHAT,
+    MAX_NUMBERED_COMPONENTS,
     WAVES_PER_CHAT,
     split_component_plan,
     split_numbered_intake,
+)
+from app.services.quote_workflow_policy import (
+    workflow_policy_int,
+    workflow_policy_snapshot,
+    workflow_policy_version,
 )
 
 UTC = timezone.utc  # noqa: UP017 - the host-side worker still supports Python 3.9
@@ -60,11 +66,19 @@ PUBLIC_FIELDS = {
     "quote_download_url",
     "quote_download_filename",
     "progress",
+    "policy_version",
 }
 
-DEFAULT_MAX_CONCURRENT_QUOTES = 4
-DEFAULT_QUOTE_SECONDS = 600
-MAX_ACTIVE_CHATS_PER_SALES_JOB = 3
+DEFAULT_MAX_CONCURRENT_QUOTES = workflow_policy_int(
+    "batching", "global_active_chat_limit"
+)
+DEFAULT_QUOTE_SECONDS = workflow_policy_int("timing", "default_quote_seconds")
+MAX_ACTIVE_CHATS_PER_SALES_JOB = workflow_policy_int(
+    "batching", "max_active_chats_per_sales_job"
+)
+MAX_CONTINUATIONS_WITHOUT_PROGRESS = workflow_policy_int(
+    "timing", "max_continuations_without_progress"
+)
 QUOTE_ENGINES = ("chatgpt", "gemini")
 DEFAULT_ENABLED_QUOTE_ENGINES = ("chatgpt",)
 
@@ -293,6 +307,8 @@ class GptQuoteRelayStore:
             normalized_options = {**options, "preferred_engine": preferred_engine}
             record = {
                 "schema_version": "astraquote-gpt-relay/3",
+                "policy_version": workflow_policy_version(),
+                "policy_snapshot": workflow_policy_snapshot(),
                 "job_id": job_id,
                 "submission_code": submission_code,
                 "cloud_provider": str(options.get("cloud_provider") or "aws"),
@@ -526,7 +542,7 @@ class GptQuoteRelayStore:
 
         if role not in {"coordinator", "component_batch"}:
             raise GptRelayError("无效的报价对话角色。", code="gpt_relay_chat_role_invalid")
-        if not 0 <= batch_index < batch_count <= 200:
+        if not 0 <= batch_index < batch_count <= MAX_NUMBERED_COMPONENTS:
             raise GptRelayError("无效的报价对话批次。", code="gpt_relay_chat_batch_invalid")
         stable_reference = is_codex_chat_reference(chat_url) or is_gemini_chat_reference(
             chat_url
@@ -763,10 +779,13 @@ class GptQuoteRelayStore:
         error = checkpoint.get("error") or {}
         return checkpoint.get("stage") == "failed" and error.get("retryable") is not True
 
-    def reserve_continuation(self, job_id: str, *, maximum: int = 1) -> bool:
+    def reserve_continuation(self, job_id: str, *, maximum: int | None = None) -> bool:
         """Atomically reserve one retry for the current unchanged checkpoint."""
 
-        maximum = 1
+        effective_maximum = min(
+            MAX_CONTINUATIONS_WITHOUT_PROGRESS,
+            max(1, maximum or MAX_CONTINUATIONS_WITHOUT_PROGRESS),
+        )
         with self._lock():
             path = self._path(job_id)
             if not path.exists():
@@ -779,7 +798,7 @@ class GptQuoteRelayStore:
             previous = record.get("last_progress_fingerprint")
             fingerprint = self._merge_progress(previous, self.progress_fingerprint(job_id))
             stalled = int(record.get("stalled_continuation_attempts") or 0)
-            if stalled >= maximum:
+            if stalled >= effective_maximum:
                 return False
             record.update(
                 {
@@ -1118,7 +1137,10 @@ class GptQuoteRelayStore:
             return None
         components = value.get("components")
         scenarios = value.get("scenarios")
-        if not isinstance(components, list) or not 1 <= len(components) <= 200:
+        if (
+            not isinstance(components, list)
+            or not 1 <= len(components) <= MAX_NUMBERED_COMPONENTS
+        ):
             return None
         if not isinstance(scenarios, list) or not 1 <= len(scenarios) <= 3:
             return None
@@ -1750,6 +1772,7 @@ class GptQuoteRelayStore:
         starting = any(item["status"] == "starting" for item in engines.values())
         return {
             "status": "ready" if ready else "starting" if starting else "offline",
+            "policy_version": workflow_policy_version(),
             "message": (
                 "服务正常"
                 if ready
