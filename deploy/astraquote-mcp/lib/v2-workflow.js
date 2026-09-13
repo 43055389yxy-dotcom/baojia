@@ -544,7 +544,7 @@ function priceWorkflowGuard({ quoteMode, relayJobId, quoteComponents, componentL
       supported: true,
       api_attempts_required: 1,
       same_component_billing_scenario_scope_required: true,
-      disallowed_for: ['credentials', 'authorization'],
+      disallowed_for: [],
       save_tool: 'get_prices',
       save_field: 'official_page_price_evidence',
     },
@@ -1030,6 +1030,27 @@ function validatePartialQuoteContract(input, priceBatch) {
   }
 }
 
+function validateSalesRelayCompleteness(input, priceBatch) {
+  const unpriced = input.unpriced_services || [];
+  if (!priceBatch.relay_job_id || unpriced.length === 0) return;
+  const unpricedKeys = new Set(unpriced.map((component) => component.component_key));
+  const attempts = (priceBatch.query_contexts || []).filter((context) => (
+    unpricedKeys.has(context.component_key) && context.purpose === 'pricing'
+  ));
+  const error = new Error(
+    'A sales quote cannot be delivered with manual price placeholders. Complete these components from the official pricing page.',
+  );
+  error.code = 'sales_quote_official_page_price_required';
+  error.retryable = true;
+  error.terminal = false;
+  error.details = {
+    component_keys: [...unpricedKeys],
+    api_attempt_query_ids: [...new Set(attempts.map((context) => context.query_id))],
+    next_action: 'Reuse successful components. For every remaining billing scope, read the same provider and account-site official pricing page, save official_page_price_evidence through get_prices, then build the complete quote again. Do not create unpriced_services or sales-manual rows.',
+  };
+  throw error;
+}
+
 function evidenceReferences(holder) {
   if (Array.isArray(holder?.price_evidence) && holder.price_evidence.length > 0) {
     return holder.price_evidence;
@@ -1129,11 +1150,6 @@ function mergeSavedOfficialPageEvidence({
       }
       if (!result || result.provider !== provider) {
         violations.push(`official_page_api_attempt_missing_or_wrong_provider:${evidence.component_key}:${evidence.billing_key}:${queryId}`);
-        continue;
-      }
-      if (['credentials', 'authorization'].includes(result.error_category)
-        || result.capability_preflight === true) {
-        violations.push(`official_page_api_attempt_is_permission_blocker:${evidence.component_key}:${evidence.billing_key}:${queryId}`);
         continue;
       }
       if (reusableQueryResult(result, context)) {
@@ -1987,8 +2003,6 @@ class AstraQuoteV2Workflow {
     const coveredScopes = new Set();
     const acceptedEvidence = [];
     const violations = [];
-    const disallowedFailureCategories = new Set(['credentials', 'authorization']);
-
     for (const component of input.services || []) {
       for (const group of componentEvidenceGroups(component)) {
         for (const evidence of officialPageEvidenceReferences(group.holder)) {
@@ -2054,13 +2068,6 @@ class AstraQuoteV2Workflow {
             if (!result || result.provider !== input.cloud_provider) {
               violations.push(
                 `official_page_api_attempt_missing_or_wrong_provider:${component.component_key}:${evidence.billing_key}:${queryId}`,
-              );
-              continue;
-            }
-            if (disallowedFailureCategories.has(result.error_category)
-              || result.capability_preflight === true) {
-              violations.push(
-                `official_page_api_attempt_is_permission_blocker:${component.component_key}:${evidence.billing_key}:${queryId}`,
               );
               continue;
             }
@@ -2496,6 +2503,7 @@ class AstraQuoteV2Workflow {
       throw error;
     }
     validatePartialQuoteContract(normalizedInput, priceBatch);
+    validateSalesRelayCompleteness(normalizedInput, priceBatch);
     normalizedInput.unpriced_services = enrichUnpricedServices(normalizedInput, priceBatch);
     validateCustomerDocumentMetadata(normalizedInput);
     const pageEvidence = this.validatePriceEvidence(normalizedInput, priceBatch);
@@ -2612,6 +2620,7 @@ module.exports = {
   enrichUnpricedServices,
   prepareOfficialApiSubmission,
   validateCustomerDocumentMetadata,
+  validateSalesRelayCompleteness,
   validateSealedCustomerFacts,
   applySealedComponentPresentation,
   sealedComponentOrder,

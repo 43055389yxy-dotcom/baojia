@@ -159,7 +159,7 @@ def test_batch_failure_state_churn_is_not_real_progress(worker, running_job, mon
     assert browser.continue_quote.call_count == 1
 
 
-def test_single_chat_retries_only_incomplete_components_once_then_requests_partial_excel(
+def test_single_chat_retries_only_incomplete_components_once_then_forces_official_page(
     worker, running_job, monkeypatch,
 ):
     store, job_id, checkpoint_path = running_job
@@ -194,8 +194,9 @@ def test_single_chat_retries_only_incomplete_components_once_then_requests_parti
     assert '"done"' not in retry_prompt
 
     assert worker.continue_from_saved_stage(store, browser, active, message="续跑")
-    partial_prompt = browser.continue_quote.call_args.args[1]
-    assert "生成部分报价和 Excel" in partial_prompt
+    official_page_prompt = browser.continue_quote.call_args.args[1]
+    assert "官方价格页" in official_page_prompt
+    assert "不得标注销售手填" in official_page_prompt
     assert browser.continue_quote.call_count == 2
 
 

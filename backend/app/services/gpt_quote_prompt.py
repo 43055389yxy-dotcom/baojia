@@ -98,9 +98,9 @@ def build_quote_context_prompt(options: dict[str, Any]) -> str:
         "缺少后无法正式查价时，必须由 GPT 从本次官方允许值中选择最小刚需、"
         "最低价的可计值继续，并在该组件中简短说明。"
         "不得因为缺少参数停止组件或整张报价，程序不得替 GPT 写死业务参数。\n"
-        "每个计费项先现场调用一次官方价格 API；未取得完整可用费率且不是权限问题时，"
+        "每个计费项先现场调用一次官方价格 API；未取得完整可用费率时，"
         "立即改查同一云厂商、同一账号站点的官方价格页并保存证据，不要重复撞同一路径。"
-        "不得复用其他报价的历史单价。\n"
+        "API 未取到价格不能转成销售手填，也不得复用其他报价的历史单价。\n"
         "某组件官方没有销售所选的长期购买方式时，不要把整单判失败，也不要显示不适用；"
         "在该长期方案中使用此组件的按量月费，pricing_basis 标为 on_demand_fallback，"
         "月费与按量相同、预付为 0，其他确有长期价格的组件仍按真实长期价格计算。"
@@ -140,8 +140,9 @@ def build_quote_continuation_prompt(
         component_scope = (
             "后台已核对真实组件状态。本次只重新组织并补查以下尚未完成的组件一次："
             f"{json.dumps(component_keys, ensure_ascii=False)}。"
-            "已经成功的组件及证据必须直接复用，严禁重新查询。补查结束后立即生成完整报价；"
-            "仍未成功的组件放入 unpriced_services，生成部分报价和 Excel，并标注请销售手动填写。\n\n"
+            "已经成功的组件及证据必须直接复用，严禁重新查询。API 未取得完整价格的组件"
+            "必须改用同厂商、同账号站点的官网价格页并把证据保存回当前批次；"
+            "不得转成销售手填。全部组件核价后再生成完整报价。\n\n"
         )
     return (
         f"{ASTRAQUOTE_MENTION} 这不是新报价，当前 AstraQuote 报价尚未产生最终结果。"
@@ -160,16 +161,16 @@ def build_quote_partial_finalization_prompt(
     relay_job_id: str,
     submission_code: str,
 ) -> str:
-    """Stop retrying an unchanged stage and publish verified successes."""
+    """Stop repeating APIs and force the official-page completion path."""
 
     return (
         f"{ASTRAQUOTE_MENTION} 后台已确认补发一次后仍没有真实进展。"
-        "现在停止重复查价，不要整单报错。"
-        "请从 AstraQuote 已保存阶段读取成功组件及其官方证据，立即生成部分报价和 Excel；"
-        "仍未取得价格的组件全部放入 unpriced_services，并设置 is_partial=true。"
-        "未取得价格的组件不得按 0 元、不得计入任何合计，也不得丢失。\n\n"
+        "现在停止重复调用已经失败的 API，并复用所有成功证据。"
+        "对仍未取得完整价格的组件，必须改查同一云厂商、同一账号站点的官方价格页，"
+        "把官网单价证据保存回当前批次后生成完整报价和 Excel。"
+        "不得生成 unpriced_services，不得标注销售手填，也不得把占位 0 元当价格。\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n\n"
-        "完成后按正常最终状态协议结束；不得再输出计划、继续等待或重新查询已经成功的组件。"
+        "完成后按正常最终状态协议结束；不得再输出计划或重新查询已经成功的组件。"
     )
 
 
@@ -184,7 +185,8 @@ def build_quote_failed_components_retry_prompt(
         f"{ASTRAQUOTE_MENTION} 销售已选择重试部分报价中的未完成组件。这不是新报价。"
         "请读取 AstraQuote 保存的组件计划、价格批次和部分报价，只处理 unpriced_services；"
         "已经核价成功的组件、官方证据和 Excel 数据必须直接复用，不得重新查询。"
-        "完成后重新核对整单：全部成功则交付完整报价；仍有组件失败则再次交付部分报价。\n\n"
+        "API 未取得完整价格时必须转同厂商、同账号站点官网价格页并保存证据；"
+        "不得再次交付销售手填项。全部成功后交付完整报价。\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。"
     )
 

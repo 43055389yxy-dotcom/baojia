@@ -1126,7 +1126,7 @@ def test_continuation_prompt_reuses_identity_without_restoring_customer_text() -
     assert "build_estimate" not in prompt
 
 
-def test_partial_finalization_prompt_returns_saved_successes_without_customer_text() -> None:
+def test_partial_finalization_prompt_forces_official_page_completion_without_customer_text() -> None:
     prompt = build_quote_partial_finalization_prompt(
         relay_job_id="gpt-dddddddddddddddddddddddddddddddd",
         submission_code="6",
@@ -1134,8 +1134,9 @@ def test_partial_finalization_prompt_returns_saved_successes_without_customer_te
 
     assert prompt.startswith("@AstraQuote ")
     assert "补发一次" in prompt
-    assert "部分报价" in prompt
-    assert "未取得价格的组件不得按 0 元" in prompt
+    assert "官方价格页" in prompt
+    assert "不得标注销售手填" in prompt
+    assert "不得生成 unpriced_services" in prompt
     assert "gpt-dddddddddddddddddddddddddddddddd" in prompt
     assert "客户需求" not in prompt
 

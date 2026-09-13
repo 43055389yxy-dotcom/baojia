@@ -332,7 +332,7 @@ test('official pricing page evidence still requires one qualifying API failure',
   );
 });
 
-test('official pricing page fallback rejects third-party hosts and permission failures', async (t) => {
+test('official pricing page fallback rejects third-party hosts and accepts unusable API attempts', async (t) => {
   const thirdParty = fixture({ status: 'not_found', itemIds: [] });
   t.after(() => fs.rmSync(thirdParty.directory, { recursive: true, force: true }));
   const thirdPartyBatch = await failedPricingAttempts(thirdParty.workflow);
@@ -357,12 +357,11 @@ test('official pricing page fallback rejects third-party hosts and permission fa
   deniedInput.services[0].official_page_price_evidence = [officialPageEvidence([
     'page-attempt-1', 'page-attempt-2', 'page-attempt-3',
   ])];
-  await assert.rejects(
-    denied.workflow.buildEstimate(deniedInput),
-    (error) => error.code === 'official_price_evidence_invalid'
-      && error.details.violations.some(
-        (violation) => violation.startsWith('official_page_api_attempt_is_permission_blocker:'),
-      ),
+  const delivered = await denied.workflow.buildEstimate(deniedInput);
+  assert.equal(delivered.status, 'displayed_on_page');
+  assert.equal(
+    denied.workflow.store.get(delivered.quote_id).official_page_price_ir.length,
+    1,
   );
 });
 
@@ -557,7 +556,7 @@ test('a complete quote cannot hide an unpriced component', async (t) => {
   );
 });
 
-test('retrying a delivered partial quote creates a newer complete quote instead of replaying it', async (t) => {
+test('sales relay cannot deliver missing components as manual-price placeholders', async (t) => {
   const { workflow, directory } = fixture({ rateCandidates: [{
     rate_id: 'rate-1', official_item_id: 'item-1', unit_price: '12.34', currency: 'USD',
   }] });
@@ -625,52 +624,13 @@ test('retrying a delivered partial quote creates a newer complete quote instead 
       configuration_summary: '对象存储 2 TiB，价格尚未取得。',
     },
   }];
-  const firstDelivery = await workflow.buildEstimate(partial);
-
-  fs.writeFileSync(relayJobPath, JSON.stringify({
-    ...relayJob, partial_retry_generation: 1,
-  }));
-  await workflow.getPrices({
-    relay_job_id: relayJobId, submission_code: '2', price_batch_id: batch.price_batch_id,
-    queries: [{ provider: 'azure', query_id: 'price-2', filter: 'valid' }],
-    query_contexts: [{
-      query_id: 'price-2', purpose: 'pricing',
-      component_key: 'cmp_storage_0002', billing_key: 'storage',
-    }],
-  });
-  const complete = quoteInput(batch.price_batch_id, { monthly: '17.34' });
-  Object.assign(complete, {
-    relay_job_id: relayJobId,
-    pricing_scenarios: [{
-      scenario_key: 'on_demand', monthly_total: '17.34', upfront_total: '0',
-    }],
-    idempotency_key: 'complete-after-partial-retry',
-  });
-  complete.fact_ledger.push(partial.fact_ledger[1]);
-  complete.services[0].scenario_costs = [{
-    scenario_key: 'on_demand', pricing_basis: 'on_demand',
-    monthly_cost: '12.34', upfront_cost: '0',
-  }];
-  complete.services[0].expected_monthly_cost = '12.34';
-  complete.services.push({
-    component_key: 'cmp_storage_0002', region: 'eastasia', fact_ids: ['F2'],
-    price_evidence: [{ query_id: 'price-2', official_item_ids: ['item-1'] }],
-    expected_monthly_cost: '5.00',
-    scenario_costs: [{
-      scenario_key: 'on_demand', pricing_basis: 'on_demand',
-      monthly_cost: '5.00', upfront_cost: '0',
-    }],
-    customer_facing: {
-      service_name: '对象存储', quantity: '2 TiB', requirement_summary: '对象存储 2 TiB。',
-      configuration_summary: '对象存储 2 TiB。',
-    },
-  });
-
-  const secondDelivery = await workflow.buildEstimate(complete);
-
-  assert.notEqual(secondDelivery.quote_id, firstDelivery.quote_id);
-  assert.equal(workflow.store.get(secondDelivery.quote_id).is_partial, false);
-  assert.equal(workflow.store.findByRelayJobId(relayJobId).quote_id, secondDelivery.quote_id);
+  await assert.rejects(
+    workflow.buildEstimate(partial),
+    (error) => error.code === 'sales_quote_official_page_price_required'
+      && error.retryable === true
+      && error.details.component_keys.includes('cmp_storage_0002'),
+  );
+  assert.equal(workflow.store.findByRelayJobId(relayJobId), null);
 });
 
 test('resuming a price batch queries only unfinished ids and reuses successful results', async (t) => {

@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.16.0';
+const VERSION = '3.16.1';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -502,7 +502,7 @@ const buildEstimateInput = z.object({
     '兼容字段；当前所有报价均生成 Excel 并返回销售页面，不发送 WebHook。',
   ),
   is_partial: z.boolean().default(false).describe(
-    '仅在有限重试后仍有组件无法取得官方价格时设为 true；已成功组件照常交付，未核价组件必须全部列入 unpriced_services。',
+    '仅供非销售中继的兼容流程使用；销售中继报价必须全部核价，不允许用部分报价或销售手填项结束。',
   ),
   expected_monthly_total: z.string().regex(/^\d+(?:\.\d{1,10})?$/),
   pricing_scenarios: z.array(quoteScenarioTotal).min(1).max(3).optional().describe(
@@ -514,7 +514,7 @@ const buildEstimateInput = z.object({
     '不产生额外云费用的结构化资源。只能消费 disposition=zero_cost 的客户事实。',
   ),
   unpriced_services: z.array(unpricedService).max(200).default([]).describe(
-    '部分报价中仍未取得官方价格的组件。它们不参与金额合计，禁止按 0 元处理。完整报价必须为空。',
+    '仅供非销售中继的兼容部分报价使用。销售中继任务必须通过官方 API 或同站点官网证据完成全部组件，本字段必须为空。',
   ),
   assumptions: z.array(z.string().min(1).max(500).describe(
     '仅填写不补就无法正式查价、且 GPT 已从官方允许值中采用最小或最低价取值的必要参数；可省略的参数不得形成假设。',
@@ -732,7 +732,7 @@ function buildServer(workflow) {
 
   server.registerTool('build_estimate', {
     title: 'Validate and deliver an official quote',
-    description: 'Checks selected official catalog evidence, fact coverage and GPT-calculated totals, then creates one Excel link and returns it with the quote to the sales page. After one effective official API failure in one declared scope, official_page_price_evidence is accepted from the same provider and account site. If a component still cannot be priced, submit it through the verified partial-quote contract instead of ending with prose only. Unused discovery and replaced attempts need not succeed.',
+    description: 'Checks selected official catalog evidence, fact coverage and GPT-calculated totals, then creates one Excel link and returns it with the quote to the sales page. After one incomplete official API attempt in one declared scope, save official_page_price_evidence from the same provider and account site. Sales relay quotes cannot finish with unpriced services or sales-manual placeholders; all components require accepted API or official-page evidence. Unused discovery and replaced attempts need not succeed.',
     inputSchema: buildEstimateInput,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, guarded((args) => workflow.buildEstimate(normalizeBuildEstimateInput(args))));
