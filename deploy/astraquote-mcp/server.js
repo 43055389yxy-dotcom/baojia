@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.16.1';
+const VERSION = '3.17.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -146,8 +146,8 @@ const limitedRecord = (maximum, description) => z.record(jsonValue).refine(
 
 const authenticatedCloudPriceQueryShape = {
   query_id: z.string().min(1).max(100),
-  endpoint: z.string().min(4).max(255).describe(
-    'Official provider API hostname for this live request. Protocol, path, credentials and authorization are forbidden.',
+  endpoint: z.string().min(4).max(255).optional().describe(
+    'Optional official provider API hostname. AstraQuote replaces it with its verified base hostname when the provider/service is cataloged; protocol, path, credentials and authorization are forbidden.',
   ),
   service: z.string().regex(/^[A-Za-z0-9._-]{1,80}$/),
   action: z.string().regex(/^[A-Za-z0-9._-]{0,160}$/).optional(),
@@ -701,7 +701,7 @@ function buildServer(workflow) {
 
   server.registerTool('get_prices', {
     title: 'Batch query official cloud prices',
-    description: 'Always set quote_mode: a request for a formal quote, Excel or sales-page delivery MUST use formal_quote; never downgrade it to price_lookup because some prices are missing. Requires a non-empty incremental queries array. For a formal quote, every query MUST have a query_contexts entry. A pre-split sales relay call MUST preserve relay_batch_index, relay_batch_count and the reserved price_batch_id from its prompt, and quote_components MUST contain only that batch; the backend appends and seals each batch. A legacy formal quote registers the complete plan on its first call. Submit as many prepared scopes as fit this call so independent official requests can run in parallel. Each authenticated-cloud query must contain the complete official endpoint, service, region and current response contract chosen by GPT for that live call; the MCP does not learn or reuse product, country or region API routes. Full official results are persisted. If response_compacted=true, read only required details with get_price_results. Invalid or unsupported parameter values are correctable: repair only the rejected fields and retry. needs_refinement, terminal=false, or must_continue=true means do not give the user a final answer. After one incomplete official API result for the same component/billing/scenario scope, read the provider official pricing page and call get_prices again with the saved query plus top-level official_page_price_evidence; the saved API is not called twice and the fallback becomes available to final merge. GPT chooses products, required minimum parameter values and quote totals; program-assigned sales batches are immutable.',
+    description: 'Always set quote_mode: a request for a formal quote, Excel or sales-page delivery MUST use formal_quote; never downgrade it to price_lookup because some prices are missing. Requires a non-empty incremental queries array. For a formal quote, every query MUST have a query_contexts entry. A pre-split sales relay call MUST preserve relay_batch_index, relay_batch_count and the reserved price_batch_id from its prompt, and quote_components MUST contain only that batch; the backend appends and seals each batch. A legacy formal quote registers the complete plan on its first call. Submit as many prepared scopes as fit this call so independent official requests can run in parallel. For authenticated clouds, supply provider, service, region and the current read-only request/response contract; AstraQuote selects a verified basic official hostname for cataloged services and never caches paths, parameters, response fields or rates. Full official results are persisted. If response_compacted=true, read only required details with get_price_results. Invalid or unsupported parameter values are correctable: repair only the rejected fields and retry. needs_refinement, terminal=false, or must_continue=true means do not give the user a final answer. After one incomplete official API result for the same component/billing/scenario scope, read the provider official pricing page and call get_prices again with the saved query plus top-level official_page_price_evidence; the saved API is not called twice and the fallback becomes available to final merge. GPT chooses products, required minimum parameter values and quote totals; program-assigned sales batches are immutable.',
     // Keep the JSON Schema visible to MCP clients. ZodEffects produced by
     // superRefine serializes as an empty object in the MCP SDK, so cross-field
     // checks run inside the guarded handler instead.

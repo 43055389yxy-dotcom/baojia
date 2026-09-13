@@ -1,0 +1,53 @@
+{
+  "schema_version": "astraquote-official-api-base-routes/1",
+  "catalog_checked_at": "2026-09-13",
+  "providers": {
+    "tencent": {
+      "routes": [
+        {"services": ["cvm"], "endpoint": "cvm.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/213/15728"},
+        {"services": ["cbs"], "endpoint": "cbs.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/362/16311"},
+        {"services": ["redis", "tencentdbredis"], "endpoint": "redis.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/239/20026"},
+        {"services": ["cdb", "mysql"], "endpoint": "cdb.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/236/18576"},
+        {"services": ["postgres", "postgresql"], "endpoint": "postgres.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/409/16771"},
+        {"services": ["apigateway"], "endpoint": "apigateway.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/628/14893"},
+        {"services": ["es", "elasticsearch"], "endpoint": "es.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/845/30620"},
+        {"services": ["tdmq", "rocketmq"], "endpoint": "tdmq.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/1493/96013"},
+        {"services": ["scf", "function"], "endpoint": "scf.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/583/17234"},
+        {"services": ["clb"], "endpoint": "clb.tencentcloudapi.com", "official_source_url": "https://cloud.tencent.com/document/product/214/30689"}
+      ]
+    },
+    "alibaba": {
+      "routes": [
+        {"services": ["bssopenapi", "business", "billing"], "endpoint": "business.aliyuncs.com", "official_source_url": "https://api.aliyun.com/product/BssOpenApi"},
+        {"services": ["ecs"], "endpoint_template": "ecs.{region}.aliyuncs.com", "official_source_url": "https://api.aliyun.com/product/Ecs"},
+        {"services": ["rds"], "endpoint_template": "rds.{region}.aliyuncs.com", "official_source_url": "https://api.aliyun.com/product/Rds"},
+        {"services": ["r-kvstore", "rkvstore", "redis"], "endpoint_template": "r-kvstore.{region}.aliyuncs.com", "official_source_url": "https://api.aliyun.com/product/R-kvstore"}
+      ]
+    },
+    "huawei": {
+      "routes": [
+        {"services": ["bss", "billing"], "endpoint": "bss.myhuaweicloud.com", "official_source_url": "https://support.huaweicloud.com/api-bpconsole/zh-cn_topic_0079711804.html"}
+      ]
+    },
+    "baidu": {
+      "routes": [
+        {"services": ["billing"], "endpoint": "billing.baidubce.com", "official_source_url": "https://cloud.baidu.com/doc/BILLING/index.html"},
+        {"services": ["bcc"], "endpoint_template": "bcc.{region}.baidubce.com", "official_source_url": "https://cloud.baidu.com/doc/BCC/index.html"}
+      ]
+    },
+    "volcengine": {
+      "default_endpoint": "open.volcengineapi.com",
+      "official_source_url": "https://www.volcengine.com/docs/6369/67269"
+    },
+    "ctyun": {
+      "routes": [
+        {"services": ["ecs", "ctecs", "evs", "eip", "elb", "sbw"], "endpoint": "ctecs-global.ctapi.ctyun.cn", "official_source_url": "https://www.ctyun.cn/document/10026730/10044097"},
+        {"services": ["redis", "dcs", "dcs2"], "endpoint": "dcs2-global.ctapi.ctyun.cn", "official_source_url": "https://www.ctyun.cn/document/10029420/11030280"},
+        {"services": ["zos", "oss", "obs", "objectstorage"], "endpoint": "zos-global.ctapi.ctyun.cn", "official_source_url": "https://www.ctyun.cn/document/10026735/11093498"},
+        {"services": ["cbr", "backup"], "endpoint": "ctcbr-global.ctapi.ctyun.cn", "official_source_url": "https://www.ctyun.cn/document/10051003/10118058"},
+        {"services": ["cce", "ccse", "kubernetes"], "endpoint": "ccse-global.ctapi.ctyun.cn", "official_source_url": "https://www.ctyun.cn/document/10083472/11006032"},
+        {"services": ["lts", "log"], "endpoint": "ctlts-global.ctapi.ctyun.cn", "official_source_url": "https://www.ctyun.cn/document/10261471/11057680"}
+      ]
+    }
+  }
+}

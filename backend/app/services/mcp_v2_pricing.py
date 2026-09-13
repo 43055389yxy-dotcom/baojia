@@ -14,6 +14,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.services.aws_query_executor import ReadOnlyAwsQueryExecutor
+from app.services.official_api_base_routes import official_api_base_route
 from app.services.official_cloud_clients import (
     OfficialCloudApiClient,
     OfficialCloudClientError,
@@ -169,7 +170,7 @@ class CommercialRateField(StrictModel):
 
 class AuthenticatedCatalogQuery(StrictModel):
     query_id: str = Field(min_length=1, max_length=100)
-    endpoint: str = Field(min_length=4, max_length=255)
+    endpoint: str | None = Field(default=None, min_length=4, max_length=255)
     service: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9._-]+$")
     action: str = Field(default="", max_length=160, pattern=r"^[A-Za-z0-9._-]*$")
     version: str | None = Field(default=None, min_length=1, max_length=40)
@@ -375,16 +376,22 @@ def _validate_response_path(path: str) -> None:
 
 
 def _validate_authenticated_catalog_query(query: AuthenticatedCatalogQuery) -> None:
-    endpoint = query.endpoint.strip().lower().rstrip(".")
-    suffixes = _PROVIDER_OFFICIAL_SUFFIXES[query.provider]
-    if (
-        "://" in endpoint
-        or "/" in endpoint
-        or ":" in endpoint
-        or not any(endpoint.endswith(suffix) for suffix in suffixes)
-    ):
-        raise ValueError(f"{query.provider} query must use an official endpoint")
-    query.endpoint = endpoint
+    if query.endpoint:
+        supplied_endpoint = query.endpoint.strip().lower().rstrip(".")
+        suffixes = _PROVIDER_OFFICIAL_SUFFIXES[query.provider]
+        if (
+            "://" in supplied_endpoint
+            or "/" in supplied_endpoint
+            or ":" in supplied_endpoint
+            or not any(supplied_endpoint.endswith(suffix) for suffix in suffixes)
+        ):
+            raise ValueError(f"{query.provider} query must use an official endpoint")
+        query.endpoint = supplied_endpoint
+    base_route = official_api_base_route(query.provider, query.service, query.region)
+    if base_route:
+        query.endpoint = base_route["endpoint"]
+        if not query.official_source_url and base_route.get("official_source_url"):
+            query.official_source_url = base_route["official_source_url"]
     if (
         not query.path.startswith("/")
         or ".." in query.path
@@ -836,6 +843,11 @@ class OfficialPricingService:
     def _get_authenticated_catalog(
         self, query: AuthenticatedCatalogQuery
     ) -> dict[str, Any]:
+        if not query.endpoint:
+            raise OfficialCatalogQueryError(
+                "No verified official API base route is configured for this service.",
+                code="official_api_base_route_not_configured",
+            )
         if not _credentials_available(
             self._provider_credentials.get(query.provider) or {}
         ):
@@ -959,6 +971,8 @@ def _error_recovery_traits(exc: Exception) -> tuple[str, bool]:
     code = str(getattr(exc, "code", "") or "").casefold()
     message = str(exc).casefold()
     folded = f"{code} {message}"
+    if code == "official_api_base_route_not_configured":
+        return "route_not_found", True
     if any(token in folded for token in ("signaturedoesnotmatch", "invalidsignature")):
         return "request_signing", True
     if any(token in folded for token in ("timeout", "temporar", "connection", "tls", "ssl")):

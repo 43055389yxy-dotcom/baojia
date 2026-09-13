@@ -135,9 +135,12 @@ test("sales portal uses a pale-blue glass theme and distinguishes queued work", 
   assert.match(css, /\.sales-result-backdrop[^{]*\{[^}]*rgba\(213, 235, 251, \.72\)/s);
   assert.match(page, /role="combobox"/);
   assert.match(page, /sales-region-options-panel/);
-  assert.match(page, /地域代码按当前云厂商解释/);
-  assert.match(page, /最终可购性以每个产品的官方响应为准/);
+  assert.doesNotMatch(page, /地域代码按当前云厂商解释/);
   assert.match(page, /id="sales-region"[\s\S]*?readOnly/);
+  assert.match(page, /selectedRegionLabel/);
+  assert.match(page, /value=\{selectedRegionLabel\}/);
+  assert.doesNotMatch(page, /<small>\{item\.code\}<\/small>/);
+  assert.match(page, /系统会自动使用对应的官方地域编号/);
   assert.doesNotMatch(page, /可保留当前输入/);
   assert.doesNotMatch(page, /<datalist/);
   assert.match(css, /grid-template-columns:\s*repeat\(4, minmax\(0, 1fr\)\)/);

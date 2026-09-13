@@ -443,6 +443,54 @@ def test_authenticated_clouds_preserve_raw_candidates_and_declared_rates(
     assert authenticated.calls[0].provider == provider
 
 
+def test_authenticated_cloud_query_uses_cataloged_base_route_over_a_guessed_host() -> None:
+    query = CtyunPriceQuery(
+        query_id="ctyun-ecs-price",
+        endpoint="ctapi.ctyun.cn",
+        service="ecs",
+        region="200000001790",
+        path="/v4/order/new-query-price",
+        official_source_url="https://www.ctyun.cn/document/10026730/10044097",
+    )
+
+    assert query.endpoint == "ctecs-global.ctapi.ctyun.cn"
+
+
+def test_authenticated_cloud_query_can_omit_a_cataloged_base_route() -> None:
+    query = AlibabaPriceQuery(
+        query_id="alibaba-ecs-price",
+        service="ecs",
+        action="DescribePrice",
+        version="2014-05-26",
+        region="cn-hangzhou",
+    )
+
+    assert query.endpoint == "ecs.cn-hangzhou.aliyuncs.com"
+
+
+def test_unknown_authenticated_service_without_endpoint_returns_a_scoped_route_failure() -> None:
+    authenticated = _AuthenticatedRecorder([{"unused": True}])
+    service = OfficialPricingService(
+        _UnusedAwsExecutor(),
+        authenticated_request=authenticated,
+        provider_credentials={
+            "ctyun": {"access_key_id": "configured", "secret_access_key": "configured"}
+        },
+    )
+    query = CtyunPriceQuery(
+        query_id="ctyun-future-service",
+        service="future-service",
+        region="200000001790",
+        path="/v4/query-price",
+    )
+
+    result = service.get_prices(GetPricesRequest(queries=[query]))["results"][0]
+
+    assert result["status"] == "query_failed"
+    assert result["code"] == "official_api_base_route_not_configured"
+    assert authenticated.calls == []
+
+
 def test_authenticated_cloud_large_result_requires_refinement_without_truncation() -> None:
     authenticated = _AuthenticatedRecorder(
         [
@@ -620,7 +668,8 @@ def test_authenticated_query_failure_returns_machine_recovery_plan() -> None:
     ]
 
 
-def test_successful_authenticated_query_returns_official_identity_without_route_cache_metadata() -> None:
+def test_successful_authenticated_query_returns_official_identity_without_route_cache_metadata(
+) -> None:
     authenticated = _AuthenticatedRecorder(
         [{"result": {"items": [{"sku": "sku-1", "price": "1.25"}]}}]
     )

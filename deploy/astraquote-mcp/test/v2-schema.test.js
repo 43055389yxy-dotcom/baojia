@@ -242,7 +242,7 @@ test('get_prices accepts all ten provider-specific raw query shapes', async (t) 
   assert.equal(result.structuredContent.input.queries[3].response_filters.displayName, 'Compute Engine');
 });
 
-test('get_prices requires every authenticated cloud call to declare its live API route', async (t) => {
+test('get_prices lets the verified base-route catalog supply a known authenticated endpoint', async (t) => {
   const { client, server } = await connectedClient();
   t.after(async () => {
     await client.close();
@@ -261,8 +261,8 @@ test('get_prices requires every authenticated cloud call to declare its live API
     },
   });
 
-  assert.equal(result.isError, true);
-  assert.match(result.content[0].text, /endpoint/);
+  assert.equal(result.isError, undefined);
+  assert.equal(result.structuredContent.input.queries[0].endpoint, undefined);
 
   const tool = (await client.listTools()).tools.find((item) => item.name === 'get_prices');
   assert.doesNotMatch(JSON.stringify(tool.inputSchema.properties.queries), /route_id/);
@@ -289,7 +289,7 @@ test('query lifecycle metadata is visible in the MCP schema and survives tool va
   assert.deepEqual(result.structuredContent.input.query_contexts, queryContexts);
 });
 
-test('get_prices schema rejects an authenticated query without its live endpoint', async (t) => {
+test('get_prices schema still requires the authenticated service identity', async (t) => {
   const { client, server } = await connectedClient();
   t.after(async () => {
     await client.close();

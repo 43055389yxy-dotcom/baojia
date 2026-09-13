@@ -12,6 +12,7 @@ const {
 } = require('./cloud-market-profiles');
 const { PricingCapabilityStore } = require('./pricing-capability-store');
 const { canFinalizeRelayJob } = require('./relay-job-state');
+const { withOfficialApiBaseRoute } = require('./official-api-base-routes');
 const {
   PROGRESS_GUIDANCE, mergeQueryContexts, queryProgress, componentProgress,
   assertQueryIdentity, contextEvidenceViolations, pricingScopeKey, reusableQueryResult,
@@ -1572,11 +1573,12 @@ class AstraQuoteV2Workflow {
       error.details = { expected: existing.quote_mode, received: quoteMode };
       throw error;
     }
+    const materializedQueries = input.queries.map(withOfficialApiBaseRoute);
     const preliminaryQueries = new Map(
       (existing?.request?.queries || []).map((item) => [item.query_id, item]),
     );
-    assertQueryIdentity(preliminaryQueries, input.queries);
-    for (const query of input.queries) preliminaryQueries.set(query.query_id, query);
+    assertQueryIdentity(preliminaryQueries, materializedQueries);
+    for (const query of materializedQueries) preliminaryQueries.set(query.query_id, query);
     const preliminaryContexts = mergeQueryContexts(
       existing?.query_contexts, input.query_contexts, preliminaryQueries,
     );
@@ -1584,10 +1586,9 @@ class AstraQuoteV2Workflow {
       quoteMode,
       relayJobId,
       quoteComponents,
-      queries: input.queries,
+      queries: materializedQueries,
       queryContexts: preliminaryContexts,
     });
-    const materializedQueries = input.queries.map((query) => ({ ...query }));
     const queryIds = materializedQueries.map((query) => query.query_id);
     if (new Set(queryIds).size !== queryIds.length) {
       const error = new Error('Every official price query must have a unique query_id.');

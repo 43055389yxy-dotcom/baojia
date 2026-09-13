@@ -100,12 +100,13 @@ def _encoded_query(parameters: dict[str, Any]) -> str:
 
 
 class OfficialCloudApiClient:
-    """Sign and send one caller-specified read-only official API request.
+    """Sign and send one read-only official API request.
 
-    Endpoint/action/path safety is validated by the Pydantic query boundary.
-    This class only authenticates and transports the exact request supplied by
-    GPT; it does not select products, fill defaults, convert usage or calculate
-    prices.
+    Known provider/service endpoint hosts are supplied by the declarative base
+    route catalog at the Pydantic boundary. Action, path and request fields stay
+    live inputs. This class only authenticates and transports that validated
+    request; it does not select products, fill business defaults, convert usage
+    or calculate prices.
     """
 
     def __init__(

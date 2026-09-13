@@ -372,6 +372,10 @@ export default function SalesQuotePage() {
     [selectedScenarios],
   );
   const providerScenarios = regionCatalog?.pricing_scenarios ?? [];
+  const selectedRegionLabel = useMemo(
+    () => regionCatalog?.regions.find((region) => region.code === preferredRegion)?.label ?? "",
+    [preferredRegion, regionCatalog],
+  );
   const filteredRegions = useMemo(() => {
     const query = preferredRegion.trim().toLocaleLowerCase();
     const regions = regionCatalog?.regions ?? [];
@@ -634,14 +638,14 @@ export default function SalesQuotePage() {
               <div className="sales-section-heading">
                 <div>
                   <label htmlFor="sales-region">选择首选地域</label>
-                  <p>{regionCatalog?.site_label ?? "正在读取账号站点"} · 地域代码按当前云厂商解释，最终可购性以每个产品的官方响应为准</p>
+                  <p>{regionCatalog?.site_label ?? "正在读取账号站点"} · 请选择业务部署地域，系统会自动使用对应的官方地域编号</p>
                 </div>
                 <span>02 / 04</span>
               </div>
               <div className="sales-region-select-wrap" ref={regionPickerRef}>
                 <input
                   id="sales-region"
-                  value={preferredRegion}
+                  value={selectedRegionLabel}
                   readOnly
                   onFocus={() => setRegionOpen(true)}
                   onKeyDown={(event) => {
@@ -679,7 +683,6 @@ export default function SalesQuotePage() {
                         }}
                       >
                         <strong>{item.label}</strong>
-                        <small>{item.code}</small>
                       </button>
                     )) : (
                       <p>当前云厂商暂无可选官方地域，请联系管理员更新地域目录。</p>

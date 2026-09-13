@@ -1023,13 +1023,6 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.sales-region-options-panel small {
-  overflow: hidden;
-  color: #7393aa;
-  font: 650 9px ui-monospace, SFMono-Regular, Menlo, monospace;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .sales-region-options-panel > p {
   grid-column: 1 / -1;
   margin: 0;

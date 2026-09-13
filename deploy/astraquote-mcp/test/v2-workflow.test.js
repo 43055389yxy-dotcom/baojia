@@ -115,6 +115,33 @@ async function priceBatch(workflow, provider = 'azure') {
   });
 }
 
+test('workflow materializes a verified base hostname before calling and saving a query', async () => {
+  const context = fixture({ provider: 'ctyun' });
+  let received;
+  context.backend.getPrices = async (input) => {
+    received = input;
+    return {
+      status: 'completed', result_count: 1,
+      results: [{
+        query_id: input.queries[0].query_id, provider: 'ctyun', status: 'exact',
+        official_item_ids: ['ctyun-item'], official_rate_candidates: [],
+        items: [{ id: 'ctyun-item' }],
+      }],
+    };
+  };
+
+  const result = await context.workflow.getPrices({
+    quote_mode: 'price_lookup',
+    queries: [{
+      provider: 'ctyun', query_id: 'ctyun-ecs', service: 'ecs',
+      region: '200000001790', path: '/v4/order/new-query-price',
+    }],
+  });
+
+  assert.equal(received.queries[0].endpoint, 'ctecs-global.ctapi.ctyun.cn');
+  assert.equal(result.results[0].query_id, 'ctyun-ecs');
+});
+
 async function failedPricingAttempts(workflow, count = 3, {
   provider = 'azure', errorCategory,
 } = {}) {
@@ -773,7 +800,7 @@ test('saved details page all official rates with complete counts and never modif
   assert.equal(workflow.store.getPriceBatch(batch.price_batch_id).result.results[0].official_rate_candidates.length, 45);
 });
 
-test('authenticated pricing always uses the complete live request without learning routes', async (t) => {
+test('authenticated pricing keeps live request details without learning fine-grained routes', async (t) => {
   const { workflow, directory, backend } = fixture({ provider: 'alibaba' });
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const received = [];
