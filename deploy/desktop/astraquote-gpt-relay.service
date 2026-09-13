@@ -3,6 +3,7 @@ Description=AstraQuote Codex Chat desktop quote relay
 After=network-online.target docker.service vncserver@:1.service
 Wants=network-online.target
 Requires=docker.service vncserver@:1.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

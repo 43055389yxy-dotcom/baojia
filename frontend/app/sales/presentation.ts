@@ -1,12 +1,9 @@
 type ProgressJob = {
   status?: string;
-  active_quote_count?: number;
-  max_concurrent_quotes?: number;
-  queued_ahead_count?: number;
-  estimated_wait_minutes?: number;
   progress?: {
     stage?: string;
     total_component_count?: number;
+    top_level_component_count?: number;
     completed_component_count?: number;
     failed_component_count?: number;
     component_chat_count?: number;
@@ -20,34 +17,11 @@ type UnpricedComponent = {
   retryable?: boolean;
 };
 
-export function queuedStatusDetail(job: ProgressJob) {
-  const activeCount = job.active_quote_count ?? 0;
-  const capacity = job.max_concurrent_quotes ?? 4;
-  const queuedAhead = job.queued_ahead_count ?? 0;
-  const waitMinutes = job.estimated_wait_minutes ?? 0;
-  const parts = [`当前占用 ${activeCount}/${capacity} 个报价名额`];
-  if (queuedAhead > 0) parts.push(`${queuedAhead} 个任务排在您前面`);
-  const wait = waitMinutes > 0 ? `预计等待约 ${waitMinutes} 分钟` : "等待系统分配名额";
-  return `${parts.join("，")}，${wait}。`;
-}
-
-export function processingStatusDetail(job: ProgressJob) {
-  const progress = job.progress;
-  const stage = progress?.stage;
-  if (stage === "artifacts_generated") return "报价已核对，正在生成销售页面。";
-  if (stage === "estimate_validated") return "报价已通过核对，正在生成 Excel。";
-  const total = progress?.total_component_count;
-  const completed = progress?.completed_component_count ?? 0;
-  const failed = progress?.failed_component_count ?? 0;
-  if (typeof total === "number" && total > 0) {
-    const failedText = failed > 0 ? `，${failed} 个暂未完成，成功结果已保存` : "";
-    const batches = progress?.component_chat_count ?? 1;
-    const batchText = batches > 1 ? `，共 ${batches} 批按可用名额处理` : "";
-    const retryText = stage === "pricing_request_rejected" ? "正在修正查价请求，重试次数有限。" : "";
-    return `后台已确认 ${completed}/${total} 个组件完成${failedText}${batchText}。${retryText}`;
-  }
-  if (stage === "pricing_request_rejected") return "官方查价请求需要修正，系统正在进行有限重试。";
-  return "正在整理需求并建立组件清单。";
+export function estimatedQuoteWindow(job: ProgressJob) {
+  const componentCount = job.progress?.top_level_component_count
+    ?? job.progress?.total_component_count
+    ?? 0;
+  return componentCount > 10 ? "15～30 分钟" : "10～20 分钟";
 }
 
 export function progressPercent(job: ProgressJob): number | null {

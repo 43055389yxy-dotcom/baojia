@@ -310,6 +310,7 @@ restart_host_browser_relay() {
     --wd=/ \
     /bin/sh -ceu '
       /usr/bin/systemctl enable astraquote-gpt-relay.service
+      /usr/bin/rm -f /home/ec2-user/astraquote/data/gpt-relay/worker-heartbeat.json
       /usr/bin/systemctl restart astraquote-gpt-relay.service
       /usr/bin/systemctl disable --now astraquote-gemini-relay.service || true
     '
@@ -373,7 +374,7 @@ wait_for_host_browser_relay() {
 }
 
 wait_for_chatgpt_quote_engine() {
-  echo "Waiting for the ChatGPT desktop quote engine"
+  echo "Waiting for the ChatGPT desktop quote engine to become ready"
   docker run --rm --privileged --pid=host \
     --entrypoint /usr/bin/nsenter \
     astraquote:production \
@@ -386,14 +387,15 @@ wait_for_chatgpt_quote_engine() {
     --root=/proc/1/root \
     --wd=/ \
     /bin/sh -ceu '
-      for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
-        if systemctl is-active --quiet astraquote-gpt-relay.service; then
-          sleep 5
-          systemctl is-active --quiet astraquote-gpt-relay.service && exit 0
+      heartbeat_path=/home/ec2-user/astraquote/data/gpt-relay/worker-heartbeat.json
+      for attempt in $(seq 1 30); do
+        if systemctl is-active --quiet astraquote-gpt-relay.service \
+          && /home/ec2-user/astraquote/gpt-relay-venv/bin/python -c "import json,sys; from datetime import datetime,timezone; heartbeat=json.load(open(sys.argv[1], encoding=\"utf-8\")); updated=datetime.fromisoformat(str(heartbeat[\"updated_at\"]).replace(\"Z\", \"+00:00\")); fresh=(datetime.now(timezone.utc)-updated).total_seconds() < 45; raise SystemExit(0 if heartbeat.get(\"logged_in\") is True and fresh else 1)" "$heartbeat_path"; then
+          exit 0
         fi
         sleep 5
       done
-      echo "The ChatGPT desktop quote engine did not remain active" >&2
+      echo "The ChatGPT desktop quote engine did not become ready" >&2
       exit 1
     '
 }

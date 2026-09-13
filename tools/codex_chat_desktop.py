@@ -143,11 +143,20 @@ class CodexChatDesktop:
     def start(self) -> None:
         try:
             self._connect()
+            self._prepare_chat_surface()
         except Exception as exc:  # noqa: BLE001 - the desktop may be closed manually
             self._recover_desktop(exc)
             self._connect()
+            self._prepare_chat_surface()
+        self.driver = self
+
+    def _prepare_chat_surface(self) -> None:
+        """Expose a usable Chat surface after CDP itself becomes available."""
+
         self.driver = self
         if not self._chat_surface_ready():
+            if self._login_screen_visible():
+                return
             self._open_deep_link(CODEX_NEW_CHAT_LINK)
             self._wait_until(self._chat_surface_ready, timeout=90)
 
@@ -167,6 +176,25 @@ class CodexChatDesktop:
         self._websocket = None
         self._connect()
         self.driver = self
+
+    def _login_screen_visible(self) -> bool:
+        try:
+            body = str(self._evaluate("document.body?.innerText || ''") or "")
+        except Exception:  # noqa: BLE001 - a broken control channel is not logout
+            return False
+        return any(
+            marker in body
+            for marker in ("Log in", "登录 ChatGPT", "Continue with Google")
+        )
+
+    def recover_if_unavailable(self) -> bool:
+        """Repair a stale renderer connection without looping on real logout."""
+
+        if self._login_screen_visible():
+            return False
+        self.close()
+        self.start()
+        return self.logged_in()
 
     def _cdp_target_available(self) -> bool:
         """Return whether the visible Codex desktop renderer is controllable."""
@@ -343,11 +371,9 @@ class CodexChatDesktop:
         try:
             if self._chat_surface_ready():
                 return True
-            body = str(self._evaluate("document.body?.innerText || ''") or "")
-            return not any(
-                marker in body
-                for marker in ("Log in", "登录 ChatGPT", "Continue with Google")
-            ) and bool(self._evaluate("Boolean(document.querySelector('main'))"))
+            return not self._login_screen_visible() and bool(
+                self._evaluate("Boolean(document.querySelector('main'))")
+            )
         except Exception:  # noqa: BLE001 - authentication check must remain non-fatal
             return False
 

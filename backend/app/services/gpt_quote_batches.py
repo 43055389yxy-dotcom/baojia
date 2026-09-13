@@ -116,7 +116,12 @@ def build_numbered_intake_batch_prompt(
         "本批沿用以下整单报价条件：\n"
         f"{quote_context.strip()}\n\n"
         "本批客户需求（每个实际换行是一项独立顶层组件）：\n"
-        f"{owned_lines}"
+        f"{owned_lines}\n\n"
+        "本批全部组件完成选型、核价和金额计算后，必须调用 build_estimate，"
+        "设置 delivery_mode=save_component_batch，并原样传入本提示中的 "
+        "relay_batch_index、relay_batch_count 和 price_batch_id；只提交本批结果。"
+        "工具返回 component_batch_saved 时立即结束本轮；最后一批会由程序自动合并、"
+        "校验并生成销售页和 Excel，不要再由 AI 整理整单。"
     )
 
 
@@ -198,8 +203,11 @@ def build_component_batch_prompt(
         f"当前为第 {batch_index + 1}/{batch_count} 批。只处理下面列出的组件，"
         "不得读取、猜测或修改其他批次。使用已经封存的 price_batch_id，"
         "逐组件查询并保存官方价格证据；已经成功的计费项直接复用，只补未完成项。"
-        "本批结束后不要生成最终整单，也不要自行合并；总控对话会在所有批次结束后"
-        "由后台统一合并、核对并生成 Excel。\n\n"
+        "本批全部组件完成选型、核价和金额计算后，必须调用 build_estimate，"
+        "设置 delivery_mode=save_component_batch，并原样传入本提示中的批次编号；"
+        "只提交本批 Fact Ledger、组件结果、方案费用和本批小计。"
+        "工具返回 component_batch_saved 时结束本轮；最后一批由程序自动合并、"
+        "核对并生成 Excel。不要生成最终整单，也不要自行整理跨批次内容。\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n"
         f"price_batch_id：{price_batch_id}\n"
         f"relay_batch_index：{batch_index}\n"
@@ -208,27 +216,6 @@ def build_component_batch_prompt(
         f"{quote_context.strip()}\n\n"
         "本批已清洗组件（JSON）：\n"
         f"{json.dumps(safe_components, ensure_ascii=False, separators=(',', ':'))}"
-    )
-
-
-def build_quote_merge_prompt(
-    *,
-    relay_job_id: str,
-    submission_code: str,
-    price_batch_id: str,
-) -> str:
-    """Return the coordinator to the saved state for one final merge."""
-
-    return (
-        f"{ASTRAQUOTE_MENTION} 所有组件子批次已经停止运行。"
-        "请在总控对话中读取 AstraQuote 后台保存的"
-        "组件计划、price_batch 和真实组件状态，立即做最终机械合并与编译器校验。"
-        "已有官方价格的组件必须全部进入报价；永久失败或一次补发后仍未完成的组件"
-        "进入 unpriced_services，不得按 0 元，不得计入合计。若存在未核价组件，"
-        "生成部分报价和 Excel，并将未完成项标注为请销售手动填写；"
-        "否则生成完整报价和 Excel。不得重复查询已经成功的组件。\n\n"
-        f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n"
-        f"price_batch_id：{price_batch_id}。"
     )
 
 
@@ -247,8 +234,34 @@ def build_component_batch_continuation_prompt(
         f"{ASTRAQUOTE_MENTION} 这不是新报价。"
         "请先读取后台组件状态，只把本批尚未完成的组件重新组织后补查一次，"
         "已经成功的查询必须复用，不得处理其他批次，也不要生成最终整单。"
+        "补查结束后必须调用 build_estimate，设置 delivery_mode=save_component_batch，"
+        "只保存本批最终组件结果；最后一批由程序自动合并并生成 Excel。"
         f"当前为第 {batch_index + 1}/{batch_count} 批；"
         f"允许处理的 component_key：{json.dumps(component_keys, ensure_ascii=False)}。\n\n"
+        f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n"
+        f"price_batch_id：{price_batch_id}\n"
+        f"relay_batch_index：{batch_index}\n"
+        f"relay_batch_count：{batch_count}。"
+    )
+
+
+def build_component_batch_finalize_prompt(
+    *,
+    relay_job_id: str,
+    submission_code: str,
+    price_batch_id: str,
+    batch_index: int,
+    batch_count: int,
+    component_keys: list[str],
+) -> str:
+    """Ask for the missing structured save after all prices are already durable."""
+
+    return (
+        f"{ASTRAQUOTE_MENTION} 本批价格证据已经全部保存，不要重新查价。"
+        "现在只完成本批结构化收口：调用 build_estimate，"
+        "设置 delivery_mode=save_component_batch，只提交本批 Fact Ledger、组件结果、"
+        "销售所选全部方案费用和本批小计。不要读取其他批次，不要由 AI 合并整单。"
+        f"允许提交的 component_key：{json.dumps(component_keys, ensure_ascii=False)}。\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n"
         f"price_batch_id：{price_batch_id}\n"
         f"relay_batch_index：{batch_index}\n"

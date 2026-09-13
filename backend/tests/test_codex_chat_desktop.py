@@ -476,6 +476,59 @@ def test_start_revives_codex_after_the_desktop_window_is_closed(
     assert desktop.driver is desktop
 
 
+def test_start_revives_codex_when_renderer_opens_but_chat_surface_is_stuck(
+    desktop_module, monkeypatch,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=60,
+    )
+    attempts = []
+    recovered = []
+
+    monkeypatch.setattr(desktop, "_connect", lambda: attempts.append("connect"))
+
+    def prepare_surface():
+        attempts.append("surface")
+        if attempts.count("surface") == 1:
+            raise TimeoutError("renderer stuck")
+
+    monkeypatch.setattr(desktop, "_prepare_chat_surface", prepare_surface)
+    monkeypatch.setattr(
+        desktop,
+        "_recover_desktop",
+        lambda _error: recovered.append("restarted"),
+    )
+
+    desktop.start()
+
+    assert attempts == ["connect", "surface", "connect", "surface"]
+    assert recovered == ["restarted"]
+    assert desktop.driver is desktop
+
+
+def test_unavailable_session_recovers_but_real_login_screen_is_left_for_admin(
+    desktop_module, monkeypatch,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=60,
+    )
+    restarted = []
+    monkeypatch.setattr(desktop, "_login_screen_visible", lambda: False)
+    monkeypatch.setattr(desktop, "close", lambda: restarted.append("closed"))
+    monkeypatch.setattr(desktop, "start", lambda: restarted.append("started"))
+    monkeypatch.setattr(desktop, "logged_in", lambda: True)
+
+    assert desktop.recover_if_unavailable()
+    assert restarted == ["closed", "started"]
+
+    restarted.clear()
+    monkeypatch.setattr(desktop, "_login_screen_visible", lambda: True)
+    assert not desktop.recover_if_unavailable()
+    assert restarted == []
+
+
 @pytest.mark.parametrize(
     ("running", "expected_action"),
     [("true", "restart"), ("false", "start")],

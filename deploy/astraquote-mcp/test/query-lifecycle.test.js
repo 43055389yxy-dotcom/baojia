@@ -553,6 +553,176 @@ test('pre-split relay chats append only their own component plan into one reserv
   }), (error) => error.code === 'relay_merge_not_authorized');
 });
 
+test('pre-split relay batches save isolated quote fragments and the last fragment delivers once', async (t) => {
+  const { workflow, store } = fixture(t);
+  const displayed = [];
+  workflow.deliverer = {
+    async deliverPageResult(record) {
+      displayed.push(record);
+      return { status: 'displayed_on_page', page_result: { currency: record.currency } };
+    },
+  };
+  const relayJobId = `gpt-${'8'.repeat(32)}`;
+  const reservedBatchId = 'aqpb_bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const relayDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'aq-auto-merge-relay-'));
+  const previousRelayDirectory = process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+  process.env.ASTRAQUOTE_GPT_RELAY_DIR = relayDirectory;
+  fs.mkdirSync(path.join(relayDirectory, 'jobs'), { recursive: true });
+  fs.writeFileSync(path.join(relayDirectory, 'jobs', `${relayJobId}.json`), JSON.stringify({
+    job_id: relayJobId,
+    submission_code: '4',
+    status: 'processing',
+    reserved_price_batch_id: reservedBatchId,
+    intake_component_count: 2,
+    intake_batch_count: 2,
+    intake_batches: [
+      { batch_index: 0, batch_count: 2, component_keys: ['cmp_intake_0001'], source_lines: [] },
+      { batch_index: 1, batch_count: 2, component_keys: ['cmp_intake_0002'], source_lines: [] },
+    ],
+    quote_options: { cloud_provider: 'azure', pricing_scenarios: ['on_demand'] },
+  }));
+  t.after(() => {
+    fs.rmSync(relayDirectory, { recursive: true, force: true });
+    if (previousRelayDirectory === undefined) delete process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+    else process.env.ASTRAQUOTE_GPT_RELAY_DIR = previousRelayDirectory;
+  });
+
+  for (const [index, componentKey] of ['cmp_intake_0001', 'cmp_intake_0002'].entries()) {
+    await workflow.getPrices({
+      quote_mode: 'formal_quote', relay_job_id: relayJobId, submission_code: '4',
+      relay_batch_index: index, relay_batch_count: 2, price_batch_id: reservedBatchId,
+      queries: [query(`batch-${index}`, true)],
+      query_contexts: [context(`batch-${index}`, 'compute', componentKey)],
+      quote_components: [{
+        component_key: componentKey,
+        customer_owned_source: `组件数量：${index + 1}。`,
+        billing_scopes: [{ billing_key: 'compute' }],
+      }],
+    });
+  }
+
+  const fragmentInput = (index, componentKey, monthly) => ({
+    delivery_mode: 'save_component_batch',
+    relay_job_id: relayJobId,
+    relay_batch_index: index,
+    relay_batch_count: 2,
+    quote_name: `第 ${index + 1} 批`,
+    cloud_provider: 'azure',
+    default_region: 'eastasia',
+    currency: 'USD',
+    price_batch_id: reservedBatchId,
+    expected_monthly_total: monthly,
+    pricing_scenarios: [{
+      scenario_key: 'on_demand', monthly_total: monthly, upfront_total: '0',
+    }],
+    fact_ledger: [{
+      fact_id: 'F1', component_key: componentKey, field: 'quantity',
+      value: index + 1, unit: 'count', scope: 'total',
+      cleaned_evidence: `组件数量：${index + 1}。`, disposition: 'billable',
+    }],
+    services: [{
+      component_key: componentKey, region: 'eastasia',
+      price_evidence: [{ query_id: `batch-${index}`, official_item_ids: ['item-1'] }],
+      fact_ids: ['F1'], expected_monthly_cost: monthly,
+      scenario_costs: [{
+        scenario_key: 'on_demand', pricing_basis: 'on_demand',
+        monthly_cost: monthly, upfront_cost: '0',
+        price_evidence: [{ query_id: `batch-${index}`, official_item_ids: ['item-1'] }],
+      }],
+      customer_facing: {
+        service_name: `服务 ${index + 1}`, model_or_plan: '正式规格',
+        quantity: `${index + 1}`, requirement_summary: `组件数量：${index + 1}。`,
+        configuration_summary: `组件数量：${index + 1}。`,
+      },
+    }],
+    zero_cost_services: [], unpriced_services: [], assumptions: [], adjustments: [],
+    idempotency_key: `relay-fragment-${index}-first-attempt`,
+  });
+
+  const first = await workflow.buildEstimate(
+    fragmentInput(0, 'cmp_intake_0001', '12.345'),
+  );
+  assert.equal(first.status, 'component_batch_saved');
+  assert.deepEqual(first.pending_batch_indexes, [1]);
+  assert.equal(displayed.length, 0);
+  await assert.rejects(workflow.buildEstimate({
+    ...fragmentInput(0, 'cmp_intake_0001', '13.00'),
+    idempotency_key: 'relay-fragment-0-conflicting-attempt',
+  }), (error) => error.code === 'relay_component_result_immutable');
+
+  const final = await workflow.buildEstimate(
+    fragmentInput(1, 'cmp_intake_0002', '0.105'),
+  );
+  assert.equal(final.status, 'displayed_on_page');
+  assert.equal(displayed.length, 1);
+  assert.equal(displayed[0].expected_monthly_total, '12.45');
+  assert.deepEqual(displayed[0].resource_ir.map((item) => item.component_key), [
+    'cmp_intake_0001', 'cmp_intake_0002',
+  ]);
+  assert.equal(new Set(displayed[0].fact_ledger.map((fact) => fact.fact_id)).size, 2);
+
+  const replay = await workflow.buildEstimate({
+    ...fragmentInput(1, 'cmp_intake_0002', '0.105'),
+    idempotency_key: 'relay-fragment-1-second-attempt',
+  });
+  assert.equal(replay.idempotent_replay, true);
+  assert.equal(displayed.length, 1);
+  assert.equal(store.getPriceBatch(reservedBatchId).component_result_fragments.length, 2);
+});
+
+test('a saved relay quote fragment cannot contain or overwrite another batch', async (t) => {
+  const { workflow } = fixture(t);
+  const relayJobId = `gpt-${'7'.repeat(32)}`;
+  const reservedBatchId = 'aqpb_cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const relayDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'aq-fragment-boundary-'));
+  const previousRelayDirectory = process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+  process.env.ASTRAQUOTE_GPT_RELAY_DIR = relayDirectory;
+  fs.mkdirSync(path.join(relayDirectory, 'jobs'), { recursive: true });
+  fs.writeFileSync(path.join(relayDirectory, 'jobs', `${relayJobId}.json`), JSON.stringify({
+    job_id: relayJobId, submission_code: '5', status: 'processing',
+    reserved_price_batch_id: reservedBatchId, intake_component_count: 2, intake_batch_count: 2,
+    intake_batches: [
+      { batch_index: 0, batch_count: 2, component_keys: ['cmp_intake_0001'], source_lines: [] },
+      { batch_index: 1, batch_count: 2, component_keys: ['cmp_intake_0002'], source_lines: [] },
+    ],
+    quote_options: { cloud_provider: 'azure', pricing_scenarios: ['on_demand'] },
+  }));
+  t.after(() => {
+    fs.rmSync(relayDirectory, { recursive: true, force: true });
+    if (previousRelayDirectory === undefined) delete process.env.ASTRAQUOTE_GPT_RELAY_DIR;
+    else process.env.ASTRAQUOTE_GPT_RELAY_DIR = previousRelayDirectory;
+  });
+  for (const [index, componentKey] of ['cmp_intake_0001', 'cmp_intake_0002'].entries()) {
+    await workflow.getPrices({
+      quote_mode: 'formal_quote', relay_job_id: relayJobId, submission_code: '5',
+      relay_batch_index: index, relay_batch_count: 2, price_batch_id: reservedBatchId,
+      queries: [query(`owned-${index}`, true)],
+      query_contexts: [context(`owned-${index}`, 'compute', componentKey)],
+      quote_components: [{ component_key: componentKey,
+        customer_owned_source: `组件数量：${index + 1}。`, billing_scopes: [{ billing_key: 'compute' }] }],
+    });
+  }
+
+  await assert.rejects(workflow.buildEstimate({
+    delivery_mode: 'save_component_batch', relay_job_id: relayJobId,
+    relay_batch_index: 0, relay_batch_count: 2, quote_name: '越界批次',
+    cloud_provider: 'azure', default_region: 'eastasia', currency: 'USD',
+    price_batch_id: reservedBatchId, expected_monthly_total: '1',
+    pricing_scenarios: [{ scenario_key: 'on_demand', monthly_total: '1', upfront_total: '0' }],
+    fact_ledger: [{ fact_id: 'F1', component_key: 'cmp_intake_0002', field: 'quantity',
+      value: 2, unit: 'count', scope: 'total', cleaned_evidence: '组件数量：2。', disposition: 'billable' }],
+    services: [{ component_key: 'cmp_intake_0002', region: 'eastasia',
+      price_evidence: [{ query_id: 'owned-1', official_item_ids: ['item-1'] }], fact_ids: ['F1'],
+      expected_monthly_cost: '1', scenario_costs: [{ scenario_key: 'on_demand',
+        pricing_basis: 'on_demand', monthly_cost: '1', upfront_cost: '0',
+        price_evidence: [{ query_id: 'owned-1', official_item_ids: ['item-1'] }] }],
+      customer_facing: { service_name: '服务 2', model_or_plan: '规格', quantity: '2',
+        requirement_summary: '组件数量：2。', configuration_summary: '组件数量：2。' } }],
+    zero_cost_services: [], unpriced_services: [], assumptions: [], adjustments: [],
+    idempotency_key: 'cross-batch-fragment-attempt',
+  }), (error) => error.code === 'relay_component_result_batch_mismatch');
+});
+
 test('an old exact error envelope is re-queried and cannot count as completed evidence', async (t) => {
   const { workflow, store, calls } = fixture(t);
   const first = await workflow.getPrices({ queries: [query('price', true)] });

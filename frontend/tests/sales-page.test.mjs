@@ -11,6 +11,8 @@ test("sales portal keeps its internal job identity private and recovers active j
   assert.match(page, /提交报价/);
   assert.match(page, /\/api\/quote-relay\/jobs/);
   assert.match(page, /\/api\/quote-relay\/health/);
+  assert.match(page, /服务启动中/);
+  assert.match(page, /health\?\.status === "starting"/);
   assert.match(page, /ACTIVE_JOB_KEY/);
   assert.match(page, /window\.sessionStorage\.setItem/);
   assert.match(page, /pricing_scenarios/);
@@ -74,12 +76,16 @@ test("sales portal requires consecutive numbered lines before submission", async
 
 test("sales portal exposes only formal progress copy and no internal implementation", async () => {
   const page = await readFile(new URL("../app/sales/page.tsx", import.meta.url), "utf8");
+  const presentation = await readFile(new URL("../app/sales/presentation.ts", import.meta.url), "utf8");
 
-  assert.match(page, /报价申请已提交/);
-  assert.match(page, /5～10 分钟/);
-  assert.doesNotMatch(page, /5～20 分钟/);
+  assert.match(page, /报价正在生成/);
+  assert.match(page, /需求解析、官方价格核验与一致性校验等多层验证/);
+  assert.match(page, /10～20 分钟/);
+  assert.match(presentation, /15～30 分钟/);
   assert.match(page, /sales-job-progress/);
+  assert.match(page, /role="progressbar"/);
   assert.match(page, /报价结果和 Excel 已生成/);
+  assert.doesNotMatch(page, /组件核价进度|后台已确认|个组件完成|sales-job-stages/);
   assert.doesNotMatch(page, /企业微信群/);
   assert.doesNotMatch(page, /管理员查看对话|清洗|客户原始需求|events\?\.length/);
 });
@@ -124,11 +130,9 @@ test("sales portal uses a pale-blue glass theme and distinguishes queued work", 
   const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
 
   assert.match(page, /queued:\s*\{ title: "报价正在排队"/);
-  assert.match(page, /job\.status === "queued" \? "等待启动"/);
-  assert.match(page, /active_quote_count\?: number/);
-  assert.match(page, /queued_ahead_count\?: number/);
-  assert.match(page, /estimated_wait_minutes\?: number/);
-  assert.match(page, /queuedStatusDetail/);
+  assert.match(page, /报价任务已进入处理队列/);
+  assert.match(page, /estimatedQuoteWindow/);
+  assert.doesNotMatch(page, /queuedStatusDetail|processingStatusDetail/);
   assert.match(css, /color-scheme:\s*light/);
   assert.match(css, /--page:\s*#eef8ff/);
   assert.match(css, /backdrop-filter:\s*blur\(28px\) saturate\(145%\)/);
@@ -147,4 +151,7 @@ test("sales portal uses a pale-blue glass theme and distinguishes queued work", 
   assert.match(css, /\.sales-provider-row\s*\{[^}]*grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\)/s);
   assert.match(css, /background:\s*rgba\(239, 249, 255, \.985\)/);
   assert.match(css, /\.sales-region-options-panel\s*\{[^}]*position:\s*relative/s);
+  assert.match(css, /@keyframes sales-progress-indeterminate/);
+  assert.match(css, /@keyframes sales-visual-breathe/);
+  assert.match(css, /\.sales-job-progress-track\.is-indeterminate/);
 });

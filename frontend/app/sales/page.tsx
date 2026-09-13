@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { canRetryUnpriced, money, processingStatusDetail, progressPercent, queuedStatusDetail, unpricedRecoveryText } from "./presentation";
+import { canRetryUnpriced, estimatedQuoteWindow, money, progressPercent, unpricedRecoveryText } from "./presentation";
 import { validateNumberedComponentLines } from "./numbered-components";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "/api/backend";
@@ -99,21 +99,21 @@ type RegionCatalog = {
 };
 
 type RelayHealth = {
-  status: "ready" | "offline";
+  status: "ready" | "starting" | "offline";
   message?: string;
   provider_catalogs?: Partial<Record<CloudProvider, {
     available: boolean;
     message?: string;
   }>>;
   engines?: Partial<Record<QuoteEngine, {
-    status: "ready" | "offline";
+    status: "ready" | "starting" | "offline";
     max_concurrent_quotes: number;
   }>>;
 };
 
 const statusCopy: Record<RelayJob["status"], { title: string; detail?: string }> = {
   queued: { title: "报价正在排队", detail: "正在等待可用的报价名额。" },
-  processing: { title: "报价申请已提交" },
+  processing: { title: "报价正在生成" },
   needs_login: { title: "报价等待登录", detail: "报价服务正在等待管理员恢复登录。" },
   completed: { title: "报价已完成", detail: "报价结果和 Excel 已生成。" },
   partial: { title: "部分报价已完成", detail: "已返回成功组件；未取得价格的组件没有计入合计。" },
@@ -138,10 +138,6 @@ const PROVIDER_ORDER: CloudProvider[] = [
   "aws", "azure", "oci", "gcp", "tencent",
   "alibaba", "huawei", "baidu", "volcengine", "ctyun",
 ];
-
-function estimateWindow() {
-  return "5～10 分钟";
-}
 
 function providerLabel(provider: CloudProvider | undefined) {
   return PROVIDER_META[provider ?? "aws"].label;
@@ -232,9 +228,7 @@ export default function SalesQuotePage() {
   const active = Boolean(job && ["queued", "processing", "needs_login"].includes(job.status));
   const retryAvailable = job?.status === "partial" && canRetryUnpriced(job.quick_quote_result);
   const completedPercent = job ? progressPercent(job) : null;
-  const resultReady = Boolean(job?.quick_quote_result);
-  const inventoryReady = Boolean(job?.progress?.total_component_count || resultReady);
-  const pricesReady = completedPercent === 100 || Boolean(job?.status === "completed" && resultReady);
+  const quoteWindow = job ? estimatedQuoteWindow(job) : "10～20 分钟";
 
   const loadJob = useCallback(async (jobId: string, signal: AbortSignal) => {
     const response = await fetch(`${API_BASE}/api/quote-relay/jobs/${encodeURIComponent(jobId)}`, {
@@ -554,6 +548,13 @@ export default function SalesQuotePage() {
   }
 
   const ready = health?.status === "ready";
+  const healthLabel = ready
+    ? "服务正常"
+    : health?.status === "starting"
+      ? "服务启动中"
+      : health
+        ? "服务维护中"
+        : "状态检测中";
   const selectedCatalog = health?.provider_catalogs?.[cloudProvider];
   const selectedCatalogUnavailable = selectedCatalog?.available === false;
 
@@ -572,7 +573,7 @@ export default function SalesQuotePage() {
         </a>
         <div className={`sales-portal-health ${ready ? "ready" : "waiting"}`}>
           <i aria-hidden="true" />
-          <span>{ready ? "服务正常" : health ? "服务维护中" : "状态检测中"}</span>
+          <span>{healthLabel}</span>
         </div>
       </header>
 
@@ -772,6 +773,7 @@ export default function SalesQuotePage() {
             <span className="sales-job-orbit sales-job-orbit-two" />
             <span className="sales-job-node sales-job-node-one" />
             <span className="sales-job-node sales-job-node-two" />
+            <span className="sales-job-node sales-job-node-three" />
             <div className="sales-job-status-icon">
               {["completed", "partial"].includes(job.status) ? "✓" : job.status === "failed" ? "!" : job.status === "cancelled" ? "×" : <i />}
             </div>
@@ -784,10 +786,10 @@ export default function SalesQuotePage() {
                 ? "已生成部分报价和 Excel，成功组件可立即使用，未报价组件没有计入合计。"
                 : "报价结果和 Excel 已生成，可查看、复制或下载。"
               : job.status === "queued"
-                ? queuedStatusDetail(job)
+                ? "报价任务已进入处理队列，系统将在资源可用后自动开始，无需重复提交。"
               : job.status === "processing"
-                ? processingStatusDetail(job)
-                : statusCopy[job.status].detail ?? `预计 ${estimateWindow()}完成，结果将在当前页面显示。`}</span>
+                ? "为确保结果准确，报价需经过需求解析、官方价格核验与一致性校验等多层验证，处理时间可能较长，请耐心等待。"
+                : statusCopy[job.status].detail ?? "报价结果将在当前页面显示。"}</span>
             {job.status === "failed" && (
               <small className="sales-failure-reference">
                 错误码 {job.failure_code || "AQ-QUOTE-FAILED"}
@@ -797,19 +799,24 @@ export default function SalesQuotePage() {
 
           {active && (
             <div className="sales-job-progress" aria-label="报价处理状态">
-              <div><span>{job.status === "queued" ? "等待启动" : job.status === "needs_login" ? "等待服务恢复" : "组件核价进度"}</span><b>{job.status === "processing" && <i />} {job.status === "queued" ? "排队中" : job.status === "needs_login" ? "等待管理员" : "正在运行"}</b></div>
-              {completedPercent !== null && <i role="progressbar" aria-label="已完成核价的组件比例" aria-valuemin={0} aria-valuemax={100} aria-valuenow={completedPercent}><span style={{ width: `${completedPercent}%` }} /></i>}
-              <small>{job.status === "queued" ? queuedStatusDetail(job) : job.status === "needs_login" ? "请联系管理员恢复服务，恢复后将继续处理本次报价。" : processingStatusDetail(job)}</small>
+              <div
+                className={`sales-job-progress-track ${completedPercent === null ? "is-indeterminate" : ""} ${job.status === "needs_login" ? "is-paused" : ""}`}
+                role="progressbar"
+                aria-label="报价处理进度"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={completedPercent ?? undefined}
+              >
+                <span style={completedPercent === null ? undefined : { width: `${completedPercent}%` }} />
+                <i aria-hidden="true" />
+              </div>
+              <small>{job.status === "needs_login"
+                ? "服务恢复后将自动继续，无需重新提交。"
+                : job.status === "queued"
+                  ? `开始处理后，预计处理时间：${quoteWindow}`
+                  : `预计处理时间：${quoteWindow}`}</small>
             </div>
           )}
-
-          <div className="sales-job-stages" aria-hidden="true">
-            <span className={inventoryReady ? "complete" : job.status === "processing" ? "current" : ""}><i />需求识别</span>
-            <b />
-            <span className={pricesReady ? "complete" : job.status === "processing" && inventoryReady ? "current" : ""}><i />官方核价</span>
-            <b />
-            <span className={["completed", "partial"].includes(job.status) && resultReady ? "complete" : job.status === "processing" && pricesReady ? "current" : ""}><i />生成结果</span>
-          </div>
 
           <div className="sales-job-actions">
             {active

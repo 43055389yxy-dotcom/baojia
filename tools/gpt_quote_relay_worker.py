@@ -28,9 +28,9 @@ from app.services.gpt_browser_navigation import (
 from app.services.gpt_quote_batches import (
     WAVES_PER_CHAT,
     build_component_batch_continuation_prompt,
+    build_component_batch_finalize_prompt,
     build_component_batch_prompt,
     build_numbered_intake_batch_prompt,
-    build_quote_merge_prompt,
 )
 from app.services.gpt_quote_prompt import (
     build_quote_context_prompt,
@@ -74,6 +74,10 @@ BATCH_STATE_SETTLE_SECONDS = max(
     POLL_SECONDS * 2,
     float(os.environ.get("ASTRAQUOTE_GPT_BATCH_STATE_SETTLE_SECONDS", "12")),
 )
+BROWSER_RECOVERY_COOLDOWN_SECONDS = max(
+    15.0,
+    float(os.environ.get("ASTRAQUOTE_GPT_BROWSER_RECOVERY_COOLDOWN_SECONDS", "30")),
+)
 MAX_CONTINUATION_ATTEMPTS = bounded_continuation_attempts(
     os.environ.get("ASTRAQUOTE_GPT_MAX_CONTINUATIONS")
 )
@@ -101,6 +105,7 @@ def write_heartbeat(
     logged_in: bool,
     message: str,
     browser: str,
+    state: str,
 ) -> None:
     atomic_json(
         store.heartbeat_path_for(RELAY_ENGINE),
@@ -109,10 +114,33 @@ def write_heartbeat(
             "worker_id": WORKER_ID,
             "browser": browser,
             "logged_in": logged_in,
+            "state": state,
             "project_name": None,
             "message": message,
         },
     )
+
+
+def browser_login_with_recovery(
+    browser: Any,
+    last_recovery_at: float,
+    *,
+    now: float | None = None,
+    before_recovery: Any | None = None,
+) -> tuple[bool, float, bool]:
+    """Reconnect a stale desktop renderer once per cooldown window."""
+
+    checked_at = time.monotonic() if now is None else now
+    if browser.logged_in():
+        return True, last_recovery_at, False
+    if checked_at - last_recovery_at < BROWSER_RECOVERY_COOLDOWN_SECONDS:
+        return False, last_recovery_at, False
+    recover = getattr(browser, "recover_if_unavailable", None)
+    if not callable(recover):
+        return False, last_recovery_at, False
+    if callable(before_recovery):
+        before_recovery()
+    return bool(recover()), checked_at, True
 
 
 @dataclass
@@ -137,6 +165,7 @@ class ActiveQuote:
     batch_progress_fingerprint: str = ""
     machine_progress_fingerprint: str = ""
     stalled_attempts: int = 0
+    finalize_attempts: int = 0
     previous_conversation_ids: tuple[str, ...] = ()
     backend_settle_fingerprint: str = ""
     backend_settle_started_at: float = 0.0
@@ -296,11 +325,19 @@ def batch_progress_fingerprint(batch: dict[str, Any], previous: str = "") -> str
 
 
 def batch_is_finished(batch: dict[str, Any]) -> bool:
+    if batch.get("component_result_required") is True:
+        return (
+            batch.get("component_result_saved") is True
+            and batch.get("automatic_delivery_pending") is not True
+        )
     component_keys = list(batch.get("component_keys") or [])
     states = batch.get("component_states") or {}
-    return bool(component_keys) and all(
+    prices_completed = bool(component_keys) and all(
         states.get(component_key) == "completed" for component_key in component_keys
     )
+    if not prices_completed:
+        return False
+    return batch.get("automatic_delivery_pending") is not True
 
 
 def incomplete_component_keys(batch: dict[str, Any]) -> list[str]:
@@ -324,6 +361,10 @@ def component_batch_state_fingerprint(
     return json.dumps(
         {
             "completed": sorted(completed),
+            "component_result_saved": bool(batch.get("component_result_saved")),
+            "automatic_delivery_pending": bool(
+                batch.get("automatic_delivery_pending")
+            ),
             "remaining": [
                 key for key in batch.get("component_keys") or []
                 if key not in completed
@@ -417,6 +458,47 @@ def continue_component_batch(
             active,
             completed_status="saved",
         )
+    prices_completed = bool(batch.get("component_keys")) and all(
+        (batch.get("component_states") or {}).get(component_key) == "completed"
+        for component_key in batch.get("component_keys") or []
+    )
+    component_result_missing = batch.get("component_result_required") is True and not batch.get(
+        "component_result_saved"
+    )
+    delivery_retry_needed = batch.get("automatic_delivery_pending") is True
+    if prices_completed and (component_result_missing or delivery_retry_needed):
+        if active.finalize_attempts >= MAX_CONTINUATION_ATTEMPTS:
+            return advance_to_next_wave(
+                store,
+                browser,
+                active,
+                completed_status="stalled",
+            )
+        latest = store.get(active.job_id)
+        browser.continue_quote(
+            active,
+            build_component_batch_finalize_prompt(
+                relay_job_id=active.job_id,
+                submission_code=str(latest.get("submission_code") or ""),
+                price_batch_id=str(batch["price_batch_id"]),
+                batch_index=active.batch_index,
+                batch_count=int(batch["batch_count"]),
+                component_keys=list(batch.get("component_keys") or []),
+            ),
+        )
+        active.finalize_attempts += 1
+        store.update_chat_session(
+            active.job_id,
+            active.batch_index,
+            status="running",
+            finalize_attempts=active.finalize_attempts,
+            progress_fingerprint=fingerprint,
+            backend_settle_fingerprint=None,
+            backend_settle_started_at_epoch=None,
+        )
+        active.backend_settle_fingerprint = ""
+        active.backend_settle_started_at = 0.0
+        return True
     if active.stalled_attempts >= MAX_CONTINUATION_ATTEMPTS:
         return advance_to_next_wave(
             store,
@@ -537,6 +619,7 @@ def advance_to_next_wave(
     active.role = "component_batch"
     active.component_keys = tuple(next_batch.get("component_keys") or [])
     active.stalled_attempts = 0
+    active.finalize_attempts = 0
     active.batch_progress_fingerprint = ""
     active.machine_progress_fingerprint = ""
     active.backend_settle_fingerprint = ""
@@ -590,7 +673,7 @@ def advance_machine_completed_wave(
                 return True
             if not continue_component_batch(store, browser, active):
                 active_quotes.pop(session_key, None)
-            maybe_start_final_merge(
+            settle_programmatic_delivery(
                 store, browser, active_quotes, active.job_id,
             )
         except PendingPromptSubmissionError:
@@ -805,68 +888,62 @@ def create_missing_component_chats(
             break
 
 
-def maybe_start_final_merge(
+def settle_programmatic_delivery(
     store: GptQuoteRelayStore,
     browser: Any,
     active_quotes: dict[str, ActiveQuote],
     job_id: str,
 ) -> None:
-    """Return to the coordinator only after every component chat has stopped."""
+    """Reconcile automatic delivery without opening a final AI merge turn."""
 
     batches = store.quote_chat_batches(job_id)
     if len(batches) <= 1:
         return
-    record = store.get(job_id)
-    if record.get("status") != "processing":
+    current = store.reconcile_delivery_receipt(job_id)
+    if current.get("status") in {"completed", "partial", "failed", "cancelled"}:
+        stop_terminal_job_chats(
+            browser,
+            active_quotes,
+            job_id,
+            cancelled=current.get("status") == "cancelled",
+        )
         return
     if any(active.job_id == job_id for active in active_quotes.values()):
         return
-    if len(active_quotes) >= store.max_concurrent_quotes:
-        return
+    record = store.get(job_id)
     sessions = {
         int(item.get("batch_index", -1)): item
         for item in (record.get("chat_sessions") or [])
     }
-    for batch in batches:
-        if batch_is_finished(batch):
-            continue
-        session = sessions.get(int(batch["batch_index"]))
-        if not session or session.get("status") != "stalled":
-            return
-    if any(item.get("status") == "merging" for item in sessions.values()):
-        return
     if any(item.get("status") == "running" for item in sessions.values()):
         return
-    coordinator = sessions.get(0)
-    if not coordinator:
+    incomplete_results = [
+        int(batch["batch_index"])
+        for batch in batches
+        if batch.get("component_result_required") is True
+        and not batch.get("component_result_saved")
+    ]
+    delivery_pending = [
+        int(batch["batch_index"])
+        for batch in batches
+        if batch.get("automatic_delivery_pending") is True
+    ]
+    if not incomplete_results and not delivery_pending:
         return
-    active = active_quotes.get(f"{job_id}:0")
-    if active is None:
-        active = browser.resume_quote(
-            job_id,
-            str(coordinator["chat_url"]),
-            batch_index=0,
-            batch_count=len(batches),
-            role="merge",
-            component_keys=list(batches[0]["component_keys"]),
-        )
-    else:
-        active.role = "merge"
-    # Persist the merge reservation and keep the resumed coordinator visible
-    # before touching the renderer.  A send-button race may leave a valid
-    # draft in the composer; without this ordering the next loop re-authorizes
-    # and recreates the same merge over and over.
-    active.role = "merge"
-    active_quotes[active.session_key] = active
-    store.update_chat_session(job_id, 0, status="merging")
-    store.authorize_merge(job_id)
-    browser.continue_quote(
-        active,
-        build_quote_merge_prompt(
-            relay_job_id=job_id,
-            submission_code=str(record.get("submission_code") or ""),
-            price_batch_id=str(batches[0]["price_batch_id"]),
-        ),
+    store.purge_all_sources(job_id)
+    store.update_if_not_cancelled(
+        job_id,
+        {
+            "status": "failed",
+            "error": {
+                "code": "component_result_delivery_failed",
+                "message": "组件批次已停止，但结构化结果保存或自动交付仍未完成。",
+                "batch_indexes": sorted(set(incomplete_results + delivery_pending)),
+            },
+            "lease_expires_at": None,
+        },
+        stage="failed",
+        message="组件结果保存或自动交付补发一次后仍未完成，任务已停止",
     )
 
 
@@ -1023,7 +1100,7 @@ def handle_no_progress_timeout(
         browser.close_quote(active)
         if not continue_component_batch(store, browser, active):
             active_quotes.pop(active.session_key, None)
-        maybe_start_final_merge(store, browser, active_quotes, active.job_id)
+        settle_programmatic_delivery(store, browser, active_quotes, active.job_id)
         return
     browser.close_quote(active)
     if not continue_from_saved_stage(
@@ -1079,6 +1156,7 @@ def reattach_job_chats(
             wave_count=int(session.get("wave_count") or 1),
         )
         active.stalled_attempts = int(session.get("stalled_attempts") or 0)
+        active.finalize_attempts = int(session.get("finalize_attempts") or 0)
         active.batch_progress_fingerprint = str(
             session.get("progress_fingerprint") or ""
         )
@@ -1198,11 +1276,41 @@ def main() -> int:
         )
     )
     active_quotes: dict[str, ActiveQuote] = {}
+    last_recovery_at = -BROWSER_RECOVERY_COOLDOWN_SECONDS
+    recovery_failures = 0
+    write_heartbeat(
+        store,
+        logged_in=False,
+        message=f"{engine_display_name()} 正在启动",
+        browser=engine_display_name(),
+        state="starting",
+    )
     while True:
         try:
             if browser.driver is None:
+                write_heartbeat(
+                    store,
+                    logged_in=False,
+                    message=f"{engine_display_name()} 正在连接桌面",
+                    browser=engine_display_name(),
+                    state="starting",
+                )
                 browser.start()
-            logged_in = browser.logged_in()
+            logged_in, last_recovery_at, _recovery_attempted = (
+                browser_login_with_recovery(
+                    browser,
+                    last_recovery_at,
+                    before_recovery=lambda: write_heartbeat(
+                        store,
+                        logged_in=False,
+                        message=f"{engine_display_name()} 正在自动恢复",
+                        browser=engine_display_name(),
+                        state="recovering",
+                    ),
+                )
+            )
+            if logged_in:
+                recovery_failures = 0
             if logged_in and not active_quotes:
                 for record in store.claim_submitted_for_monitoring(
                     WORKER_ID,
@@ -1214,7 +1322,7 @@ def main() -> int:
                     create_missing_component_chats(
                         store, browser, active_quotes, record["job_id"],
                     )
-                    maybe_start_final_merge(
+                    settle_programmatic_delivery(
                         store, browser, active_quotes, record["job_id"],
                     )
             if logged_in:
@@ -1228,6 +1336,7 @@ def main() -> int:
                     else "等待销售报价任务"
                 ) if logged_in else f"等待管理员登录 {engine_display_name()}",
                 browser=engine_display_name(),
+                state="ready" if logged_in else "needs_login",
             )
             if not logged_in:
                 for job_id in {quote.job_id for quote in active_quotes.values()}:
@@ -1247,7 +1356,7 @@ def main() -> int:
                     create_missing_component_chats(
                         store, browser, active_quotes, record["job_id"],
                     )
-                    maybe_start_final_merge(
+                    settle_programmatic_delivery(
                         store, browser, active_quotes, record["job_id"],
                     )
                     if pending_active_quote(active_quotes) is not None:
@@ -1285,7 +1394,7 @@ def main() -> int:
                     )
                     if pending_active_quote(active_quotes) is not None:
                         break
-                    maybe_start_final_merge(store, browser, active_quotes, job_id)
+                    settle_programmatic_delivery(store, browser, active_quotes, job_id)
 
             pending_quote = pending_active_quote(active_quotes)
             if pending_quote is None and advance_machine_completed_wave(
@@ -1342,7 +1451,7 @@ def main() -> int:
                             continue
                         if not continue_component_batch(store, browser, active):
                             active_quotes.pop(session_key, None)
-                        maybe_start_final_merge(
+                        settle_programmatic_delivery(
                             store, browser, active_quotes, job_id,
                         )
                         continue
@@ -1406,11 +1515,13 @@ def main() -> int:
             browser.close()
             return 0
         except Exception as exc:  # noqa: BLE001 - keep the supervisor alive
+            recovery_failures += 1
             write_heartbeat(
                 store,
                 logged_in=False,
                 message=f"{engine_display_name()} 工作进程异常：{str(exc)[:500]}",
                 browser=engine_display_name(),
+                state="recovering" if recovery_failures < 3 else "error",
             )
             # Submitted conversations continue server-side while the desktop
             # renderer restarts. Leave them processing for reference reattachment.

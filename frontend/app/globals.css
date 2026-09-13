@@ -331,7 +331,11 @@ button, a { -webkit-tap-highlight-color: transparent; }
   margin: clamp(42px, 7vh, 82px) auto 0;
   padding: clamp(40px, 6vw, 72px);
 }
-.sales-job-visual { position: relative; display: grid; width: 220px; aspect-ratio: 1; grid-row: span 4; place-items: center; border: 1px solid rgba(78, 218, 255, .15); border-radius: 50%; background: radial-gradient(circle, rgba(29, 112, 148, .24), transparent 65%); box-shadow: inset 0 0 60px rgba(36, 152, 198, .09), 0 0 70px rgba(26, 150, 211, .09); }
+.sales-job-visual { position: relative; display: grid; width: 220px; aspect-ratio: 1; grid-row: span 3; place-items: center; border: 1px solid rgba(78, 218, 255, .15); border-radius: 50%; background: radial-gradient(circle, rgba(29, 112, 148, .24), transparent 65%); box-shadow: inset 0 0 60px rgba(36, 152, 198, .09), 0 0 70px rgba(26, 150, 211, .09); }
+.sales-job-visual::before,
+.sales-job-visual::after { position: absolute; border-radius: 50%; content: ""; pointer-events: none; }
+.sales-job-visual::before { inset: -9%; border: 1px solid rgba(67, 220, 255, .11); animation: sales-visual-breathe 3.8s ease-in-out infinite; }
+.sales-job-visual::after { inset: 39%; background: rgba(67, 220, 255, .16); filter: blur(18px); animation: sales-core-glow 2.4s ease-in-out infinite; }
 .sales-job-orbit { position: absolute; inset: 10%; border: 1px solid rgba(67, 220, 255, .25); border-radius: 50%; }
 .sales-job-orbit::after { position: absolute; width: 8px; height: 8px; top: 10%; left: 18%; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 18px var(--cyan); content: ""; }
 .sales-job-orbit-one { animation: sales-orbit 7s linear infinite; }
@@ -339,18 +343,24 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .sales-job-node { position: absolute; width: 7px; height: 7px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 0 6px rgba(67, 220, 255, .08), 0 0 18px rgba(67, 220, 255, .58); animation: sales-node-pulse 2s ease-in-out infinite; }
 .sales-job-node-one { top: 12%; right: 18%; }
 .sales-job-node-two { bottom: 15%; left: 13%; animation-delay: -1s; }
-.sales-job-status-icon { display: grid; width: 56px; height: 56px; place-items: center; border: 1px solid rgba(75, 211, 255, .34); border-radius: 17px; background: linear-gradient(145deg, rgba(24, 100, 136, .72), rgba(13, 47, 71, .9)); color: var(--cyan); font-size: 25px; font-weight: 900; box-shadow: 0 14px 34px rgba(0, 0, 0, .22), 0 0 30px rgba(47, 189, 245, .1); }
+.sales-job-node-three { top: 53%; right: 4%; width: 5px; height: 5px; animation-delay: -.45s; }
+.sales-job-status-icon { position: relative; display: grid; width: 56px; height: 56px; place-items: center; border: 1px solid rgba(75, 211, 255, .34); border-radius: 17px; background: linear-gradient(145deg, rgba(24, 100, 136, .72), rgba(13, 47, 71, .9)); color: var(--cyan); font-size: 25px; font-weight: 900; box-shadow: 0 14px 34px rgba(0, 0, 0, .22), 0 0 30px rgba(47, 189, 245, .1); }
+.status-processing .sales-job-status-icon::before { position: absolute; inset: -10px; border: 1px solid rgba(67, 220, 255, .2); border-radius: 23px; content: ""; animation: sales-icon-wave 2.2s ease-out infinite; }
 .sales-job-status-icon > i { width: 23px; height: 23px; border: 2px solid rgba(117, 211, 239, .22); border-top-color: var(--cyan); border-radius: 50%; animation: sales-spinner .9s linear infinite; }
 .sales-job-copy h1 { font-size: clamp(36px, 5vw, 52px); }
 .sales-job-copy > p { font-size: 10px; }
 .sales-job-copy > span { display: block; margin-top: 12px; color: var(--muted); font-size: 14px; line-height: 1.7; }
-.sales-job-progress { width: 100%; padding: 18px; border: 1px solid var(--line); border-radius: 14px; background: rgba(9, 32, 50, .78); }
-.sales-job-progress > div { display: flex; align-items: center; justify-content: space-between; color: #a6c4d5; font-size: 12px; }
-.sales-job-progress b { display: inline-flex; align-items: center; gap: 7px; color: var(--cyan); font-size: 10px; }
-.sales-job-progress b > i { width: 6px; height: 6px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 0 5px rgba(67, 220, 255, .08); animation: sales-status-pulse 1.5s ease-in-out infinite; }
-.sales-job-progress > i { position: relative; display: block; overflow: hidden; height: 4px; margin-top: 13px; border-radius: 999px; background: rgba(93, 153, 184, .14); }
-.sales-job-progress > i > span { position: absolute; inset: 0 auto 0 0; border-radius: inherit; background: linear-gradient(90deg, var(--cyan), var(--blue)); box-shadow: 0 0 16px rgba(60, 160, 229, .34); transition: width .35s ease; }
-.sales-job-progress small { display: block; margin-top: 10px; color: #66879c; font-size: 10px; text-align: right; }
+.sales-job-progress { position: relative; width: 100%; overflow: hidden; padding: 22px 22px 18px; border: 1px solid var(--line); border-radius: 16px; background: rgba(9, 32, 50, .78); }
+.sales-job-progress::before { position: absolute; width: 32%; height: 140%; top: -20%; left: -45%; background: linear-gradient(90deg, transparent, rgba(77, 188, 241, .1), transparent); content: ""; transform: skewX(-18deg); animation: sales-progress-panel-scan 4.8s ease-in-out infinite; }
+.sales-job-progress-track { position: relative; display: block; overflow: hidden; height: 8px; border-radius: 999px; background: rgba(93, 153, 184, .14); box-shadow: inset 0 1px 3px rgba(13, 61, 91, .16); }
+.sales-job-progress-track > span { position: absolute; inset: 0 auto 0 0; min-width: 0; border-radius: inherit; background: linear-gradient(90deg, var(--cyan), #54d8ed 48%, var(--blue)); background-size: 180% 100%; box-shadow: 0 0 18px rgba(60, 160, 229, .34); transition: width .8s cubic-bezier(.2, .72, .2, 1); animation: sales-progress-gradient 2.4s linear infinite; }
+.sales-job-progress-track > span::after { position: absolute; inset: 0; background: linear-gradient(90deg, transparent 15%, rgba(255, 255, 255, .72) 50%, transparent 85%); content: ""; transform: translateX(-100%); animation: sales-progress-shimmer 2.1s ease-in-out infinite; }
+.sales-job-progress-track > i { position: absolute; width: 32px; height: 100%; top: 0; left: -40px; background: radial-gradient(circle, rgba(255, 255, 255, .86), transparent 68%); filter: blur(2px); animation: sales-progress-scan 2.6s ease-in-out infinite; }
+.sales-job-progress-track.is-indeterminate > span { width: 34%; min-width: 90px; animation: sales-progress-indeterminate 2.2s cubic-bezier(.55, 0, .3, 1) infinite, sales-progress-gradient 2.4s linear infinite; }
+.sales-job-progress-track.is-paused { opacity: .55; }
+.sales-job-progress-track.is-paused > span,
+.sales-job-progress-track.is-paused > i { animation-play-state: paused; }
+.sales-job-progress small { position: relative; display: block; margin-top: 13px; color: #66879c; font-size: 11px; font-weight: 650; text-align: center; letter-spacing: .02em; }
 .sales-result-unpriced { margin: 18px 0 0; padding: 16px; border: 1px solid rgba(224, 143, 53, .34); border-radius: 12px; background: rgba(224, 143, 53, .08); }
 .sales-result-notice { margin: 18px 0 0; padding: 12px 14px; border: 1px solid rgba(62, 126, 152, .25); border-radius: 10px; color: #486b79; background: rgba(94, 175, 205, .09); }
 .sales-result-unpriced > strong { display: block; margin-bottom: 10px; color: #b76d18; }
@@ -358,14 +368,6 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .sales-result-unpriced p span { color: #6f7f89; }
 .sales-result-unpriced p small { display: block; margin-top: 5px; color: #946529; line-height: 1.6; }
 .sales-result-action-note > small { display: block; margin-top: 6px; color: var(--danger); }
-.sales-job-stages { display: flex; align-items: center; gap: 10px; }
-.sales-job-stages span { display: inline-flex; align-items: center; gap: 7px; color: #526f82; font-size: 10px; white-space: nowrap; }
-.sales-job-stages span > i { width: 8px; height: 8px; border: 1px solid #506d80; border-radius: 50%; }
-.sales-job-stages span.complete { color: #8ab9cb; }
-.sales-job-stages span.complete > i { border-color: var(--green); background: var(--green); box-shadow: 0 0 10px rgba(84, 239, 188, .3); }
-.sales-job-stages span.current { color: #a9eaff; }
-.sales-job-stages span.current > i { border-color: var(--cyan); box-shadow: 0 0 0 4px rgba(67, 220, 255, .08); animation: sales-status-pulse 1.6s ease-in-out infinite; }
-.sales-job-stages > b { width: min(10vw, 74px); height: 1px; background: linear-gradient(90deg, rgba(92, 157, 189, .1), rgba(92, 157, 189, .3)); }
 .sales-job-actions { display: flex; gap: 10px; }
 .status-failed .sales-job-status-icon { border-color: rgba(255, 142, 136, .3); background: rgba(101, 31, 36, .42); color: var(--danger); }
 .status-cancelled .sales-job-status-icon { color: #86a2b5; }
@@ -431,7 +433,14 @@ button, a { -webkit-tap-highlight-color: transparent; }
 @keyframes sales-orbit { to { transform: rotate(360deg); } }
 @keyframes sales-orbit-reverse { to { transform: rotate(-360deg); } }
 @keyframes sales-node-pulse { 50% { opacity: .4; transform: scale(.7); } }
-@keyframes sales-progress-scan { 0% { left: -34%; } 100% { left: 100%; } }
+@keyframes sales-visual-breathe { 50% { opacity: .42; transform: scale(1.045); } }
+@keyframes sales-core-glow { 50% { opacity: .45; transform: scale(1.7); } }
+@keyframes sales-icon-wave { 0% { opacity: .8; transform: scale(.84); } 80%, 100% { opacity: 0; transform: scale(1.35); } }
+@keyframes sales-progress-scan { 0%, 12% { left: -40px; opacity: 0; } 38% { opacity: 1; } 88%, 100% { left: 100%; opacity: 0; } }
+@keyframes sales-progress-panel-scan { 0%, 18% { left: -45%; opacity: 0; } 48% { opacity: 1; } 82%, 100% { left: 115%; opacity: 0; } }
+@keyframes sales-progress-gradient { to { background-position: -180% 0; } }
+@keyframes sales-progress-shimmer { 55%, 100% { transform: translateX(100%); } }
+@keyframes sales-progress-indeterminate { 0% { left: -36%; width: 28%; } 52% { width: 46%; } 100% { left: 108%; width: 25%; } }
 @keyframes sales-button-shine { 0%, 32% { left: -50%; } 68%, 100% { left: 125%; } }
 @keyframes sales-result-fade { from { opacity: 0; } }
 @keyframes sales-result-rise { from { opacity: 0; transform: translateY(18px) scale(.985); } }
@@ -448,7 +457,7 @@ button, a { -webkit-tap-highlight-color: transparent; }
   .sales-job-card { grid-template-columns: 1fr; min-height: 0; gap: 24px; text-align: center; }
   .sales-job-visual { width: 180px; grid-row: auto; margin: 0 auto; }
   .sales-job-progress { text-align: left; }
-  .sales-job-stages, .sales-job-actions { justify-content: center; }
+  .sales-job-actions { justify-content: center; }
   .sales-result-layout { display: block; overflow: auto; }
   .sales-result-body, .sales-result-summary { overflow: visible; }
   .sales-result-summary { border-top: 1px solid var(--line); border-left: 0; }
@@ -471,8 +480,6 @@ button, a { -webkit-tap-highlight-color: transparent; }
   .sales-quote-form textarea { min-height: 230px; }
   .sales-form-submit-row { justify-content: stretch; }
   .sales-submit { width: 100%; }
-  .sales-job-stages { gap: 6px; }
-  .sales-job-stages > b { width: 18px; }
   .sales-job-actions { flex-direction: column; }
   .sales-result-backdrop { padding: 9px; }
   .sales-result-dialog { max-height: calc(100vh - 18px); border-radius: 18px; }
@@ -722,6 +729,8 @@ body {
   background: radial-gradient(circle, rgba(189, 232, 255, .72), rgba(238, 248, 255, .22) 66%);
   box-shadow: inset 0 0 60px rgba(62, 156, 215, .12), 0 20px 65px rgba(63, 134, 183, .12);
 }
+.sales-job-visual::before { border-color: rgba(44, 164, 225, .2); }
+.sales-job-visual::after { background: rgba(44, 164, 225, .16); }
 .sales-job-orbit { border-color: rgba(44, 164, 225, .35); }
 .sales-job-node { box-shadow: 0 0 0 6px rgba(44, 164, 225, .1), 0 0 18px rgba(44, 164, 225, .48); }
 .sales-job-status-icon {
@@ -735,13 +744,11 @@ body {
   background: rgba(255, 255, 255, .64);
   box-shadow: inset 0 1px white;
 }
-.sales-job-progress > div { color: #52758f; font-size: 13px; }
+.sales-job-progress-track {
+  background: rgba(85, 145, 188, .14);
+  box-shadow: inset 0 1px 3px rgba(57, 113, 151, .13);
+}
 .sales-job-progress small { color: #7893a7; font-size: 11px; }
-.sales-job-progress > i { background: rgba(85, 145, 188, .16); }
-.sales-job-stages span { color: #839daf; font-size: 11px; }
-.sales-job-stages span.complete { color: #4f8296; }
-.sales-job-stages span.current { color: #247eae; }
-.sales-job-stages > b { background: linear-gradient(90deg, rgba(92, 157, 189, .13), rgba(92, 157, 189, .36)); }
 .status-failed .sales-job-status-icon { background: rgba(255, 235, 237, .72); }
 
 .sales-result-backdrop {

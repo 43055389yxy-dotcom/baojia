@@ -152,6 +152,11 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   assert.equal(getPrices.inputSchema.properties.relay_batch_count.type, 'integer');
   assert.equal(getPrices.inputSchema.properties.official_page_price_evidence.type, 'array');
   assert.equal(buildEstimate.inputSchema.properties.services.maxItems, 200);
+  assert.deepEqual(buildEstimate.inputSchema.properties.delivery_mode.enum, [
+    'deliver_quote', 'save_component_batch',
+  ]);
+  assert.equal(buildEstimate.inputSchema.properties.relay_batch_index.type, 'integer');
+  assert.equal(buildEstimate.inputSchema.properties.relay_batch_count.type, 'integer');
   assert.match(JSON.stringify(getPrices.inputSchema.properties.queries), /provider/);
   assert.match(JSON.stringify(getPrices.inputSchema.properties.queries), /query_id/);
   assert.match(INSTRUCTIONS, /GPT.*理解.*选择.*计算/s);
@@ -170,6 +175,7 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   assert.match(getPrices.description, /one incomplete official API result.*official pricing page/is);
   assert.match(getPrices.description, /official_page_price_evidence/is);
   assert.match(buildEstimate.description, /official_page_price_evidence/i);
+  assert.match(buildEstimate.description, /save_component_batch.*last.*Excel/is);
   assert.doesNotMatch(INSTRUCTIONS, /Calculator|import_estimate|模板映射/i);
 });
 

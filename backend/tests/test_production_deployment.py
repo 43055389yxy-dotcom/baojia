@@ -16,6 +16,7 @@ def test_jenkins_deploy_updates_and_restarts_the_host_codex_chat_relay() -> None
     assert '"$RELAY_WORKER_COMMAND "*' in script
     assert "--entrypoint /usr/bin/nsenter" in script
     assert "/usr/bin/systemctl enable astraquote-gpt-relay.service" in script
+    assert "/usr/bin/rm -f /home/ec2-user/astraquote/data/gpt-relay/worker-heartbeat.json" in script
     assert "/usr/bin/systemctl restart astraquote-gpt-relay.service" in script
     assert "/usr/bin/systemctl disable --now astraquote-gemini-relay.service" in script
     assert "/usr/bin/systemctl enable astraquote-gemini-relay.service" not in script
@@ -28,6 +29,10 @@ def test_jenkins_deploy_updates_and_restarts_the_host_codex_chat_relay() -> None
     assert "configured_restart" in script
     assert 'configured_restart" != always' in script
     assert "host_codex_cdp_ready" in script
+    assert "worker-heartbeat.json" in script
+    assert "heartbeat.get" in script
+    assert "logged_in" in script
+    assert "The ChatGPT desktop quote engine did not become ready" in script
     assert 'docker restart "$CODEX_CONTAINER" >/dev/null' in script
     assert "--network host" in script
     assert "--entrypoint /usr/bin/curl" in script
@@ -67,6 +72,8 @@ def test_jenkins_health_checks_explain_the_failure_stage() -> None:
     assert "ASTRAQUOTE_CODEX_CONTAINER=astraquote-chatgpt-desktop" in unit
     assert "ASTRAQUOTE_CODEX_CDP=http://127.0.0.1:9222" in unit
     assert "ExecStartPre=/usr/bin/docker start astraquote-chatgpt-desktop" in unit
+    assert "StartLimitIntervalSec=0" in unit
+    assert "Restart=always" in unit
     assert "ASTRAQUOTE_FIREFOX_PROFILE" not in unit
     assert "ASTRAQUOTE_CHATGPT_PROJECT" not in unit
     assert "chatgpt.com/projects" not in unit

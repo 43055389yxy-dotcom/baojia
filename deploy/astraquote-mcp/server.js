@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.17.0';
+const VERSION = '3.18.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -487,9 +487,18 @@ const quoteAdjustment = z.object({
 }).strict();
 
 const buildEstimateInput = z.object({
+  delivery_mode: z.enum(['deliver_quote', 'save_component_batch']).default('deliver_quote').describe(
+    '程序预拆分的销售任务每一小批必须使用 save_component_batch；最后一个小批保存后由程序自动机械合并并生成 Excel。旧的非分批调用使用 deliver_quote。',
+  ),
   quote_name: z.string().min(1).max(160),
   cloud_provider: cloudProvider,
   relay_job_id: z.string().regex(/^gpt-[a-f0-9]{32}$/).optional().describe('销售前端提供的内部任务编号，用于撤回后的交付保护。'),
+  relay_batch_index: z.number().int().min(0).max(199).optional().describe(
+    'save_component_batch 必填；程序分配的零基小批编号。',
+  ),
+  relay_batch_count: z.number().int().min(1).max(200).optional().describe(
+    'save_component_batch 必填；同一销售报价的执行小批总数。',
+  ),
   default_region: region,
   region_adjustment_reason: z.string().min(1).max(500).optional().describe(
     '仅当实际报价地域不同于销售首选地域时填写。实际地域必须是当前云厂商和账号站点的官方地域代码，不得复制其他云厂商同名代码的含义；说明首选地域不能承载整套产品以及所选同站点相邻地域。',
@@ -509,7 +518,7 @@ const buildEstimateInput = z.object({
     '销售所选方案的整单合计；每一项必须等于全部 services[].scenario_costs 的机械加总。',
   ),
   fact_ledger: z.array(fact).max(500),
-  services: z.array(pricedService).min(1).max(200),
+  services: z.array(pricedService).max(200).default([]),
   zero_cost_services: z.array(zeroCostService).max(200).default([]).describe(
     '不产生额外云费用的结构化资源。只能消费 disposition=zero_cost 的客户事实。',
   ),
@@ -658,7 +667,7 @@ function guarded(handler) {
 function normalizeBuildEstimateInput(input) {
   return {
     ...input,
-    services: input.services.map(({
+    services: (input.services || []).map(({
       monthly_cost: monthlyCost,
       expected_monthly_cost: legacyMonthlyCost,
       ...service
@@ -732,7 +741,7 @@ function buildServer(workflow) {
 
   server.registerTool('build_estimate', {
     title: 'Validate and deliver an official quote',
-    description: 'Checks selected official catalog evidence, fact coverage and GPT-calculated totals, then creates one Excel link and returns it with the quote to the sales page. After one incomplete official API attempt in one declared scope, save official_page_price_evidence from the same provider and account site. Sales relay quotes cannot finish with unpriced services or sales-manual placeholders; all components require accepted API or official-page evidence. Unused discovery and replaced attempts need not succeed.',
+    description: 'For a program-split sales relay batch, use delivery_mode=save_component_batch with the exact relay_batch_index and relay_batch_count and submit only that batch. It validates and seals GPT-selected official evidence, facts and component totals. The last saved batch is mechanically merged by the program, revalidated, and delivered with one Excel link; no final AI merge is needed. Legacy non-batch calls use deliver_quote. After one incomplete official API attempt in one declared scope, save official_page_price_evidence from the same provider and account site. Sales relay quotes cannot finish with unpriced services or sales-manual placeholders.',
     inputSchema: buildEstimateInput,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, guarded((args) => workflow.buildEstimate(normalizeBuildEstimateInput(args))));

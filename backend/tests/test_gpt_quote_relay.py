@@ -22,9 +22,9 @@ from app.services.gpt_browser_navigation import (
 )
 from app.services.gpt_quote_batches import (
     build_component_batch_continuation_prompt,
+    build_component_batch_finalize_prompt,
     build_component_batch_prompt,
     build_numbered_intake_batch_prompt,
-    build_quote_merge_prompt,
     parse_numbered_component_lines,
     split_component_plan,
     split_numbered_intake,
@@ -857,6 +857,28 @@ def test_health_reports_fresh_worker_heartbeat(tmp_path: Path) -> None:
     assert "project_name" not in health
 
 
+def test_health_reports_fresh_worker_startup_separately_from_maintenance(
+    tmp_path: Path,
+) -> None:
+    store = GptQuoteRelayStore(tmp_path)
+    store.heartbeat_path.write_text(
+        json.dumps(
+            {
+                "updated_at": "2999-01-01T00:00:00+00:00",
+                "logged_in": False,
+                "state": "recovering",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    health = store.health()
+
+    assert health["status"] == "starting"
+    assert health["message"] == "报价服务正在启动"
+    assert health["engines"]["chatgpt"]["status"] == "starting"
+
+
 def test_login_waiting_job_resumes_without_losing_source(tmp_path: Path) -> None:
     store = GptQuoteRelayStore(tmp_path)
     public = store.create("东京 EC2 两台，按需。", {})
@@ -1148,9 +1170,12 @@ def test_every_automated_followup_explicitly_mentions_astraquote() -> None:
     }
     prompts = [
         build_quote_failed_components_retry_prompt(**identity),
-        build_quote_merge_prompt(
+        build_component_batch_finalize_prompt(
             **identity,
             price_batch_id="aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            batch_index=1,
+            batch_count=2,
+            component_keys=["cmp_compute_0001"],
         ),
         build_component_batch_continuation_prompt(
             **identity,
@@ -1164,6 +1189,7 @@ def test_every_automated_followup_explicitly_mentions_astraquote() -> None:
     assert all(prompt.startswith("@AstraQuote ") for prompt in prompts)
     assert "relay_batch_index：1" in prompts[-1]
     assert "relay_batch_count：2" in prompts[-1]
+    assert "delivery_mode=save_component_batch" in prompts[1]
 
 
 def test_codex_worker_keeps_continuation_and_receipt_integration() -> None:
@@ -1179,6 +1205,8 @@ def test_codex_worker_keeps_continuation_and_receipt_integration() -> None:
     assert "store.request_partial_finalization(job_id)" in worker
     assert "build_quote_partial_finalization_prompt(" in worker
     assert "browser.continue_quote(active, continuation_prompt)" in worker
+    assert "settle_programmatic_delivery(" in worker
+    assert "build_quote_merge_prompt" not in worker
     assert "is_persistent_permission_action(" not in worker
     assert "'允许一次', 'Allow once'" in desktop
     assert "'始终允许'" not in desktop
@@ -1687,6 +1715,76 @@ def test_relay_builds_private_chat_batches_from_the_sealed_price_plan(tmp_path: 
     sales = store.public_get(public["job_id"])
     assert "customer_owned_source" not in json.dumps(sales)
     assert "整单原始报价资料" not in json.dumps(sales)
+
+
+def test_numbered_relay_exposes_component_result_save_and_automatic_delivery_state(
+    tmp_path: Path,
+) -> None:
+    checkpoints = tmp_path / "v2-quotes"
+    store = GptQuoteRelayStore(tmp_path / "relay", checkpoint_directory=checkpoints)
+    request = (
+        "1. 云服务器：1 台。\n2. 对象存储：1 TiB。\n"
+        "3. 数据库：1 套。\n4. 缓存：1 套。\n5. 网关：1 个。\n"
+        "6. 消息队列：1 套。"
+    )
+    public = store.create(
+        request,
+        {},
+        numbered_components=parse_numbered_component_lines(request),
+    )
+    record = store.get(public["job_id"])
+    batch_id = record["reserved_price_batch_id"]
+    checkpoints.mkdir(parents=True)
+    (checkpoints / f"relay-{public['job_id']}.json").write_text(
+        json.dumps({"relay_job_id": public["job_id"], "price_batch_id": batch_id}),
+        encoding="utf-8",
+    )
+    components = [
+        {
+            "component_key": f"cmp_intake_{index:04d}",
+            "customer_owned_source": f"组件 {index}。",
+            "billing_scopes": [{"billing_key": "base"}],
+        }
+        for index in range(1, 7)
+    ]
+    price_batch_path = checkpoints / f"{batch_id}.json"
+    price_batch_path.write_text(
+        json.dumps({
+            "price_batch_id": batch_id,
+            "relay_job_id": public["job_id"],
+            "quote_components": components,
+            "component_lifecycle": [
+                {"component_key": item["component_key"], "state": "completed"}
+                for item in components
+            ],
+            "component_result_fragments": [{"batch_index": 0}],
+        }),
+        encoding="utf-8",
+    )
+
+    batches = store.quote_chat_batches(public["job_id"])
+    assert batches[0]["component_result_required"] is True
+    assert batches[0]["component_result_saved"] is True
+    assert batches[1]["component_result_saved"] is False
+    assert batches[0]["automatic_delivery_pending"] is False
+
+    saved = json.loads(price_batch_path.read_text(encoding="utf-8"))
+    saved["component_result_fragments"].append({"batch_index": 1})
+    saved["automatic_delivery_owner_batch_index"] = 1
+    price_batch_path.write_text(json.dumps(saved), encoding="utf-8")
+    batches = store.quote_chat_batches(public["job_id"])
+    assert batches[1]["automatic_delivery_pending"] is True
+
+    (checkpoints / f"relay-{public['job_id']}.json").write_text(
+        json.dumps({
+            "relay_job_id": public["job_id"], "price_batch_id": batch_id,
+            "stage": "delivery_completed",
+        }),
+        encoding="utf-8",
+    )
+    assert store.quote_chat_batches(public["job_id"])[1][
+        "automatic_delivery_pending"
+    ] is False
 
 
 def test_relay_persists_multiple_codex_chat_references_for_one_sales_quote(

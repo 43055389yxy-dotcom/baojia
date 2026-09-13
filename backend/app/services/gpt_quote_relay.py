@@ -419,6 +419,17 @@ class GptQuoteRelayStore:
             for item in (batch.get("component_lifecycle") or [])
             if isinstance(item, dict)
         }
+        saved_result_batches = {
+            int(item.get("batch_index"))
+            for item in (batch.get("component_result_fragments") or [])
+            if isinstance(item, dict)
+            and str(item.get("batch_index", "")).isdigit()
+        }
+        automatic_delivery_owner = batch.get("automatic_delivery_owner_batch_index")
+        all_component_results_saved = bool(saved_result_batches) and len(
+            saved_result_batches
+        ) == int(record.get("intake_batch_count") or len(saved_result_batches))
+        delivery_complete = checkpoint.get("stage") == "delivery_completed"
 
         intake_batches = self.intake_chat_batches(job_id)
         if intake_batches:
@@ -465,6 +476,14 @@ class GptQuoteRelayStore:
                         "component_states": {
                             key: lifecycle_by_key.get(key, "pending") for key in state_keys
                         },
+                        "component_result_required": True,
+                        "component_result_saved": batch_index in saved_result_batches,
+                        "automatic_delivery_pending": bool(
+                            all_component_results_saved
+                            and not delivery_complete
+                            and automatic_delivery_owner is not None
+                            and int(automatic_delivery_owner) == batch_index
+                        ),
                     }
                 )
             return result
@@ -488,6 +507,9 @@ class GptQuoteRelayStore:
                     )
                     for item in group
                 },
+                "component_result_required": False,
+                "component_result_saved": False,
+                "automatic_delivery_pending": False,
             }
             for index, group in enumerate(grouped)
         ]
@@ -1709,27 +1731,36 @@ class GptQuoteRelayStore:
             path = self.heartbeat_path_for(engine)
             heartbeat: dict[str, Any] = {}
             ready = False
+            fresh = False
             if path.exists():
                 try:
                     heartbeat = self._read(path)
                     updated = datetime.fromisoformat(str(heartbeat["updated_at"]))
-                    ready = (
-                        datetime.now(UTC) - updated < timedelta(seconds=45)
-                        and bool(heartbeat.get("logged_in"))
-                    )
+                    fresh = datetime.now(UTC) - updated < timedelta(seconds=45)
+                    ready = fresh and bool(heartbeat.get("logged_in"))
                 except (OSError, ValueError, KeyError, TypeError):
                     ready = False
+                    fresh = False
             updated_text = str(heartbeat.get("updated_at") or "") or None
             if updated_text and (latest_updated_at is None or updated_text > latest_updated_at):
                 latest_updated_at = updated_text
+            heartbeat_state = str(heartbeat.get("state") or "")
+            starting = fresh and heartbeat_state in {"starting", "recovering"}
             engines[engine] = {
-                "status": "ready" if ready else "offline",
+                "status": "ready" if ready else "starting" if starting else "offline",
                 "max_concurrent_quotes": self.max_concurrent_quotes,
             }
         ready = any(item["status"] == "ready" for item in engines.values())
+        starting = any(item["status"] == "starting" for item in engines.values())
         return {
-            "status": "ready" if ready else "offline",
-            "message": "服务正常" if ready else "报价服务暂时不可用",
+            "status": "ready" if ready else "starting" if starting else "offline",
+            "message": (
+                "服务正常"
+                if ready
+                else "报价服务正在启动"
+                if starting
+                else "报价服务暂时不可用"
+            ),
             "updated_at": latest_updated_at,
             "engines": engines,
         }

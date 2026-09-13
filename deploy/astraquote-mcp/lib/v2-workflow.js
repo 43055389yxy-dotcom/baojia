@@ -2,7 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { randomUUID } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const { isDeepStrictEqual } = require('node:util');
 
 const { V2QuoteStore } = require('./v2-quote-store');
@@ -444,13 +444,188 @@ function assertRelayBatchesReadyForEstimate(relayJob, priceBatch) {
     };
     throw error;
   }
-  if (manifest.batchCount > 1 && relayJob.merge_authorized !== true) {
+  const savedResultBatches = new Set(
+    (priceBatch.component_result_fragments || []).map((item) => Number(item.batch_index)),
+  );
+  const automaticMergeReady = savedResultBatches.size === manifest.batchCount
+    && manifest.batches.every((item) => savedResultBatches.has(Number(item.batch_index)));
+  if (manifest.batchCount > 1
+    && !automaticMergeReady
+    && relayJob.merge_authorized !== true) {
     const error = new Error('The desktop worker has not authorized the final multi-chat merge yet.');
     error.code = 'relay_merge_not_authorized';
     error.retryable = true;
     error.terminal = false;
     throw error;
   }
+}
+
+function decimalParts(value) {
+  const text = String(value);
+  if (!/^\d+(?:\.\d{1,10})?$/.test(text)) {
+    const error = new Error('A programmatic quote total is not a valid non-negative decimal.');
+    error.code = 'component_result_total_invalid';
+    error.details = { value: text };
+    throw error;
+  }
+  const [integer, fraction = ''] = text.split('.');
+  return { integer, fraction };
+}
+
+function sumDecimalStrings(values) {
+  const parts = values.map(decimalParts);
+  const scale = parts.reduce((maximum, item) => Math.max(maximum, item.fraction.length), 0);
+  const total = parts.reduce((sum, item) => (
+    sum + BigInt(`${item.integer}${item.fraction.padEnd(scale, '0')}`)
+  ), 0n);
+  if (scale === 0) return total.toString();
+  const padded = total.toString().padStart(scale + 1, '0');
+  const integer = padded.slice(0, -scale);
+  const fraction = padded.slice(-scale).replace(/0+$/u, '');
+  return fraction ? `${integer}.${fraction}` : integer;
+}
+
+function relayBatchOwnedKeys(priceBatch, batchIndex) {
+  const batch = (priceBatch.relay_component_batches || []).find(
+    (item) => Number(item.batch_index) === Number(batchIndex),
+  );
+  return batch ? [...new Set((batch.component_keys || []).map(String))] : [];
+}
+
+function scopedPriceBatch(priceBatch, ownedKeys) {
+  const owned = new Set(ownedKeys);
+  const queryContexts = (priceBatch.query_contexts || []).filter(
+    (item) => item.purpose === 'discovery' || owned.has(item.component_key),
+  );
+  const queryIds = new Set(queryContexts.map((item) => item.query_id));
+  return {
+    ...priceBatch,
+    quote_components: (priceBatch.quote_components || []).filter(
+      (item) => owned.has(item.component_key),
+    ),
+    relay_component_batches: (priceBatch.relay_component_batches || []).filter(
+      (item) => (item.component_keys || []).some((key) => owned.has(key)),
+    ),
+    query_contexts: queryContexts,
+    official_page_price_evidence: (priceBatch.official_page_price_evidence || []).filter(
+      (item) => owned.has(item.component_key),
+    ),
+    result: {
+      ...(priceBatch.result || {}),
+      results: (priceBatch.result?.results || []).filter((item) => queryIds.has(item.query_id)),
+    },
+  };
+}
+
+function namespacedFactId(batchIndex, fact) {
+  const digest = createHash('sha256')
+    .update(JSON.stringify([Number(batchIndex), fact.component_key, fact.fact_id]))
+    .digest('hex')
+    .slice(0, 48);
+  return `b${Number(batchIndex)}_${digest}`;
+}
+
+function namespaceFragmentFacts(input, batchIndex) {
+  const ids = new Map((input.fact_ledger || []).map((fact) => [
+    fact.fact_id, namespacedFactId(batchIndex, fact),
+  ]));
+  const rewriteComponent = (component) => ({
+    ...component,
+    fact_ids: (component.fact_ids || []).map((factId) => ids.get(factId) || factId),
+  });
+  return {
+    ...input,
+    fact_ledger: (input.fact_ledger || []).map((fact) => ({
+      ...fact, fact_id: ids.get(fact.fact_id),
+    })),
+    services: (input.services || []).map(rewriteComponent),
+    zero_cost_services: (input.zero_cost_services || []).map(rewriteComponent),
+    unpriced_services: (input.unpriced_services || []).map(rewriteComponent),
+  };
+}
+
+function assembleComponentResultFragments(priceBatch, relayJob) {
+  const manifest = relayIntakeManifest(relayJob);
+  const fragments = [...(priceBatch.component_result_fragments || [])]
+    .sort((left, right) => Number(left.batch_index) - Number(right.batch_index));
+  if (!manifest || fragments.length !== manifest.batchCount) {
+    const error = new Error('Not every component result batch has been saved.');
+    error.code = 'relay_component_results_incomplete';
+    error.retryable = true;
+    error.terminal = false;
+    throw error;
+  }
+  const first = fragments[0].input;
+  const metadataFields = ['cloud_provider', 'default_region', 'currency', 'preferred_region'];
+  for (const fragment of fragments.slice(1)) {
+    for (const field of metadataFields) {
+      if ((fragment.input[field] || '') !== (first[field] || '')) {
+        const error = new Error('Component quote batches disagree on whole-quote metadata.');
+        error.code = 'relay_component_result_metadata_mismatch';
+        error.details = { field, first: first[field] || null, received: fragment.input[field] || null };
+        throw error;
+      }
+    }
+  }
+  const scenarioKeys = (first.pricing_scenarios || []).map((item) => item.scenario_key);
+  const pricingScenarios = scenarioKeys.map((scenarioKey) => {
+    const entries = fragments.map((fragment) => (
+      (fragment.input.pricing_scenarios || []).find(
+        (scenario) => scenario.scenario_key === scenarioKey,
+      )
+    ));
+    if (entries.some((entry) => !entry)) {
+      const error = new Error('Component quote batches do not contain the same pricing scenarios.');
+      error.code = 'relay_component_result_scenarios_mismatch';
+      error.details = { scenario_key: scenarioKey };
+      throw error;
+    }
+    return {
+      scenario_key: scenarioKey,
+      ...(entries[0].label ? { label: entries[0].label } : {}),
+      monthly_total: sumDecimalStrings(entries.map((entry) => entry.monthly_total)),
+      upfront_total: sumDecimalStrings(entries.map((entry) => entry.upfront_total || '0')),
+    };
+  });
+  const receivedScenarioSets = fragments.map((fragment) => (
+    (fragment.input.pricing_scenarios || []).map((item) => item.scenario_key).sort()
+  ));
+  const expectedScenarioSet = [...scenarioKeys].sort();
+  if (receivedScenarioSets.some((keys) => !isDeepStrictEqual(keys, expectedScenarioSet))) {
+    const error = new Error('Component quote batches do not contain the same pricing scenarios.');
+    error.code = 'relay_component_result_scenarios_mismatch';
+    throw error;
+  }
+  return {
+    delivery_mode: 'deliver_quote',
+    quote_name: first.quote_name,
+    cloud_provider: first.cloud_provider,
+    relay_job_id: first.relay_job_id,
+    default_region: first.default_region,
+    preferred_region: first.preferred_region,
+    ...(first.region_adjustment_reason
+      ? { region_adjustment_reason: first.region_adjustment_reason }
+      : {}),
+    currency: first.currency,
+    price_batch_id: first.price_batch_id,
+    display_result_on_page: true,
+    is_partial: fragments.some((fragment) => fragment.input.is_partial === true),
+    expected_monthly_total: sumDecimalStrings(
+      fragments.map((fragment) => fragment.input.expected_monthly_total),
+    ),
+    pricing_scenarios: pricingScenarios,
+    fact_ledger: fragments.flatMap((fragment) => fragment.input.fact_ledger || []),
+    services: fragments.flatMap((fragment) => fragment.input.services || []),
+    zero_cost_services: fragments.flatMap(
+      (fragment) => fragment.input.zero_cost_services || [],
+    ),
+    unpriced_services: fragments.flatMap(
+      (fragment) => fragment.input.unpriced_services || [],
+    ),
+    assumptions: fragments.flatMap((fragment) => fragment.input.assumptions || []),
+    adjustments: fragments.flatMap((fragment) => fragment.input.adjustments || []),
+    idempotency_key: `relay-automatic-delivery-${first.relay_job_id}`,
+  };
 }
 
 function assertFormalQuotePricingPlan({ quoteMode, relayJobId, quoteComponents, queries, queryContexts }) {
@@ -1819,6 +1994,9 @@ class AstraQuoteV2Workflow {
       quote_components: finalQuoteComponents,
       registered_relay_batches: finalRelayPlan.registeredBatches,
       relay_component_batches: finalRelayPlan.componentBatches,
+      component_result_fragments: latest?.component_result_fragments || [],
+      automatic_delivery_owner_batch_index:
+        latest?.automatic_delivery_owner_batch_index ?? null,
       query_contexts: finalQueryContexts,
       query_lifecycle: progress.query_lifecycle,
       component_lifecycle: componentStatus.component_lifecycle,
@@ -2379,6 +2557,155 @@ class AstraQuoteV2Workflow {
     }
   }
 
+  validateComponentResultFragment(input, priceBatch, relayJob) {
+    const manifest = relayIntakeManifest(relayJob);
+    const batchIndex = Number(input.relay_batch_index);
+    const batchCount = Number(input.relay_batch_count);
+    if (!manifest
+      || !Number.isInteger(batchIndex)
+      || batchCount !== manifest.batchCount
+      || !manifest.batches.some((item) => Number(item.batch_index) === batchIndex)) {
+      const error = new Error('The component result batch identity does not match the sales task.');
+      error.code = 'relay_component_result_batch_mismatch';
+      error.retryable = true;
+      error.details = {
+        expected_batch_count: manifest?.batchCount || null,
+        received_batch_index: input.relay_batch_index ?? null,
+        received_batch_count: input.relay_batch_count ?? null,
+      };
+      throw error;
+    }
+    const ownedKeys = relayBatchOwnedKeys(priceBatch, batchIndex);
+    const submitted = [
+      ...(input.services || []),
+      ...(input.zero_cost_services || []),
+      ...(input.unpriced_services || []),
+    ];
+    uniqueComponentKeys(submitted);
+    const submittedKeys = submitted.map((item) => item.component_key).sort();
+    const expectedKeys = [...ownedKeys].sort();
+    if (expectedKeys.length === 0 || !isDeepStrictEqual(submittedKeys, expectedKeys)) {
+      const error = new Error('The component result contains missing or cross-batch components.');
+      error.code = 'relay_component_result_batch_mismatch';
+      error.retryable = true;
+      error.details = {
+        relay_batch_index: batchIndex,
+        expected_component_keys: expectedKeys,
+        received_component_keys: submittedKeys,
+      };
+      throw error;
+    }
+
+    const batchPriceEvidence = scopedPriceBatch(priceBatch, ownedKeys);
+    const evidenceBoundInput = attachSavedOfficialPageEvidence(input, batchPriceEvidence);
+    validateSealedCustomerFacts(evidenceBoundInput, batchPriceEvidence);
+    const normalizedInput = applySealedComponentPresentation(validateScenarioSemantics(
+      normalizeScenarioCosts(normalizeComponentCosts(evidenceBoundInput)),
+    ), batchPriceEvidence);
+    const marketProfile = this.capabilityStore.marketProfile(normalizedInput.cloud_provider);
+    const regionScopes = [
+      { region: normalizedInput.default_region, scope: 'quote' },
+      ...(normalizedInput.services || []).map((component) => ({
+        region: component.region, scope: 'priced_component', component_key: component.component_key,
+      })),
+      ...(normalizedInput.zero_cost_services || []).map((component) => ({
+        region: component.region, scope: 'zero_cost_component', component_key: component.component_key,
+      })),
+      ...(normalizedInput.unpriced_services || []).map((component) => ({
+        region: component.region, scope: 'unpriced_component', component_key: component.component_key,
+      })),
+    ].filter((item) => item.region);
+    const mismatchedScope = regionScopes.find((item) => providerRegionMismatch(
+      normalizedInput.cloud_provider, item.region, marketProfile,
+    ));
+    const regionMismatch = mismatchedScope
+      ? providerRegionMismatch(
+        normalizedInput.cloud_provider, mismatchedScope.region, marketProfile,
+      )
+      : null;
+    if (regionMismatch) {
+      const error = new Error('The quote region code does not belong to the selected cloud provider.');
+      error.code = 'quote_region_provider_mismatch';
+      error.retryable = true;
+      error.details = { ...regionMismatch, ...mismatchedScope };
+      throw error;
+    }
+    validatePartialQuoteContract(normalizedInput, batchPriceEvidence);
+    validateSalesRelayCompleteness(normalizedInput, batchPriceEvidence);
+    normalizedInput.unpriced_services = enrichUnpricedServices(
+      normalizedInput, batchPriceEvidence,
+    );
+    validateCustomerDocumentMetadata(normalizedInput);
+    this.validatePriceEvidence(normalizedInput, batchPriceEvidence);
+    this.validateZeroCostEvidence(normalizedInput, batchPriceEvidence);
+    prepareOfficialApiSubmission(normalizedInput);
+    return namespaceFragmentFacts(normalizedInput, batchIndex);
+  }
+
+  async saveComponentResultFragment(input, priceBatch, relayJob) {
+    const batchIndex = Number(input.relay_batch_index);
+    const batchCount = Number(input.relay_batch_count);
+    const validated = this.validateComponentResultFragment(input, priceBatch, relayJob);
+    const {
+      delivery_mode: _deliveryMode,
+      relay_batch_index: _relayBatchIndex,
+      relay_batch_count: _relayBatchCount,
+      idempotency_key: _idempotencyKey,
+      display_result_on_page: _displayResultOnPage,
+      submission_code: _submissionCode,
+      ...fragmentInput
+    } = validated;
+    const latest = this.store.getPriceBatch(input.price_batch_id);
+    const fragments = [...(latest.component_result_fragments || [])];
+    const existing = fragments.find((item) => Number(item.batch_index) === batchIndex);
+    if (existing && !isDeepStrictEqual(existing.input, fragmentInput)) {
+      const error = new Error('This component result batch is already sealed and cannot be changed.');
+      error.code = 'relay_component_result_immutable';
+      error.details = { relay_batch_index: batchIndex };
+      throw error;
+    }
+    if (!existing) {
+      fragments.push({
+        schema_version: 'astraquote-v3-component-result/1',
+        batch_index: batchIndex,
+        batch_count: batchCount,
+        saved_at: new Date().toISOString(),
+        input: fragmentInput,
+      });
+      fragments.sort((left, right) => Number(left.batch_index) - Number(right.batch_index));
+    }
+    const manifest = relayIntakeManifest(relayJob);
+    const savedIndexes = new Set(fragments.map((item) => Number(item.batch_index)));
+    const allSaved = Boolean(manifest)
+      && savedIndexes.size === manifest.batchCount
+      && manifest.batches.every((item) => savedIndexes.has(Number(item.batch_index)));
+    const updatedBatch = {
+      ...latest,
+      updated_at: new Date().toISOString(),
+      component_result_fragments: fragments,
+      automatic_delivery_owner_batch_index: allSaved
+        ? (latest.automatic_delivery_owner_batch_index ?? batchIndex)
+        : (latest.automatic_delivery_owner_batch_index ?? null),
+    };
+    this.store.putPriceBatch(updatedBatch);
+    if (!allSaved) {
+      return {
+        status: 'component_batch_saved',
+        terminal: false,
+        must_continue: true,
+        price_batch_id: input.price_batch_id,
+        relay_batch_index: batchIndex,
+        relay_batch_count: batchCount,
+        saved_batch_indexes: [...savedIndexes].sort((left, right) => left - right),
+        pending_batch_indexes: manifest.batches
+          .map((item) => Number(item.batch_index))
+          .filter((index) => !savedIndexes.has(index)),
+        next_step: 'This component batch is sealed. Stop this turn; the desktop worker will send the next assigned batch.',
+      };
+    }
+    return this.buildEstimate(assembleComponentResultFragments(updatedBatch, relayJob));
+  }
+
   async deliverRecord(record) {
     let deliveryResult;
     if (typeof this.deliverer.createArtifact === 'function'
@@ -2463,6 +2790,18 @@ class AstraQuoteV2Workflow {
       const error = new Error('The saved price batch belongs to a different sales quote task.');
       error.code = 'price_batch_relay_context_mismatch';
       throw error;
+    }
+    if (relayBoundInput.delivery_mode === 'save_component_batch') {
+      if (!relayBoundInput.relay_job_id) {
+        const error = new Error('A component result batch must belong to a sales quote task.');
+        error.code = 'relay_component_result_context_required';
+        throw error;
+      }
+      return this.saveComponentResultFragment(
+        relayBoundInput,
+        priceBatch,
+        readRelayJob(relayBoundInput.relay_job_id),
+      );
     }
     if (relayBoundInput.relay_job_id) {
       assertRelayBatchesReadyForEstimate(

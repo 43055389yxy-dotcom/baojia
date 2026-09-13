@@ -7,7 +7,7 @@ const source = await readFile(new URL("../app/sales/presentation.ts", import.met
 const compiled = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
-const { progressPercent, processingStatusDetail, queuedStatusDetail, unpricedRecoveryText, canRetryUnpriced, money } =
+const { progressPercent, estimatedQuoteWindow, unpricedRecoveryText, canRetryUnpriced, money } =
   await import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
 
 test("sales progress never invents completion or treats queue/login as running", () => {
@@ -18,20 +18,12 @@ test("sales progress never invents completion or treats queue/login as running",
   assert.equal(progressPercent({ status: "processing", progress: { total_component_count: 40, completed_component_count: 38 } }), 95);
 });
 
-test("quote assembly remains visible after all prices are saved and batches do not imply unlimited parallelism", () => {
-  const text = processingStatusDetail({ progress: { stage: "estimate_validated", total_component_count: 60, completed_component_count: 60, component_chat_count: 3 } });
-  assert.match(text, /正在生成 Excel/);
-  const large = processingStatusDetail({ progress: { total_component_count: 120, completed_component_count: 38, component_chat_count: 6 } });
-  assert.match(large, /38\/120/);
-  assert.match(large, /6 批/);
-  assert.doesNotMatch(large, /6 批并行/);
-});
-
-test("queued sales see shared quote slots rather than a misleading salesperson count", () => {
-  const text = queuedStatusDetail({ active_quote_count: 3, max_concurrent_quotes: 4, queued_ahead_count: 1, estimated_wait_minutes: 5 });
-  assert.match(text, /3\/4 个报价名额/);
-  assert.match(text, /1 个任务排在您前面/);
-  assert.match(text, /预计等待约 5 分钟/);
+test("sales see a professional time window without internal component counters", () => {
+  assert.equal(estimatedQuoteWindow({ progress: { top_level_component_count: 10 } }), "10～20 分钟");
+  assert.equal(estimatedQuoteWindow({ progress: { top_level_component_count: 11 } }), "15～30 分钟");
+  assert.equal(estimatedQuoteWindow({ progress: { top_level_component_count: 20 } }), "15～30 分钟");
+  assert.equal(estimatedQuoteWindow({ progress: { total_component_count: 20 } }), "15～30 分钟");
+  assert.equal(estimatedQuoteWindow({}), "10～20 分钟");
 });
 
 test("partial recovery is actionable without echoing internal errors or offering impossible retries", () => {

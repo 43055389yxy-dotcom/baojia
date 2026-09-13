@@ -204,11 +204,17 @@ def test_failed_component_is_not_treated_as_completed_before_its_one_retry(worke
     assert not worker.batch_is_finished({
         "component_keys": ["a"], "component_states": {"a": "failed"},
     })
+    assert not worker.batch_is_finished({
+        "component_keys": ["a"], "component_states": {"a": "completed"},
+        "component_result_required": True,
+    })
     assert worker.batch_is_finished({
         "component_keys": ["a"], "component_states": {"a": "completed"},
+        "component_result_required": True, "component_result_saved": True,
     })
     assert not worker.batch_is_finished({
         "component_keys": ["a", "b"], "component_states": {"a": "completed"},
+        "component_result_required": False, "component_result_saved": True,
     })
 
 
@@ -229,130 +235,55 @@ def test_unconfirmed_ui_send_does_not_consume_component_retry(worker, running_jo
     assert store.get(job_id)["chat_sessions"][0].get("stalled_attempts", 0) == 0
 
 
-def test_final_merge_waits_until_running_chats_have_stopped(worker, running_job, monkeypatch):
-    store, job_id, _ = running_job
-    for index in range(2):
-        store.record_chat_session(
-            job_id, batch_index=index, batch_count=2,
-            chat_url=codex_chat(index),
-            role="coordinator" if index == 0 else "component_batch", component_keys=[str(index)],
-        )
-    batches = [{"batch_index": index, "price_batch_id": "aqpb_id", "component_keys": [str(index)],
-                "component_states": {str(index): "completed"}} for index in range(2)]
-    monkeypatch.setattr(store, "quote_chat_batches", lambda *_: batches)
-    coordinator = worker.ActiveQuote(job_id, "https://chatgpt.com/c/batch-0", 100)
-    active = {coordinator.session_key: coordinator}
-    browser = Mock()
-    worker.maybe_start_final_merge(store, browser, active, job_id)
-    browser.continue_quote.assert_not_called()
-    assert coordinator.role == "coordinator"
-
-
-def test_merge_cannot_take_a_fifth_active_chat_slot(worker, running_job, monkeypatch):
-    store, job_id, _ = running_job
-    for index in range(2):
-        store.record_chat_session(
-            job_id, batch_index=index, batch_count=2,
-            chat_url=codex_chat(index),
-            role="coordinator" if index == 0 else "component_batch", component_keys=[str(index)],
-        )
-        store.update_chat_session(job_id, index, status="saved")
-    batches = [{"batch_index": index, "price_batch_id": "aqpb_id", "component_keys": [str(index)],
-                "component_states": {str(index): "completed"}} for index in range(2)]
-    monkeypatch.setattr(store, "quote_chat_batches", lambda *_: batches)
-    active = {f"other-{i}:0": worker.ActiveQuote(f"other-{i}", "https://chatgpt.com/c/other", 100)
-              for i in range(4)}
-    browser = Mock()
-    worker.maybe_start_final_merge(store, browser, active, job_id)
-    browser.resume_quote.assert_not_called()
-    browser.continue_quote.assert_not_called()
-
-
-def test_final_merge_is_authorized_only_when_every_batch_chat_has_stopped(
+def test_completed_prices_trigger_one_small_batch_result_save_not_a_retry(
     worker, running_job, monkeypatch,
 ):
     store, job_id, _ = running_job
-    for index in range(2):
-        store.record_chat_session(
-            job_id, batch_index=index, batch_count=2,
-            chat_url=codex_chat(index),
-            role="coordinator" if index == 0 else "component_batch",
-            component_keys=[str(index)],
-        )
-        store.update_chat_session(job_id, index, status="saved")
-    batches = [
-        {
-            "batch_index": index,
-            "batch_count": 2,
-            "price_batch_id": "aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "component_keys": [str(index)],
-            "component_states": {str(index): "completed"},
-        }
-        for index in range(2)
-    ]
-    monkeypatch.setattr(store, "quote_chat_batches", lambda *_: batches)
-    browser = Mock()
-    browser.resume_quote.side_effect = lambda job, url, **kwargs: worker.ActiveQuote(
-        job, url, 100, **kwargs,
+    store.record_chat_session(
+        job_id, batch_index=0, batch_count=2,
+        chat_url=codex_chat(0), role="coordinator", component_keys=["a"],
     )
-
-    worker.maybe_start_final_merge(store, browser, {}, job_id)
-
-    assert store.get(job_id)["merge_authorized"] is True
-    browser.continue_quote.assert_called_once()
-
-
-def test_final_merge_keeps_coordinator_reserved_when_ui_send_is_pending(
-    worker, running_job, monkeypatch,
-):
-    store, job_id, _ = running_job
-    for index in range(2):
-        store.record_chat_session(
-            job_id, batch_index=index, batch_count=2,
-            chat_url=codex_chat(index),
-            role="coordinator" if index == 0 else "component_batch",
-            component_keys=[str(index)],
-        )
-        store.update_chat_session(job_id, index, status="stalled")
-    batches = [
-        {
-            "batch_index": index,
-            "batch_count": 2,
-            "price_batch_id": "aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "component_keys": [str(index)],
-            "component_states": {str(index): "pending"},
-        }
-        for index in range(2)
-    ]
-    monkeypatch.setattr(store, "quote_chat_batches", lambda *_: batches)
+    batch = {
+        "batch_index": 0, "batch_count": 2,
+        "price_batch_id": "aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "component_keys": ["a"], "component_states": {"a": "completed"},
+        "component_result_required": True, "component_result_saved": False,
+    }
+    monkeypatch.setattr(worker, "active_batch", lambda *_: batch)
+    active = worker.ActiveQuote(job_id, codex_chat(0), 100, batch_count=2)
     browser = Mock()
-    browser.resume_quote.side_effect = lambda job, url, **kwargs: worker.ActiveQuote(
-        job, url, 100, **kwargs,
-    )
-    browser.continue_quote.side_effect = worker.PendingPromptSubmissionError("draft")
-    active = {}
-
-    with pytest.raises(worker.PendingPromptSubmissionError):
-        worker.maybe_start_final_merge(store, browser, active, job_id)
-
-    assert list(active) == [f"{job_id}:0"]
-    assert active[f"{job_id}:0"].role == "merge"
-    session = store.get(job_id)["chat_sessions"][0]
-    assert session["status"] == "merging"
-    assert [event["stage"] for event in store.get(job_id)["events"]].count("merge") == 1
-
-    worker.maybe_start_final_merge(store, browser, active, job_id)
+    assert worker.continue_component_batch(store, browser, active)
+    prompt = browser.continue_quote.call_args.args[1]
+    assert "delivery_mode=save_component_batch" in prompt
+    assert "不要重新查价" in prompt
+    assert active.stalled_attempts == 0
+    assert active.finalize_attempts == 1
+    assert not worker.continue_component_batch(store, browser, active)
     assert browser.continue_quote.call_count == 1
-    assert [event["stage"] for event in store.get(job_id)["events"]].count("merge") == 1
+    assert store.get(job_id)["chat_sessions"][0]["status"] == "stalled"
 
 
-def test_authorize_merge_is_idempotent(running_job):
+def test_saved_batch_advances_without_reopening_a_final_merge_chat(
+    worker, running_job, monkeypatch,
+):
     store, job_id, _ = running_job
+    store.record_chat_session(
+        job_id, batch_index=0, batch_count=1,
+        chat_url=codex_chat(0), role="coordinator", component_keys=["a"],
+    )
+    batch = {
+        "batch_index": 0, "batch_count": 1,
+        "price_batch_id": "aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "component_keys": ["a"], "component_states": {"a": "completed"},
+        "component_result_saved": True, "automatic_delivery_pending": False,
+    }
+    monkeypatch.setattr(worker, "active_batch", lambda *_: batch)
+    active = worker.ActiveQuote(job_id, codex_chat(0), 100)
+    browser = Mock()
 
-    store.authorize_merge(job_id)
-    store.authorize_merge(job_id)
-
-    assert [event["stage"] for event in store.get(job_id)["events"]].count("merge") == 1
+    assert not worker.continue_component_batch(store, browser, active)
+    browser.continue_quote.assert_not_called()
+    assert store.get(job_id)["chat_sessions"][0]["status"] == "saved"
 
 
 @pytest.mark.parametrize("status", ["partial", "completed", "cancelled"])
@@ -484,6 +415,36 @@ def test_production_worker_constructs_codex_chat_adapter_not_firefox(worker):
 
     assert "CodexChatDesktop(" in main_source
     assert "browser = ChatGptBrowser()" not in main_source
+
+
+def test_worker_recovers_a_stale_codex_control_session_with_backoff(worker):
+    browser = Mock()
+    browser.logged_in.return_value = False
+    browser.recover_if_unavailable.return_value = True
+
+    logged_in, last_recovery, attempted = worker.browser_login_with_recovery(
+        browser,
+        last_recovery_at=0,
+        now=100,
+    )
+
+    assert logged_in
+    assert last_recovery == 100
+    assert attempted
+    browser.recover_if_unavailable.assert_called_once_with()
+
+    browser.reset_mock()
+    browser.logged_in.return_value = False
+    logged_in, last_recovery, attempted = worker.browser_login_with_recovery(
+        browser,
+        last_recovery_at=95,
+        now=100,
+    )
+
+    assert not logged_in
+    assert last_recovery == 95
+    assert not attempted
+    browser.recover_if_unavailable.assert_not_called()
 
 
 def test_numbered_intake_starts_only_three_conversations_with_five_items_each(
