@@ -456,6 +456,25 @@ class CodexChatDesktop:
             )
         )
 
+    def _composer_ready_for_new_turn(self) -> bool:
+        """Require an empty, enabled composer before appending another wave."""
+
+        return bool(
+            self._evaluate(
+                f"""
+                (() => {{
+                  const composer = document.querySelector({json.dumps(COMPOSER_SELECTOR)});
+                  return Boolean(
+                    composer
+                    && !composer.innerText.trim()
+                    && composer.getAttribute('contenteditable') === 'true'
+                    && composer.getAttribute('aria-disabled') !== 'true'
+                  );
+                }})()
+                """
+            )
+        )
+
     def _click_send_control(self) -> bool:
         """Click the enabled send control nearest the active composer."""
 
@@ -1001,6 +1020,15 @@ class CodexChatDesktop:
                 f"Codex Chat quote did not finish in {self.quote_timeout_seconds} seconds"
             )
         return None
+
+    def ready_for_next_turn(self, quote: Any) -> bool:
+        """Return true only when a backend-complete wave can safely be followed."""
+
+        self._switch_to_quote(quote)
+        self._scroll_to_latest()
+        if self._approve_tool_if_needed():
+            return False
+        return not self._generation_active() and self._composer_ready_for_new_turn()
 
     def continue_quote(self, quote: Any, prompt: str) -> None:
         self._switch_to_quote(quote)

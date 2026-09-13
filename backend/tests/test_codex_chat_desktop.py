@@ -222,7 +222,10 @@ def test_send_prompt_clicks_visible_send_control_and_confirms_new_turn(
 
     desktop._send_prompt("@AstraQuote 正式报价")
 
-    assert any("send-button" in expression and ".click()" in expression for expression in expressions)
+    assert any(
+        "send-button" in expression and ".click()" in expression
+        for expression in expressions
+    )
 
 
 def test_switch_refuses_to_leave_a_conversation_with_an_unsent_draft(
@@ -338,6 +341,44 @@ def test_switch_submits_pending_draft_even_when_quote_is_already_current(
     with pytest.raises(desktop_module.PendingPromptSubmissionError):
         desktop._switch_to_quote(quote)
     assert submitted == [4]
+
+
+def test_ready_for_next_turn_requires_idle_generation_and_ready_composer(
+    desktop_module,
+    monkeypatch,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=60,
+    )
+    quote = object()
+    monkeypatch.setattr(desktop, "_switch_to_quote", lambda _quote: None)
+    monkeypatch.setattr(desktop, "_scroll_to_latest", lambda: None)
+    monkeypatch.setattr(desktop, "_approve_tool_if_needed", lambda: False)
+    monkeypatch.setattr(desktop, "_generation_active", lambda: False)
+    monkeypatch.setattr(desktop, "_composer_ready_for_new_turn", lambda: True)
+
+    assert desktop.ready_for_next_turn(quote)
+
+    monkeypatch.setattr(desktop, "_generation_active", lambda: True)
+    assert not desktop.ready_for_next_turn(quote)
+
+
+def test_ready_for_next_turn_waits_after_approving_a_tool_card(
+    desktop_module,
+    monkeypatch,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=60,
+    )
+    monkeypatch.setattr(desktop, "_switch_to_quote", lambda _quote: None)
+    monkeypatch.setattr(desktop, "_scroll_to_latest", lambda: None)
+    monkeypatch.setattr(desktop, "_approve_tool_if_needed", lambda: True)
+    monkeypatch.setattr(desktop, "_generation_active", lambda: False)
+    monkeypatch.setattr(desktop, "_composer_ready_for_new_turn", lambda: True)
+
+    assert not desktop.ready_for_next_turn(object())
 
 
 def test_new_chat_clears_a_stale_unsent_draft(desktop_module, monkeypatch):

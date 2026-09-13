@@ -200,8 +200,15 @@ def test_single_chat_retries_only_incomplete_components_once_then_requests_parti
 
 
 def test_failed_component_is_not_treated_as_completed_before_its_one_retry(worker):
-    assert not worker.batch_is_finished({"component_states": {"a": "failed"}})
-    assert worker.batch_is_finished({"component_states": {"a": "completed"}})
+    assert not worker.batch_is_finished({
+        "component_keys": ["a"], "component_states": {"a": "failed"},
+    })
+    assert worker.batch_is_finished({
+        "component_keys": ["a"], "component_states": {"a": "completed"},
+    })
+    assert not worker.batch_is_finished({
+        "component_keys": ["a", "b"], "component_states": {"a": "completed"},
+    })
 
 
 def test_unconfirmed_ui_send_does_not_consume_component_retry(worker, running_job, monkeypatch):
@@ -511,6 +518,217 @@ def test_completed_first_wave_sends_second_five_in_same_conversation(
     assert sessions[0]["chat_url"] == sessions[1]["chat_url"] == codex_chat(0)
     assert sessions[0]["status"] == "saved"
     assert sessions[1]["status"] == "running"
+
+
+def test_backend_completed_wave_advances_before_assistant_prose_is_polled(
+    worker,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = GptQuoteRelayStore(tmp_path / "relay", max_concurrent_quotes=4)
+    text = "\n".join(f"{index}. 组件 {index}：配置。" for index in range(1, 11))
+    job = store.create(text, {}, numbered_components=parse_numbered_component_lines(text))
+    record = store.claim_next("test-worker")
+    browser = Mock()
+    browser.logged_in.return_value = True
+    browser.start_quote.return_value = worker.ActiveQuote(job["job_id"], codex_chat(0), 100)
+    active = worker.submit_job(store, browser, record)
+    assert active is not None
+    completed = {
+        "batch_index": 0,
+        "batch_count": 2,
+        "price_batch_id": store.get(job["job_id"])["reserved_price_batch_id"],
+        "component_keys": [f"cmp_intake_{index:04d}" for index in range(1, 6)],
+        "component_states": {
+            f"cmp_intake_{index:04d}": "completed" for index in range(1, 6)
+        },
+    }
+    monkeypatch.setattr(worker, "active_batch", lambda *_: completed)
+    browser.ready_for_next_turn.return_value = True
+    active_quotes = {active.session_key: active}
+
+    assert worker.advance_machine_completed_wave(store, browser, active_quotes)
+
+    assert active.batch_index == 1
+    assert "cmp_intake_0006" in browser.continue_quote.call_args.args[1]
+    browser.poll_quote.assert_not_called()
+
+
+def test_backend_completion_does_not_send_while_the_conversation_is_still_busy(
+    worker,
+    running_job,
+    monkeypatch,
+) -> None:
+    store, job_id, _ = running_job
+    store.record_chat_session(
+        job_id, batch_index=0, batch_count=2,
+        chat_url=codex_chat(0), role="coordinator", component_keys=["a"],
+    )
+    active = worker.ActiveQuote(
+        job_id, codex_chat(0), 100, batch_count=2, component_keys=("a",),
+    )
+    monkeypatch.setattr(worker, "active_batch", lambda *_: {
+        "batch_index": 0,
+        "batch_count": 2,
+        "price_batch_id": "aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "component_keys": ["a"],
+        "component_states": {"a": "completed"},
+    })
+    browser = Mock()
+    browser.ready_for_next_turn.return_value = False
+
+    assert worker.advance_machine_completed_wave(
+        store, browser, {active.session_key: active},
+    )
+    browser.continue_quote.assert_not_called()
+
+
+def test_completed_wave_fast_path_does_not_starve_an_older_sibling_chat(
+    worker,
+    running_job,
+    monkeypatch,
+) -> None:
+    store, job_id, _ = running_job
+    older = worker.ActiveQuote(
+        job_id, codex_chat(0), 100, batch_count=2,
+        conversation_index=0, component_keys=("a",), last_polled_at=10.0,
+    )
+    completed = worker.ActiveQuote(
+        job_id, codex_chat(1), 100, batch_index=1, batch_count=2,
+        conversation_index=1, component_keys=("b",), last_polled_at=20.0,
+    )
+    batches = {
+        0: {
+            "component_keys": ["a"], "component_states": {"a": "pending"},
+        },
+        1: {
+            "component_keys": ["b"], "component_states": {"b": "completed"},
+        },
+    }
+    monkeypatch.setattr(worker, "active_batch", lambda _store, quote: batches[quote.batch_index])
+    browser = Mock()
+
+    assert not worker.advance_machine_completed_wave(
+        store,
+        browser,
+        {older.session_key: older, completed.session_key: completed},
+    )
+    browser.ready_for_next_turn.assert_not_called()
+
+
+def test_incomplete_backend_state_must_settle_before_the_one_retry(
+    worker,
+    running_job,
+    monkeypatch,
+) -> None:
+    store, job_id, _ = running_job
+    store.record_chat_session(
+        job_id, batch_index=0, batch_count=2,
+        chat_url=codex_chat(0), role="coordinator", component_keys=["a", "b"],
+    )
+    active = worker.ActiveQuote(
+        job_id, codex_chat(0), 100, batch_count=2, component_keys=("a", "b"),
+    )
+    batch = {
+        "batch_index": 0,
+        "batch_count": 2,
+        "price_batch_id": "aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "component_keys": ["a", "b"],
+        "component_states": {"a": "completed", "b": "pending"},
+    }
+    monkeypatch.setattr(worker, "active_batch", lambda *_: batch)
+    monkeypatch.setattr(worker.time, "time", lambda: 1_000.0)
+
+    assert not worker.component_batch_state_settled(store, active, now=100.0)
+    assert not worker.component_batch_state_settled(
+        store,
+        active,
+        now=100.0 + worker.BATCH_STATE_SETTLE_SECONDS - 0.1,
+    )
+    assert worker.component_batch_state_settled(
+        store,
+        active,
+        now=100.0 + worker.BATCH_STATE_SETTLE_SECONDS,
+    )
+    session = store.get(job_id)["chat_sessions"][0]
+    assert session["backend_settle_fingerprint"]
+    assert session["backend_settle_started_at_epoch"] == 1_000.0
+
+
+def test_new_backend_success_resets_settle_window_instead_of_retrying_early(
+    worker,
+    running_job,
+    monkeypatch,
+) -> None:
+    store, job_id, _ = running_job
+    store.record_chat_session(
+        job_id, batch_index=0, batch_count=2,
+        chat_url=codex_chat(0), role="coordinator", component_keys=["a", "b"],
+    )
+    active = worker.ActiveQuote(
+        job_id, codex_chat(0), 100, batch_count=2, component_keys=("a", "b"),
+    )
+    batch = {
+        "batch_index": 0,
+        "batch_count": 2,
+        "price_batch_id": "aqpb_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "component_keys": ["a", "b"],
+        "component_states": {"a": "pending", "b": "pending"},
+    }
+    monkeypatch.setattr(worker, "active_batch", lambda *_: batch)
+
+    assert not worker.component_batch_state_settled(store, active, now=100.0)
+    batch["component_states"]["a"] = "completed"
+    assert not worker.component_batch_state_settled(
+        store,
+        active,
+        now=100.0 + worker.BATCH_STATE_SETTLE_SECONDS,
+    )
+    assert active.backend_settle_started_at == 100.0 + worker.BATCH_STATE_SETTLE_SECONDS
+
+
+def test_backend_state_regression_cannot_reopen_a_saved_component(worker) -> None:
+    batch = {
+        "component_keys": ["a", "b"],
+        "component_states": {"a": "completed", "b": "pending"},
+    }
+    progress = worker.batch_progress_fingerprint(batch)
+    first = worker.component_batch_state_fingerprint(batch, progress)
+    batch["component_states"]["a"] = "pending"
+
+    assert worker.component_batch_state_fingerprint(batch, progress) == first
+
+
+def test_worker_restart_restores_the_backend_settle_window(
+    worker,
+    running_job,
+    monkeypatch,
+) -> None:
+    store, job_id, _ = running_job
+    store.record_chat_session(
+        job_id, batch_index=0, batch_count=2,
+        chat_url=codex_chat(0), role="coordinator", component_keys=["a"],
+    )
+    store.update_chat_session(
+        job_id,
+        0,
+        backend_settle_fingerprint='{"completed":[],"remaining":["a"]}',
+        backend_settle_started_at_epoch=995.0,
+    )
+    record = store.get(job_id)
+    browser = Mock()
+    browser.resume_quote.side_effect = lambda current_job, url, **kwargs: worker.ActiveQuote(
+        current_job, url, 100, **kwargs,
+    )
+    monkeypatch.setattr(worker.time, "time", lambda: 1_000.0)
+    monkeypatch.setattr(worker.time, "monotonic", lambda: 200.0)
+    active_quotes: dict[str, worker.ActiveQuote] = {}
+
+    worker.reattach_job_chats(store, browser, record, active_quotes)
+
+    active = active_quotes[f"{job_id}:0"]
+    assert active.backend_settle_fingerprint
+    assert active.backend_settle_started_at == 195.0
 
 
 def test_worker_restart_resumes_unsent_second_wave_in_the_same_conversation(

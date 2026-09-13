@@ -26,10 +26,30 @@ def bounded_continuation_attempts(value: str | None) -> int:
     return min(1, max(1, requested))
 
 
-def active_quote_poll_order(active_quotes: Mapping[str, Any]) -> tuple[str, ...]:
-    """Snapshot every active tab so one polling round cannot omit background work."""
+def active_quote_poll_order(
+    active_quotes: Mapping[str, Any],
+    *,
+    limit: int | None = None,
+) -> tuple[str, ...]:
+    """Visit the least-recently inspected conversations first.
 
-    return tuple(active_quotes.keys())
+    The desktop has one visible window.  Sampling every active conversation in
+    one loop made that window jump several times within a few seconds.  A
+    stable least-recently-polled order keeps the scan fair while allowing the
+    caller to inspect only one conversation per tick.
+    """
+
+    ordered = sorted(
+        enumerate(active_quotes.items()),
+        key=lambda item: (
+            float(getattr(item[1][1], "last_polled_at", 0.0) or 0.0),
+            item[0],
+        ),
+    )
+    keys = tuple(item[1][0] for item in ordered)
+    if limit is None:
+        return keys
+    return keys[: max(0, int(limit))]
 
 
 def should_extend_quote_deadline(

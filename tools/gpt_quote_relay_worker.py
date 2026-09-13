@@ -60,14 +60,20 @@ if RELAY_ENGINE == "gemini":
 else:
     from codex_chat_desktop import (
         CodexChatDesktop,
-        PendingPromptSubmissionError as CodexPendingPromptSubmissionError,
         is_pending_chat_reference,
+    )
+    from codex_chat_desktop import (
+        PendingPromptSubmissionError as CodexPendingPromptSubmissionError,
     )
 
     PendingPromptSubmissionError = CodexPendingPromptSubmissionError
 
 POLL_SECONDS = float(os.environ.get("ASTRAQUOTE_GPT_RELAY_POLL_SECONDS", "4"))
 QUOTE_TIMEOUT_SECONDS = int(os.environ.get("ASTRAQUOTE_GPT_QUOTE_TIMEOUT", "600"))
+BATCH_STATE_SETTLE_SECONDS = max(
+    POLL_SECONDS * 2,
+    float(os.environ.get("ASTRAQUOTE_GPT_BATCH_STATE_SETTLE_SECONDS", "12")),
+)
 MAX_CONTINUATION_ATTEMPTS = bounded_continuation_attempts(
     os.environ.get("ASTRAQUOTE_GPT_MAX_CONTINUATIONS")
 )
@@ -132,6 +138,9 @@ class ActiveQuote:
     machine_progress_fingerprint: str = ""
     stalled_attempts: int = 0
     previous_conversation_ids: tuple[str, ...] = ()
+    backend_settle_fingerprint: str = ""
+    backend_settle_started_at: float = 0.0
+    last_polled_at: float = 0.0
 
     @property
     def session_key(self) -> str:
@@ -287,8 +296,11 @@ def batch_progress_fingerprint(batch: dict[str, Any], previous: str = "") -> str
 
 
 def batch_is_finished(batch: dict[str, Any]) -> bool:
-    states = list((batch.get("component_states") or {}).values())
-    return bool(states) and all(state == "completed" for state in states)
+    component_keys = list(batch.get("component_keys") or [])
+    states = batch.get("component_states") or {}
+    return bool(component_keys) and all(
+        states.get(component_key) == "completed" for component_key in component_keys
+    )
 
 
 def incomplete_component_keys(batch: dict[str, Any]) -> list[str]:
@@ -299,6 +311,28 @@ def incomplete_component_keys(batch: dict[str, Any]) -> list[str]:
         key for key in batch.get("component_keys") or []
         if states.get(key) != "completed"
     ]
+
+
+def component_batch_state_fingerprint(
+    batch: dict[str, Any],
+    previous_progress: str = "",
+) -> str:
+    """Describe only durable success and the remaining owned component keys."""
+
+    progress = batch_progress_fingerprint(batch, previous_progress)
+    completed = set(json.loads(progress))
+    return json.dumps(
+        {
+            "completed": sorted(completed),
+            "remaining": [
+                key for key in batch.get("component_keys") or []
+                if key not in completed
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def active_batch(
@@ -332,6 +366,37 @@ def refresh_progress_deadline(store: GptQuoteRelayStore, active: ActiveQuote) ->
         active.generation_grace_used = False
 
 
+def component_batch_state_settled(
+    store: GptQuoteRelayStore,
+    active: ActiveQuote,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Wait for delayed backend writes before spending the batch's sole retry."""
+
+    batch = active_batch(store, active)
+    if batch is None or batch_is_finished(batch):
+        return True
+    if active.stalled_attempts >= MAX_CONTINUATION_ATTEMPTS:
+        return True
+    observed_at = time.monotonic() if now is None else now
+    progress = batch_progress_fingerprint(batch, active.batch_progress_fingerprint)
+    active.batch_progress_fingerprint = progress
+    fingerprint = component_batch_state_fingerprint(batch, progress)
+    if fingerprint != active.backend_settle_fingerprint:
+        active.backend_settle_fingerprint = fingerprint
+        active.backend_settle_started_at = observed_at
+        store.update_chat_session(
+            active.job_id,
+            active.batch_index,
+            progress_fingerprint=progress,
+            backend_settle_fingerprint=fingerprint,
+            backend_settle_started_at_epoch=time.time(),
+        )
+        return False
+    return observed_at - active.backend_settle_started_at >= BATCH_STATE_SETTLE_SECONDS
+
+
 def continue_component_batch(
     store: GptQuoteRelayStore,
     browser: Any,
@@ -360,7 +425,11 @@ def continue_component_batch(
             completed_status="stalled",
         )
     latest = store.get(active.job_id)
-    remaining_component_keys = incomplete_component_keys(batch)
+    completed_component_keys = set(json.loads(fingerprint))
+    remaining_component_keys = [
+        key for key in batch.get("component_keys") or []
+        if key not in completed_component_keys
+    ]
     if not remaining_component_keys:
         return advance_to_next_wave(
             store,
@@ -389,7 +458,11 @@ def continue_component_batch(
         status="running",
         stalled_attempts=active.stalled_attempts,
         progress_fingerprint=fingerprint,
+        backend_settle_fingerprint=None,
+        backend_settle_started_at_epoch=None,
     )
+    active.backend_settle_fingerprint = ""
+    active.backend_settle_started_at = 0.0
     return True
 
 
@@ -421,6 +494,8 @@ def advance_to_next_wave(
             active.batch_index,
             status=completed_status,
             stalled_attempts=active.stalled_attempts,
+            backend_settle_fingerprint=None,
+            backend_settle_started_at_epoch=None,
         )
         return False
 
@@ -440,6 +515,8 @@ def advance_to_next_wave(
         active.batch_index,
         status=completed_status,
         stalled_attempts=active.stalled_attempts,
+        backend_settle_fingerprint=None,
+        backend_settle_started_at_epoch=None,
     )
     store.record_chat_session(
         active.job_id,
@@ -462,7 +539,79 @@ def advance_to_next_wave(
     active.stalled_attempts = 0
     active.batch_progress_fingerprint = ""
     active.machine_progress_fingerprint = ""
+    active.backend_settle_fingerprint = ""
+    active.backend_settle_started_at = 0.0
     return True
+
+
+def advance_machine_completed_wave(
+    store: GptQuoteRelayStore,
+    browser: Any,
+    active_quotes: dict[str, ActiveQuote],
+) -> bool:
+    """Advance one backend-complete wave without waiting for assistant prose.
+
+    The function deliberately inspects at most one visible conversation.  This
+    both prioritizes a ready second wave and prevents one desktop window from
+    bouncing through every active conversation in a single relay tick.
+    """
+
+    # Only the overall least-recently inspected conversation may take this
+    # fast path.  An unusually long final response in one completed wave must
+    # not starve permission checks and progress reads in its sibling chats.
+    for session_key in active_quote_poll_order(active_quotes, limit=1):
+        active = active_quotes.get(session_key)
+        if (
+            active is None
+            or active.batch_count <= 1
+            or active.role == "merge"
+        ):
+            continue
+        batch = active_batch(store, active)
+        if batch is None or not batch_is_finished(batch):
+            continue
+        active.last_polled_at = time.monotonic()
+        current = store.reconcile_delivery_receipt(active.job_id)
+        if current.get("status") in {"completed", "partial", "failed"}:
+            stop_terminal_job_chats(browser, active_quotes, active.job_id)
+            return True
+        if current.get("status") == "cancelled":
+            stop_terminal_job_chats(
+                browser, active_quotes, active.job_id, cancelled=True,
+            )
+            return True
+        try:
+            store.renew_lease(active.job_id, WORKER_ID, lease_minutes=35)
+            previous_reference = active.chat_url
+            ready = getattr(browser, "ready_for_next_turn", None)
+            can_continue = bool(ready(active)) if callable(ready) else True
+            persist_promoted_chat_reference(store, active, previous_reference)
+            if not can_continue:
+                return True
+            if not continue_component_batch(store, browser, active):
+                active_quotes.pop(session_key, None)
+            maybe_start_final_merge(
+                store, browser, active_quotes, active.job_id,
+            )
+        except PendingPromptSubmissionError:
+            active.stable_since = time.monotonic()
+        except Exception as exc:  # noqa: BLE001 - isolate this visible quote
+            if is_transient_browser_poll_exception(exc):
+                reconnect = getattr(browser, "reconnect", None)
+                if callable(reconnect):
+                    try:
+                        reconnect()
+                    except Exception:  # noqa: BLE001,S110 - retry next tick
+                        pass
+            else:
+                fail_job(store, active.job_id, exc)
+                try:
+                    browser.close_quote(active)
+                except Exception:  # noqa: BLE001,S110 - terminal cleanup is best effort
+                    pass
+                active_quotes.pop(session_key, None)
+        return True
+    return False
 
 
 def create_missing_component_chats(
@@ -928,6 +1077,18 @@ def reattach_job_chats(
         active.batch_progress_fingerprint = str(
             session.get("progress_fingerprint") or ""
         )
+        active.backend_settle_fingerprint = str(
+            session.get("backend_settle_fingerprint") or ""
+        )
+        if active.backend_settle_fingerprint:
+            try:
+                settle_epoch = float(session.get("backend_settle_started_at_epoch"))
+                settle_age = max(0.0, time.time() - settle_epoch)
+            except (TypeError, ValueError):
+                settle_age = 0.0
+            active.backend_settle_started_at = max(
+                0.0, time.monotonic() - settle_age,
+            )
         active_quotes[active.session_key] = active
 
     if record.get("partial_retry_pending"):
@@ -1122,15 +1283,23 @@ def main() -> int:
                     maybe_start_final_merge(store, browser, active_quotes, job_id)
 
             pending_quote = pending_active_quote(active_quotes)
+            if pending_quote is None and advance_machine_completed_wave(
+                store, browser, active_quotes,
+            ):
+                time.sleep(POLL_SECONDS)
+                continue
+
+            pending_quote = pending_active_quote(active_quotes)
             poll_order = (
                 [pending_quote.session_key]
                 if pending_quote is not None
-                else active_quote_poll_order(active_quotes)
+                else active_quote_poll_order(active_quotes, limit=1)
             )
             for session_key in poll_order:
                 active = active_quotes.get(session_key)
                 if active is None:
                     continue
+                active.last_polled_at = time.monotonic()
                 job_id = active.job_id
                 current = store.reconcile_delivery_receipt(job_id)
                 if current.get("status") in {"completed", "partial", "failed"}:
@@ -1164,6 +1333,8 @@ def main() -> int:
                         continue
                     batches = store.quote_chat_batches(job_id)
                     if len(batches) > 1 and active.role != "merge":
+                        if not component_batch_state_settled(store, active):
+                            continue
                         if not continue_component_batch(store, browser, active):
                             active_quotes.pop(session_key, None)
                         maybe_start_final_merge(
@@ -1203,7 +1374,7 @@ def main() -> int:
                     # current conversation active and try its send control on
                     # the next round instead of switching away.
                     active.stable_since = time.monotonic()
-                    continue
+                    break
                 except Exception as exc:  # noqa: BLE001 - classify live renderer failures
                     if is_transient_browser_poll_exception(exc):
                         # Quote clients replace live DOM nodes while generating. The

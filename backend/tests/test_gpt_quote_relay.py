@@ -1260,18 +1260,19 @@ def test_quote_context_requires_ai_to_fill_only_minimum_required_official_values
     assert "不得因为缺少参数停止" in prompt
 
 
-def test_every_active_quote_tab_is_visited_in_each_polling_round() -> None:
+def test_active_quote_polling_is_fair_without_switching_every_chat_per_tick() -> None:
     active_quotes = {
-        "gpt-first": object(),
-        "gpt-second": object(),
-        "gpt-third": object(),
+        "gpt-first": type("Quote", (), {"last_polled_at": 30.0})(),
+        "gpt-second": type("Quote", (), {"last_polled_at": 10.0})(),
+        "gpt-third": type("Quote", (), {"last_polled_at": 20.0})(),
     }
 
     assert active_quote_poll_order(active_quotes) == (
-        "gpt-first",
         "gpt-second",
         "gpt-third",
+        "gpt-first",
     )
+    assert active_quote_poll_order(active_quotes, limit=1) == ("gpt-second",)
 
 
 def test_stale_dom_reference_is_retryable_without_failing_the_quote() -> None:
