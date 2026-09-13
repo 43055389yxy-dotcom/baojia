@@ -193,6 +193,153 @@ def test_rich_mention_selector_requires_plugin_markup(desktop_module):
     assert "AstraQuote" in desktop_module.RICH_MENTION_SELECTOR
 
 
+def test_send_prompt_clicks_visible_send_control_and_confirms_new_turn(
+    desktop_module, monkeypatch,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=60,
+    )
+    expressions = []
+    counts = iter([2, 3])
+
+    monkeypatch.setattr(desktop, "_user_message_count", lambda: next(counts))
+    monkeypatch.setattr(desktop, "_call", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(desktop, "_dispatch_key", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(desktop, "_wait_until", lambda check, **_kwargs: check())
+
+    def evaluate(expression):
+        expressions.append(expression)
+        if "return 'ready'" in expression:
+            return "ready"
+        if "data-list-navigation-item" in expression:
+            return True
+        if "已发送消息" in expression:
+            return True
+        return True
+
+    monkeypatch.setattr(desktop, "_evaluate", evaluate)
+
+    desktop._send_prompt("@AstraQuote 正式报价")
+
+    assert any("send-button" in expression and ".click()" in expression for expression in expressions)
+
+
+def test_switch_refuses_to_leave_a_conversation_with_an_unsent_draft(
+    desktop_module, monkeypatch,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=60,
+    )
+    quote = type("Quote", (), {
+        "job_id": "gpt-0123456789abcdef0123456789abcdef",
+        "chat_url": desktop_module.codex_chat_reference(
+            "6aa52a28-5510-83ee-b69a-42c10c9f1ddb"
+        ),
+        "previous_conversation_ids": (),
+        "batch_index": 0,
+        "batch_count": 1,
+        "role": "coordinator",
+    })()
+    sidebar_clicked = []
+
+    def evaluate(expression):
+        if "const jobId" in expression:
+            return False
+        if "pending_astraquote" in expression:
+            return "pending_other"
+        if "SIDEBAR" in expression:
+            sidebar_clicked.append(True)
+        return False
+
+    monkeypatch.setattr(desktop, "_evaluate", evaluate)
+
+    with pytest.raises(desktop_module.PendingPromptSubmissionError):
+        desktop._switch_to_quote(quote)
+    assert not sidebar_clicked
+
+
+def test_switch_submits_pending_astraquote_draft_before_navigation(
+    desktop_module,
+    monkeypatch,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=60,
+    )
+    quote = type("Quote", (), {
+        "job_id": "gpt-0123456789abcdef0123456789abcdef",
+        "chat_url": desktop_module.codex_chat_reference(
+            "6aa52a28-5510-83ee-b69a-42c10c9f1ddb"
+        ),
+        "previous_conversation_ids": (),
+        "batch_index": 0,
+        "batch_count": 1,
+        "role": "coordinator",
+    })()
+    submitted = []
+
+    def evaluate(expression):
+        if "const jobId" in expression:
+            return False
+        if "pending_astraquote" in expression:
+            return "pending_astraquote"
+        return False
+
+    monkeypatch.setattr(desktop, "_evaluate", evaluate)
+    monkeypatch.setattr(desktop, "_user_message_count", lambda: 3)
+    monkeypatch.setattr(
+        desktop,
+        "_submit_composer_and_confirm",
+        lambda count: submitted.append(count),
+    )
+
+    with pytest.raises(desktop_module.PendingPromptSubmissionError):
+        desktop._switch_to_quote(quote)
+    assert submitted == [3]
+
+
+def test_switch_submits_pending_draft_even_when_quote_is_already_current(
+    desktop_module,
+    monkeypatch,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=60,
+    )
+    quote = type("Quote", (), {
+        "job_id": "gpt-0123456789abcdef0123456789abcdef",
+        "chat_url": desktop_module.codex_chat_reference(
+            "6aa52a28-5510-83ee-b69a-42c10c9f1ddb"
+        ),
+        "previous_conversation_ids": (),
+        "batch_index": 0,
+        "batch_count": 1,
+        "role": "coordinator",
+    })()
+    submitted = []
+
+    def evaluate(expression):
+        if "const jobId" in expression:
+            return True
+        if "pending_astraquote" in expression:
+            return "pending_astraquote"
+        return False
+
+    monkeypatch.setattr(desktop, "_evaluate", evaluate)
+    monkeypatch.setattr(desktop, "_user_message_count", lambda: 4)
+    monkeypatch.setattr(
+        desktop,
+        "_submit_composer_and_confirm",
+        lambda count: submitted.append(count),
+    )
+
+    with pytest.raises(desktop_module.PendingPromptSubmissionError):
+        desktop._switch_to_quote(quote)
+    assert submitted == [4]
+
+
 def test_new_chat_clears_a_stale_unsent_draft(desktop_module, monkeypatch):
     desktop = desktop_module.CodexChatDesktop(
         active_quote_factory=dict,

@@ -707,7 +707,7 @@ export default function SalesQuotePage() {
                     placeholder={"1. Linux 云服务器 1 台，2 核 4GB\n2. 数据库 1 套，4 核 16GB"}
                   />
                   <div className="sales-field-foot">
-                    <span>每行一个组件，序号必须连续；每 20 个组件自动分批</span>
+                    <span>每行一个组件，序号必须连续；每个对话最多 10 个，按 5 个一轮处理</span>
                     <b>{requirement.length.toLocaleString()} / 12,000</b>
                   </div>
                 </div>

@@ -7,7 +7,6 @@ const { isDeepStrictEqual } = require('node:util');
 
 const { V2QuoteStore } = require('./v2-quote-store');
 const { QuoteDeliveryService } = require('./quote-delivery');
-const { OfficialPriceCache } = require('./official-price-cache');
 const {
   officialPricingPageUrlAllowed, pricingScenarios, providerRegionMismatch,
 } = require('./cloud-market-profiles');
@@ -99,6 +98,7 @@ function relayIntakeManifest(relayJob) {
   if (batches.length === 0) return null;
   return {
     batchCount: Number(relayJob.intake_batch_count || batches.length),
+    chatCount: Number(relayJob.intake_chat_count || Math.ceil(batches.length / 2)),
     componentCount: Number(relayJob.intake_component_count || 0),
     priceBatchId: String(relayJob.reserved_price_batch_id || ''),
     batches,
@@ -376,7 +376,7 @@ function priceWorkflowGuard({ quoteMode, relayJobId, quoteComponents, componentL
     }),
     official_page_fallback: {
       supported: true,
-      api_attempts_required: 3,
+      api_attempts_required: 1,
       same_component_billing_scenario_scope_required: true,
       disallowed_for: ['credentials', 'authorization'],
       build_estimate_field: 'official_page_price_evidence',
@@ -1124,7 +1124,6 @@ class AstraQuoteV2Workflow {
     store = new V2QuoteStore(),
     deliverer = new QuoteDeliveryService(),
     capabilityStore,
-    priceCache,
     resultByteBudget: configuredResultByteBudget,
   }) {
     this.backend = backend;
@@ -1132,9 +1131,6 @@ class AstraQuoteV2Workflow {
     this.deliverer = deliverer;
     this.capabilityStore = capabilityStore || new PricingCapabilityStore({
       directory: path.join(this.store.directory, 'pricing-capabilities'),
-    });
-    this.priceCache = priceCache || new OfficialPriceCache({
-      directory: path.join(this.store.directory, 'official-price-cache'),
     });
     this.resultByteBudget = resultByteBudget(configuredResultByteBudget);
   }
@@ -1288,7 +1284,6 @@ class AstraQuoteV2Workflow {
       existing?.query_contexts, input.query_contexts, mergedQueries,
     );
     const pendingQueries = [];
-    const freshCacheResults = [];
     const capabilityPreflightResults = [];
     const contextById = new Map(queryContexts.map((context) => [context.query_id, context]));
     const forceCapabilityRecheck = input.force_capability_recheck === true
@@ -1302,12 +1297,6 @@ class AstraQuoteV2Workflow {
           error.details = { query_id: query.query_id };
           throw error;
         }
-        continue;
-      }
-      const marketProfile = this.capabilityStore.marketProfile(query.provider);
-      const cached = this.priceCache.get(query, { marketProfile, allowStale: false });
-      if (cached) {
-        freshCacheResults.push(cached);
         continue;
       }
       const blocker = forceCapabilityRecheck
@@ -1364,31 +1353,11 @@ class AstraQuoteV2Workflow {
       throw error;
     }
     const liveResults = result.results || [];
-    const transientCategories = new Set(['transport', 'rate_limit', 'provider_unavailable']);
-    const completedLiveResults = liveResults.map((item) => {
-      const query = materializedQueries.find((candidate) => candidate.query_id === item.query_id);
-      if (!query) return item;
-      const marketProfile = this.capabilityStore.marketProfile(query.provider);
-      if (item.status === 'query_failed' && transientCategories.has(item.error_category)) {
-        const stale = this.priceCache.get(query, { marketProfile, allowStale: true });
-        if (stale?.cache_status === 'stale') {
-          return {
-            ...stale,
-            cache_status: 'stale_fallback',
-            source_request_skipped: false,
-            live_error: {
-              error_category: item.error_category,
-              code: item.code,
-              message: item.message,
-            },
-          };
-        }
-      }
-      this.priceCache.put(query, item, { marketProfile });
-      return item;
-    });
+    // A new query identity always reaches the current official source. Only
+    // successful evidence already saved inside this exact price batch may be
+    // reused when the same quote resumes.
+    const completedLiveResults = liveResults;
     const responseResults = new Map([
-      ...freshCacheResults,
       ...capabilityPreflightResults,
       ...completedLiveResults,
     ].map((item) => [item.query_id, item]));
@@ -1466,7 +1435,7 @@ class AstraQuoteV2Workflow {
       ? finalRelayPlan.manifest.componentCount
       : componentStatus.top_level_component_count;
     const componentChatCount = finalRelayPlan.manifest
-      ? finalRelayPlan.manifest.batchCount
+      ? finalRelayPlan.manifest.chatCount
       : componentStatus.component_chat_count;
     const pendingComponentCount = componentStatus.pending_component_count + missingRegisteredRoots;
     const completed = quoteComponents.length > 0
@@ -1548,14 +1517,11 @@ class AstraQuoteV2Workflow {
       resumed_batch: Boolean(existing),
       reused_query_ids: materializedQueries
         .filter((query) => !pendingQueries.includes(query)
-          && !freshCacheResults.some((item) => item.query_id === query.query_id)
           && !capabilityPreflightResults.some((item) => item.query_id === query.query_id))
         .map((query) => query.query_id),
       queried_query_ids: pendingQueries.map((query) => query.query_id),
-      price_cache_hit_query_ids: freshCacheResults.map((item) => item.query_id),
-      stale_price_fallback_query_ids: completedLiveResults
-        .filter((item) => item.cache_status === 'stale_fallback')
-        .map((item) => item.query_id),
+      price_cache_hit_query_ids: [],
+      stale_price_fallback_query_ids: [],
       capability_preflight_query_ids: capabilityPreflightResults
         .map((item) => item.query_id),
       total_component_count: totalComponentCount,
@@ -1723,9 +1689,9 @@ class AstraQuoteV2Workflow {
           }
 
           const attemptIds = [...new Set(evidence.api_attempt_query_ids || [])];
-          if (attemptIds.length < 3) {
+          if (attemptIds.length < 1) {
             violations.push(
-              `official_page_requires_three_api_attempts:${component.component_key}:${evidence.billing_key}`,
+              `official_page_requires_api_attempt:${component.component_key}:${evidence.billing_key}`,
             );
           }
           let qualifyingAttempts = 0;
@@ -1762,9 +1728,9 @@ class AstraQuoteV2Workflow {
             }
             qualifyingAttempts += 1;
           }
-          if (qualifyingAttempts < 3) {
+          if (qualifyingAttempts < 1) {
             violations.push(
-              `official_page_has_fewer_than_three_qualifying_failures:${component.component_key}:${evidence.billing_key}`,
+              `official_page_has_no_qualifying_api_failure:${component.component_key}:${evidence.billing_key}`,
             );
           }
 

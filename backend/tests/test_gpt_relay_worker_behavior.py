@@ -204,7 +204,7 @@ def test_failed_component_is_not_treated_as_completed_before_its_one_retry(worke
     assert worker.batch_is_finished({"component_states": {"a": "completed"}})
 
 
-def test_child_budget_is_durable_before_send_failure(worker, running_job, monkeypatch):
+def test_unconfirmed_ui_send_does_not_consume_component_retry(worker, running_job, monkeypatch):
     store, job_id, _ = running_job
     store.record_chat_session(
         job_id, batch_index=1, batch_count=2,
@@ -218,7 +218,7 @@ def test_child_budget_is_durable_before_send_failure(worker, running_job, monkey
     browser.continue_quote.side_effect = RuntimeError("delivery was uncertain")
     with pytest.raises(RuntimeError):
         worker.continue_component_batch(store, browser, active)
-    assert store.get(job_id)["chat_sessions"][0]["stalled_attempts"] == 1
+    assert store.get(job_id)["chat_sessions"][0].get("stalled_attempts", 0) == 0
 
 
 def test_final_merge_waits_until_running_chats_have_stopped(worker, running_job, monkeypatch):
@@ -425,7 +425,7 @@ def test_production_worker_constructs_codex_chat_adapter_not_firefox(worker):
     assert "browser = ChatGptBrowser()" not in main_source
 
 
-def test_numbered_intake_is_sent_as_three_isolated_chats_before_ai_cleanup(
+def test_numbered_intake_starts_only_three_conversations_with_five_items_each(
     worker,
     tmp_path: Path,
 ) -> None:
@@ -454,13 +454,119 @@ def test_numbered_intake_is_sent_as_three_isolated_chats_before_ai_cleanup(
     child_prompts = [call.args[1] for call in browser.start_component_batch.call_args_list]
     assert set(active) == {f"{job['job_id']}:{index}" for index in range(3)}
     assert "cmp_intake_0001" in first_prompt
-    assert "cmp_intake_0021" not in first_prompt
-    assert "cmp_intake_0021" in child_prompts[0]
-    assert "cmp_intake_0041" not in child_prompts[0]
-    assert "cmp_intake_0041" in child_prompts[1]
+    assert "cmp_intake_0006" not in first_prompt
+    assert "cmp_intake_0011" in child_prompts[0]
+    assert "cmp_intake_0016" not in child_prompts[0]
+    assert "cmp_intake_0021" in child_prompts[1]
+    assert "cmp_intake_0026" not in child_prompts[1]
     internal = store.get(job["job_id"])
-    assert internal["source_purged_at"]
-    assert all(not batch["source_lines"] for batch in internal["intake_batches"])
+    assert internal["source_purged_at"] is None
+    assert not internal["intake_batches"][0]["source_lines"]
+    assert not internal["intake_batches"][2]["source_lines"]
+    assert not internal["intake_batches"][4]["source_lines"]
+    assert len(internal["intake_batches"][1]["source_lines"]) == 5
+
+
+def test_completed_first_wave_sends_second_five_in_same_conversation(
+    worker,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = GptQuoteRelayStore(tmp_path / "relay", max_concurrent_quotes=4)
+    text = "\n".join(f"{index}. 组件 {index}：配置。" for index in range(1, 11))
+    job = store.create(
+        text,
+        {"cloud_provider": "aws", "preferred_region": "ap-southeast-1"},
+        numbered_components=parse_numbered_component_lines(text),
+    )
+    record = store.claim_next("test-worker")
+    browser = Mock()
+    browser.logged_in.return_value = True
+    browser.start_quote.return_value = worker.ActiveQuote(job["job_id"], codex_chat(0), 100)
+    active = worker.submit_job(store, browser, record)
+    assert active is not None
+    first_batch = {
+        "batch_index": 0,
+        "batch_count": 2,
+        "price_batch_id": store.get(job["job_id"])["reserved_price_batch_id"],
+        "component_keys": [f"cmp_intake_{index:04d}" for index in range(1, 6)],
+        "component_states": {
+            f"cmp_intake_{index:04d}": "completed" for index in range(1, 6)
+        },
+    }
+    monkeypatch.setattr(worker, "active_batch", lambda *_: first_batch)
+
+    assert worker.continue_component_batch(store, browser, active)
+
+    assert active.batch_index == 1
+    assert active.conversation_index == 0
+    assert active.component_keys == tuple(
+        f"cmp_intake_{index:04d}" for index in range(6, 11)
+    )
+    assert browser.continue_quote.call_args.args[0] is active
+    second_prompt = browser.continue_quote.call_args.args[1]
+    assert "cmp_intake_0006" in second_prompt
+    assert "cmp_intake_0001" not in second_prompt
+    sessions = store.get(job["job_id"])["chat_sessions"]
+    assert sessions[0]["chat_url"] == sessions[1]["chat_url"] == codex_chat(0)
+    assert sessions[0]["status"] == "saved"
+    assert sessions[1]["status"] == "running"
+
+
+def test_worker_restart_resumes_unsent_second_wave_in_the_same_conversation(
+    worker,
+    tmp_path: Path,
+) -> None:
+    store = GptQuoteRelayStore(tmp_path / "relay", max_concurrent_quotes=4)
+    text = "\n".join(f"{index}. 组件 {index}：配置。" for index in range(1, 11))
+    job = store.create(text, {}, numbered_components=parse_numbered_component_lines(text))
+    record = store.claim_next("old-worker")
+    assert record is not None
+    store.record_chat_session(
+        job["job_id"], batch_index=0, batch_count=2,
+        chat_url=codex_chat(0), role="coordinator",
+        component_keys=[f"cmp_intake_{index:04d}" for index in range(1, 6)],
+        conversation_index=0, wave_index=0, wave_count=2,
+    )
+    store.update_chat_session(job["job_id"], 0, status="saved")
+    store.purge_intake_batch(job["job_id"], 0)
+    browser = Mock()
+    browser.resume_quote.side_effect = lambda job_id, url, **kwargs: worker.ActiveQuote(
+        job_id, url, 100, **kwargs,
+    )
+    active: dict[str, worker.ActiveQuote] = {}
+
+    worker.create_missing_component_chats(store, browser, active, job["job_id"])
+
+    assert list(active) == [f"{job['job_id']}:0"]
+    assert active[f"{job['job_id']}:0"].batch_index == 1
+    assert "cmp_intake_0006" in browser.continue_quote.call_args.args[1]
+    latest = store.get(job["job_id"])
+    assert latest["intake_batches"][1]["source_lines"] == []
+    assert latest["chat_sessions"][1]["chat_url"] == codex_chat(0)
+
+
+def test_same_sales_job_never_opens_more_than_three_active_conversations(
+    worker,
+    tmp_path: Path,
+) -> None:
+    store = GptQuoteRelayStore(tmp_path / "relay", max_concurrent_quotes=4)
+    text = "\n".join(f"{index}. 组件 {index}：配置。" for index in range(1, 61))
+    job = store.create(text, {}, numbered_components=parse_numbered_component_lines(text))
+    record = store.claim_next("test-worker")
+    browser = Mock()
+    browser.logged_in.return_value = True
+    browser.start_quote.return_value = worker.ActiveQuote(job["job_id"], codex_chat(0), 100)
+    browser.start_component_batch.side_effect = lambda job_id, _prompt, **kwargs: (
+        worker.ActiveQuote(job_id, codex_chat(kwargs["batch_index"]), 100, **kwargs)
+    )
+    first = worker.submit_job(store, browser, record)
+    active = {first.session_key: first}
+
+    worker.create_missing_component_chats(store, browser, active, job["job_id"])
+
+    assert len([quote for quote in active.values() if quote.job_id == job["job_id"]]) == 3
+    assert browser.start_component_batch.call_count == 2
 
 
 def test_local_codex_conversation_ids_do_not_serialize_component_chat_creation(

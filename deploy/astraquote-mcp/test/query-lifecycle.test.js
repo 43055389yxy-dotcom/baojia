@@ -322,7 +322,7 @@ test('component chat count uses top-level groups and keeps child components in t
 
   assert.equal(result.total_component_count, 22);
   assert.equal(result.top_level_component_count, 21);
-  assert.equal(result.component_chat_count, 2);
+  assert.equal(result.component_chat_count, 3);
 });
 
 test('parallel component chats merge into one price batch without overwriting each other', async (t) => {

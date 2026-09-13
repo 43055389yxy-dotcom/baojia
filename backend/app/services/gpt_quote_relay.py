@@ -29,7 +29,12 @@ from app.services.codex_chat_references import (
     is_codex_conversation_id,
 )
 from app.services.gemini_chat_references import is_gemini_chat_reference
-from app.services.gpt_quote_batches import split_component_plan, split_numbered_intake
+from app.services.gpt_quote_batches import (
+    COMPONENTS_PER_CHAT,
+    WAVES_PER_CHAT,
+    split_component_plan,
+    split_numbered_intake,
+)
 
 UTC = timezone.utc  # noqa: UP017 - the host-side worker still supports Python 3.9
 
@@ -59,7 +64,7 @@ PUBLIC_FIELDS = {
 
 DEFAULT_MAX_CONCURRENT_QUOTES = 4
 DEFAULT_QUOTE_SECONDS = 600
-COMPONENTS_PER_CHAT = 20
+MAX_ACTIVE_CHATS_PER_SALES_JOB = 3
 QUOTE_ENGINES = ("chatgpt", "gemini")
 DEFAULT_ENABLED_QUOTE_ENGINES = ("chatgpt",)
 
@@ -270,6 +275,12 @@ class GptQuoteRelayStore:
                 {
                     "batch_index": index,
                     "batch_count": len(intake_groups),
+                    "conversation_index": index // WAVES_PER_CHAT,
+                    "wave_index": index % WAVES_PER_CHAT,
+                    "wave_count": min(
+                        WAVES_PER_CHAT,
+                        len(intake_groups) - (index // WAVES_PER_CHAT) * WAVES_PER_CHAT,
+                    ),
                     "component_keys": [str(item["component_key"]) for item in group],
                     "source_lines": [
                         {
@@ -305,6 +316,11 @@ class GptQuoteRelayStore:
                     len(numbered_components or []) if intake_batches else None
                 ),
                 "intake_batch_count": len(intake_batches) if intake_batches else None,
+                "intake_chat_count": (
+                    math.ceil(len(intake_batches) / WAVES_PER_CHAT)
+                    if intake_batches
+                    else None
+                ),
                 "intake_batches": intake_batches,
                 "reserved_price_batch_id": (
                     f"aqpb_{uuid.uuid4()}" if intake_batches else None
@@ -486,6 +502,9 @@ class GptQuoteRelayStore:
         role: str,
         component_keys: list[str],
         previous_conversation_ids: list[str] | None = None,
+        conversation_index: int | None = None,
+        wave_index: int = 0,
+        wave_count: int = 1,
     ) -> dict[str, Any]:
         """Persist one logical chat while the robot keeps a single window."""
 
@@ -519,6 +538,11 @@ class GptQuoteRelayStore:
                 {
                     "batch_index": batch_index,
                     "batch_count": batch_count,
+                    "conversation_index": (
+                        batch_index if conversation_index is None else conversation_index
+                    ),
+                    "wave_index": wave_index,
+                    "wave_count": wave_count,
                     "chat_url": str(chat_url),
                     "role": role,
                     "component_keys": list(component_keys),
@@ -619,7 +643,11 @@ class GptQuoteRelayStore:
     def _public_progress(self, record: dict[str, Any]) -> dict[str, Any] | None:
         checkpoint = self._checkpoint(str(record.get("job_id") or ""))
         intake_total = self._safe_count(record.get("intake_component_count"))
-        intake_chat_count = self._safe_count(record.get("intake_batch_count"))
+        intake_chat_count = self._safe_count(record.get("intake_chat_count"))
+        if intake_chat_count is None:
+            intake_batch_count = self._safe_count(record.get("intake_batch_count"))
+            if intake_batch_count is not None:
+                intake_chat_count = math.ceil(intake_batch_count / WAVES_PER_CHAT)
         if checkpoint is None and intake_total is None:
             return None
         checkpoint = checkpoint or {}
@@ -790,6 +818,7 @@ class GptQuoteRelayStore:
         )
         return min(
             self.max_concurrent_quotes,
+            MAX_ACTIVE_CHATS_PER_SALES_JOB,
             max(1, math.ceil(total / COMPONENTS_PER_CHAT)),
         )
 

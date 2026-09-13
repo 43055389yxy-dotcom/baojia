@@ -166,7 +166,7 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   assert.match(INSTRUCTIONS, /created.*立即执行.*不得只汇报/s);
   assert.match(getPrices.description, /formal quote.*relay_batch_index.*quote_components/is);
   assert.match(getPrices.description, /must_continue.*final answer/is);
-  assert.match(getPrices.description, /three.*official API.*official pricing page/is);
+  assert.match(getPrices.description, /one effective official API failure.*official pricing page/is);
   assert.match(buildEstimate.description, /official_page_price_evidence/i);
   assert.doesNotMatch(INSTRUCTIONS, /Calculator|import_estimate|模板映射/i);
 });

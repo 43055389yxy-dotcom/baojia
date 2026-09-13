@@ -65,7 +65,7 @@ test("sales portal requires consecutive numbered lines before submission", async
 
   assert.match(page, /validateNumberedComponentLines/);
   assert.match(page, /每行一个组件，序号必须连续/);
-  assert.match(page, /每 20 个组件自动分批/);
+  assert.match(page, /每个对话最多 10 个，按 5 个一轮处理/);
   assert.match(page, /1\. Linux 云服务器/);
   assert.match(validator, /split\("\\n"\)/);
   assert.match(validator, /第 \$\{lineNumber\} 行必须以连续序号/);

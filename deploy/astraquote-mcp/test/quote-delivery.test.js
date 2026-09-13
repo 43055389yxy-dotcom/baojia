@@ -83,7 +83,7 @@ test('official pricing page fallback is disclosed only as a safe sales-page noti
 
   const result = buildPageResult(pageRecord);
 
-  assert.match(result.pricing_notice, /官方 API 连续三次/);
+  assert.match(result.pricing_notice, /官方 API 一次未取得/);
   assert.match(result.pricing_notice, /官方价格页/);
   assert.doesNotMatch(JSON.stringify(result.components), /source_urls|api_attempt_query_ids/);
 });

@@ -8,12 +8,11 @@ const path = require('node:path');
 
 const { AstraQuoteV2Workflow, enrichUnpricedServices } = require('../lib/v2-workflow');
 const { V2QuoteStore } = require('../lib/v2-quote-store');
-const { OfficialPriceCache } = require('../lib/official-price-cache');
 const { providerRegionMismatch } = require('../lib/cloud-market-profiles');
 
 function fixture({
   status = 'exact', provider = 'azure', itemIds = ['item-1'], rateCandidates = [],
-  resultByteBudget, priceCache,
+  resultByteBudget,
 } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-api-workflow-'));
   const delivered = [];
@@ -54,7 +53,6 @@ function fixture({
       store: new V2QuoteStore({ directory }),
       deliverer,
       resultByteBudget,
-      priceCache,
     }),
   };
 }
@@ -222,14 +220,14 @@ test('get_prices stores raw official evidence without choosing or calculating', 
   assert.equal(result.monthly_total, undefined);
 });
 
-test('three failed official API attempts unlock GPT-selected official pricing page evidence', async (t) => {
+test('one failed official API attempt unlocks GPT-selected official pricing page evidence', async (t) => {
   const { workflow, directory } = fixture({ status: 'not_found', itemIds: [] });
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  const batchId = await failedPricingAttempts(workflow);
+  const batchId = await failedPricingAttempts(workflow, 1);
   const input = quoteInput(batchId, { evidence: [] });
-  input.idempotency_key = 'official-page-after-three-api-failures';
+  input.idempotency_key = 'official-page-after-one-api-failure';
   input.services[0].official_page_price_evidence = [officialPageEvidence([
-    'page-attempt-1', 'page-attempt-2', 'page-attempt-3',
+    'page-attempt-1',
   ])];
 
   const delivered = await workflow.buildEstimate(input);
@@ -243,20 +241,20 @@ test('three failed official API attempts unlock GPT-selected official pricing pa
   assert.equal(saved.billing_usage_ir[0].official_page_price_evidence.length, 1);
 });
 
-test('official pricing page evidence stays locked until three qualifying API failures', async (t) => {
+test('official pricing page evidence still requires one qualifying API failure', async (t) => {
   const { workflow, directory } = fixture({ status: 'not_found', itemIds: [] });
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  const batchId = await failedPricingAttempts(workflow, 2);
-  const input = quoteInput(batchId, { evidence: [] });
+  const batch = await priceBatch(workflow);
+  const input = quoteInput(batch.price_batch_id, { evidence: [] });
   input.services[0].official_page_price_evidence = [officialPageEvidence([
-    'page-attempt-1', 'page-attempt-2', 'page-attempt-2',
+    'missing-attempt',
   ])];
 
   await assert.rejects(
     workflow.buildEstimate(input),
     (error) => error.code === 'official_price_evidence_invalid'
       && error.details.violations.some(
-        (violation) => violation.startsWith('official_page_requires_three_api_attempts:'),
+        (violation) => violation.startsWith('official_page_api_attempt_'),
       ),
   );
 });
@@ -332,15 +330,11 @@ test('a usable API rate remains preferred over an official pricing page fallback
 });
 
 
-test('a second identical quote uses the shared exact official price cache', async (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-price-cache-flow-'));
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  const priceCache = new OfficialPriceCache({ directory: path.join(directory, 'cache') });
+test('a second identical quote reaches the live official source again', async (t) => {
   const context = fixture({
     rateCandidates: [{
       rate_id: 'rate-1', official_item_id: 'item-1', unit_price: '12.34', currency: 'USD',
     }],
-    priceCache,
   });
   t.after(() => fs.rmSync(context.directory, { recursive: true, force: true }));
   let backendCalls = 0;
@@ -357,32 +351,23 @@ test('a second identical quote uses the shared exact official price cache', asyn
     queries: [{ provider: 'azure', query_id: 'second', filter: 'same-official-query' }],
   });
 
-  assert.equal(backendCalls, 1);
-  assert.deepEqual(repeated.price_cache_hit_query_ids, ['second']);
+  assert.equal(backendCalls, 2);
+  assert.deepEqual(repeated.price_cache_hit_query_ids, []);
   assert.equal(repeated.results[0].query_id, 'second');
-  assert.equal(repeated.results[0].cache_status, 'fresh');
+  assert.equal(repeated.results[0].cache_status, undefined);
 });
 
 
-test('transient provider outage uses bounded stale official evidence but authorization never does', async (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'astraquote-stale-flow-'));
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  let now = Date.parse('2026-09-12T00:00:00.000Z');
-  const priceCache = new OfficialPriceCache({
-    directory: path.join(directory, 'cache'), freshTtlMs: 1_000,
-    maximumStaleMs: 60_000, now: () => now,
-  });
+test('transient provider outage is not replaced by a stale cross-quote price', async (t) => {
   const context = fixture({
     rateCandidates: [{
       rate_id: 'rate-1', official_item_id: 'item-1', unit_price: '12.34', currency: 'USD',
     }],
-    priceCache,
   });
   t.after(() => fs.rmSync(context.directory, { recursive: true, force: true }));
   await context.workflow.getPrices({
     queries: [{ provider: 'azure', query_id: 'seed', filter: 'same-official-query' }],
   });
-  now += 2_000;
   context.backend.getPrices = async (input) => ({ results: input.queries.map((item) => ({
     query_id: item.query_id, provider: item.provider, status: 'query_failed', terminal: false,
     retryable: true, error_category: 'provider_unavailable', code: 'catalog_maintenance',
@@ -392,19 +377,9 @@ test('transient provider outage uses bounded stale official evidence but authori
   const fallback = await context.workflow.getPrices({
     queries: [{ provider: 'azure', query_id: 'outage', filter: 'same-official-query' }],
   });
-  assert.equal(fallback.results[0].status, 'exact');
-  assert.equal(fallback.results[0].cache_status, 'stale_fallback');
-  assert.equal(fallback.results[0].live_error.error_category, 'provider_unavailable');
-  const fallbackQuote = quoteInput(fallback.price_batch_id, {
-    evidence: [{ query_id: 'outage', official_item_ids: ['item-1'] }],
-  });
-  fallbackQuote.idempotency_key = 'workflow-stale-official-cache-disclosure';
-  const delivered = await context.workflow.buildEstimate(fallbackQuote);
-  const saved = context.workflow.store.get(delivered.quote_id);
-  assert.equal(saved.verification.cache_fallback.used, true);
-  assert.deepEqual(saved.adjustments, []);
-  assert.deepEqual(saved.verification.cache_fallback.query_ids, ['outage']);
-  assert.doesNotMatch(JSON.stringify(saved.resource_ir), /维护|限流|连接中断|价格快照/);
+  assert.equal(fallback.results[0].status, 'query_failed');
+  assert.equal(fallback.results[0].error_category, 'provider_unavailable');
+  assert.equal(fallback.results[0].cache_status, undefined);
 
   context.backend.getPrices = async (input) => ({ results: input.queries.map((item) => ({
     query_id: item.query_id, provider: item.provider, status: 'query_failed', terminal: true,
@@ -1385,7 +1360,7 @@ test('price lookup responses tell weaker clients that quote coverage is unknown 
   assert.equal(result.workflow_guard.formal_quote_final_response_allowed, false);
   assert.match(result.workflow_guard.formal_quote_required_action, /quote_components/);
   assert.equal(result.workflow_guard.official_page_fallback.supported, true);
-  assert.equal(result.workflow_guard.official_page_fallback.api_attempts_required, 3);
+  assert.equal(result.workflow_guard.official_page_fallback.api_attempts_required, 1);
 });
 
 test('a created relay job tells GPT to build non-empty queries before price lookup', (t) => {

@@ -40,14 +40,14 @@ from app.services.gpt_quote_prompt import (
 from app.services.gpt_quote_relay import GptQuoteRelayStore, GptRelayError
 
 
-def test_numbered_sales_intake_splits_forty_four_components_before_ai() -> None:
+def test_numbered_sales_intake_splits_forty_four_components_into_five_item_waves() -> None:
     components = parse_numbered_component_lines(
         "\n".join(f"{index}. 组件 {index}：配置。" for index in range(1, 45))
     )
 
     batches = split_numbered_intake(components)
 
-    assert [len(batch) for batch in batches] == [20, 20, 4]
+    assert [len(batch) for batch in batches] == [5, 5, 5, 5, 5, 5, 5, 5, 4]
     assert components[0]["component_key"] == "cmp_intake_0001"
     assert components[-1]["component_key"] == "cmp_intake_0044"
 
@@ -90,7 +90,7 @@ def test_numbered_intake_prompt_contains_only_its_owned_lines() -> None:
     assert "relay_batch_count：2" in prompt
 
 
-def test_component_plan_splits_twenty_top_level_groups_and_keeps_children_together() -> None:
+def test_component_plan_splits_five_top_level_waves_and_keeps_children_together() -> None:
     plan = [
         {
             "component_key": f"cmp_root_{index:04d}",
@@ -111,17 +111,26 @@ def test_component_plan_splits_twenty_top_level_groups_and_keeps_children_togeth
 
     batches = split_component_plan(plan)
 
-    assert len(batches) == 3
+    assert len(batches) == 9
     assert [batch[0]["component_key"] for batch in batches] == [
         "cmp_root_0000",
+        "cmp_root_0005",
+        "cmp_root_0010",
+        "cmp_root_0015",
         "cmp_root_0020",
+        "cmp_root_0025",
+        "cmp_root_0030",
+        "cmp_root_0035",
         "cmp_root_0040",
     ]
-    first_keys = {item["component_key"] for item in batches[0]}
-    assert "cmp_root_0019" in first_keys
-    assert "cmp_child_0001" in first_keys
+    owning_batch_keys = {item["component_key"] for item in batches[3]}
+    assert "cmp_root_0019" in owning_batch_keys
+    assert "cmp_child_0001" in owning_batch_keys
     assert "cmp_child_0001" not in {
-        item["component_key"] for batch in batches[1:] for item in batch
+        item["component_key"]
+        for index, batch in enumerate(batches)
+        if index != 3
+        for item in batch
     }
 
     forty = split_component_plan(
@@ -144,8 +153,8 @@ def test_component_plan_splits_twenty_top_level_groups_and_keeps_children_togeth
             for index in range(60)
         ]
     )
-    assert [len(batch) for batch in forty] == [20, 20]
-    assert [len(batch) for batch in sixty] == [20, 20, 20]
+    assert [len(batch) for batch in forty] == [5] * 8
+    assert [len(batch) for batch in sixty] == [5] * 12
 
 
 def test_component_batch_prompt_contains_only_that_batches_cleaned_sources() -> None:
@@ -230,9 +239,12 @@ def test_relay_persists_only_pre_split_numbered_batches_and_reserves_three_slots
     internal = store.get(public["job_id"])
     assert internal["customer_request"] == ""
     assert internal["intake_component_count"] == 44
-    assert internal["intake_batch_count"] == 3
+    assert internal["intake_batch_count"] == 9
+    assert internal["intake_chat_count"] == 5
     assert internal["reserved_price_batch_id"].startswith("aqpb_")
-    assert [len(batch["source_lines"]) for batch in internal["intake_batches"]] == [20, 20, 4]
+    assert [len(batch["source_lines"]) for batch in internal["intake_batches"]] == [
+        5, 5, 5, 5, 5, 5, 5, 5, 4,
+    ]
     assert store._slot_count(internal) == 3
 
 
@@ -249,10 +261,12 @@ def test_purging_one_numbered_batch_does_not_delete_unsent_batches(tmp_path: Pat
 
     assert purged["intake_batches"][0]["source_lines"] == []
     assert purged["intake_batches"][0]["status"] == "submitted"
-    assert len(purged["intake_batches"][1]["source_lines"]) == 1
+    assert len(purged["intake_batches"][1]["source_lines"]) == 5
     assert purged["source_purged_at"] is None
 
-    fully_purged = store.purge_intake_batch(job["job_id"], 1)
+    fully_purged = purged
+    for batch_index in range(1, 5):
+        fully_purged = store.purge_intake_batch(job["job_id"], batch_index)
     assert fully_purged["source_purged_at"]
 
 
@@ -400,7 +414,7 @@ def test_each_engine_has_four_independent_slots_and_overflow_falls_back_atomical
     assert claimed_gemini is not None
     assert claimed_gemini["job_id"] == overflow["job_id"]
     assert claimed_gemini["assigned_engine"] == "gemini"
-    assert store._slot_count(claimed_gemini) == 2
+    assert store._slot_count(claimed_gemini) == 3
 
 
 def test_gemini_preference_falls_back_to_chatgpt_when_all_gemini_slots_are_used(
@@ -899,7 +913,7 @@ def test_per_quote_prompt_contains_only_per_order_context() -> None:
         / "astraquote-mcp"
         / "instructions.zh-CN.md"
     ).read_text(encoding="utf-8")
-    assert "每 20 个顶层组件一批" in plugin_instructions
+    assert "每 5 个组件一轮、每个对话两轮" in plugin_instructions
     assert "销售选择的是首选地域" in plugin_instructions
     assert "没有完全匹配时选最接近的小一档" in plugin_instructions
 
@@ -1666,8 +1680,8 @@ def test_relay_builds_private_chat_batches_from_the_sealed_price_plan(tmp_path: 
 
     batches = store.quote_chat_batches(public["job_id"])
 
-    assert [len(batch["components"]) for batch in batches] == [20, 1]
-    assert batches[1]["component_keys"] == ["cmp_root_0020"]
+    assert [len(batch["components"]) for batch in batches] == [5, 5, 5, 5, 1]
+    assert batches[4]["component_keys"] == ["cmp_root_0020"]
     sales = store.public_get(public["job_id"])
     assert "customer_owned_source" not in json.dumps(sales)
     assert "整单原始报价资料" not in json.dumps(sales)

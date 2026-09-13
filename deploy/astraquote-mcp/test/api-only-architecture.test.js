@@ -49,7 +49,7 @@ test('public MCP is an official-first ten-cloud workflow with bounded page fallb
   assert.match(INSTRUCTIONS, /needs_refinement.*安全重试预算/s);
   assert.match(INSTRUCTIONS, /无真实进展.*上限.*部分交付/s);
   assert.match(INSTRUCTIONS, /terminal=false.*不.*无限/s);
-  assert.match(INSTRUCTIONS, /三个不同 `query_id`.*官方价格页/s);
+  assert.match(INSTRUCTIONS, /现场调用一次.*官方价格页/s);
   assert.match(INSTRUCTIONS, /权限或凭据拒绝.*不能用网页证据掩盖/s);
   assert.match(INSTRUCTIONS, /需求理解.*最终金额都由 GPT 完成/s);
 });

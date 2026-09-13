@@ -199,7 +199,7 @@ function componentProgress(components = [], lifecycle = [], results = []) {
   ).length;
   return {
     top_level_component_count: topLevelComponentCount,
-    component_chat_count: Math.ceil(topLevelComponentCount / 20),
+    component_chat_count: Math.ceil(topLevelComponentCount / 10),
     total_component_count: states.length,
     completed_component_count: states.filter((item) => item.state === 'completed').length,
     failed_component_count: states.filter((item) => item.state === 'failed').length,

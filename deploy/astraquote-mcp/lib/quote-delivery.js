@@ -169,7 +169,7 @@ function buildPageResult(record) {
     pricingNotices.push('销售提示：官方价格接口临时不可用，部分价格采用带时间戳的最近官方价格快照；建议发送客户前再次确认。');
   }
   if (record.verification?.official_pricing_page_evidence?.used === true) {
-    pricingNotices.push('销售提示：部分计费项在官方 API 连续三次未取得可用费率后，采用云厂商官方价格页并保存了来源和读取时间。');
+    pricingNotices.push('销售提示：部分计费项在官方 API 一次未取得可用费率后，采用云厂商官方价格页并保存了来源和读取时间。');
   }
   return {
     schema_version: 'astraquote-page-result/1',

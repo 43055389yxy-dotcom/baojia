@@ -26,6 +26,7 @@ from app.services.gpt_browser_navigation import (
     is_transient_browser_poll_exception,
 )
 from app.services.gpt_quote_batches import (
+    WAVES_PER_CHAT,
     build_component_batch_continuation_prompt,
     build_component_batch_prompt,
     build_numbered_intake_batch_prompt,
@@ -39,15 +40,31 @@ from app.services.gpt_quote_prompt import (
     build_quote_prompt,
     parse_final_response,
 )
-from app.services.gpt_quote_relay import GptQuoteRelayStore, utc_now
+from app.services.gpt_quote_relay import (
+    MAX_ACTIVE_CHATS_PER_SALES_JOB,
+    GptQuoteRelayStore,
+    utc_now,
+)
 
 RELAY_ENGINE = os.environ.get("ASTRAQUOTE_RELAY_ENGINE", "chatgpt").strip().lower()
 if RELAY_ENGINE not in {"chatgpt", "gemini"}:
     raise RuntimeError("ASTRAQUOTE_RELAY_ENGINE must be chatgpt or gemini")
+
+
+class PendingPromptSubmissionError(RuntimeError):
+    """Keep a browser-side draft pending without failing the quote."""
+
+
 if RELAY_ENGINE == "gemini":
     from gemini_chat_browser import GeminiChatBrowser
 else:
-    from codex_chat_desktop import CodexChatDesktop, is_pending_chat_reference
+    from codex_chat_desktop import (
+        CodexChatDesktop,
+        PendingPromptSubmissionError as CodexPendingPromptSubmissionError,
+        is_pending_chat_reference,
+    )
+
+    PendingPromptSubmissionError = CodexPendingPromptSubmissionError
 
 POLL_SECONDS = float(os.environ.get("ASTRAQUOTE_GPT_RELAY_POLL_SECONDS", "4"))
 QUOTE_TIMEOUT_SECONDS = int(os.environ.get("ASTRAQUOTE_GPT_QUOTE_TIMEOUT", "600"))
@@ -106,6 +123,9 @@ class ActiveQuote:
     generation_grace_used: bool = False
     batch_index: int = 0
     batch_count: int = 1
+    conversation_index: int | None = None
+    wave_index: int = 0
+    wave_count: int = 1
     role: str = "coordinator"
     component_keys: tuple[str, ...] = ()
     batch_progress_fingerprint: str = ""
@@ -115,7 +135,12 @@ class ActiveQuote:
 
     @property
     def session_key(self) -> str:
-        return f"{self.job_id}:{self.batch_index}"
+        conversation_index = (
+            self.batch_index
+            if self.conversation_index is None
+            else self.conversation_index
+        )
+        return f"{self.job_id}:{conversation_index}"
 
 
 def mark_needs_login(store: GptQuoteRelayStore, record: dict[str, Any]) -> None:
@@ -175,6 +200,9 @@ def submit_job(
         )
         active = browser.start_quote(job_id, prompt)
         active.batch_count = int(record.get("intake_batch_count") or len(intake_batches))
+        active.conversation_index = int(first_batch.get("conversation_index") or 0)
+        active.wave_index = int(first_batch.get("wave_index") or 0)
+        active.wave_count = int(first_batch.get("wave_count") or 1)
         active.component_keys = tuple(first_batch.get("component_keys") or [])
         store.record_chat_session(
             job_id,
@@ -184,6 +212,9 @@ def submit_job(
             role="coordinator",
             component_keys=list(active.component_keys),
             previous_conversation_ids=list(active.previous_conversation_ids),
+            conversation_index=active.conversation_index,
+            wave_index=active.wave_index,
+            wave_count=active.wave_count,
         )
         store.update_if_not_cancelled(
             job_id,
@@ -315,31 +346,28 @@ def continue_component_batch(
     if fingerprint != active.batch_progress_fingerprint:
         active.batch_progress_fingerprint = fingerprint
     if batch_is_finished(batch):
-        store.update_chat_session(active.job_id, active.batch_index, status="saved")
-        return False
-    if active.stalled_attempts >= MAX_CONTINUATION_ATTEMPTS:
-        store.update_chat_session(
-            active.job_id,
-            active.batch_index,
-            status="stalled",
-            stalled_attempts=active.stalled_attempts,
+        return advance_to_next_wave(
+            store,
+            browser,
+            active,
+            completed_status="saved",
         )
-        return False
-    active.stalled_attempts += 1
-    # Reserve before sending. An uncertain send or worker restart must not
-    # restore the same allowance and repeat the instruction forever.
-    store.update_chat_session(
-        active.job_id,
-        active.batch_index,
-        status="running",
-        stalled_attempts=active.stalled_attempts,
-        progress_fingerprint=fingerprint,
-    )
+    if active.stalled_attempts >= MAX_CONTINUATION_ATTEMPTS:
+        return advance_to_next_wave(
+            store,
+            browser,
+            active,
+            completed_status="stalled",
+        )
     latest = store.get(active.job_id)
     remaining_component_keys = incomplete_component_keys(batch)
     if not remaining_component_keys:
-        store.update_chat_session(active.job_id, active.batch_index, status="saved")
-        return False
+        return advance_to_next_wave(
+            store,
+            browser,
+            active,
+            completed_status="saved",
+        )
     browser.continue_quote(
         active,
         build_component_batch_continuation_prompt(
@@ -351,6 +379,89 @@ def continue_component_batch(
             component_keys=remaining_component_keys,
         ),
     )
+    # The desktop adapter returns only after it sees the new user turn. A UI
+    # draft that was not submitted therefore never consumes the one content
+    # retry allowed for this five-component wave.
+    active.stalled_attempts += 1
+    store.update_chat_session(
+        active.job_id,
+        active.batch_index,
+        status="running",
+        stalled_attempts=active.stalled_attempts,
+        progress_fingerprint=fingerprint,
+    )
+    return True
+
+
+def advance_to_next_wave(
+    store: GptQuoteRelayStore,
+    browser: Any,
+    active: ActiveQuote,
+    *,
+    completed_status: str,
+) -> bool:
+    """Send the second five items in the same conversation, if present."""
+
+    intake_batches = store.intake_chat_batches(active.job_id)
+    next_batch_index = active.batch_index + 1
+    next_batch = next(
+        (
+            item
+            for item in intake_batches
+            if int(item.get("batch_index", -1)) == next_batch_index
+            and int(item.get("conversation_index", -1))
+            == int(active.conversation_index or 0)
+        ),
+        None,
+    )
+    source_lines = list(next_batch.get("source_lines") or []) if next_batch else []
+    if not source_lines:
+        store.update_chat_session(
+            active.job_id,
+            active.batch_index,
+            status=completed_status,
+            stalled_attempts=active.stalled_attempts,
+        )
+        return False
+
+    record = store.get(active.job_id)
+    prompt = build_numbered_intake_batch_prompt(
+        relay_job_id=active.job_id,
+        submission_code=str(record.get("submission_code") or ""),
+        price_batch_id=str(record.get("reserved_price_batch_id") or ""),
+        batch_index=next_batch_index,
+        batch_count=int(record.get("intake_batch_count") or len(intake_batches)),
+        components=source_lines,
+        quote_context=build_quote_context_prompt(record.get("quote_options") or {}),
+    )
+    browser.continue_quote(active, prompt)
+    store.update_chat_session(
+        active.job_id,
+        active.batch_index,
+        status=completed_status,
+        stalled_attempts=active.stalled_attempts,
+    )
+    store.record_chat_session(
+        active.job_id,
+        batch_index=next_batch_index,
+        batch_count=int(record.get("intake_batch_count") or len(intake_batches)),
+        chat_url=active.chat_url,
+        role="component_batch",
+        component_keys=list(next_batch.get("component_keys") or []),
+        previous_conversation_ids=list(active.previous_conversation_ids),
+        conversation_index=active.conversation_index,
+        wave_index=int(next_batch.get("wave_index") or 0),
+        wave_count=int(next_batch.get("wave_count") or 1),
+    )
+    store.purge_intake_batch(active.job_id, next_batch_index)
+    active.batch_index = next_batch_index
+    active.wave_index = int(next_batch.get("wave_index") or 0)
+    active.wave_count = int(next_batch.get("wave_count") or 1)
+    active.role = "component_batch"
+    active.component_keys = tuple(next_batch.get("component_keys") or [])
+    active.stalled_attempts = 0
+    active.batch_progress_fingerprint = ""
+    active.machine_progress_fingerprint = ""
     return True
 
 
@@ -371,11 +482,74 @@ def create_missing_component_chats(
             int(item.get("batch_index", -1)): item
             for item in (record.get("chat_sessions") or [])
         }
+        # If the worker restarted after finishing the first five but before it
+        # could send the second five, recover the saved conversation and send
+        # the pending second wave there. Never open a replacement chat.
+        for intake_batch in intake_batches:
+            batch_index = int(intake_batch["batch_index"])
+            conversation_index = int(
+                intake_batch.get("conversation_index", batch_index // WAVES_PER_CHAT)
+            )
+            wave_index = int(
+                intake_batch.get("wave_index", batch_index % WAVES_PER_CHAT)
+            )
+            if wave_index != 1 or batch_index in sessions:
+                continue
+            if not (intake_batch.get("source_lines") or []):
+                continue
+            previous = sessions.get(batch_index - 1)
+            if not previous or previous.get("status") not in {"saved", "stalled"}:
+                continue
+            if any(
+                quote.job_id == job_id
+                and int(quote.conversation_index or 0) == conversation_index
+                for quote in active_quotes.values()
+            ):
+                continue
+            if len(active_quotes) >= store.max_concurrent_quotes:
+                break
+            if sum(
+                quote.job_id == job_id for quote in active_quotes.values()
+            ) >= MAX_ACTIVE_CHATS_PER_SALES_JOB:
+                break
+            active = browser.resume_quote(
+                job_id,
+                str(previous["chat_url"]),
+                batch_index=batch_index - 1,
+                batch_count=int(record.get("intake_batch_count") or len(intake_batches)),
+                role=str(previous.get("role") or "component_batch"),
+                component_keys=list(previous.get("component_keys") or []),
+                previous_conversation_ids=list(
+                    previous.get("previous_conversation_ids") or []
+                ),
+                conversation_index=conversation_index,
+                wave_index=0,
+                wave_count=int(intake_batch.get("wave_count") or WAVES_PER_CHAT),
+            )
+            if advance_to_next_wave(
+                store,
+                browser,
+                active,
+                completed_status=str(previous.get("status") or "saved"),
+            ):
+                active_quotes[active.session_key] = active
+            if is_pending_browser_reference(active.chat_url):
+                break
+
         for intake_batch in intake_batches[1:]:
             batch_index = int(intake_batch["batch_index"])
+            conversation_index = int(
+                intake_batch.get("conversation_index", batch_index // WAVES_PER_CHAT)
+            )
+            if int(intake_batch.get("wave_index", batch_index % WAVES_PER_CHAT)) != 0:
+                continue
             if batch_index in sessions or not (intake_batch.get("source_lines") or []):
                 continue
             if len(active_quotes) >= store.max_concurrent_quotes:
+                break
+            if sum(
+                quote.job_id == job_id for quote in active_quotes.values()
+            ) >= MAX_ACTIVE_CHATS_PER_SALES_JOB:
                 break
             prompt = build_numbered_intake_batch_prompt(
                 relay_job_id=job_id,
@@ -393,6 +567,9 @@ def create_missing_component_chats(
                 batch_count=int(record.get("intake_batch_count") or len(intake_batches)),
                 component_keys=list(intake_batch.get("component_keys") or []),
             )
+            active.conversation_index = conversation_index
+            active.wave_index = int(intake_batch.get("wave_index") or 0)
+            active.wave_count = int(intake_batch.get("wave_count") or 1)
             store.record_chat_session(
                 job_id,
                 batch_index=batch_index,
@@ -401,6 +578,9 @@ def create_missing_component_chats(
                 role="component_batch",
                 component_keys=list(intake_batch.get("component_keys") or []),
                 previous_conversation_ids=list(active.previous_conversation_ids),
+                conversation_index=active.conversation_index,
+                wave_index=active.wave_index,
+                wave_count=active.wave_count,
             )
             store.purge_intake_batch(job_id, batch_index)
             active_quotes[active.session_key] = active
@@ -433,6 +613,10 @@ def create_missing_component_chats(
             continue
         if len(active_quotes) >= store.max_concurrent_quotes:
             break
+        if sum(
+            quote.job_id == job_id for quote in active_quotes.values()
+        ) >= MAX_ACTIVE_CHATS_PER_SALES_JOB:
+            break
         prompt = build_component_batch_prompt(
             relay_job_id=job_id,
             submission_code=str(record.get("submission_code") or ""),
@@ -449,6 +633,9 @@ def create_missing_component_chats(
             batch_count=int(batch["batch_count"]),
             component_keys=list(batch["component_keys"]),
         )
+        active.conversation_index = batch_index // WAVES_PER_CHAT
+        active.wave_index = batch_index % WAVES_PER_CHAT
+        active.wave_count = WAVES_PER_CHAT
         store.record_chat_session(
             job_id,
             batch_index=batch_index,
@@ -457,6 +644,9 @@ def create_missing_component_chats(
             role="component_batch",
             component_keys=list(batch["component_keys"]),
             previous_conversation_ids=list(active.previous_conversation_ids),
+            conversation_index=active.conversation_index,
+            wave_index=active.wave_index,
+            wave_count=active.wave_count,
         )
         active.batch_progress_fingerprint = batch_progress_fingerprint(batch)
         active_quotes[active.session_key] = active
@@ -728,6 +918,11 @@ def reattach_job_chats(
             previous_conversation_ids=list(
                 session.get("previous_conversation_ids") or []
             ),
+            conversation_index=int(
+                session.get("conversation_index", batch_index // WAVES_PER_CHAT)
+            ),
+            wave_index=int(session.get("wave_index", batch_index % WAVES_PER_CHAT)),
+            wave_count=int(session.get("wave_count") or 1),
         )
         active.stalled_attempts = int(session.get("stalled_attempts") or 0)
         active.batch_progress_fingerprint = str(
@@ -1002,6 +1197,13 @@ def main() -> int:
                     active_quotes.pop(session_key, None)
                 except TimeoutError:
                     handle_no_progress_timeout(store, browser, active, active_quotes)
+                except PendingPromptSubmissionError:
+                    # A UI-level non-send is not a pricing attempt and must not
+                    # fail the quote or consume the one content retry. Keep the
+                    # current conversation active and try its send control on
+                    # the next round instead of switching away.
+                    active.stable_since = time.monotonic()
+                    continue
                 except Exception as exc:  # noqa: BLE001 - classify live renderer failures
                     if is_transient_browser_poll_exception(exc):
                         # Quote clients replace live DOM nodes while generating. The

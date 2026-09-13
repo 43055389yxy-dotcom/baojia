@@ -60,6 +60,10 @@ class PendingConversationReferenceError(RuntimeError):
     """The prompt is running but Codex has not listed its stable chat id yet."""
 
 
+class PendingPromptSubmissionError(RuntimeError):
+    """A composed prompt is still visible and must not be abandoned."""
+
+
 def split_astraquote_prompt(prompt: str) -> str:
     """Return prompt text after an exact leading AstraQuote mention."""
 
@@ -440,21 +444,111 @@ class CodexChatDesktop:
             or 0
         )
 
+    def _composer_is_empty(self) -> bool:
+        return bool(
+            self._evaluate(
+                f"""
+                (() => {{
+                  const composer = document.querySelector({json.dumps(COMPOSER_SELECTOR)});
+                  return Boolean(composer && !composer.innerText.trim());
+                }})()
+                """
+            )
+        )
+
+    def _click_send_control(self) -> bool:
+        """Click the enabled send control nearest the active composer."""
+
+        return bool(
+            self._evaluate(
+                f"""
+                (() => {{
+                  const composer = document.querySelector({json.dumps(COMPOSER_SELECTOR)});
+                  if (!composer) return false;
+                  const visible = node => Boolean(
+                    node && !node.disabled
+                    && node.getAttribute('aria-disabled') !== 'true'
+                    && (node.offsetWidth || node.offsetHeight || node.getClientRects().length)
+                  );
+                  const scope = composer.closest('form') || composer.parentElement || document;
+                  const selectors = [
+                    'button[data-testid="send-button"]',
+                    '[data-testid="send-button"]',
+                    'button[aria-label*="发送"]',
+                    'button[aria-label*="Send"]'
+                  ];
+                  let target = selectors
+                    .map(selector => scope.querySelector(selector) || document.querySelector(selector))
+                    .find(visible);
+                  if (!target) {{
+                    target = [...scope.querySelectorAll('button')].find(node => {{
+                      const label = `${{node.getAttribute('aria-label') || ''}} ${{node.innerText || ''}}`;
+                      return visible(node) && /发送|Send/i.test(label) && !/停止|Stop/i.test(label);
+                    }});
+                  }}
+                  if (!target) return false;
+                  target.click();
+                  return true;
+                }})()
+                """
+            )
+        )
+
+    def _submit_composer_and_confirm(self, previous_user_messages: int) -> None:
+        """Submit once and return only after the UI owns a new user turn."""
+
+        def submitted() -> bool:
+            return (
+                self._user_message_count() > previous_user_messages
+                and self._composer_is_empty()
+            )
+
+        clicked = self._click_send_control()
+        if not clicked:
+            self._dispatch_key("Enter", "Enter")
+        try:
+            self._wait_until(submitted, timeout=12)
+            return
+        except TimeoutError:
+            # The renderer can replace the enabled button between discovery
+            # and click. Locate it afresh once before declaring an uncertain
+            # UI submission; this is not a content retry.
+            if not self._click_send_control():
+                self._dispatch_key("Enter", "Enter")
+        try:
+            self._wait_until(submitted, timeout=33)
+        except TimeoutError as exc:
+            raise PendingPromptSubmissionError(
+                "报价内容仍停留在输入框，尚未确认发送；保留当前对话等待重试。"
+            ) from exc
+
     def _send_prompt(self, prompt: str) -> None:
         remainder = split_astraquote_prompt(prompt)
         user_message_count = self._user_message_count()
-        focused = self._evaluate(
+        composer_state = self._evaluate(
             f"""
             (() => {{
               const composer = document.querySelector({json.dumps(COMPOSER_SELECTOR)});
-              if (!composer || composer.innerText.trim()) return false;
+              if (!composer) return 'missing';
+              if (composer.innerText.trim()) {{
+                return composer.querySelector({json.dumps(RICH_MENTION_SELECTOR)})
+                  ? 'pending_astraquote'
+                  : 'pending_other';
+              }}
               composer.focus();
-              return true;
+              return 'ready';
             }})()
             """
         )
-        if not focused:
-            raise RuntimeError("Codex Chat 输入框未就绪或含有未发送内容。")
+        if composer_state == "pending_astraquote":
+            # A previous button click was not accepted by the renderer. Reuse
+            # that exact draft instead of inserting a duplicate continuation.
+            self._submit_composer_and_confirm(user_message_count)
+            return
+        if composer_state != "ready":
+            raise PendingPromptSubmissionError(
+                "Codex Chat 输入框未就绪或含有未发送内容。"
+            )
         self._call("Input.insertText", {"text": "@"})
 
         def choose_astraquote() -> bool:
@@ -487,11 +581,7 @@ class CodexChatDesktop:
             f"Boolean(document.querySelector({json.dumps(RICH_MENTION_SELECTOR)}))"
         ):
             raise RuntimeError("AstraQuote 插件标记在发送前丢失。")
-        self._dispatch_key("Enter", "Enter")
-        self._wait_until(
-            lambda: self._user_message_count() > user_message_count,
-            timeout=45,
-        )
+        self._submit_composer_and_confirm(user_message_count)
         valid_user_mention = self._evaluate(
             f"""
             (() => {{
@@ -615,7 +705,36 @@ class CodexChatDesktop:
                 )
             )
 
-        if current_quote_visible():
+        quote_is_current = current_quote_visible()
+        pending_composer_state = str(
+            self._evaluate(
+                f"""
+                (() => {{
+                  const composer = document.querySelector({json.dumps(COMPOSER_SELECTOR)});
+                  if (!composer || !composer.innerText || !composer.innerText.trim()) {{
+                    return 'empty';
+                  }}
+                  return composer.querySelector({json.dumps(RICH_MENTION_SELECTOR)})
+                    ? 'pending_astraquote'
+                    : 'pending_other';
+                }})()
+                """
+            )
+        )
+        if pending_composer_state == "pending_astraquote":
+            # A renderer/navigation race may leave an already prepared quote
+            # prompt in the current composer. Submit that exact draft before
+            # any sidebar switch, then let the next polling round rediscover
+            # which logical quote owns the new turn.
+            self._submit_composer_and_confirm(self._user_message_count())
+            raise PendingPromptSubmissionError(
+                "检测到未发送的 AstraQuote 内容，已优先发送并保留当前对话。"
+            )
+        if pending_composer_state == "pending_other":
+            raise PendingPromptSubmissionError(
+                "当前报价内容尚未发送，禁止切换到其他对话。"
+            )
+        if quote_is_current:
             self.promote_pending_reference(quote)
             return
         if (
@@ -685,6 +804,9 @@ class CodexChatDesktop:
         role: str = "coordinator",
         component_keys: list[str] | None = None,
         previous_conversation_ids: list[str] | None = None,
+        conversation_index: int | None = None,
+        wave_index: int = 0,
+        wave_count: int = 1,
     ) -> Any:
         now = time.monotonic()
         active = self.active_quote_factory(
@@ -697,6 +819,9 @@ class CodexChatDesktop:
             role=role,
             component_keys=tuple(component_keys or []),
             previous_conversation_ids=tuple(previous_conversation_ids or []),
+            conversation_index=conversation_index,
+            wave_index=wave_index,
+            wave_count=wave_count,
         )
         try:
             self._switch_to_quote(active)

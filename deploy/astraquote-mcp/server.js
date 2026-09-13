@@ -15,7 +15,7 @@ const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delive
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
 
-const VERSION = '3.14.0';
+const VERSION = '3.15.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -337,7 +337,7 @@ const officialPagePriceEvidence = z.object({
   ),
   scenario_key: scenarioKey.optional(),
   source_url: z.string().url().max(2000).describe(
-    'GPT 在官方 API 对同一计费项连续三次未取得可用费率后选择的云厂商官方 HTTPS 价格页。',
+    'GPT 在官方 API 对同一计费项一次未取得可用费率后选择的云厂商官方 HTTPS 价格页。',
   ),
   source_title: z.string().min(1).max(300),
   price_item: z.string().min(1).max(500).describe('官方页面中的具体计费项目或价格档位。'),
@@ -349,8 +349,8 @@ const officialPagePriceEvidence = z.object({
   unit: z.string().min(1).max(120),
   observed_at: z.string().datetime({ offset: true }).describe('GPT 读取官方价格页的时间。'),
   source_excerpt: z.string().min(1).max(1000).describe('足以核对价格、币种、单位和适用范围的简短官方页面摘录。'),
-  api_attempt_query_ids: z.array(z.string().min(1).max(100)).min(3).max(30).describe(
-    '同一组件、计费项和方案下至少三个未取得可用费率的官方 API 查询 ID。',
+  api_attempt_query_ids: z.array(z.string().min(1).max(100)).min(1).max(30).describe(
+    '同一组件、计费项和方案下未取得可用费率的官方 API 查询 ID；一次有效失败即可转官网。',
   ),
 }).strict();
 
@@ -367,7 +367,7 @@ const componentScenarioCost = z.object({
   price_query_ids: z.array(z.string().min(1).max(100)).min(1).max(30).optional(),
   price_evidence: z.array(officialPriceEvidence).min(1).max(30).optional(),
   official_page_price_evidence: z.array(officialPagePriceEvidence).min(1).max(30).optional().describe(
-    '仅在同一计费项的官方 API 已连续三次未取得可用费率后使用；仍由 GPT 选价格和计算。',
+    '同一计费项的官方 API 一次未取得可用费率后即可使用；仍由 GPT 选价格和计算。',
   ),
 }).strict();
 
@@ -405,7 +405,7 @@ const pricedService = z.object({
     'GPT 从官方原始结果中选中的查询、SKU/价格项及具体费率身份。正式商业报价不得选择 Free Tier、Always Free、免费试用或账户赠送额度。',
   ),
   official_page_price_evidence: z.array(officialPagePriceEvidence).min(1).max(30).optional().describe(
-    'API 优先；同一计费项连续三次未取得可用费率后，GPT 可提交对应账号站点的云厂商官方价格页证据。',
+    'API 优先；同一计费项一次未取得可用费率后，GPT 可提交对应账号站点的云厂商官方价格页证据。',
   ),
   fact_ids: z.array(factId).min(1).max(100).describe(
     '该组件在 ResourceIR、BillingUsageIR 和 PriceIR 中消费的客户事实 ID。',
@@ -676,7 +676,7 @@ function buildServer(workflow) {
 
   server.registerTool('get_prices', {
     title: 'Batch query official cloud prices',
-    description: 'Always set quote_mode: a request for a formal quote, Excel or sales-page delivery MUST use formal_quote; never downgrade it to price_lookup because some prices are missing. Requires a non-empty incremental queries array. For a formal quote, every query MUST have a query_contexts entry. A pre-split sales relay call MUST preserve relay_batch_index, relay_batch_count and the reserved price_batch_id from its prompt, and quote_components MUST contain only that batch; the backend appends and seals each batch. A legacy formal quote registers the complete plan on its first call. Submit as many prepared scopes as fit this call so independent official requests can run in parallel. Each authenticated-cloud query must contain the complete official endpoint, service, region and current response contract chosen by GPT for that live call; the MCP does not learn or reuse product, country or region API routes. Full official results are persisted. If response_compacted=true, read only required details with get_price_results. Invalid or unsupported parameter values are correctable: repair only the rejected fields and retry. needs_refinement, terminal=false, or must_continue=true means do not give the user a final answer. After three qualifying official API failures for the same component/billing/scenario scope, use that provider and account-site official pricing page through build_estimate. GPT chooses products, required minimum parameter values and quote totals; program-assigned sales batches are immutable.',
+    description: 'Always set quote_mode: a request for a formal quote, Excel or sales-page delivery MUST use formal_quote; never downgrade it to price_lookup because some prices are missing. Requires a non-empty incremental queries array. For a formal quote, every query MUST have a query_contexts entry. A pre-split sales relay call MUST preserve relay_batch_index, relay_batch_count and the reserved price_batch_id from its prompt, and quote_components MUST contain only that batch; the backend appends and seals each batch. A legacy formal quote registers the complete plan on its first call. Submit as many prepared scopes as fit this call so independent official requests can run in parallel. Each authenticated-cloud query must contain the complete official endpoint, service, region and current response contract chosen by GPT for that live call; the MCP does not learn or reuse product, country or region API routes. Full official results are persisted. If response_compacted=true, read only required details with get_price_results. Invalid or unsupported parameter values are correctable: repair only the rejected fields and retry. needs_refinement, terminal=false, or must_continue=true means do not give the user a final answer. After one effective official API failure for the same component/billing/scenario scope, use that provider and account-site official pricing page through build_estimate. GPT chooses products, required minimum parameter values and quote totals; program-assigned sales batches are immutable.',
     // Keep the JSON Schema visible to MCP clients. ZodEffects produced by
     // superRefine serializes as an empty object in the MCP SDK, so cross-field
     // checks run inside the guarded handler instead.
@@ -707,7 +707,7 @@ function buildServer(workflow) {
 
   server.registerTool('build_estimate', {
     title: 'Validate and deliver an official quote',
-    description: 'Checks selected official catalog evidence, fact coverage and GPT-calculated totals, then creates one Excel link and returns it with the quote to the sales page. After three qualifying official API failures in one declared scope, official_page_price_evidence is accepted from the same provider and account site. If a component still cannot be priced, submit it through the verified partial-quote contract instead of ending with prose only. Unused discovery and replaced attempts need not succeed.',
+    description: 'Checks selected official catalog evidence, fact coverage and GPT-calculated totals, then creates one Excel link and returns it with the quote to the sales page. After one effective official API failure in one declared scope, official_page_price_evidence is accepted from the same provider and account site. If a component still cannot be priced, submit it through the verified partial-quote contract instead of ending with prose only. Unused discovery and replaced attempts need not succeed.',
     inputSchema: buildEstimateInput,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, guarded((args) => workflow.buildEstimate(normalizeBuildEstimateInput(args))));

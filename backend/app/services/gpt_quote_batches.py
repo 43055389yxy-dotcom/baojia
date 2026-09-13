@@ -13,7 +13,9 @@ import re
 from collections import defaultdict
 from typing import Any
 
-COMPONENTS_PER_CHAT = 20
+COMPONENTS_PER_WAVE = 5
+WAVES_PER_CHAT = 2
+COMPONENTS_PER_CHAT = COMPONENTS_PER_WAVE * WAVES_PER_CHAT
 ASTRAQUOTE_MENTION = "@AstraQuote"
 MAX_NUMBERED_COMPONENTS = 200
 _NUMBERED_COMPONENT_LINE = re.compile(
@@ -65,7 +67,7 @@ def parse_numbered_component_lines(customer_request: str) -> list[dict[str, Any]
 def split_numbered_intake(
     components: list[dict[str, Any]],
     *,
-    maximum_components: int = COMPONENTS_PER_CHAT,
+    maximum_components: int = COMPONENTS_PER_WAVE,
 ) -> list[list[dict[str, Any]]]:
     """Split the mechanically numbered sales intake without reading its meaning."""
 
@@ -89,13 +91,23 @@ def build_numbered_intake_batch_prompt(
 ) -> str:
     """Create the first-pass prompt for exactly one pre-split intake batch."""
 
+    conversation_index = batch_index // WAVES_PER_CHAT
+    conversation_count = (batch_count + WAVES_PER_CHAT - 1) // WAVES_PER_CHAT
+    conversation_start = conversation_index * WAVES_PER_CHAT
+    conversation_wave_count = min(
+        WAVES_PER_CHAT,
+        max(1, batch_count - conversation_start),
+    )
+    wave_index = batch_index - conversation_start
     owned_lines = "\n".join(
         f"[component_key={item['component_key']}] {item['source_line']}"
         for item in components
     )
     return (
         f"{ASTRAQUOTE_MENTION} 请使用 AstraQuote 完成正式报价。"
-        f"这是同一张报价的第 {batch_index + 1}/{batch_count} 个组件批次，"
+        f"这是同一张报价的第 {conversation_index + 1}/{conversation_count} 个对话，"
+        f"当前为本对话第 {wave_index + 1}/{conversation_wave_count} 轮，"
+        f"也是整单第 {batch_index + 1}/{batch_count} 个执行小批，"
         "只处理并保存本批；全部批次完成后由后台统一合并交付。\n\n"
         f"交付信息：提交码 {submission_code}；内部任务编号 {relay_job_id}。\n"
         f"price_batch_id：{price_batch_id}\n"
@@ -111,7 +123,7 @@ def build_numbered_intake_batch_prompt(
 def split_component_plan(
     components: list[dict[str, Any]],
     *,
-    maximum_top_level_components: int = COMPONENTS_PER_CHAT,
+    maximum_top_level_components: int = COMPONENTS_PER_WAVE,
 ) -> list[list[dict[str, Any]]]:
     """Split by top-level ownership and keep every descendant with its root."""
 
