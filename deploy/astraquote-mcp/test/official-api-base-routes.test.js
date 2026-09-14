@@ -32,14 +32,30 @@ test('a single registered operation is filled when the caller omits it', () => {
   assert.equal(query.action, 'InquiryPriceRunInstances');
 });
 
-test('registered routes reject an operation invented by the caller', () => {
-  assert.throws(
-    () => withOfficialApiBaseRoute({
-      provider: 'tencent', service: 'cvm', region: 'ap-shanghai',
-      action: 'RunInstances', path: '/',
-    }),
-    (error) => error.code === 'official_api_operation_not_registered',
-  );
+test('registered routes allow additional read-only official operations', () => {
+  const query = withOfficialApiBaseRoute({
+    provider: 'alibaba_intl', service: 'bssopenapi', region: 'ap-southeast-1',
+    endpoint: 'caller-guessed.example.com', action: 'QuerySkuPriceList', path: '/',
+  });
+
+  assert.equal(query.endpoint, 'business.ap-southeast-1.aliyuncs.com');
+  assert.equal(query.action, 'QuerySkuPriceList');
+});
+
+test('registered routes reject state-changing operations even when the caller supplies one', () => {
+  for (const action of [
+    'RunInstances', 'CreateInstance', 'ModifyInstance', 'DeleteInstance',
+    'SetRenewal', 'RenewInstance', 'PayOrder', 'RefundInstance', 'BatchCreateInstance',
+  ]) {
+    assert.throws(
+      () => withOfficialApiBaseRoute({
+        provider: 'alibaba_intl', service: 'bssopenapi', region: 'ap-southeast-1',
+        action, path: '/',
+      }),
+      (error) => error.code === 'official_api_mutating_operation_blocked',
+      action,
+    );
+  }
 });
 
 test('basic routes support fixed and region-scoped official hosts', () => {

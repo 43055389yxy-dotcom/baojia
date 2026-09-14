@@ -11,6 +11,15 @@ const CATALOG_CANDIDATES = [
   path.resolve(__dirname, '../../../policies/official-api-base-routes.json'),
 ].filter(Boolean);
 const SAFE_REGION = /^[A-Za-z0-9][A-Za-z0-9.-]{0,79}$/;
+const MUTATING_OPERATION_VERBS = new Set([
+  'activate', 'add', 'allocate', 'apply', 'attach', 'bind', 'cancel', 'change',
+  'close', 'create', 'deactivate', 'delete', 'deploy', 'disable', 'downgrade',
+  'detach', 'enable', 'execute', 'install', 'invoke', 'launch', 'modify', 'open',
+  'pay', 'purchase', 'buy', 'reboot',
+  'refund', 'release', 'remove', 'renew', 'reset', 'resize', 'restart', 'run',
+  'scale', 'set', 'start', 'stop', 'submit', 'subscribe', 'terminate', 'unbind',
+  'uninstall', 'unsubscribe', 'update', 'upgrade',
+]);
 
 let cachedCatalog;
 
@@ -35,6 +44,55 @@ function catalog() {
 
 function serviceKey(value) {
   return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+
+function operationIdentity(query) {
+  if (String(query?.action || '').trim()) return String(query.action).trim();
+  const segments = String(query?.path || '').split('/').filter(Boolean);
+  return segments.at(-1) || '';
+}
+
+
+function operationVerb(value) {
+  const tokens = String(value || '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .split(/[^A-Za-z0-9]+/u)
+    .map((token) => token.toLowerCase())
+    .filter((token) => /^[a-z]/u.test(token));
+  const first = tokens[0] || '';
+  if (first === 'batch') return tokens[1] || first;
+  if (first.startsWith('batch') && first.length > 5) return first.slice(5);
+  return first;
+}
+
+
+function assertNonMutatingOperation(query, route, registered) {
+  const operation = operationIdentity(query);
+  if (!operation) {
+    const error = new Error('An official API operation is required.');
+    error.code = 'official_api_operation_missing';
+    error.retryable = true;
+    error.details = {
+      provider: route.provider,
+      service: route.service,
+      registered_operations: route.operations,
+    };
+    throw error;
+  }
+  // Catalog operations are trusted defaults, not a closed allowlist. Providers
+  // add read-only discovery and pricing actions over time, so pass those through
+  // while retaining the official-host boundary and blocking state changes.
+  if (registered || !MUTATING_OPERATION_VERBS.has(operationVerb(operation))) return;
+  const error = new Error('State-changing official API operations are blocked.');
+  error.code = 'official_api_mutating_operation_blocked';
+  error.retryable = false;
+  error.details = {
+    provider: route.provider,
+    service: route.service,
+    blocked_operation: operation,
+  };
+  throw error;
 }
 
 
@@ -97,17 +155,7 @@ function withOfficialApiBaseRoute(query) {
       return supplied === expected
         || (!materialized.action && !operation.startsWith('/') && supplied.endsWith(expected));
     });
-    if (!allowed) {
-      const error = new Error('The request must use a registered official pricing operation.');
-      error.code = 'official_api_operation_not_registered';
-      error.retryable = true;
-      error.details = {
-        provider: route.provider,
-        service: route.service,
-        allowed_operations: route.operations,
-      };
-      throw error;
-    }
+    assertNonMutatingOperation(materialized, route, allowed);
   }
   return {
     ...materialized,

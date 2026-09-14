@@ -804,7 +804,7 @@ test('saved details page all official rates with complete counts and never modif
   assert.equal(workflow.store.getPriceBatch(batch.price_batch_id).result.results[0].official_rate_candidates.length, 45);
 });
 
-test('authenticated pricing keeps business parameters while enforcing registered operations', async (t) => {
+test('authenticated pricing keeps business parameters and permits unregistered read-only operations', async (t) => {
   const { workflow, directory, backend } = fixture({ provider: 'alibaba' });
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const received = [];
@@ -830,13 +830,26 @@ test('authenticated pricing keeps business parameters while enforcing registered
     region: 'ap-southeast-1', region_parameter: 'Region', method: 'POST', path: '/',
     query_parameters: { ProductCode: 'rds' }, body: {}, response_filters: {},
   }] });
+  const third = await workflow.getPrices({ queries: [{
+    provider: 'alibaba', query_id: 'live-third', endpoint: 'caller-guessed.example.com',
+    service: 'bssopenapi', action: 'QuerySkuPriceList', version: '2017-12-14',
+    region: 'ap-southeast-1', region_parameter: 'none', method: 'POST', path: '/',
+    query_parameters: { CommodityCode: 'ecs', PriceEntityCode: 'instance_type' },
+    body: {}, response_filters: {},
+  }] });
 
   assert.equal(first.learned_routes, undefined);
   assert.equal(second.learned_routes, undefined);
-  assert.equal(received.length, 2);
+  assert.equal(third.learned_routes, undefined);
+  assert.equal(received.length, 3);
   assert.equal(received[1].endpoint, 'business.aliyuncs.com');
   assert.equal(received[1].action, 'GetPayAsYouGoPrice');
   assert.deepEqual(received[1].query_parameters, { ProductCode: 'rds' });
+  assert.equal(received[2].endpoint, 'business.aliyuncs.com');
+  assert.equal(received[2].action, 'QuerySkuPriceList');
+  assert.deepEqual(received[2].query_parameters, {
+    CommodityCode: 'ecs', PriceEntityCode: 'instance_type',
+  });
 });
 
 test('build validates selected official evidence then delivers', async (t) => {
