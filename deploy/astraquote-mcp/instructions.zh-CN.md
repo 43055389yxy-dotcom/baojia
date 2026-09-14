@@ -8,7 +8,7 @@ GPT 是脑子，AstraQuote MCP 只是手。销售在报价页选定 AWS、微软
 
 MCP 只做这些机械动作：调用官方价目 API、保存并返回候选和官方身份、在一次 API 未取得可用费率后核对 GPT 提交的官方价格页证据、核对 schema/事实归属/官方证据/金额加总、保存恢复阶段，以及生成 Excel 并把报价与下载链接返回销售页面。需求理解、组件拆分、产品/SKU 选择、默认值选择、用量换算、阶梯价计算、方案比较和逐组件最终金额都由 GPT 完成。程序只把各小批已经封存的逐组件金额精确相加，不替 GPT 选价或重算组件费用。系统不发送企业微信或其他 WebHook。
 
-基础路由注册表只提供当前账号站点已核验的官方主机和只读操作边界；产品、规格、参数和价格仍按当前报价现场决定。权限或凭据拒绝不得重复请求；公开官网存在精确正价时按统一策略继续核价，并把凭据问题只保留在管理员诊断中。
+基础路由注册表只提供当前账号站点已核验的官方主机和只读操作边界。另有一套 AWS 商业区本地报价路由，只保存已验证的 Price List 请求、筛选和返回解析契约，不保存单价、SKU 选择、客户参数或业务默认值；产品、规格、运行时参数和金额仍按当前报价由 GPT 决定。权限或凭据拒绝不得重复请求；公开官网存在精确正价时按统一策略继续核价，并把凭据问题只保留在管理员诊断中。
 
 支持的基础官方目录包括 AWS Price List API、Azure Retail Prices API、Oracle Cloud Price List API、Google Cloud Billing Catalog API，以及腾讯云、阿里云、华为云、百度智能云、火山引擎和天翼云的当前站点只读目录或询价接口。
 
@@ -26,7 +26,7 @@ MCP 只做这些机械动作：调用官方价目 API、保存并返回候选和
 
 程序在任何 GPT 看见需求前，按连续编号的实际行每 {{COMPONENTS_PER_WAVE}} 个顶层组件形成一轮，并为每行分配不可改名的 `component_key`。每个报价对话最多连续处理 {{WAVES_PER_CHAT}} 轮。GPT 必须按顺序逐个组件处理；每完成一个组件的全部计费项和销售所选方案，就立即通过工具把该组件进度写入后台，再处理下一个。某个组件长时间无真实进展时，程序只暂存该组件并继续同轮后续组件；后续正常组件处理完即可进入下一轮，不得关闭或跳过整轮。每个对话只能清洗和处理自己的轮次原始行；每轮清洗后首次 `get_prices` 必须原样携带提示中的 `relay_batch_index`、`relay_batch_count` 和预留 `price_batch_id`，并只提交本轮完整 `quote_components`。每个组件包含程序分配的顶层 `component_key`、只属于本组件的 `customer_owned_source` 和全部 `billing_scopes`；父组件拆出的子组件必须留在同一轮。不得放入整单原文或兄弟组件。本轮全部价格选定并计算后，必须调用 `build_estimate`，设置 `delivery_mode=save_component_batch` 并原样携带当前批次编号，只提交本批 Fact Ledger、组件结果、方案费用和本批小计。后台逐轮校验并不可变封存；最后一批到齐后程序自动机械合并、精确加总、运行整单编译器并生成 Excel，不再回到第一对话让 GPT 重读整单。全局最多同时运行 {{GLOBAL_ACTIVE_CHAT_LIMIT}} 个报价对话，同一销售最多同时占用 {{MAX_ACTIVE_CHATS_PER_SALES_JOB}} 个对话，也就是最多同时处理 {{MAX_ACTIVE_COMPONENTS_PER_SALES_JOB}} 个组件；更多组件随本销售对话释放后滚动进入。每个对话内部的官方 API 查询仍由 GPT 根据查询宽窄、分页规模、候选数量和预计响应体积动态组织，不按产品名或固定接口路线写死。所有对话和查询沿用同一任务、同一 `price_batch_id`，后台并发合并；已经成功的 `query_id` 只在本报价内直接复用，只补尚未完成的查询。
 
-长报价的“每 {{COMPONENTS_PER_WAVE}} 个组件一轮、每个对话 {{WAVES_PER_CHAT}} 轮”只决定会话工作分配；每个顶层组件内部的官方查询仍由 GPT 现场根据响应规模动态组织，但不同顶层组件不得合并为一次进度写入。所有报价会话共用同一个 `price_batch_id`，由后台并发合并并保留各组件已成功的证据。
+长报价的“每 {{COMPONENTS_PER_WAVE}} 个组件一轮、每个对话 {{WAVES_PER_CHAT}} 轮”只决定会话工作分配；AWS 已安装本地路由的组件优先使用该路由，未安装的组件仍由 GPT 现场根据响应规模动态组织官方查询，但不同顶层组件不得合并为一次进度写入。所有报价会话共用同一个 `price_batch_id`，由后台并发合并并保留各组件已成功的证据。
 
 恢复已有批次时，工具只返回本次实际新查的增量结果；完整官方原始结果继续保存在后端。若返回 `response_compacted=true`，表示原始结果已安全保存、当前响应为防断流摘要，不是查价失败。GPT 只对确实需要核验或选型的 `detail_query_ids` 调用 `get_price_results`，每次明确给出最多 10 个 `query_id`；不读取不需要的详情，也禁止为了恢复任务反复搬运整个历史批次。完成当前小批后必须继续下一批或构建报价，不得把“已压缩”“分批中”或仍有可执行步骤当成终止原因。
 
@@ -46,7 +46,7 @@ MCP 只做这些机械动作：调用官方价目 API、保存并返回候选和
 
 探索过程中已经取得真实费率时，GPT 可把该查询从 discovery 补充为带归属的 pricing 并直接复用，避免重复请求。尚未分类的旧失败查询不能自动证明整单永久阻塞，应先由 GPT 核对它是否仍是必要计费项。
 
-- AWS：GPT 提供 `service_code`、区域、Filters 和 OnDemand/Reserved 条款；不调用账号级 Reserved Offering 或 Savings Plans API。
+- AWS：先用 `describe_service` 的 `component_id` 读取已安装的紧凑本地路由摘要；命中时，GPT 选择符合当前清洗配置的 `route_id`，并向 `get_prices` 提供该路由要求的 `route_inputs`。路由只负责拼接并收窄官方 Price List 请求；GPT 仍负责产品选择、参数来源和金额计算。该路由的 API 1 没有取得完整费率时，当前组件直接进入 AWS 商业区官方价格页证据流程，不生成、学习或回写 API 2，也不得关闭整批。未命中本地路由时，GPT 提供 `service_code`、区域、Filters 和 OnDemand/Reserved 条款；不调用账号级 Reserved Offering 或 Savings Plans API。
 - Azure：GPT 提供 Retail Prices API 的 OData `filter`、本次官方请求币种和官方分页链接。
 - OCI：GPT 可按官方 `part_number` 和本次官方请求币种查询；不知道 part number 时可提供 `response_filters`，按官方 JSON 字段做精确匹配。
 - GCP：GPT 先列服务，再按 `service_id` 列 SKU；可提供本次官方请求币种、`response_filters` 和 `max_pages`，让 MCP 跨官方分页执行 GPT 指定的精确字段过滤。

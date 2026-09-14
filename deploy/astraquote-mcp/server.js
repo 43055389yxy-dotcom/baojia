@@ -20,7 +20,7 @@ const {
   workflowPolicyVersion,
 } = require('./lib/quote-workflow-policy');
 
-const VERSION = '3.20.0';
+const VERSION = '3.21.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -71,7 +71,16 @@ const cloudProvider = z.enum([
   'baidu', 'volcengine', 'ctyun',
 ]);
 
-const describeServiceInput = z.object({ service_code: serviceCode }).strict();
+const describeServiceInput = z.object({
+  service_code: serviceCode,
+  component_id: z.string().regex(/^[a-z0-9][a-z0-9-]{1,79}$/).optional().describe(
+    'Optional installed local AWS pricing component id used to narrow verified route summaries.',
+  ),
+  pricing_model: z.enum(['on_demand', 'reserved']).optional(),
+  route_search: z.string().max(160).optional(),
+  route_offset: z.number().int().min(0).max(10000).default(0),
+  route_limit: z.number().int().min(1).max(50).default(20),
+}).strict();
 
 const attributeValuesInput = z.object({
   service_code: serviceCode,
@@ -92,6 +101,13 @@ const awsPriceQuery = z.object({
   term_years: z.union([z.literal(1), z.literal(3)]).optional(),
   payment_option: z.enum(['no_upfront', 'partial_upfront', 'all_upfront']).optional(),
   offering_class: z.enum(['standard', 'convertible']).optional(),
+  route_id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{2,159}$/).optional().describe(
+    'Verified route id returned by describe_service. The route supplies only request and response contracts, never a price or product choice.',
+  ),
+  route_inputs: z.record(z.union([z.string(), z.number().int(), z.boolean()])).refine(
+    (value) => Object.keys(value).length <= 40,
+    'At most 40 local-route runtime inputs are allowed.',
+  ).default({}).describe('Current validated configuration values required by the selected local route.'),
 }).strict();
 
 const azurePriceQuery = z.object({
@@ -327,6 +343,13 @@ const getPricesInputSchema = z.object({
 
 const getPricesInput = getPricesInputSchema.superRefine((value, context) => {
   value.queries.forEach((query, index) => {
+    if (query.provider === 'aws' && Object.keys(query.route_inputs || {}).length && !query.route_id) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'AWS route_inputs require a route_id returned by describe_service.',
+        path: ['queries', index, 'route_id'],
+      });
+    }
     if (query.provider === 'gcp' && query.operation === 'list_skus' && !query.currency_code) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
@@ -734,8 +757,8 @@ function buildServer(workflow) {
   );
 
   server.registerTool('describe_service', {
-    title: 'Describe an AWS Price List service',
-    description: 'AWS-only auxiliary discovery. It returns official attributes and never chooses a service for GPT.',
+    title: 'Discover AWS pricing routes or service attributes',
+    description: 'AWS-only discovery. It first reads compact verified local route contracts for the service code without network access; component_id and route_search narrow the result. If no local route exists it returns official Price List service attributes. It never chooses a product or value for GPT.',
     inputSchema: describeServiceInput,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, guarded((args) => workflow.describeService(args)));
@@ -749,7 +772,7 @@ function buildServer(workflow) {
 
   server.registerTool('get_prices', {
     title: 'Batch query official cloud prices',
-    description: `Always set quote_mode; formal quotes, Excel and sales-page delivery use formal_quote. Requires non-empty incremental queries and one query_contexts entry for each formal pricing query. Preserve relay_batch_index, relay_batch_count, price_batch_id and the current quote_components batch. Full official results are persisted; use get_price_results only for required compacted details. needs_refinement, terminal=false or must_continue means continue the required action and do not give a final answer. GPT supplies current product parameters and response paths while AstraQuote enforces registered hosts and read-only operations. ${renderWorkflowPolicySlice('quote_context')}`,
+    description: `Always set quote_mode; formal quotes, Excel and sales-page delivery use formal_quote. Requires non-empty incremental queries and one query_contexts entry for each formal pricing query. For installed AWS components, discover and prefer a verified local route_id; GPT still supplies current validated route_inputs and performs product selection and calculation. A local route failure affects only that component and follows the existing same-site official price-page fallback. Preserve relay_batch_index, relay_batch_count, price_batch_id and the current quote_components batch. Full official results are persisted; use get_price_results only for required compacted details. needs_refinement, terminal=false or must_continue means continue the required action and do not give a final answer. GPT supplies current product parameters and response paths while AstraQuote enforces registered hosts and read-only operations. ${renderWorkflowPolicySlice('quote_context')}`,
     // Keep the JSON Schema visible to MCP clients. ZodEffects produced by
     // superRefine serializes as an empty object in the MCP SDK, so cross-field
     // checks run inside the guarded handler instead.

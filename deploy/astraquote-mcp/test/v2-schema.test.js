@@ -142,6 +142,7 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
     'build_estimate',
   ]);
   const getPrices = listed.tools.find((tool) => tool.name === 'get_prices');
+  const describeService = listed.tools.find((tool) => tool.name === 'describe_service');
   const buildEstimate = listed.tools.find((tool) => tool.name === 'build_estimate');
   assert.ok(getPrices.inputSchema.required.includes('queries'));
   assert.ok(getPrices.inputSchema.required.includes('quote_mode'));
@@ -151,6 +152,8 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   assert.equal(getPrices.inputSchema.properties.relay_batch_index.type, 'integer');
   assert.equal(getPrices.inputSchema.properties.relay_batch_count.type, 'integer');
   assert.equal(getPrices.inputSchema.properties.official_page_price_evidence.type, 'array');
+  assert.equal(describeService.inputSchema.properties.component_id.type, 'string');
+  assert.equal(describeService.inputSchema.properties.route_limit.type, 'integer');
   assert.equal(buildEstimate.inputSchema.properties.services.maxItems, 200);
   assert.deepEqual(buildEstimate.inputSchema.properties.delivery_mode.enum, [
     'deliver_quote', 'save_component_batch',
@@ -162,7 +165,8 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   assert.match(INSTRUCTIONS, /GPT.*理解.*选择.*计算/s);
   assert.match(INSTRUCTIONS, /AWS.*Azure.*Oracle.*Google.*腾讯云.*阿里云.*华为云.*百度智能云.*火山引擎.*天翼云/s);
   assert.match(INSTRUCTIONS, /官方文档.*官方 SDK/s);
-  assert.doesNotMatch(INSTRUCTIONS, /route_id|缓存道路|道路级错误/);
+  assert.match(INSTRUCTIONS, /route_id/);
+  assert.doesNotMatch(INSTRUCTIONS, /缓存道路|道路级错误/);
   assert.match(INSTRUCTIONS, /第三方网页.*绝不能作为价格证据/s);
   assert.match(INSTRUCTIONS, /工具入参校验.*可修正.*重试/s);
   assert.match(INSTRUCTIONS, /queries.*非空/s);
@@ -176,7 +180,7 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   assert.equal(getPrices.inputSchema.properties.official_page_price_evidence.type, 'array');
   assert.match(buildEstimate.description, /official_page_price_evidence/i);
   assert.match(buildEstimate.description, /save_component_batch.*最后一批.*Excel/is);
-  assert.match(INSTRUCTIONS, /统一执行策略版本：`2026-09-14-unified-v2`/);
+  assert.match(INSTRUCTIONS, /统一执行策略版本：`2026-09-14-aws-local-routes-v1`/);
   assert.match(INSTRUCTIONS, /一个顶层组件为一次进度写入单位/);
   assert.match(INSTRUCTIONS, /不得把多个顶层组件合并到同一次价格调用/);
   assert.match(INSTRUCTIONS, /每 5 个组件形成一轮.*每个对话最多 10 个组件/s);
@@ -200,6 +204,8 @@ test('get_prices accepts all twelve provider-site raw query shapes', async (t) =
         {
           provider: 'aws', query_id: 'aws-1', service_code: 'AmazonEC2',
           region: 'ap-northeast-1', filters: { instanceType: 'm7g.large' },
+          route_id: 'aws-commercial-ec2-shared-instance-on-demand',
+          route_inputs: { operating_system: 'Linux', dedicated: false, vcpu: 2 },
         },
         {
           provider: 'azure', query_id: 'azure-1',
@@ -265,6 +271,9 @@ test('get_prices accepts all twelve provider-site raw query shapes', async (t) =
   });
   assert.equal(result.isError, undefined);
   assert.equal(result.structuredContent.input.queries.length, 12);
+  assert.equal(result.structuredContent.input.queries[0].route_id,
+    'aws-commercial-ec2-shared-instance-on-demand');
+  assert.equal(result.structuredContent.input.queries[0].route_inputs.vcpu, 2);
   assert.equal(result.structuredContent.input.queries[3].response_filters.displayName, 'Compute Engine');
 });
 
@@ -291,7 +300,7 @@ test('get_prices lets the verified base-route catalog supply a known authenticat
   assert.equal(result.structuredContent.input.queries[0].endpoint, undefined);
 
   const tool = (await client.listTools()).tools.find((item) => item.name === 'get_prices');
-  assert.doesNotMatch(JSON.stringify(tool.inputSchema.properties.queries), /route_id/);
+  assert.match(JSON.stringify(tool.inputSchema.properties.queries), /route_id/);
 });
 
 test('query lifecycle metadata is visible in the MCP schema and survives tool validation', async (t) => {

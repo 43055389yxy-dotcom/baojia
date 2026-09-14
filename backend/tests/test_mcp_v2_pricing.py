@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 import app.aws_main as aws_main
 from app.services.mcp_v2_pricing import (
     BaiduPriceQuery,
+    DescribeServiceRequest,
     GetPricesRequest,
     OfficialPricingService,
     PriceQuery,
@@ -22,6 +23,186 @@ class FakeExecutor:
     def execute(self, **kwargs):
         self.calls.append(kwargs)
         return self.responses.pop(0)
+
+
+def test_describe_service_reads_verified_local_routes_without_aws_network() -> None:
+    executor = FakeExecutor([])
+    service = OfficialPricingService(executor)
+
+    result = service.describe_service(
+        DescribeServiceRequest(
+            service_code="AmazonEC2",
+            component_id="ec2",
+            pricing_model="on_demand",
+            route_limit=20,
+        )
+    )
+
+    assert result["status"] == "found"
+    assert result["source"] == "AstraQuote verified local AWS pricing routes"
+    assert result["matched_count"] >= 1
+    assert result["routes"][0]["route_id"].startswith("aws-commercial-ec2-")
+    assert executor.calls == []
+
+
+def test_describe_service_prefers_local_routes_by_service_code_without_component_id() -> None:
+    executor = FakeExecutor([])
+    service = OfficialPricingService(executor)
+
+    result = service.describe_service(
+        DescribeServiceRequest(
+            service_code="AmazonEC2",
+            pricing_model="on_demand",
+            route_search="shared instance",
+        )
+    )
+
+    assert result["status"] == "found"
+    assert {route["component_id"] for route in result["routes"]} == {"ec2"}
+    assert executor.calls == []
+
+
+def test_get_prices_executes_verified_local_route_with_runtime_inputs() -> None:
+    product = json.loads(
+        _price_product(
+            "SKU-LOCAL",
+            {
+                "SKU-LOCAL.hour": {
+                    "rateCode": "SKU-LOCAL.hour",
+                    "description": "Linux instance hours",
+                    "beginRange": "0",
+                    "endRange": "Inf",
+                    "unit": "Hrs",
+                    "pricePerUnit": {"USD": "0.1020000000"},
+                }
+            },
+        )
+    )
+    product["product"]["attributes"].update(
+        {
+            "servicecode": "AmazonEC2",
+            "usagetype": "APS1-BoxUsage:m7g.large",
+            "locationType": "AWS Region",
+            "availabilityzone": "NA",
+        }
+    )
+    executor = FakeExecutor([{"PriceList": [json.dumps(product)]}])
+    service = OfficialPricingService(executor)
+
+    result = service.get_prices(
+        GetPricesRequest(
+            queries=[
+                PriceQuery(
+                    query_id="local-ec2",
+                    service_code="AmazonEC2",
+                    region="ap-southeast-1",
+                    pricing_model="on_demand",
+                    route_id="aws-commercial-ec2-shared-instance-on-demand",
+                    route_inputs={
+                        "instance_type": "m7g.large",
+                        "operating_system": "Linux",
+                        "preinstalled_software": "NA",
+                        "license_model": "No License required",
+                        "operation": "RunInstances",
+                    },
+                )
+            ]
+        )
+    )
+
+    item = result["results"][0]
+    assert item["status"] == "exact"
+    assert item["local_route_id"] == "aws-commercial-ec2-shared-instance-on-demand"
+    assert item["component_id"] == "ec2"
+    assert item["route_source"] == "verified_local_contract"
+    assert executor.calls[0]["parameters"]["ServiceCode"] == "AmazonEC2"
+    assert {
+        (value["Field"], value["Value"]) for value in executor.calls[0]["parameters"]["Filters"]
+    } >= {
+        ("instanceType", "m7g.large"),
+        ("operatingSystem", "Linux"),
+        ("tenancy", "Shared"),
+    }
+
+
+def test_missing_local_route_fails_only_that_query_and_requests_page_fallback() -> None:
+    executor = FakeExecutor([])
+    service = OfficialPricingService(executor)
+
+    result = service.get_prices(
+        GetPricesRequest(
+            queries=[
+                PriceQuery(
+                    query_id="missing-route",
+                    service_code="AmazonEC2",
+                    region="ap-southeast-1",
+                    route_id="aws-commercial-ec2-route-does-not-exist",
+                )
+            ]
+        )
+    )
+
+    item = result["results"][0]
+    assert item["status"] == "query_failed"
+    assert item["code"] == "aws_local_route_not_found"
+    assert item["recovery"]["next_action"] == "use_verified_official_price_page"
+    assert executor.calls == []
+
+
+def test_local_route_relaxes_optional_labels_only_with_stable_usage_semantics() -> None:
+    product = {
+        "serviceCode": "AmazonS3",
+        "product": {
+            "sku": "S3-TIER1",
+            "attributes": {
+                "servicecode": "AmazonS3",
+                "usagetype": "APS1-Requests-Tier1",
+                "operation": "",
+            },
+        },
+        "terms": {
+            "OnDemand": {
+                "S3-TIER1.term": {
+                    "offerTermCode": "JRTCKXETXF",
+                    "effectiveDate": "2026-09-01T00:00:00Z",
+                    "termAttributes": {},
+                    "priceDimensions": {
+                        "S3-TIER1.requests": {
+                            "rateCode": "S3-TIER1.requests",
+                            "description": "Tier 1 requests",
+                            "beginRange": "0",
+                            "endRange": "Inf",
+                            "unit": "Requests",
+                            "pricePerUnit": {"USD": "0.000005"},
+                        }
+                    },
+                }
+            }
+        },
+    }
+    executor = FakeExecutor([{"PriceList": []}, {"PriceList": [json.dumps(product)]}])
+    service = OfficialPricingService(executor)
+
+    result = service.get_prices(
+        GetPricesRequest(
+            queries=[
+                PriceQuery(
+                    query_id="s3-tier1",
+                    service_code="AmazonS3",
+                    region="ap-southeast-1",
+                    route_id="aws-commercial-s3-requests-standard-tier-1",
+                )
+            ]
+        )
+    )
+
+    assert result["results"][0]["status"] == "exact"
+    assert len(executor.calls) == 2
+    first_fields = {value["Field"] for value in executor.calls[0]["parameters"]["Filters"]}
+    second_fields = {value["Field"] for value in executor.calls[1]["parameters"]["Filters"]}
+    assert "group" in first_fields
+    assert "group" not in second_fields
+    assert "regionCode" in second_fields
 
 
 def _price_product(sku: str, dimensions: dict[str, object]) -> str:
@@ -176,14 +357,11 @@ def test_get_prices_batches_queries_and_returns_every_official_dimension() -> No
         "Hrs",
         "Quantity",
     ]
-    assert exact["products"][0]["price_dimensions"][0]["price_per_unit"] == {
-        "USD": "0.1020000000"
-    }
+    assert exact["products"][0]["price_dimensions"][0]["price_per_unit"] == {"USD": "0.1020000000"}
     assert all(call["service"] == "pricing" for call in executor.calls)
     assert executor.calls[0]["parameters"]["ServiceCode"] == "AmazonEC2"
     assert {
-        (item["Field"], item["Value"])
-        for item in executor.calls[0]["parameters"]["Filters"]
+        (item["Field"], item["Value"]) for item in executor.calls[0]["parameters"]["Filters"]
     } >= {
         ("regionCode", "ap-southeast-1"),
         ("instanceType", "m7g.large"),
@@ -277,9 +455,7 @@ def test_reserved_prices_use_price_list_terms_instead_of_account_offering_apis()
         "PurchaseOption": "All Upfront",
         "OfferingClass": "standard",
     }
-    assert item["products"][0]["price_dimensions"][0]["price_per_unit"] == {
-        "USD": "540.0000000000"
-    }
+    assert item["products"][0]["price_dimensions"][0]["price_per_unit"] == {"USD": "540.0000000000"}
     assert len(executor.calls) == 1
     assert executor.calls[0]["service"] == "pricing"
     assert executor.calls[0]["operation"] == "get_products"
@@ -426,11 +602,13 @@ def test_v2_schema_error_returns_field_details_and_is_retryable(monkeypatch) -> 
     response = TestClient(aws_main.app).post(
         "/api/mcp/v2/prices",
         json={
-            "queries": [{
-                "provider": "azure",
-                "query_id": "azure-without-currency",
-                "filter": "serviceName eq 'Virtual Machines'",
-            }]
+            "queries": [
+                {
+                    "provider": "azure",
+                    "query_id": "azure-without-currency",
+                    "filter": "serviceName eq 'Virtual Machines'",
+                }
+            ]
         },
         headers={"X-AstraQuote-MCP-Token": "test-token"},
     )
@@ -439,7 +617,4 @@ def test_v2_schema_error_returns_field_details_and_is_retryable(monkeypatch) -> 
     payload = response.json()
     assert payload["code"] == "request_schema_invalid"
     assert payload["retryable"] is True
-    assert any(
-        item["path"].endswith("currency_code")
-        for item in payload["details"]["violations"]
-    )
+    assert any(item["path"].endswith("currency_code") for item in payload["details"]["violations"])

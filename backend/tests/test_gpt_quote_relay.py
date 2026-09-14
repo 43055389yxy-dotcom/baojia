@@ -227,7 +227,7 @@ def test_relay_queues_and_hides_raw_customer_text(tmp_path: Path) -> None:
     internal = store.get(public["job_id"])
     assert internal["customer_request"] == "东京 EC2 两台，按需。"
     assert internal["continuation_attempts"] == 0
-    assert internal["policy_version"] == "2026-09-14-unified-v2"
+    assert internal["policy_version"] == "2026-09-14-aws-local-routes-v1"
     assert internal["policy_snapshot"]["batching"]["components_per_wave"] == 5
     assert "prompt_directives" not in internal["policy_snapshot"]
     assert public["policy_version"] == internal["policy_version"]
@@ -933,7 +933,7 @@ def test_per_quote_prompt_contains_only_per_order_context() -> None:
     assert "quote_components" not in prompt
     assert "每 20 个组件" not in prompt
     assert "禁止为了满足目标而向上选择" not in prompt
-    assert "执行策略版本：2026-09-14-unified-v2" in prompt
+    assert "执行策略版本：2026-09-14-aws-local-routes-v1" in prompt
 
     plugin_instructions = (
         Path(__file__).resolve().parents[2]

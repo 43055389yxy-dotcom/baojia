@@ -341,6 +341,53 @@ test('one failed official API attempt unlocks GPT-selected official pricing page
   assert.equal(saved.billing_usage_ir[0].official_page_price_evidence.length, 1);
 });
 
+test('a failed verified local AWS route goes to the official page without a second API route', async (t) => {
+  const context = fixture({ status: 'not_found', provider: 'aws', itemIds: [] });
+  t.after(() => fs.rmSync(context.directory, { recursive: true, force: true }));
+  let officialCalls = 0;
+  const originalGetPrices = context.backend.getPrices;
+  context.backend.getPrices = async (input) => {
+    officialCalls += 1;
+    return originalGetPrices(input);
+  };
+  const component = {
+    component_key: 'cmp_compute_0001',
+    customer_owned_source: '云服务器数量：1。',
+    billing_scopes: [{ billing_key: 'compute' }],
+  };
+  const first = await context.workflow.getPrices({
+    quote_mode: 'formal_quote',
+    queries: [{
+      provider: 'aws', query_id: 'local-route-first', service_code: 'AmazonEC2',
+      region: 'ap-southeast-1', route_id: 'aws-commercial-ec2-shared-instance-on-demand',
+      route_inputs: { instance_type: 'm7g.large' },
+    }],
+    query_contexts: [{
+      query_id: 'local-route-first', purpose: 'pricing',
+      component_key: 'cmp_compute_0001', billing_key: 'compute',
+    }],
+    quote_components: [component],
+  });
+
+  const second = await context.workflow.getPrices({
+    quote_mode: 'formal_quote',
+    price_batch_id: first.price_batch_id,
+    queries: [{
+      provider: 'aws', query_id: 'local-route-second', service_code: 'AmazonEC2',
+      region: 'ap-southeast-1', route_id: 'aws-commercial-ec2-shared-instance-on-demand',
+      route_inputs: { instance_type: 'm7g.xlarge' },
+    }],
+    query_contexts: [{
+      query_id: 'local-route-second', purpose: 'pricing',
+      component_key: 'cmp_compute_0001', billing_key: 'compute',
+    }],
+  });
+
+  assert.equal(officialCalls, 1);
+  assert.equal(second.results[0].code, 'aws_local_route_official_page_required');
+  assert.equal(second.results[0].recovery.next_action, 'use_verified_official_price_page');
+});
+
 test('official pricing page evidence still requires one qualifying API failure', async (t) => {
   const { workflow, directory } = fixture({ status: 'not_found', itemIds: [] });
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -1467,7 +1514,7 @@ test('price lookup responses tell weaker clients that quote coverage is unknown 
   });
 
   assert.equal(result.workflow_guard.mode, 'price_lookup');
-  assert.equal(result.workflow_guard.policy_version, '2026-09-14-unified-v2');
+  assert.equal(result.workflow_guard.policy_version, '2026-09-14-aws-local-routes-v1');
   assert.equal(result.workflow_guard.quote_plan_registered, false);
   assert.equal(result.workflow_guard.quote_coverage_known, false);
   assert.equal(result.workflow_guard.formal_quote_final_response_allowed, false);

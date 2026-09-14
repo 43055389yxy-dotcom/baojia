@@ -1862,6 +1862,7 @@ class AstraQuoteV2Workflow {
     const contextById = new Map(queryContexts.map((context) => [context.query_id, context]));
     const priorFailedAttempts = new Map();
     const priorNetworkAttemptCounts = new Map();
+    const failedLocalAwsRouteScopes = new Set();
     for (const [priorQueryId, priorQuery] of existingQueries) {
       const priorContext = contextById.get(priorQueryId);
       const priorScope = pricingScopeKey(
@@ -1880,6 +1881,17 @@ class AstraQuoteV2Workflow {
           priorScope,
           Number(priorNetworkAttemptCounts.get(priorScope) || 0) + 1,
         );
+      }
+      const correctableLocalInput = [
+        'aws_local_route_input_missing',
+        'aws_local_route_input_unknown',
+        'aws_local_route_input_invalid',
+        'aws_local_route_filter_conflict',
+      ].includes(priorResult.code);
+      if (workflowPolicyValue(
+        'pricing', 'local_aws_route_fallback_to_official_page',
+      ) && priorQuery.provider === 'aws' && priorQuery.route_id && !correctableLocalInput) {
+        failedLocalAwsRouteScopes.add(priorScope);
       }
     }
     const forceCapabilityRecheck = input.force_capability_recheck === true
@@ -1925,6 +1937,22 @@ class AstraQuoteV2Workflow {
           message: 'This exact official pricing request already failed in the current quote.',
           details: { duplicate_of_query_id: duplicateOf },
           recovery: { retryable: false, next_action: 'use_official_price_page' },
+          capability_preflight: true,
+          official_item_ids: [],
+        });
+        continue;
+      }
+      if (currentScope && failedLocalAwsRouteScopes.has(currentScope)) {
+        capabilityPreflightResults.push({
+          query_id: query.query_id,
+          provider: query.provider,
+          status: 'query_failed',
+          terminal: true,
+          retryable: false,
+          error_category: 'official_api_unavailable',
+          code: 'aws_local_route_official_page_required',
+          message: 'The verified local AWS API route was already attempted for this billing scope.',
+          recovery: { retryable: false, next_action: 'use_verified_official_price_page' },
           capability_preflight: true,
           official_item_ids: [],
         });

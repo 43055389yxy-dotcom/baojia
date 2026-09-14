@@ -13,6 +13,11 @@ from urllib.parse import quote, urlparse
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.services.aws_pricing_routes import (
+    AwsPricingRouteCatalog,
+    AwsPricingRouteError,
+    PreparedAwsPricingRoute,
+)
 from app.services.aws_query_executor import ReadOnlyAwsQueryExecutor
 from app.services.official_api_base_routes import official_api_base_route
 from app.services.official_cloud_clients import (
@@ -33,14 +38,26 @@ class OfficialCatalogQueryError(RuntimeError):
 
 class DescribeServiceRequest(StrictModel):
     service_code: str = Field(min_length=2, max_length=120)
+    component_id: str | None = Field(
+        default=None,
+        min_length=2,
+        max_length=80,
+        pattern=r"^[a-z0-9][a-z0-9-]*$",
+    )
+    pricing_model: Literal["on_demand", "reserved"] | None = None
+    route_search: str | None = Field(default=None, max_length=160)
+    route_offset: int = Field(default=0, ge=0, le=10000)
+    route_limit: int = Field(default=20, ge=1, le=50)
 
 
-class AttributeValuesRequest(DescribeServiceRequest):
+class AttributeValuesRequest(StrictModel):
+    service_code: str = Field(min_length=2, max_length=120)
     attribute_name: str = Field(min_length=1, max_length=160)
     max_results: int = Field(default=1000, ge=1, le=1000)
 
 
-class ProductSearchRequest(DescribeServiceRequest):
+class ProductSearchRequest(StrictModel):
+    service_code: str = Field(min_length=2, max_length=120)
     region: str = Field(default="global", min_length=3, max_length=40)
     filters: dict[str, str] = Field(default_factory=dict)
     max_results: int = Field(default=100, ge=1, le=1000)
@@ -56,9 +73,18 @@ class AwsPriceQuery(ProductSearchRequest):
     term_years: Literal[1, 3] | None = None
     payment_option: Literal["no_upfront", "partial_upfront", "all_upfront"] | None = None
     offering_class: Literal["standard", "convertible"] | None = None
+    route_id: str | None = Field(
+        default=None,
+        min_length=3,
+        max_length=160,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+    )
+    route_inputs: dict[str, str | int | bool] = Field(default_factory=dict, max_length=40)
 
     @model_validator(mode="after")
     def validate_purchase_terms(self) -> AwsPriceQuery:
+        if self.route_inputs and not self.route_id:
+            raise ValueError("route_inputs require route_id")
         if self.pricing_model == "on_demand":
             if any(
                 value is not None
@@ -390,15 +416,11 @@ def _validate_response_path(path: str) -> None:
         not parts
         or len(parts) > 20
         or any(
-            not part
-            or len(part) > 120
-            or not part.replace("_", "").replace("-", "").isalnum()
+            not part or len(part) > 120 or not part.replace("_", "").replace("-", "").isalnum()
             for part in parts
         )
     ):
-        raise ValueError(
-            "official response paths must be dotted fields or RFC 6901 JSON Pointers"
-        )
+        raise ValueError("official response paths must be dotted fields or RFC 6901 JSON Pointers")
 
 
 def _validate_authenticated_catalog_query(query: AuthenticatedCatalogQuery) -> None:
@@ -438,9 +460,8 @@ def _validate_authenticated_catalog_query(query: AuthenticatedCatalogQuery) -> N
         or "//" in query.path
     ):
         raise ValueError("official API path is invalid")
-    if (
-        (query.action and _MUTATING_ACTION.match(query.action))
-        or _MUTATING_REST_PATH.search(query.path)
+    if (query.action and _MUTATING_ACTION.match(query.action)) or _MUTATING_REST_PATH.search(
+        query.path
     ):
         raise ValueError("only official read-only discovery or price operations are allowed")
     if not (
@@ -470,8 +491,7 @@ def _validate_authenticated_catalog_query(query: AuthenticatedCatalogQuery) -> N
             or parsed_source.password
             or parsed_source.port not in {None, 443}
             or not any(
-                source_host == suffix.removeprefix(".")
-                or source_host.endswith(suffix)
+                source_host == suffix.removeprefix(".") or source_host.endswith(suffix)
                 for suffix in _PROVIDER_OFFICIAL_SOURCE_SUFFIXES[query.provider]
             )
         ):
@@ -503,24 +523,24 @@ class OfficialPricingService:
         gcp_api_key: str | None = None,
         authenticated_request: Any | None = None,
         provider_credentials: dict[str, dict[str, str]] | None = None,
+        route_catalog: AwsPricingRouteCatalog | None = None,
         retry_sleep: Any = time.sleep,
         retry_delays: tuple[float, ...] | None = None,
     ) -> None:
         self._executor = executor
         self._http_get = http_get
         self._gcp_api_key = (
-            os.getenv("GCP_BILLING_API_KEY", "")
-            if gcp_api_key is None
-            else gcp_api_key
+            os.getenv("GCP_BILLING_API_KEY", "") if gcp_api_key is None else gcp_api_key
         )
         self._provider_credentials = (
             _provider_credentials_from_environment()
             if provider_credentials is None
             else provider_credentials
         )
-        self._authenticated_request = authenticated_request or OfficialCloudApiClient(
-            self._provider_credentials
-        ).execute
+        self._route_catalog = route_catalog or AwsPricingRouteCatalog()
+        self._authenticated_request = (
+            authenticated_request or OfficialCloudApiClient(self._provider_credentials).execute
+        )
         self._retry_sleep = retry_sleep
         if retry_delays is None:
             retry_delays = (
@@ -531,7 +551,12 @@ class OfficialPricingService:
 
     def catalog_availability(self) -> dict[str, dict[str, Any]]:
         return {
-            "aws": {"available": True},
+            "aws": {
+                "available": True,
+                "local_route_component_count": len(self._route_catalog.component_ids),
+                "local_route_count": self._route_catalog.route_count,
+                "local_route_rejected_file_count": self._route_catalog.rejected_file_count,
+            },
             "azure": {"available": True},
             "oci": {"available": True},
             "gcp": {
@@ -552,16 +577,12 @@ class OfficialPricingService:
                     ),
                     "readiness": (
                         "configured_unverified"
-                        if _credentials_available(
-                            self._provider_credentials.get(provider) or {}
-                        )
+                        if _credentials_available(self._provider_credentials.get(provider) or {})
                         else "credentials_missing"
                     ),
                     "message": (
                         f"{PROVIDER_SOURCE_LABELS[provider]} 已配置，按产品动态验证"
-                        if _credentials_available(
-                            self._provider_credentials.get(provider) or {}
-                        )
+                        if _credentials_available(self._provider_credentials.get(provider) or {})
                         else f"{PROVIDER_SOURCE_LABELS[provider]}待配置访问密钥"
                     ),
                 }
@@ -570,6 +591,16 @@ class OfficialPricingService:
         }
 
     def describe_service(self, request: DescribeServiceRequest) -> dict[str, Any]:
+        local = self._route_catalog.describe(
+            service_code=request.service_code,
+            component_id=request.component_id,
+            pricing_model=request.pricing_model,
+            route_search=request.route_search,
+            offset=request.route_offset,
+            limit=request.route_limit,
+        )
+        if local["status"] == "found":
+            return local
         payload = self._executor.execute(
             service="pricing",
             operation="describe_services",
@@ -636,11 +667,11 @@ class OfficialPricingService:
             except Exception as exc:
                 last_error = exc
                 category, retryable = _error_recovery_traits(exc)
-                if (
-                    attempt >= 3
-                    or category
-                    not in {"transport", "rate_limit", "provider_unavailable"}
-                ):
+                if attempt >= 3 or category not in {
+                    "transport",
+                    "rate_limit",
+                    "provider_unavailable",
+                }:
                     break
                 if self._retry_delays:
                     delay_index = min(attempt - 1, len(self._retry_delays) - 1)
@@ -655,8 +686,7 @@ class OfficialPricingService:
             "terminal": not retryable,
             "retryable": retryable,
             "error_category": category,
-            "code": getattr(last_error, "code", None)
-            or "official_catalog_query_failed",
+            "code": getattr(last_error, "code", None) or "official_catalog_query_failed",
             "message": _safe_error_message(str(last_error)),
             "details": details if isinstance(details, dict) else {},
             "recovery": recovery,
@@ -699,21 +729,70 @@ class OfficialPricingService:
             narrowed["official_item_ids"] = official_item_ids
         return narrowed
 
-    def _price_list_products(self, request: ProductSearchRequest) -> list[dict[str, Any]]:
-        filters = [
+    def _prepare_local_aws_route(self, query: AwsPriceQuery) -> PreparedAwsPricingRoute | None:
+        if query.route_id is None:
+            return None
+        return self._route_catalog.prepare_query(
+            route_id=query.route_id,
+            service_code=query.service_code,
+            region=query.region,
+            pricing_model=query.pricing_model,
+            route_inputs=query.route_inputs,
+            caller_filters=query.filters,
+        )
+
+    def _price_list_products(
+        self,
+        request: ProductSearchRequest,
+        *,
+        prepared_route: PreparedAwsPricingRoute | None = None,
+    ) -> list[dict[str, Any]]:
+        effective_filters = (
+            prepared_route.filters if prepared_route is not None else request.filters
+        )
+        effective_service_code = (
+            prepared_route.service_code if prepared_route is not None else request.service_code
+        )
+        if (
+            prepared_route is None
+            and request.region.casefold() != "global"
+            and "regionCode" not in effective_filters
+        ):
+            effective_filters = {**effective_filters, "regionCode": request.region}
+        products = self._execute_price_list_products(
+            service_code=effective_service_code,
+            filters=effective_filters,
+            max_results=request.max_results,
+        )
+        if prepared_route is not None and not products:
+            relaxed_filters = _relaxed_aws_route_filters(prepared_route, effective_filters)
+            if relaxed_filters is not None:
+                products = self._execute_price_list_products(
+                    service_code=effective_service_code,
+                    filters=relaxed_filters,
+                    max_results=request.max_results,
+                )
+        if prepared_route is not None:
+            return self._route_catalog.filter_products(products, prepared_route)
+        return products
+
+    def _execute_price_list_products(
+        self,
+        *,
+        service_code: str,
+        filters: dict[str, str],
+        max_results: int,
+    ) -> list[dict[str, Any]]:
+        encoded_filters = [
             {"Type": "TERM_MATCH", "Field": field, "Value": str(value)}
-            for field, value in sorted(request.filters.items())
+            for field, value in sorted(filters.items())
         ]
-        if request.region.casefold() != "global" and "regionCode" not in request.filters:
-            filters.append(
-                {"Type": "TERM_MATCH", "Field": "regionCode", "Value": request.region}
-            )
         payload = self._executor.execute(
             service="pricing",
             operation="get_products",
             region="us-east-1",
-            parameters={"ServiceCode": request.service_code, "Filters": filters},
-            max_items=request.max_results,
+            parameters={"ServiceCode": service_code, "Filters": encoded_filters},
+            max_items=max_results,
         )
         products: list[dict[str, Any]] = []
         for item in _collect(payload, "PriceList"):
@@ -727,14 +806,15 @@ class OfficialPricingService:
         return products
 
     def _get_aws_on_demand(self, query: AwsPriceQuery) -> dict[str, Any]:
+        prepared_route = self._prepare_local_aws_route(query)
         normalized = [
             _priced_product(product, term_key="OnDemand")
-            for product in self._price_list_products(query)
+            for product in self._price_list_products(query, prepared_route=prepared_route)
         ]
-        return {
+        result = {
             "status": _identity_status(len(normalized)),
             "pricing_model": "on_demand",
-            "service_code": query.service_code,
+            "service_code": (prepared_route.service_code if prepared_route else query.service_code),
             "region": query.region,
             "product_count": len(normalized),
             "price_dimension_count": sum(
@@ -744,10 +824,20 @@ class OfficialPricingService:
             "products": normalized,
             "source": "AWS Price List API",
         }
+        if prepared_route is not None:
+            result.update(
+                {
+                    "component_id": prepared_route.component_id,
+                    "local_route_id": prepared_route.route["route_id"],
+                    "route_source": "verified_local_contract",
+                }
+            )
+        return result
 
     def _get_aws_reserved(self, query: AwsPriceQuery) -> dict[str, Any]:
+        prepared_route = self._prepare_local_aws_route(query)
         normalized: list[dict[str, Any]] = []
-        for product in self._price_list_products(query):
+        for product in self._price_list_products(query, prepared_route=prepared_route):
             priced = _priced_product(product, term_key="Reserved")
             matching_terms = [
                 term for term in priced["terms"] if _reserved_term_matches(term, query)
@@ -760,16 +850,18 @@ class OfficialPricingService:
             ]
             normalized.append(priced)
         term_count = sum(len(product["terms"]) for product in normalized)
-        status = "not_found" if not normalized else (
-            "exact" if len(normalized) == 1 and term_count == 1 else "ambiguous"
+        status = (
+            "not_found"
+            if not normalized
+            else ("exact" if len(normalized) == 1 and term_count == 1 else "ambiguous")
         )
-        return {
+        result = {
             "status": status,
             "pricing_model": "reserved",
             "term_years": query.term_years,
             "payment_option": query.payment_option,
             "offering_class": query.offering_class,
-            "service_code": query.service_code,
+            "service_code": (prepared_route.service_code if prepared_route else query.service_code),
             "region": query.region,
             "product_count": len(normalized),
             "term_count": term_count,
@@ -780,13 +872,26 @@ class OfficialPricingService:
             "products": normalized,
             "source": "AWS Price List API",
         }
+        if prepared_route is not None:
+            result.update(
+                {
+                    "component_id": prepared_route.component_id,
+                    "local_route_id": prepared_route.route["route_id"],
+                    "route_source": "verified_local_contract",
+                }
+            )
+        return result
 
     def _get_azure_prices(self, query: AzurePriceQuery) -> dict[str, Any]:
         url = query.next_page_url or self.AZURE_URL
-        params: dict[str, Any] = {} if query.next_page_url else {
-            "api-version": query.api_version,
-            "currencyCode": query.currency_code,
-        }
+        params: dict[str, Any] = (
+            {}
+            if query.next_page_url
+            else {
+                "api-version": query.api_version,
+                "currencyCode": query.currency_code,
+            }
+        )
         if query.filter and not query.next_page_url:
             params["$filter"] = query.filter
         payload = self._official_json(url, params=params)
@@ -849,9 +954,7 @@ class OfficialPricingService:
                 params["pageToken"] = page_token
             payload = self._official_json(url, params=params)
             page_items = (
-                payload.get(response_key)
-                if isinstance(payload.get(response_key), list)
-                else []
+                payload.get(response_key) if isinstance(payload.get(response_key), list) else []
             )
             scanned_item_count += len(page_items)
             items.extend(_filter_official_candidates(page_items, query.response_filters))
@@ -878,9 +981,7 @@ class OfficialPricingService:
             "source": "Google Cloud Billing Catalog API",
         }
 
-    def _get_authenticated_catalog(
-        self, query: AuthenticatedCatalogQuery
-    ) -> dict[str, Any]:
+    def _get_authenticated_catalog(self, query: AuthenticatedCatalogQuery) -> dict[str, Any]:
         base_route = official_api_base_route(query.provider, query.service, query.region)
         if base_route and base_route.get("capability") == "official_page_only":
             raise OfficialCatalogQueryError(
@@ -892,9 +993,7 @@ class OfficialPricingService:
                 "No verified official API base route is configured for this service.",
                 code="official_api_base_route_not_configured",
             )
-        if not _credentials_available(
-            self._provider_credentials.get(query.provider) or {}
-        ):
+        if not _credentials_available(self._provider_credentials.get(query.provider) or {}):
             raise OfficialCatalogQueryError(
                 f"{query.provider} official API credentials are not configured",
                 code=f"{query.provider}_credentials_not_configured",
@@ -919,43 +1018,48 @@ class OfficialPricingService:
             if isinstance(item, dict)
         ]
         next_page_token = (
-            _candidate_field(payload, query.next_page_path)
-            if query.next_page_path
-            else None
+            _candidate_field(payload, query.next_page_path) if query.next_page_path else None
         )
         diagnostics: dict[str, Any] = {
             "raw_item_count": len(raw_items),
             "filtered_item_count": len(items),
         }
-        invalid_shape = (
-            not isinstance(extracted, (dict, list))
-            or any(not isinstance(item, dict) for item in raw_items)
+        invalid_shape = not isinstance(extracted, (dict, list)) or any(
+            not isinstance(item, dict) for item in raw_items
         )
         if invalid_shape or not item_ids:
             reason = (
-                "response_items_path_missing" if extracted is missing else
-                "response_items_type_invalid" if invalid_shape else
-                "response_filters_no_match" if raw_items else
-                "official_empty_result"
+                "response_items_path_missing"
+                if extracted is missing
+                else "response_items_type_invalid"
+                if invalid_shape
+                else "response_filters_no_match"
+                if raw_items
+                else "official_empty_result"
             )
-            diagnostics.update({
-                "not_found_reason": reason,
-                "terminal": False,
-                "retryable": True,
-                "raw_response": payload,
-                "refinement_fields": _objective_refinement_fields(
-                    [item for item in raw_items if isinstance(item, dict)], excluded=set(),
-                ),
-                "recovery": {
-                    "next_action": (
-                        "revalidate_official_response_schema" if invalid_shape else
-                        "review_response_filters_and_pagination" if raw_items else
-                        "review_official_parameters_and_alternate_route"
+            diagnostics.update(
+                {
+                    "not_found_reason": reason,
+                    "terminal": False,
+                    "retryable": True,
+                    "raw_response": payload,
+                    "refinement_fields": _objective_refinement_fields(
+                        [item for item in raw_items if isinstance(item, dict)],
+                        excluded=set(),
                     ),
-                    "reason": reason,
-                    "field": query.response_items_path,
-                },
-            })
+                    "recovery": {
+                        "next_action": (
+                            "revalidate_official_response_schema"
+                            if invalid_shape
+                            else "review_response_filters_and_pagination"
+                            if raw_items
+                            else "review_official_parameters_and_alternate_route"
+                        ),
+                        "reason": reason,
+                        "field": query.response_items_path,
+                    },
+                }
+            )
             if invalid_shape:
                 return {
                     **diagnostics,
@@ -1001,6 +1105,29 @@ def _safe_error_message(value: str) -> str:
     return without_secrets[:800]
 
 
+def _relaxed_aws_route_filters(
+    prepared: PreparedAwsPricingRoute,
+    filters: dict[str, str],
+) -> dict[str, str] | None:
+    optional_labels = {"group", "productfamily"}
+    removable = {field for field in filters if field.casefold() in optional_labels}
+    if not removable:
+        return None
+    stable_fields = {"usagetype", "operation"}
+    route_rules = [
+        *(prepared.route["api_1"].get("filters") or []),
+        *(prepared.route["api_1"].get("post_filters") or []),
+    ]
+    has_stable_semantics = any(
+        str(rule.get("field") or "").casefold() in stable_fields
+        for rule in route_rules
+        if isinstance(rule, dict)
+    )
+    if not has_stable_semantics:
+        return None
+    return {field: value for field, value in filters.items() if field not in removable}
+
+
 def _bounded_retry_delay(value: str | None, fallback: float) -> float:
     try:
         parsed = float(value) if value is not None else fallback
@@ -1010,6 +1137,9 @@ def _bounded_retry_delay(value: str | None, fallback: float) -> float:
 
 
 def _error_recovery_traits(exc: Exception) -> tuple[str, bool]:
+    if isinstance(exc, AwsPricingRouteError):
+        category = "invalid_request" if exc.retryable else "official_api_unavailable"
+        return category, exc.retryable
     if isinstance(exc, OfficialCloudClientError):
         return exc.category, exc.retryable
     code = str(getattr(exc, "code", "") or "").casefold()
@@ -1185,11 +1315,7 @@ def _objective_refinement_fields(
                 continue
             collected.setdefault(field, set()).update(values)
     ranked = sorted(
-        (
-            (field, sorted(values))
-            for field, values in collected.items()
-            if values
-        ),
+        ((field, sorted(values)) for field, values in collected.items() if values),
         key=lambda item: (len(item[1]), item[0]),
     )
     return [
@@ -1231,7 +1357,8 @@ def _require_refinement_for_large_result(
     compact = {
         key: value
         for key, value in result.items()
-        if key not in {
+        if key
+        not in {
             "products",
             "items",
             "services",
@@ -1401,10 +1528,12 @@ def _official_rate_candidates(
             item_id = str(item["partNumber"])
             localizations = item.get("currencyCodeLocalizations")
             if not isinstance(localizations, list):
-                localizations = [{
-                    "currencyCode": result.get("currency") or "",
-                    "prices": item.get("prices") or [],
-                }]
+                localizations = [
+                    {
+                        "currencyCode": result.get("currency") or "",
+                        "prices": item.get("prices") or [],
+                    }
+                ]
             for localization in localizations:
                 if not isinstance(localization, dict):
                     continue
@@ -1456,9 +1585,7 @@ def _official_rate_candidates(
                         item_id,
                         unit_price=value,
                         currency=str(
-                            unit_price.get("currencyCode")
-                            or result.get("currency")
-                            or ""
+                            unit_price.get("currencyCode") or result.get("currency") or ""
                         ),
                         unit=expression.get("usageUnit"),
                         description=(
@@ -1470,9 +1597,7 @@ def _official_rate_candidates(
                     )
                     if candidate:
                         candidates.append(candidate)
-    elif provider in AUTHENTICATED_PROVIDERS and isinstance(
-        query, AuthenticatedCatalogQuery
-    ):
+    elif provider in AUTHENTICATED_PROVIDERS and isinstance(query, AuthenticatedCatalogQuery):
         for item in result.get("items") or []:
             if not isinstance(item, dict):
                 continue

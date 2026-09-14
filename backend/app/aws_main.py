@@ -61,7 +61,7 @@ quote_artifacts = QuoteArtifactStore()
 
 app = FastAPI(
     title="AstraQuote 多云报价 API",
-    version="3.2.0",
+    version="3.3.0",
     description="提供官方云价目读取与销售报价任务入口。",
 )
 app.add_middleware(
@@ -224,7 +224,7 @@ async def mcp_v2_health(request: Request) -> dict[str, Any]:
     _require_mcp_internal_token(request)
     return {
         "status": "ready",
-        "workflow_version": "3.8.0",
+        "workflow_version": "3.9.0",
         "internal_ai_enabled": False,
         "role": "official cloud catalog client",
         "price_sources": [
