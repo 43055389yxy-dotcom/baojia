@@ -426,7 +426,7 @@ class AWSPricingCalculatorAutomation:
                 "总成本估算包含监控和安全服务"
             ],
             "generated_at": datetime.now().isoformat(),
-            "aws_account_id": "590184009438"
+            "aws_account_id": "075550799913"
         }
         
         # 保存到JSON文件
@@ -512,7 +512,7 @@ def main():
     
     print("\n📋 配置详情:")
     print(f"   区域: 德国法兰克福 (eu-central-1)")
-    print(f"   AWS账户: 590184009438")
+    print(f"   AWS账户: 075550799913")
     print(f"   主要服务配置:")
     print(f"     - EC2实例: c7g.2xlarge × 2台")
     print(f"     - RDS数据库: db.m6g.2xlarge × 1台 (Multi-AZ)")
