@@ -73,7 +73,7 @@ Excel 交付需要配置私有 S3 和稳定下载入口；结果只回到销售�
 ```text
 ASTRAQUOTE_XLSX_BUCKET=...
 ASTRAQUOTE_XLSX_REGION=...
-ASTRAQUOTE_PUBLIC_BASE_URL=https://baojia.tontiancloud.com
+ASTRAQUOTE_PUBLIC_BASE_URL=https://baojia.tontianit.com
 ```
 
 瞬时故障退避可按需调整；默认等待 0.25 秒和 0.75 秒：

@@ -135,7 +135,7 @@ test('uploads the Excel file privately and returns one stable sales-page downloa
   const service = new QuoteDeliveryService({
     bucket: 'private-quote-bucket',
     region: 'ap-east-1',
-    publicBaseUrl: 'https://baojia.tontiancloud.com',
+    publicBaseUrl: 'https://baojia.tontianit.com',
     artifactDirectory,
     s3Client: { send: async (command) => { commands.push(command); return {}; } },
     documentBuilder: async () => Buffer.from('excel-package'),
@@ -184,7 +184,7 @@ test('every page delivery renders Excel and writes result plus download link to 
   const service = new QuoteDeliveryService({
     bucket: 'private-quote-bucket',
     region: 'ap-east-1',
-    publicBaseUrl: 'https://baojia.tontiancloud.com',
+    publicBaseUrl: 'https://baojia.tontianit.com',
     artifactDirectory: path.join(directory, 'artifacts'),
     deliveryGuard: async () => true,
     completionWriter: (quote, result) => writeRelayCompletionReceipt(
@@ -230,7 +230,7 @@ test('a cancelled relay job cannot upload or expose a result', async () => {
   const service = new QuoteDeliveryService({
     bucket: 'private-quote-bucket',
     region: 'ap-east-1',
-    publicBaseUrl: 'https://baojia.tontiancloud.com',
+    publicBaseUrl: 'https://baojia.tontianit.com',
     deliveryGuard: async () => false,
     s3Client: { send: async () => assert.fail('must not upload') },
     documentBuilder: async () => assert.fail('must not render'),
@@ -284,7 +284,7 @@ test('writes an authoritative relay completion receipt with page result and down
         status: 'delivered',
         quote_id: delivered.quote_id,
         page_result: { schema_version: 'astraquote-page-result/1' },
-        spreadsheet_url: 'https://baojia.tontiancloud.com/api/backend/api/quote-artifacts/aqdl_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        spreadsheet_url: 'https://baojia.tontianit.com/api/backend/api/quote-artifacts/aqdl_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
         spreadsheet_filename: 'quote.xlsx',
       },
       { directory },
@@ -316,7 +316,7 @@ test('replaying the same quote reuses its Excel artifact and does not upload twi
     const service = new QuoteDeliveryService({
       bucket: 'private-quote-bucket',
       region: 'ap-east-1',
-      publicBaseUrl: 'https://baojia.tontiancloud.com',
+      publicBaseUrl: 'https://baojia.tontianit.com',
       artifactDirectory: path.join(directory, 'artifacts'),
       deliveryGuard: async () => true,
       s3Client: { send: async () => { uploads += 1; return {}; } },

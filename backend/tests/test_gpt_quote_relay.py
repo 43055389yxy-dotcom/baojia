@@ -561,7 +561,7 @@ def test_delivery_receipt_corrects_a_false_failed_browser_result(tmp_path: Path)
                 "quote_id": "aqv2_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
                 "status": "delivered",
                 "delivered_at": "2026-09-09T17:44:15.870Z",
-                "spreadsheet_url": "https://baojia.tontiancloud.com/api/backend/api/quote-artifacts/aqdl_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "spreadsheet_url": "https://baojia.tontianit.com/api/backend/api/quote-artifacts/aqdl_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "spreadsheet_filename": "quote.xlsx",
                 "page_result": {
                     "schema_version": "astraquote-page-result/1",
@@ -613,7 +613,7 @@ def test_page_result_receipt_completes_job_and_exposes_only_display_data(
                 "quote_id": "aqv2_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
                 "status": "page_result_ready",
                 "delivered_at": "2026-09-09T17:44:15.870Z",
-                "spreadsheet_url": "https://baojia.tontiancloud.com/api/backend/api/quote-artifacts/aqdl_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "spreadsheet_url": "https://baojia.tontianit.com/api/backend/api/quote-artifacts/aqdl_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 "spreadsheet_filename": "quote.xlsx",
                 "page_result": {
                     "schema_version": "astraquote-page-result/1",
@@ -697,7 +697,7 @@ def test_partial_receipt_returns_successful_rows_and_unpriced_components(tmp_pat
                 "quote_id": "aqv2_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
                 "status": "partial_page_result_ready",
                 "delivered_at": "2026-09-12T01:02:03.000Z",
-                "spreadsheet_url": "https://baojia.tontiancloud.com/api/backend/api/quote-artifacts/aqdl_"
+                "spreadsheet_url": "https://baojia.tontianit.com/api/backend/api/quote-artifacts/aqdl_"
                 + "c" * 48,
                 "page_result": {
                     "schema_version": "astraquote-page-result/1",

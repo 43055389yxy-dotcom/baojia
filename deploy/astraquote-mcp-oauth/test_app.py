@@ -33,7 +33,7 @@ def load_gateway(
 
     salt = bytes.fromhex("11" * 16)
     digest = hashlib.scrypt(b"test-password", salt=salt, n=16384, r=8, p=1, dklen=32)
-    monkeypatch.setenv("PUBLIC_ORIGIN", "https://pricing-mcp.tontiancloud.com")
+    monkeypatch.setenv("PUBLIC_ORIGIN", "https://pricing-mcp.tontianit.com")
     monkeypatch.setenv("MCP_PATH", "/mcp")
     monkeypatch.setenv("UPSTREAM_MCP", "http://127.0.0.1:8200/v2/mcp")
     monkeypatch.setenv("ASTRAQUOTE_INTERNAL_TOKEN", "transport-secret")
@@ -221,7 +221,7 @@ def request_from(address: str) -> Request:
             "query_string": b"",
             "headers": [],
             "client": (address, 12345),
-            "server": ("pricing-mcp.tontiancloud.com", 443),
+            "server": ("pricing-mcp.tontianit.com", 443),
         }
     )
 
@@ -279,7 +279,7 @@ async def test_dynamic_registration_accepts_exact_configured_gemini_callback(
     transport = httpx.ASGITransport(app=gateway.app)
 
     async with httpx.AsyncClient(
-        transport=transport, base_url="https://pricing-mcp.tontiancloud.com"
+        transport=transport, base_url="https://pricing-mcp.tontianit.com"
     ) as client:
         response = await client.post(
             "/oauth/register",
@@ -327,7 +327,7 @@ async def test_dynamic_registration_accepts_workbuddy_public_client(
     )
 
     async with httpx.AsyncClient(
-        transport=transport, base_url="https://pricing-mcp.tontiancloud.com"
+        transport=transport, base_url="https://pricing-mcp.tontianit.com"
     ) as client:
         response = await client.post(
             "/oauth/register",
@@ -529,7 +529,7 @@ async def test_body_limit_accepts_boundary_and_ignores_unrelated_paths(
     transport = httpx.ASGITransport(app=limited_app)
 
     async with httpx.AsyncClient(
-        transport=transport, base_url="https://pricing-mcp.tontiancloud.com"
+        transport=transport, base_url="https://pricing-mcp.tontianit.com"
     ) as client:
         boundary = await client.post("/mcp", content=b"12345678")
         unrelated = await client.post("/unrelated", content=b"123456789")
@@ -556,7 +556,7 @@ async def test_body_limit_rejects_declared_oversize_before_downstream(
     transport = httpx.ASGITransport(app=limited_app)
 
     async with httpx.AsyncClient(
-        transport=transport, base_url="https://pricing-mcp.tontiancloud.com"
+        transport=transport, base_url="https://pricing-mcp.tontianit.com"
     ) as client:
         response = await client.post(path, content=b"123456789")
 
@@ -582,7 +582,7 @@ async def test_body_limit_rejects_chunked_oversize_without_content_length(
         yield b"6789"
 
     async with httpx.AsyncClient(
-        transport=transport, base_url="https://pricing-mcp.tontiancloud.com"
+        transport=transport, base_url="https://pricing-mcp.tontianit.com"
     ) as client:
         response = await client.post("/mcp", content=chunks())
 
@@ -601,7 +601,7 @@ async def test_gateway_installs_explicit_two_mib_limit(tmp_path, monkeypatch, pa
     oversized = b"x" * (gateway.MAX_REQUEST_BODY_BYTES + 1)
 
     async with httpx.AsyncClient(
-        transport=transport, base_url="https://pricing-mcp.tontiancloud.com"
+        transport=transport, base_url="https://pricing-mcp.tontianit.com"
     ) as client:
         response = await client.post(
             path,

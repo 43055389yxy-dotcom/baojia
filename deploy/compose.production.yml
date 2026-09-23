@@ -18,7 +18,7 @@ services:
       ASTRAQUOTE_AWS_DATA_DIR: /data/aws
       ASTRAQUOTE_V2_STATE_DIR: /data/v2-quotes
       ASTRAQUOTE_ARTIFACT_DIR: /data/v2-quotes/artifacts
-      ASTRAQUOTE_PUBLIC_BASE_URL: https://baojia.tontiancloud.com
+      ASTRAQUOTE_PUBLIC_BASE_URL: https://baojia.tontianit.com
       ASTRAQUOTE_GPT_RELAY_DIR: /data/gpt-relay
       ASTRAQUOTE_GPT_RELAY_UID: "1000"
       ASTRAQUOTE_GPT_RELAY_GID: "1000"
