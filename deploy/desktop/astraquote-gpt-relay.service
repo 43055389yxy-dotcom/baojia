@@ -1,8 +1,8 @@
 [Unit]
-Description=AstraQuote Codex Chat desktop quote relay
-After=network-online.target docker.service vncserver@:1.service
+Description=AstraQuote headless Codex CLI quote relay
+After=network-online.target docker.service
 Wants=network-online.target
-Requires=docker.service vncserver@:1.service
+Requires=docker.service
 StartLimitIntervalSec=0
 
 [Service]
@@ -10,17 +10,16 @@ Type=simple
 User=ec2-user
 Group=ec2-user
 WorkingDirectory=/home/ec2-user/astraquote/source
-Environment=DISPLAY=:1
-Environment=XAUTHORITY=/home/ec2-user/.Xauthority
 Environment=PYTHONPATH=/home/ec2-user/astraquote/source/backend
 Environment=ASTRAQUOTE_GPT_RELAY_DIR=/home/ec2-user/astraquote/data/gpt-relay
 Environment=ASTRAQUOTE_RELAY_ENGINE=chatgpt
 Environment=ASTRAQUOTE_GPT_RELAY_STATE=/home/ec2-user/astraquote/data/gpt-relay/browser-state.json
 Environment=ASTRAQUOTE_V2_STATE_DIR=/home/ec2-user/astraquote/data/v2-quotes
-Environment=ASTRAQUOTE_CODEX_CONTAINER=astraquote-chatgpt-desktop
-Environment=ASTRAQUOTE_CODEX_CDP=http://127.0.0.1:9222
-ExecStartPre=/usr/bin/docker inspect astraquote-chatgpt-desktop
-ExecStartPre=/usr/bin/docker start astraquote-chatgpt-desktop
+Environment=ASTRAQUOTE_CODEX_IMAGE=astraquote/chatgpt-desktop:26.908.40834-zh
+Environment=ASTRAQUOTE_CODEX_HOME=/home/ec2-user/.chatgpt-desktop-home
+Environment=ASTRAQUOTE_MCP_ENV_FILE=/home/ec2-user/astraquote/config/mcp.env
+Environment=ASTRAQUOTE_DOCKER_NETWORK=caddy-net
+ExecStartPre=/usr/bin/docker image inspect astraquote/chatgpt-desktop:26.908.40834-zh
 ExecStart=/home/ec2-user/astraquote/gpt-relay-venv/bin/python /home/ec2-user/astraquote/source/tools/gpt_quote_relay_worker.py
 Restart=always
 RestartSec=10

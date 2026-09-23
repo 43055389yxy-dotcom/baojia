@@ -5,7 +5,6 @@ APP_DIR="${WORKSPACE:?Jenkins workspace is unavailable}"
 RELAY_HOST_ROOT="/home/ec2-user/astraquote"
 RELAY_STAGE_NAME=".relay-stage-${GIT_COMMIT:-manual}"
 RELAY_WORKER_COMMAND="/home/ec2-user/astraquote/gpt-relay-venv/bin/python /home/ec2-user/astraquote/source/tools/gpt_quote_relay_worker.py"
-CODEX_CONTAINER="astraquote-chatgpt-desktop"
 CODEX_IMAGE="astraquote/chatgpt-desktop:26.908.40834-zh"
 OAUTH_CLIENT_COUNT_BEFORE=""
 
@@ -72,6 +71,48 @@ verify_oauth_database_continuity() {
     echo "OAuth client registry lost entries during deployment; refusing to report success" >&2
     return 1
   fi
+}
+
+update_caddy_route() {
+  echo "Updating the AstraQuote public routes"
+  docker run --rm -i \
+    -v /home/ec2-user/caddy-gateway/managed:/host/caddy-managed \
+    --entrypoint /bin/sh \
+    astraquote:production -ceu '
+      umask 022
+      target=/host/caddy-managed/astraquote.caddy
+      next=/host/caddy-managed/astraquote.caddy.next
+      previous=/host/caddy-managed/astraquote.caddy.previous
+      cat > "$next"
+      rm -f "$previous"
+      if test -f "$target"; then
+        cp -p "$target" "$previous"
+      fi
+      mv "$next" "$target"
+    ' < "$APP_DIR/deploy/caddy-astraquote.caddy"
+
+  if ! docker exec caddy-gateway \
+    caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile; then
+    docker run --rm \
+      -v /home/ec2-user/caddy-gateway/managed:/host/caddy-managed \
+      --entrypoint /bin/sh \
+      astraquote:production -ceu '
+        target=/host/caddy-managed/astraquote.caddy
+        previous=/host/caddy-managed/astraquote.caddy.previous
+        test -f "$previous"
+        mv "$previous" "$target"
+      '
+    echo "The AstraQuote Caddy route was invalid and has been rolled back" >&2
+    return 1
+  fi
+
+  docker exec caddy-gateway \
+    caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+  docker run --rm \
+    -v /home/ec2-user/caddy-gateway/managed:/host/caddy-managed \
+    --entrypoint /bin/sh \
+    astraquote:production -ceu \
+    'rm -f /host/caddy-managed/astraquote.caddy.previous'
 }
 
 stage_host_browser_relay() {
@@ -143,118 +184,47 @@ activate_host_browser_relay() {
     '
 }
 
-host_codex_cdp_ready() {
-  # Jenkins itself runs in a container, so its 127.0.0.1 is not the Docker
-  # host.  Probe Codex from a short-lived container sharing the host network.
-  docker run --rm --network host \
-    --entrypoint /usr/bin/curl \
-    astraquote:production \
-    -fsS --max-time 3 http://127.0.0.1:9222/json/list
-}
-
-ensure_host_codex_chat_desktop() {
-  echo "Ensuring the authenticated Codex Chat desktop is running"
+ensure_headless_codex_cli() {
+  echo "Verifying the authenticated headless Codex quote engine"
   if ! docker image inspect "$CODEX_IMAGE" >/dev/null 2>&1; then
-    echo "Required Codex desktop image is missing: $CODEX_IMAGE" >&2
+    echo "Required Codex CLI image is missing: $CODEX_IMAGE" >&2
     return 1
   fi
 
-  recreate=0
-  if ! docker inspect "$CODEX_CONTAINER" >/dev/null 2>&1; then
-    recreate=1
-  else
-    configured_image="$(docker inspect "$CODEX_CONTAINER" --format '{{.Config.Image}}')"
-    configured_shm="$(docker inspect "$CODEX_CONTAINER" --format '{{.HostConfig.ShmSize}}')"
-    configured_network="$(docker inspect "$CODEX_CONTAINER" --format '{{.HostConfig.NetworkMode}}')"
-    configured_restart="$(docker inspect "$CODEX_CONTAINER" --format '{{.HostConfig.RestartPolicy.Name}}')"
-    configured_command="$(docker inspect "$CODEX_CONTAINER" --format '{{json .Config.Cmd}}')"
-    configured_binds="$(docker inspect "$CODEX_CONTAINER" --format '{{json .HostConfig.Binds}}')"
-    if test "$configured_image" != "$CODEX_IMAGE" \
-      || test "$configured_shm" -lt 1073741824 \
-      || test "$configured_network" != host \
-      || test "$configured_restart" != always \
-      || [[ "$configured_command" != *'codex://threads/new?mode=chat'* ]] \
-      || [[ "$configured_command" != *'--remote-debugging-port=9222'* ]] \
-      || [[ "$configured_binds" != *'/home/ec2-user/.chatgpt-desktop-home:/home/chatgpt'* ]]; then
-      recreate=1
-    fi
+  # The legacy Electron container is no longer part of the quote path. Stop it
+  # without deleting its mounted profile so a rollback remains possible.
+  if docker inspect astraquote-chatgpt-desktop >/dev/null 2>&1; then
+    docker stop astraquote-chatgpt-desktop >/dev/null 2>&1 || true
   fi
 
-  previous_name="${CODEX_CONTAINER}-pre-${GIT_COMMIT:-manual}"
-  if test "$recreate" -eq 1; then
-    if docker inspect "$CODEX_CONTAINER" >/dev/null 2>&1; then
-      docker stop "$CODEX_CONTAINER" >/dev/null
-      docker rename "$CODEX_CONTAINER" "$previous_name"
-    fi
-    if ! docker run -d \
-      --name "$CODEX_CONTAINER" \
-      --user 1000:1000 \
-      --network host \
-      --shm-size 1g \
-      --restart always \
-      -e DISPLAY=:1 \
-      -e HOME=/home/chatgpt \
-      -e XAUTHORITY=/home/chatgpt/.Xauthority \
-      -e XDG_RUNTIME_DIR=/run/user/1000 \
-      -e DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
-      -e LANG=zh_CN.UTF-8 \
-      -e LC_ALL=zh_CN.UTF-8 \
-      -e LANGUAGE=zh_CN:zh \
-      -v /home/ec2-user/.chatgpt-desktop-home:/home/chatgpt \
-      -v /home/ec2-user/.Xauthority:/home/chatgpt/.Xauthority:ro \
-      -v /tmp/.X11-unix:/tmp/.X11-unix \
-      -v /run/user/1000:/run/user/1000 \
-      -v /home/ec2-user/.local/libexec/chatgpt-xdg-open:/usr/bin/xdg-open:ro \
-      "$CODEX_IMAGE" \
-      /usr/bin/chatgpt \
-      --ozone-platform=x11 \
-      --disable-gpu \
-      --no-sandbox \
-      --lang=zh-CN \
-      --remote-debugging-address=127.0.0.1 \
-      --remote-debugging-port=9222 \
-      --remote-allow-origins=http://127.0.0.1:9222 \
-      --force-renderer-accessibility \
-      'codex://threads/new?mode=chat'; then
-      docker rm -f "$CODEX_CONTAINER" >/dev/null 2>&1 || true
-      if docker inspect "$previous_name" >/dev/null 2>&1; then
-        docker rename "$previous_name" "$CODEX_CONTAINER"
-        docker start "$CODEX_CONTAINER" >/dev/null
-      fi
-      return 1
-    fi
-  else
-    if test "$(docker inspect "$CODEX_CONTAINER" --format '{{.State.Running}}')" = true; then
-      # Codex caches remote MCP tool schemas for the lifetime of the desktop
-      # process. Restart on deploy so newly added fields are usable immediately;
-      # the mounted HOME preserves login and conversation state.
-      docker restart "$CODEX_CONTAINER" >/dev/null
-    else
-      docker start "$CODEX_CONTAINER" >/dev/null
-    fi
+  stale_relays="$(docker ps -aq --filter label=com.astraquote.codex-relay=true)"
+  if test -n "$stale_relays"; then
+    docker rm -f $stale_relays >/dev/null
   fi
 
-  for attempt in {1..30}; do
-    if host_codex_cdp_ready \
-      | grep -F 'app://-/index.html' >/dev/null; then
-      return 0
-    fi
-    sleep 2
-  done
-  echo "Codex Chat desktop did not expose its local control endpoint" >&2
-  docker logs --tail 100 "$CODEX_CONTAINER" || true
-  if test "$recreate" -eq 1; then
-    docker rm -f "$CODEX_CONTAINER" >/dev/null 2>&1 || true
-    if docker inspect "$previous_name" >/dev/null 2>&1; then
-      docker rename "$previous_name" "$CODEX_CONTAINER"
-      docker start "$CODEX_CONTAINER" >/dev/null
-    fi
-  fi
-  return 1
+  docker run --rm \
+    --user 1000:1000 \
+    -e HOME=/home/chatgpt \
+    -v /home/ec2-user/.chatgpt-desktop-home:/home/chatgpt \
+    --entrypoint /usr/lib/chatgpt/resources/codex \
+    "$CODEX_IMAGE" login status
+
+  docker run --rm --network caddy-net \
+    --env-file /home/ec2-user/astraquote/config/mcp.env \
+    --entrypoint /bin/sh \
+    astraquote:production -ceu '
+      test -n "$ASTRAQUOTE_INTERNAL_TOKEN"
+      curl -fsS --max-time 10 \
+        -H "Authorization: Bearer $ASTRAQUOTE_INTERNAL_TOKEN" \
+        -H "Accept: application/json, text/event-stream" \
+        -H "Content-Type: application/json" \
+        --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"jenkins-health\",\"version\":\"1\"}}}" \
+        http://astraquote:8200/v2/mcp >/dev/null
+    '
 }
 
 install_host_relay_dependencies() {
-  echo "Installing the versioned desktop relay dependencies"
+  echo "Installing the versioned quote relay dependencies"
   docker run --rm --privileged --pid=host \
     --entrypoint /usr/bin/nsenter \
     astraquote:production \
@@ -272,7 +242,7 @@ install_host_relay_dependencies() {
 }
 
 install_host_browser_relay_service() {
-  echo "Installing the versioned desktop relay systemd unit"
+  echo "Installing the versioned quote relay systemd unit"
   docker run --rm --privileged --pid=host \
     --entrypoint /usr/bin/nsenter \
     astraquote:production \
@@ -296,7 +266,7 @@ install_host_browser_relay_service() {
 }
 
 restart_host_browser_relay() {
-  echo "Restarting the desktop relay through the Docker host systemd"
+  echo "Restarting the quote relay through the Docker host systemd"
   docker run --rm --privileged --pid=host \
     --entrypoint /usr/bin/nsenter \
     astraquote:production \
@@ -317,7 +287,7 @@ restart_host_browser_relay() {
 }
 
 diagnose_host_browser_relay() {
-  echo "Desktop relay service diagnostics"
+  echo "Quote relay service diagnostics"
   docker run --rm --privileged --pid=host \
     --entrypoint /usr/bin/nsenter \
     astraquote:production \
@@ -338,7 +308,7 @@ diagnose_host_browser_relay() {
 }
 
 wait_for_host_browser_relay() {
-  echo "Waiting for the restarted desktop relay worker to remain stable"
+  echo "Waiting for the restarted quote relay worker to remain stable"
   docker run --rm --pid=host \
     -e RELAY_WORKER_COMMAND="$RELAY_WORKER_COMMAND" \
     --entrypoint /bin/sh \
@@ -368,13 +338,13 @@ wait_for_host_browser_relay() {
           sleep 5
         fi
       done
-      echo "AstraQuote desktop relay worker was not restarted by systemd" >&2
+      echo "AstraQuote quote relay worker was not restarted by systemd" >&2
       exit 1
     '
 }
 
 wait_for_chatgpt_quote_engine() {
-  echo "Waiting for the ChatGPT desktop quote engine to become ready"
+  echo "Waiting for the headless Codex quote engine to become ready"
   docker run --rm --privileged --pid=host \
     --entrypoint /usr/bin/nsenter \
     astraquote:production \
@@ -395,7 +365,7 @@ wait_for_chatgpt_quote_engine() {
         fi
         sleep 5
       done
-      echo "The ChatGPT desktop quote engine did not become ready" >&2
+      echo "The headless Codex quote engine did not become ready" >&2
       exit 1
     '
 }
@@ -403,7 +373,7 @@ wait_for_chatgpt_quote_engine() {
 update_host_browser_relay() {
   stage_host_browser_relay
   activate_host_browser_relay
-  ensure_host_codex_chat_desktop
+  ensure_headless_codex_cli
   install_host_relay_dependencies
   install_host_browser_relay_service
   restart_host_browser_relay
@@ -453,7 +423,8 @@ for attempt in {1..24}; do
     && docker exec astraquote curl -fsS http://127.0.0.1:8001/readyz >/dev/null 2>&1; then
     echo "AstraQuote container endpoints are ready"
     verify_oauth_database_continuity
-    # The logged-in ChatGPT browser worker is a host systemd service, not a
+    update_caddy_route
+    # The logged-in headless Codex worker is a host systemd service, not a
     # container. Keep its source and policy on exactly the same revision as
     # the frontend/backend/MCP before declaring the deployment successful.
     update_host_browser_relay

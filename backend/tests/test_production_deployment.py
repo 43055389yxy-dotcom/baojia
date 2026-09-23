@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 
-def test_jenkins_deploy_updates_and_restarts_the_host_codex_chat_relay() -> None:
+def test_jenkins_deploy_updates_and_restarts_the_headless_codex_relay() -> None:
     root = Path(__file__).resolve().parents[2]
     script = (root / "deploy/jenkins-shell.sh").read_text(encoding="utf-8")
 
@@ -22,21 +22,17 @@ def test_jenkins_deploy_updates_and_restarts_the_host_codex_chat_relay() -> None
     assert "/usr/bin/systemctl enable astraquote-gemini-relay.service" not in script
     assert "/usr/bin/systemctl restart astraquote-gemini-relay.service" not in script
     assert "astraquote-chatgpt-desktop" in script
-    assert "codex://threads/new?mode=chat" in script
-    assert "--shm-size 1g" in script
-    assert "--restart always" in script
-    assert "--restart unless-stopped" not in script
-    assert "configured_restart" in script
-    assert 'configured_restart" != always' in script
-    assert "host_codex_cdp_ready" in script
+    assert "docker stop astraquote-chatgpt-desktop" in script
+    assert "--entrypoint /usr/lib/chatgpt/resources/codex" in script
+    assert '"$CODEX_IMAGE" login status' in script
+    assert "com.astraquote.codex-relay=true" in script
+    assert "http://astraquote:8200/v2/mcp" in script
+    assert 'Authorization: Bearer $ASTRAQUOTE_INTERNAL_TOKEN' in script
+    assert "host_codex_cdp_ready" not in script
     assert "worker-heartbeat.json" in script
     assert "heartbeat.get" in script
     assert "logged_in" in script
-    assert "The ChatGPT desktop quote engine did not become ready" in script
-    assert 'docker restart "$CODEX_CONTAINER" >/dev/null' in script
-    assert "--network host" in script
-    assert "--entrypoint /usr/bin/curl" in script
-    assert "if curl -fsS http://127.0.0.1:9222/json/list" not in script
+    assert "The headless Codex quote engine did not become ready" in script
     assert "cd / && exec /home/ec2-user/astraquote/gpt-relay-venv/bin/python -m pip" in script
     assert "/home/ec2-user/astraquote/gpt-relay-venv/bin/pip install" not in script
     assert "firefox" not in script.casefold()
@@ -53,8 +49,8 @@ def test_jenkins_health_checks_explain_the_failure_stage() -> None:
     assert "AstraQuote container endpoints did not become ready" in script
     assert "Staging the desktop relay source" in script
     assert "Activating the staged desktop relay source" in script
-    assert "Installing the versioned desktop relay systemd unit" in script
-    assert "Restarting the desktop relay through the Docker host systemd" in script
+    assert "Installing the versioned quote relay systemd unit" in script
+    assert "Restarting the quote relay through the Docker host systemd" in script
     assert "systemctl --no-pager --full status astraquote-gpt-relay.service" in script
     assert "journalctl --no-pager -u astraquote-gpt-relay.service -n 120" in script
     assert "snapshot_oauth_database" in script
@@ -69,15 +65,31 @@ def test_jenkins_health_checks_explain_the_failure_stage() -> None:
         "Environment=ASTRAQUOTE_V2_STATE_DIR=/home/ec2-user/astraquote/data/v2-quotes"
         in unit
     )
-    assert "ASTRAQUOTE_CODEX_CONTAINER=astraquote-chatgpt-desktop" in unit
-    assert "ASTRAQUOTE_CODEX_CDP=http://127.0.0.1:9222" in unit
-    assert "ExecStartPre=/usr/bin/docker start astraquote-chatgpt-desktop" in unit
+    assert "ASTRAQUOTE_CODEX_IMAGE=astraquote/chatgpt-desktop" in unit
+    assert "ASTRAQUOTE_DOCKER_NETWORK=caddy-net" in unit
+    assert "ExecStartPre=/usr/bin/docker image inspect" in unit
+    assert "ASTRAQUOTE_CODEX_CDP" not in unit
+    assert "vncserver@:1.service" not in unit
     assert "StartLimitIntervalSec=0" in unit
     assert "Restart=always" in unit
     assert "ASTRAQUOTE_FIREFOX_PROFILE" not in unit
     assert "ASTRAQUOTE_CHATGPT_PROJECT" not in unit
     assert "chatgpt.com/projects" not in unit
     assert "docker.service" in unit
+
+
+def test_internal_mcp_is_private_token_authenticated() -> None:
+    root = Path(__file__).resolve().parents[2]
+    compose = (root / "deploy/compose.production.yml").read_text(encoding="utf-8")
+    server = (root / "deploy/astraquote-mcp/server.js").read_text(encoding="utf-8")
+    oauth = (root / "deploy/astraquote-mcp-oauth/app.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "ASTRAQUOTE_MCP_HOST: 0.0.0.0" in compose
+    assert "ASTRAQUOTE_INTERNAL_TOKEN" in server
+    assert "validMcpBearer" in server
+    assert 'headers["authorization"] = f"Bearer {UPSTREAM_BEARER_TOKEN}"' in oauth
 
 
 def test_gemini_relay_is_a_separate_visible_persistent_worker() -> None:
@@ -112,6 +124,18 @@ def test_public_proxy_keeps_oauth_and_mcp_outside_the_sales_site() -> None:
     assert "path /mcp /oauth/* /.well-known/oauth-authorization-server" in caddyfile
     assert "reverse_proxy astraquote:8001" in caddyfile
     assert "reverse_proxy astraquote:3000" in caddyfile
+
+
+def test_jenkins_updates_and_validates_the_versioned_caddy_route() -> None:
+    root = Path(__file__).resolve().parents[2]
+    script = (root / "deploy/jenkins-shell.sh").read_text(encoding="utf-8")
+
+    assert "update_caddy_route" in script
+    assert '"$APP_DIR/deploy/caddy-astraquote.caddy"' in script
+    assert "/home/ec2-user/caddy-gateway/managed:/host/caddy-managed" in script
+    assert "caddy validate --config /etc/caddy/Caddyfile" in script
+    assert "caddy reload --config /etc/caddy/Caddyfile" in script
+    assert "The AstraQuote Caddy route was invalid and has been rolled back" in script
 
 
 def test_desktop_relay_prompt_import_does_not_require_botocore() -> None:

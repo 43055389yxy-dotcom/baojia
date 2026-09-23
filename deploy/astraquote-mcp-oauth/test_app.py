@@ -36,6 +36,7 @@ def load_gateway(
     monkeypatch.setenv("PUBLIC_ORIGIN", "https://pricing-mcp.tontiancloud.com")
     monkeypatch.setenv("MCP_PATH", "/mcp")
     monkeypatch.setenv("UPSTREAM_MCP", "http://127.0.0.1:8200/v2/mcp")
+    monkeypatch.setenv("ASTRAQUOTE_INTERNAL_TOKEN", "transport-secret")
     monkeypatch.setenv(
         "PASSWORDLESS_AUTH", "true" if passwordless_auth else "false"
     )
