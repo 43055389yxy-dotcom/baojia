@@ -199,7 +199,7 @@ class CodexCliAgent:
 
     def _command(self, container_name: str, thread_id: str = "") -> list[str]:
         command = [
-            "docker", "run", "--rm", "--name", container_name,
+            "docker", "run", "--rm", "-i", "--name", container_name,
             "--label", CONTAINER_LABEL, "--network", DOCKER_NETWORK,
             "--user", "1000:1000", "--env-file", MCP_ENV_FILE,
             "-e", "HOME=/home/chatgpt", "-v", f"{CODEX_HOME}:/home/chatgpt",
