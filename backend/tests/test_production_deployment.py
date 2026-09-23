@@ -85,11 +85,16 @@ def test_internal_mcp_is_private_token_authenticated() -> None:
     oauth = (root / "deploy/astraquote-mcp-oauth/app.py").read_text(
         encoding="utf-8"
     )
+    agent = (root / "tools/codex_cli_agent.py").read_text(encoding="utf-8")
 
     assert "ASTRAQUOTE_MCP_HOST: 0.0.0.0" in compose
     assert "ASTRAQUOTE_INTERNAL_TOKEN" in server
     assert "validMcpBearer" in server
     assert 'headers["authorization"] = f"Bearer {UPSTREAM_BEARER_TOKEN}"' in oauth
+    assert '"--cap-drop", "ALL"' in agent
+    assert '"--security-opt", "no-new-privileges"' in agent
+    assert '"--read-only"' in agent
+    assert '"--dangerously-bypass-approvals-and-sandbox"' in agent
 
 
 def test_gemini_relay_is_a_separate_visible_persistent_worker() -> None:

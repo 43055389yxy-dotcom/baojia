@@ -27,8 +27,13 @@ def test_headless_codex_command_uses_only_private_authenticated_mcp(monkeypatch)
     assert 'mcp_servers.astraquote.url="http://astraquote:8200/v2/mcp"' in rendered
     assert "ASTRAQUOTE_INTERNAL_TOKEN" in rendered
     assert "--ignore-user-config" in rendered
-    assert "--sandbox read-only" in rendered
-    assert "--ask-for-approval never" in rendered
+    assert "--dangerously-bypass-approvals-and-sandbox" in rendered
+    assert "--cap-drop ALL" in rendered
+    assert "--security-opt no-new-privileges" in rendered
+    assert "--read-only" in rendered
+    assert "--tmpfs /tmp:rw,nosuid,nodev,size=128m" in rendered
+    assert "--pids-limit 256" in rendered
+    assert "--memory 2g" in rendered
 
 
 def test_agent_prompt_removes_ui_mention_and_disallows_dynamic_app_proxy():

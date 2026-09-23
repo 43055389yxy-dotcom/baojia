@@ -118,6 +118,8 @@ def _agent_prompt(prompt: str) -> str:
         "You are the AstraQuote quote engine. Use only the MCP server named "
         "`astraquote` for quote operations. Never use `codex_apps/astraquote`, "
         "browser tools, shell commands, local files, or any other MCP server. "
+        "The surrounding container is the security boundary; do not inspect or "
+        "modify it. "
         "Follow the AstraQuote MCP instructions exactly and complete the request.\n\n"
         f"{content}"
     )
@@ -201,10 +203,14 @@ class CodexCliAgent:
         command = [
             "docker", "run", "--rm", "-i", "--name", container_name,
             "--label", CONTAINER_LABEL, "--network", DOCKER_NETWORK,
-            "--user", "1000:1000", "--env-file", MCP_ENV_FILE,
+            "--user", "1000:1000", "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges", "--read-only",
+            "--tmpfs", "/tmp:rw,nosuid,nodev,size=128m",
+            "--pids-limit", "256", "--memory", "2g",
+            "--env-file", MCP_ENV_FILE,
             "-e", "HOME=/home/chatgpt", "-v", f"{CODEX_HOME}:/home/chatgpt",
             "--entrypoint", "/usr/lib/chatgpt/resources/codex", CODEX_IMAGE,
-            "--ask-for-approval", "never", "--sandbox", "read-only",
+            "--dangerously-bypass-approvals-and-sandbox",
             "-c", f'mcp_servers.astraquote.url="{MCP_URL}"',
             "-c", 'mcp_servers.astraquote.bearer_token_env_var="ASTRAQUOTE_INTERNAL_TOKEN"',
             "exec", "--ignore-user-config", "--ignore-rules", "--json",
