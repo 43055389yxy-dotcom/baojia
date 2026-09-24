@@ -1,7 +1,7 @@
 # AstraQuote OAuth gateway
 
 The gateway is packaged inside the single AstraQuote production container. It
-publishes `https://pricing-mcp.tontianit.com/mcp` and proxies authenticated
+publishes `https://baojia.tontianit.com/mcp` and proxies authenticated
 requests to the loopback-only AstraQuote MCP process.
 
 The OAuth dynamic-registration boundary accepts the approved ChatGPT HTTPS
@@ -29,11 +29,12 @@ The public MCP exposes exactly seven tools:
 The first six tools require `pricing:read`; `build_estimate` requires
 `pricing:write`. Unknown future tools fail closed as writes.
 
-The runtime does not contain a cloud calculator or a browser. `get_prices`
-dispatches only to the selected provider's official price catalog. GPT selects
-the returned SKU/price identities and calculates the quote; `build_estimate`
-performs mechanical evidence, fact-coverage and sum checks before page or Excel
-delivery.
+The runtime does not contain a calculator browser. `get_prices` dispatches only
+to the selected provider's official price catalog. GPT selects the returned
+SKU/price identities and calculates the quote; `build_estimate` performs
+mechanical evidence, fact-coverage and sum checks, generates Excel and returns
+the result directly to GPT. AWS delivery also creates an AWS Pricing Calculator
+public share link. Every non-AWS provider returns Excel only.
 
 Production configuration is read from:
 
@@ -63,4 +64,5 @@ docker compose -f deploy/compose.production.yml up -d
 
 Release checks must cover OAuth discovery, authenticated `initialize`,
 `tools/list`, one official price query for each configured provider and one
-successful `build_estimate` delivery.
+successful `build_estimate` delivery, including an Excel download and the
+AWS-only Calculator-link rule.

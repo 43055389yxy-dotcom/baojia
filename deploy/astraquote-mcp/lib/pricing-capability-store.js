@@ -41,7 +41,8 @@ function operationOf(value) {
 
 class PricingCapabilityStore {
   constructor({ directory = path.join(
-    process.env.ASTRAQUOTE_V2_STATE_DIR || '/data/v2-quotes',
+    process.env.ASTRAQUOTE_V2_STATE_DIR
+      || path.resolve(__dirname, '../../../.astraquote/state'),
     'pricing-capabilities',
   ) } = {}) {
     this.directory = directory;

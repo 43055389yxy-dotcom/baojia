@@ -9,11 +9,14 @@ const {
   S3Client,
 } = require('@aws-sdk/client-s3');
 
+const { AwsCalculatorLinkService } = require('./aws-calculator-link');
 const { buildQuoteWorkbook, simplifyCustomerText } = require('./quote-workbook');
 const { pricingScenario } = require('./cloud-market-profiles');
 const { canFinalizeRelayJob } = require('./relay-job-state');
 
 const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+const REPOSITORY_ROOT = path.resolve(__dirname, '../../..');
+const DEFAULT_RUNTIME_DIRECTORY = path.join(REPOSITORY_ROOT, '.astraquote');
 
 class QuoteDeliveryError extends Error {
   constructor(message, { code = 'quote_delivery_failed', details = {} } = {}) {
@@ -217,14 +220,20 @@ async function writeRelayCompletionReceipt(
     submission_code: submissionCode,
     quote_id: String(record.quote_id || ''),
     status: record.is_partial === true
-      ? 'partial_page_result_ready'
-      : deliveryResult.status === 'displayed_on_page' ? 'page_result_ready' : 'delivered',
+      ? 'partial_quote_ready'
+      : deliveryResult.status === 'quote_ready' ? 'quote_ready'
+        : deliveryResult.status === 'displayed_on_page' ? 'page_result_ready' : 'delivered',
     delivered_at: new Date().toISOString(),
   };
+  if (deliveryResult.quote_result) receipt.quote_result = deliveryResult.quote_result;
   if (deliveryResult.page_result) receipt.page_result = deliveryResult.page_result;
   if (deliveryResult.spreadsheet_url) {
     receipt.spreadsheet_url = deliveryResult.spreadsheet_url;
     receipt.spreadsheet_filename = deliveryResult.spreadsheet_filename || '';
+  }
+  if (deliveryResult.aws_calculator_url) {
+    receipt.aws_calculator_url = deliveryResult.aws_calculator_url;
+    receipt.aws_calculator_url_expires_at = deliveryResult.aws_calculator_url_expires_at;
   }
   const receiptPath = path.join(completionDirectory, `${relayJobId}.json`);
   const temporaryPath = path.join(
@@ -263,9 +272,11 @@ async function writeArtifactManifest(record, artifact, { directory }) {
     schema_version: 'astraquote-artifact/1',
     token,
     quote_id: record.quote_id,
+    storage_mode: artifact.storage_mode || 's3',
     bucket: artifact.bucket,
     region: artifact.region,
     key: artifact.key,
+    local_path: artifact.local_path,
     filename: artifact.filename,
     content_type: XLSX_MIME,
     expires_at: artifact.expires_at,
@@ -296,10 +307,24 @@ async function readExistingArtifact(record, { directory, publicBaseUrl }) {
       || !/^aqdl_[a-f0-9]{48}$/.test(String(manifest.token || ''))
       || new Date(manifest.expires_at).getTime() <= Date.now()
     ) return null;
+    const storageMode = manifest.storage_mode || 's3';
+    if (storageMode === 'local') {
+      const localPath = path.resolve(String(manifest.local_path || ''));
+      try {
+        if (!(await fs.stat(localPath)).isFile()) return null;
+      } catch {
+        return null;
+      }
+    }
+    const downloadUrl = storageMode === 'local'
+      ? `${publicBaseUrl}/downloads/${manifest.token}/${encodeURIComponent(manifest.filename)}`
+      : `${publicBaseUrl}/api/backend/api/quote-artifacts/${manifest.token}`;
     return {
+      storage_mode: storageMode,
       s3_bucket: manifest.bucket,
       s3_key: manifest.key,
-      spreadsheet_url: `${publicBaseUrl}/api/backend/api/quote-artifacts/${manifest.token}`,
+      local_path: manifest.local_path,
+      spreadsheet_url: downloadUrl,
       spreadsheet_url_expires_at: manifest.expires_at,
       spreadsheet_filename: manifest.filename,
       manifest_path: path.join(directory, `${manifest.token}.json`),
@@ -312,34 +337,43 @@ async function readExistingArtifact(record, { directory, publicBaseUrl }) {
 
 class QuoteDeliveryService {
   constructor({
+    mode = process.env.ASTRAQUOTE_DELIVERY_MODE,
     bucket = process.env.ASTRAQUOTE_XLSX_BUCKET || process.env.ASTRAQUOTE_DOCX_BUCKET,
     region = process.env.ASTRAQUOTE_XLSX_REGION || process.env.ASTRAQUOTE_DOCX_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION,
     prefix = process.env.ASTRAQUOTE_XLSX_PREFIX || process.env.ASTRAQUOTE_DOCX_PREFIX || 'quotes',
     urlTtlSeconds = Number(process.env.ASTRAQUOTE_XLSX_URL_TTL_SECONDS || process.env.ASTRAQUOTE_DOCX_URL_TTL_SECONDS || 604800),
-    publicBaseUrl = process.env.ASTRAQUOTE_PUBLIC_BASE_URL,
+    publicBaseUrl = process.env.ASTRAQUOTE_PUBLIC_BASE_URL
+      || `http://127.0.0.1:${process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200}`,
     artifactDirectory = process.env.ASTRAQUOTE_ARTIFACT_DIR
-      || path.join(process.env.ASTRAQUOTE_V2_STATE_DIR || '/data/v2-quotes', 'artifacts'),
+      || path.join(process.env.ASTRAQUOTE_V2_STATE_DIR || DEFAULT_RUNTIME_DIRECTORY, 'artifacts'),
+    downloadDirectory = process.env.ASTRAQUOTE_DOWNLOAD_DIR
+      || path.join(DEFAULT_RUNTIME_DIRECTORY, 'downloads'),
     s3Client,
     documentBuilder = buildQuoteWorkbook,
     deliveryGuard = defaultDeliveryGuard,
     completionWriter = writeRelayCompletionReceipt,
+    calculatorLinkService = new AwsCalculatorLinkService(),
   } = {}) {
+    this.mode = String(mode || (bucket ? 's3' : 'local')).toLowerCase();
     this.bucket = bucket;
     this.region = region;
     this.prefix = prefix.replace(/^\/+|\/+$/g, '');
     this.urlTtlSeconds = urlTtlSeconds;
     this.publicBaseUrl = String(publicBaseUrl || '').replace(/\/+$/g, '');
     this.artifactDirectory = path.resolve(artifactDirectory);
+    this.downloadDirectory = path.resolve(downloadDirectory);
     this.s3 = s3Client || (region ? new S3Client({ region }) : null);
     this.documentBuilder = documentBuilder;
     this.deliveryGuard = deliveryGuard;
     this.completionWriter = completionWriter;
+    this.calculatorLinkService = calculatorLinkService;
   }
 
   validateConfiguration() {
     const missing = [];
-    if (!this.bucket) missing.push('ASTRAQUOTE_XLSX_BUCKET');
-    if (!this.region) missing.push('ASTRAQUOTE_XLSX_REGION/AWS_REGION');
+    if (!['local', 's3'].includes(this.mode)) missing.push('ASTRAQUOTE_DELIVERY_MODE(local|s3)');
+    if (this.mode === 's3' && !this.bucket) missing.push('ASTRAQUOTE_XLSX_BUCKET');
+    if (this.mode === 's3' && !this.region) missing.push('ASTRAQUOTE_XLSX_REGION/AWS_REGION');
     if (!/^https?:\/\//.test(this.publicBaseUrl)) missing.push('ASTRAQUOTE_PUBLIC_BASE_URL');
     if (!Number.isInteger(this.urlTtlSeconds) || this.urlTtlSeconds < 60 || this.urlTtlSeconds > 604800) {
       missing.push('ASTRAQUOTE_XLSX_URL_TTL_SECONDS(60..604800)');
@@ -370,6 +404,37 @@ class QuoteDeliveryService {
 
   async createArtifact(record) {
     return this._createOrReuseArtifact(record);
+  }
+
+  async completeMcpDelivery(record, artifact) {
+    await this.assertDeliveryAllowed(record);
+    const quoteResult = buildPageResult(record);
+    const calculatorLink = record.cloud_provider === 'aws'
+      ? await this.calculatorLinkService.create(record)
+      : null;
+    const result = {
+      status: 'quote_ready',
+      quote_id: record.quote_id,
+      quote_result: quoteResult,
+      // Compatibility for existing clients while the sales-page workflow is retired.
+      page_result: quoteResult,
+      spreadsheet_url: artifact.spreadsheet_url,
+      spreadsheet_url_expires_at: artifact.spreadsheet_url_expires_at,
+      spreadsheet_filename: artifact.spreadsheet_filename,
+      artifact_type: 'xlsx',
+      document_url: artifact.spreadsheet_url,
+      document_url_expires_at: artifact.spreadsheet_url_expires_at,
+      ...(calculatorLink || {}),
+    };
+    try {
+      await this.completionWriter(record, result);
+    } catch (error) {
+      throw new QuoteDeliveryError('The quote file exists, but its completion receipt could not be saved.', {
+        code: 'quote_completion_receipt_failed',
+        details: { quote_id: record.quote_id, error_type: error?.name || 'Error' },
+      });
+    }
+    return result;
   }
 
   async completeSalesPageDelivery(record, artifact, status = 'displayed_on_page') {
@@ -412,6 +477,38 @@ class QuoteDeliveryService {
     const filename = shortQuoteFilename(record);
     const key = `${this.prefix}/${year}/${month}/${record.quote_id}/${filename}`;
     await this.assertDeliveryAllowed(record);
+    if (this.mode === 'local') {
+      const quoteDirectory = path.join(this.downloadDirectory, record.quote_id);
+      const localPath = path.join(quoteDirectory, filename);
+      const temporaryPath = `${localPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+      try {
+        await fs.mkdir(quoteDirectory, { recursive: true, mode: 0o700 });
+        await fs.writeFile(temporaryPath, buffer, { mode: 0o600 });
+        await fs.rename(temporaryPath, localPath);
+      } catch (error) {
+        throw new QuoteDeliveryError('The Excel quote could not be saved locally.', {
+          code: 'quote_document_write_failed', details: { error_type: error?.name || 'Error' },
+        });
+      } finally {
+        await fs.rm(temporaryPath, { force: true }).catch(() => {});
+      }
+      const expiresAt = new Date(Date.now() + this.urlTtlSeconds * 1000).toISOString();
+      const artifactManifest = await writeArtifactManifest(record, {
+        storage_mode: 'local',
+        local_path: localPath,
+        filename,
+        expires_at: expiresAt,
+      }, { directory: this.artifactDirectory });
+      return {
+        storage_mode: 'local',
+        local_path: localPath,
+        spreadsheet_url: `${this.publicBaseUrl}/downloads/${artifactManifest.token}/${encodeURIComponent(filename)}`,
+        spreadsheet_url_expires_at: expiresAt,
+        spreadsheet_filename: filename,
+        manifest_path: artifactManifest.path,
+        reused: false,
+      };
+    }
     try {
       await this.s3.send(new PutObjectCommand({
         Bucket: this.bucket,
@@ -456,6 +553,7 @@ class QuoteDeliveryService {
       });
     }
     return {
+      storage_mode: 's3',
       s3_bucket: this.bucket,
       s3_key: key,
       spreadsheet_url: `${this.publicBaseUrl}/api/backend/api/quote-artifacts/${artifactManifest.token}`,
@@ -470,6 +568,47 @@ class QuoteDeliveryService {
     const artifact = await this._createOrReuseArtifact(record);
     return this.completeSalesPageDelivery(record, artifact, status);
   }
+
+  async resolveLocalDownload(token, requestedFilename) {
+    if (this.mode !== 'local' || !/^aqdl_[a-f0-9]{48}$/.test(String(token || ''))) {
+      throw new QuoteDeliveryError('Quote download not found.', {
+        code: 'quote_download_not_found', details: {},
+      });
+    }
+    let manifest;
+    try {
+      manifest = JSON.parse(await fs.readFile(
+        path.join(this.artifactDirectory, `${token}.json`), 'utf8',
+      ));
+    } catch {
+      throw new QuoteDeliveryError('Quote download not found.', {
+        code: 'quote_download_not_found', details: {},
+      });
+    }
+    if (manifest.storage_mode !== 'local'
+      || manifest.token !== token
+      || manifest.filename !== requestedFilename
+      || Date.parse(String(manifest.expires_at || '')) <= Date.now()) {
+      throw new QuoteDeliveryError('Quote download not found or expired.', {
+        code: 'quote_download_not_found', details: {},
+      });
+    }
+    const target = path.resolve(String(manifest.local_path || ''));
+    const allowedRoot = `${this.downloadDirectory}${path.sep}`;
+    if (!target.startsWith(allowedRoot)) {
+      throw new QuoteDeliveryError('Quote download path is invalid.', {
+        code: 'quote_download_path_invalid', details: {},
+      });
+    }
+    try {
+      if (!(await fs.stat(target)).isFile()) throw new Error('not a file');
+    } catch {
+      throw new QuoteDeliveryError('Quote download not found.', {
+        code: 'quote_download_not_found', details: {},
+      });
+    }
+    return { path: target, filename: manifest.filename, content_type: XLSX_MIME };
+  }
 }
 
 module.exports = {
@@ -481,6 +620,7 @@ module.exports = {
   safeName,
   safeSubmissionCode,
   shortQuoteFilename,
+  DEFAULT_RUNTIME_DIRECTORY,
   readExistingArtifact,
   writeArtifactManifest,
   writeRelayCompletionReceipt,

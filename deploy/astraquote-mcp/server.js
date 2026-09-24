@@ -12,6 +12,7 @@ const {
 const { z } = require('zod');
 
 const { AstraQuoteBackendClient, BackendError } = require('./lib/backend-client');
+const { LocalPricingClient } = require('./lib/local-pricing-client');
 const { QuoteDeliveryError, QuoteDeliveryService } = require('./lib/quote-delivery');
 const { QuoteStoreError, V2QuoteStore } = require('./lib/v2-quote-store');
 const { AstraQuoteV2Workflow } = require('./lib/v2-workflow');
@@ -21,7 +22,7 @@ const {
   workflowPolicyVersion,
 } = require('./lib/quote-workflow-policy');
 
-const VERSION = '3.21.0';
+const VERSION = '4.0.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -34,6 +35,10 @@ function validMcpBearer(headers, expectedToken) {
   const suppliedBytes = Buffer.from(supplied);
   return expectedBytes.length === suppliedBytes.length
     && crypto.timingSafeEqual(expectedBytes, suppliedBytes);
+}
+
+function isLoopbackHost(host) {
+  return ['127.0.0.1', '::1', 'localhost'].includes(String(host || '').toLowerCase());
 }
 
 function renderInstructionsTemplate(template) {
@@ -582,7 +587,7 @@ const buildEstimateInput = z.object({
   ),
   price_batch_id: z.string().regex(/^aqpb_[a-f0-9-]{36}$/),
   display_result_on_page: z.boolean().optional().describe(
-    '兼容字段；当前所有报价均生成 Excel 并返回销售页面，不发送 WebHook。',
+    '旧版兼容字段；当前所有报价均生成 Excel 并直接返回 GPT，不发送 WebHook。',
   ),
   is_partial: z.boolean().default(false).describe(
     '仅供非销售中继的兼容流程使用；销售中继报价必须全部核价，不允许用部分报价或销售手填项结束。',
@@ -784,7 +789,7 @@ function buildServer(workflow) {
 
   server.registerTool('get_prices', {
     title: 'Batch query official cloud prices',
-    description: `Always set quote_mode; formal quotes, Excel and sales-page delivery use formal_quote. Requires non-empty incremental queries and one query_contexts entry for each formal pricing query. For installed AWS components, discover and prefer a verified local route_id; GPT still supplies current validated route_inputs and performs product selection and calculation. A local route failure affects only that component and follows the existing same-site official price-page fallback. Preserve relay_batch_index, relay_batch_count, price_batch_id and the current quote_components batch. Full official results are persisted; use get_price_results only for required compacted details. needs_refinement, terminal=false or must_continue means continue the required action and do not give a final answer. GPT supplies current product parameters and response paths while AstraQuote enforces registered hosts and read-only operations. ${renderWorkflowPolicySlice('quote_context')}`,
+    description: `Always set quote_mode; formal quotes and Excel delivery use formal_quote. Requires non-empty incremental queries and one query_contexts entry for each formal pricing query. For installed AWS components, discover and prefer a verified local route_id; GPT still supplies current validated route_inputs and performs product selection and calculation. A local route failure affects only that component and follows the existing same-site official price-page fallback. Preserve relay_batch_index, relay_batch_count, price_batch_id and the current quote_components batch. Full official results are persisted; use get_price_results only for required compacted details. needs_refinement, terminal=false or must_continue means continue the required action and do not give a final answer. GPT supplies current product parameters and response paths while AstraQuote enforces registered hosts and read-only operations. ${renderWorkflowPolicySlice('quote_context')}`,
     // Keep the JSON Schema visible to MCP clients. ZodEffects produced by
     // superRefine serializes as an empty object in the MCP SDK, so cross-field
     // checks run inside the guarded handler instead.
@@ -814,8 +819,8 @@ function buildServer(workflow) {
   }, guarded((args) => workflow.resumeQuoteJob(args)));
 
   server.registerTool('build_estimate', {
-    title: 'Validate and deliver an official quote',
-    description: `Submit selected official evidence, official_page_price_evidence, Fact Ledger, component totals and all sales-selected scenarios. ${renderWorkflowPolicySlice('component_batch')} ${renderWorkflowPolicySlice('official_page_finalize')}`,
+    title: 'Validate and return an official quote',
+    description: `Submit selected official evidence, official_page_price_evidence, Fact Ledger, component totals and selected scenarios. The result is returned directly to GPT with an Excel link. AWS quotes also include an AWS Pricing Calculator public link; every other cloud returns Excel only. ${renderWorkflowPolicySlice('component_batch')} ${renderWorkflowPolicySlice('official_page_finalize')}`,
     inputSchema: buildEstimateInput,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, guarded((args) => workflow.buildEstimate(normalizeBuildEstimateInput(args))));
@@ -825,7 +830,11 @@ function buildServer(workflow) {
 
 function createApp({ backend, store, deliverer } = {}) {
   const transportToken = String(process.env.ASTRAQUOTE_INTERNAL_TOKEN || '').trim();
-  const backendClient = backend || new AstraQuoteBackendClient();
+  const localPricing = process.env.ASTRAQUOTE_LOCAL_MODE !== '0'
+    && !String(process.env.ASTRAQUOTE_BACKEND_URL || '').trim();
+  const backendClient = backend || (localPricing
+    ? new LocalPricingClient()
+    : new AstraQuoteBackendClient());
   const quoteStore = store || new V2QuoteStore();
   const quoteDeliverer = deliverer || new QuoteDeliveryService();
   const workflow = new AstraQuoteV2Workflow({
@@ -847,7 +856,11 @@ function createApp({ backend, store, deliverer } = {}) {
   app.get('/readyz', async (_req, res) => {
     try {
       await backendClient.request('/api/mcp/v2/health', { timeoutMs: 5000 });
-      res.json({ status: 'ready', version: VERSION, dependencies: ['astraquote-backend'] });
+      res.json({
+        status: 'ready',
+        version: VERSION,
+        dependencies: [localPricing && !backend ? 'local-pricing-bridge' : 'astraquote-backend'],
+      });
     } catch (error) {
       res.status(503).json({ status: 'not_ready', code: error.code || 'dependency_unavailable' });
     }
@@ -874,6 +887,11 @@ function createApp({ backend, store, deliverer } = {}) {
       await closeRequest();
     }
   };
+  if (isLoopbackHost(HOST)) {
+    app.post('/mcp', mcpHandler);
+    app.get('/mcp', (_req, res) => res.status(405).send('Method Not Allowed'));
+    app.delete('/mcp', (_req, res) => res.status(405).send('Method Not Allowed'));
+  }
   app.post('/v2/mcp', (req, res, next) => {
     if (!transportToken) {
       res.status(503).json({ error: 'mcp_transport_token_unavailable' });
@@ -887,6 +905,27 @@ function createApp({ backend, store, deliverer } = {}) {
   }, mcpHandler);
   app.get('/v2/mcp', (_req, res) => res.status(405).send('Method Not Allowed'));
   app.delete('/v2/mcp', (_req, res) => res.status(405).send('Method Not Allowed'));
+  app.get('/downloads/:token/:filename', async (req, res) => {
+    try {
+      const artifact = await quoteDeliverer.resolveLocalDownload(
+        req.params.token,
+        req.params.filename,
+      );
+      res.type(artifact.content_type);
+      res.set(
+        'Content-Disposition',
+        `attachment; filename*=UTF-8''${encodeURIComponent(artifact.filename)}`,
+      );
+      const stream = fs.createReadStream(artifact.path);
+      stream.once('error', () => {
+        if (!res.headersSent) res.status(404).json({ error: 'quote_download_not_found' });
+        else res.destroy();
+      });
+      stream.pipe(res);
+    } catch (error) {
+      res.status(404).json({ error: error.code || 'quote_download_not_found' });
+    }
+  });
   return app;
 }
 
@@ -917,4 +956,5 @@ module.exports = {
   officialPriceEvidence,
   pricedService,
   validMcpBearer,
+  isLoopbackHost,
 };

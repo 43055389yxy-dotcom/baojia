@@ -1,6 +1,6 @@
 {
   "schema_version": "astraquote-quote-workflow-policy/1",
-  "policy_version": "2026-09-14-aws-local-routes-v1",
+  "policy_version": "2026-09-24-local-mcp-v1",
   "batching": {
     "components_per_wave": 5,
     "waves_per_chat": 2,
@@ -44,17 +44,20 @@
     "owner": "program",
     "allow_partial_sales_quote": false,
     "allow_sales_manual_price": false,
-    "excel_after_all_component_batches": true
+    "excel_after_all_component_batches": true,
+    "local_excel_download": true,
+    "aws_calculator_link": true,
+    "other_cloud_calculator_link": false
   },
   "prompt_directives": {
     "missing_parameters": "客户未提供的参数，可省略且不影响正式查价时必须省略；缺少后无法正式查价时，由 GPT 从本次官方允许值中选择最小刚需、最低价的可计值继续并简短说明，不得因为缺少参数停止组件或整张报价。",
     "official_pricing": "每个计费项先现场调用一次官方价格 API。AWS 已安装并验证本地报价路由的组件，必须先读取紧凑路由摘要，再把选中的 route_id 和当前清洗配置对应的 route_inputs 交给查价工具；本地路由只提供调用与解析契约，不包含单价，也不替 GPT 选择产品或参数。该 API 未取得完整费率时，只让当前组件立即查询 AWS 同站点官方价格页并保存证据，不生成或回写 API 2，不影响同批其他组件。没有本地路由的组件继续由 GPT 现场组织官方请求。非本地路由只有在官方错误明确给出可修正字段、操作或响应路径时，才允许再发出一次实质不同的修正请求；不得只更换 query_id 重复相同请求。仍未取得完整费率时，立即查询同一云厂商、同一账号站点的官方价格页并保存证据。官网证据按正式价格完成计费项；不得复用其他报价的历史单价。",
     "long_term_fallback": "某组件没有销售所选的长期购买价格时，不判整单失败，也不显示不适用；该长期方案使用组件按量月费，pricing_basis 标为 on_demand_fallback，月费与按量相同、预付为 0。",
     "component_checkpoint": "必须按提示顺序逐个组件处理；每完成一个组件的全部计费项和销售所选方案，立即写入后台进度并确认该 component_key 已完成，再处理下一个。单个组件异常不得阻断同批后续组件。",
-    "component_batch_save": "当前小批的正常组件处理完毕后必须调用 build_estimate，设置 delivery_mode=save_component_batch，并原样提交当前批次编号和 price_batch_id；只保存本批结果。若有程序明确暂存的组件，先继续后续正常组件，待唯一一次集中补发完成后再封存该批。最后一批由程序自动合并、校验并生成销售页和 Excel，AI 不得再次整理整单。",
+    "component_batch_save": "当前小批的正常组件处理完毕后必须调用 build_estimate，设置 delivery_mode=save_component_batch，并原样提交当前批次编号和 price_batch_id；只保存本批结果。若有程序明确暂存的组件，先继续后续正常组件，待唯一一次集中补发完成后再封存该批。最后一批由本地 MCP 自动合并、校验并生成 Excel；仅 AWS 同时生成 AWS Pricing Calculator 链接，其他云不生成官网报价链接。AI 不得再次整理整单。",
     "deferred_retry": "一个组件长时间无真实进展或回复结束后仍未完成时，只暂存当前这个组件，立即继续同批后续组件及后续批次，不得关闭或跳过整批。全部正常批次处理后回到原对话，把该对话所有暂存组件合并在一次消息中补发一次；成功组件及证据必须复用，严禁重新查价。",
     "complete_sales_delivery": "销售任务不得生成 unpriced_services 或部分报价，不得标注销售手填，也不得使用假零价。官网证据也确实无法取得或校验时，保存其他成功组件并停止任务，只返回一个明确阻塞。",
-    "authoritative_status": "组件、批次和交付状态只以后端封存状态与交付回执为准；GPT 回复文字、页面动画或旧查询状态都不能单独判定成功。"
+    "authoritative_status": "组件、批次和交付状态只以 MCP 封存状态与交付结果为准；GPT 回复文字或旧查询状态都不能单独判定成功。"
   },
   "consumer_slices": {
     "quote_context": [

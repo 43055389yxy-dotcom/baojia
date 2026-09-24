@@ -47,7 +47,8 @@ function hasCommercialRate(result) {
 class OfficialPriceCache {
   constructor({
     directory = path.join(
-      process.env.ASTRAQUOTE_V2_STATE_DIR || '/data/v2-quotes',
+      process.env.ASTRAQUOTE_V2_STATE_DIR
+        || path.resolve(__dirname, '../../../.astraquote/state'),
       'official-price-cache',
     ),
     freshTtlMs = positiveInteger(

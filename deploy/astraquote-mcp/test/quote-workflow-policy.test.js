@@ -16,7 +16,7 @@ test('workflow policy is one versioned machine-readable source', () => {
   const snapshot = workflowPolicySnapshot();
 
   assert.equal(policy.schema_version, 'astraquote-quote-workflow-policy/1');
-  assert.equal(workflowPolicyVersion(), '2026-09-14-aws-local-routes-v1');
+  assert.equal(workflowPolicyVersion(), '2026-09-24-local-mcp-v1');
   assert.equal(snapshot.policy_version, workflowPolicyVersion());
   assert.equal(snapshot.prompt_directives, undefined);
   assert.equal(snapshot.consumer_slices, undefined);

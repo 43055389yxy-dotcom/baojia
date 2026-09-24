@@ -9,7 +9,7 @@ const { InMemoryTransport } = require('@modelcontextprotocol/sdk/inMemory.js');
 
 const { buildServer, INSTRUCTIONS } = require('../server');
 
-test('public MCP is an official-first twelve-site workflow with bounded page fallback', async (t) => {
+test('public MCP is an official-first twelve-site workflow with AWS-only calculator delivery', async (t) => {
   const workflow = {
     describeService: async (input) => ({ status: 'ok', input }),
     getAttributeValues: async (input) => ({ status: 'ok', input }),
@@ -34,7 +34,9 @@ test('public MCP is an official-first twelve-site workflow with bounded page fal
     listed.tools.map((tool) => tool.name),
     ['describe_service', 'get_attribute_values', 'get_prices', 'get_price_results', 'get_quote_job_status', 'resume_quote_job', 'build_estimate'],
   );
-  assert.doesNotMatch(INSTRUCTIONS, /Calculator|官方报价链接|模板指纹|模板搜索/i);
+  assert.match(INSTRUCTIONS, /仅 AWS.*AWS Pricing Calculator/s);
+  assert.match(INSTRUCTIONS, /其他云只返回 Excel/);
+  assert.doesNotMatch(INSTRUCTIONS, /模板指纹|模板搜索/i);
   assert.match(INSTRUCTIONS, /AWS Price List API/);
   assert.match(INSTRUCTIONS, /Azure Retail Prices API/);
   assert.match(INSTRUCTIONS, /Oracle Cloud Price List API/);

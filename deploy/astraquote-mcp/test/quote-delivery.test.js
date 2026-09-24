@@ -213,6 +213,7 @@ test('every page delivery renders Excel and writes result plus download link to 
 
 test('does not upload when delivery configuration is incomplete', async () => {
   const service = new QuoteDeliveryService({
+    mode: 's3',
     bucket: '',
     region: 'ap-east-1',
     s3Client: { send: async () => assert.fail('must not upload') },

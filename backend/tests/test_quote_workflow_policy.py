@@ -14,7 +14,7 @@ def test_workflow_policy_is_versioned_and_machine_snapshot_excludes_prompt_prose
     snapshot = workflow_policy_snapshot()
 
     assert policy["schema_version"] == "astraquote-quote-workflow-policy/1"
-    assert workflow_policy_version() == "2026-09-14-aws-local-routes-v1"
+    assert workflow_policy_version() == "2026-09-24-local-mcp-v1"
     assert snapshot["policy_version"] == workflow_policy_version()
     assert "prompt_directives" not in snapshot
     assert "consumer_slices" not in snapshot

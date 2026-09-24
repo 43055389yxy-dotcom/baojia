@@ -2921,7 +2921,8 @@ class AstraQuoteV2Workflow {
   async deliverRecord(record) {
     let deliveryResult;
     if (typeof this.deliverer.createArtifact === 'function'
-      && typeof this.deliverer.completeSalesPageDelivery === 'function') {
+      && (typeof this.deliverer.completeMcpDelivery === 'function'
+        || typeof this.deliverer.completeSalesPageDelivery === 'function')) {
       const artifact = await this.deliverer.createArtifact(record);
       if (record.relay_job_id) {
         this.store.putCheckpoint(record.relay_job_id, {
@@ -2933,11 +2934,13 @@ class AstraQuoteV2Workflow {
           partial_retry_generation: Number(record.partial_retry_generation || 0),
         });
       }
-      deliveryResult = await this.deliverer.completeSalesPageDelivery(
-        record,
-        artifact,
-        'displayed_on_page',
-      );
+      deliveryResult = typeof this.deliverer.completeMcpDelivery === 'function'
+        ? await this.deliverer.completeMcpDelivery(record, artifact)
+        : await this.deliverer.completeSalesPageDelivery(
+          record,
+          artifact,
+          'displayed_on_page',
+        );
     } else {
       deliveryResult = await this.deliverer.deliverPageResult(record);
     }
@@ -2959,9 +2962,11 @@ class AstraQuoteV2Workflow {
     }
     return {
       ...deliveryResult,
-      status: 'displayed_on_page',
+      status: deliveryResult.status || 'quote_ready',
       quote_id: record.quote_id,
-      next_step: 'The structured quote and Excel download link are ready on the sales page.',
+      next_step: record.cloud_provider === 'aws'
+        ? 'Return the structured quote, Excel download link, and AWS Pricing Calculator link directly in GPT.'
+        : 'Return the structured quote and Excel download link directly in GPT. Do not create a cloud-provider calculator link.',
     };
   }
 

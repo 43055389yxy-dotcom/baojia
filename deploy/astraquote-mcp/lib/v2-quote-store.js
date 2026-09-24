@@ -15,7 +15,8 @@ class QuoteStoreError extends Error {
 
 class V2QuoteStore {
   constructor({
-    directory = process.env.ASTRAQUOTE_V2_STATE_DIR || '/data/v2-quotes',
+    directory = process.env.ASTRAQUOTE_V2_STATE_DIR
+      || path.resolve(__dirname, '../../../.astraquote/state'),
     ownerUid = process.env.ASTRAQUOTE_GPT_RELAY_UID,
     ownerGid = process.env.ASTRAQUOTE_GPT_RELAY_GID,
   } = {}) {

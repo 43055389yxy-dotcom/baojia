@@ -13,15 +13,15 @@ services:
       - /home/ec2-user/astraquote/config/mcp.env
       - /home/ec2-user/astraquote/config/oauth.env
     environment:
-      BACKEND_API_URL: http://127.0.0.1:8000
-      ASTRAQUOTE_BACKEND_URL: http://127.0.0.1:8000
-      ASTRAQUOTE_AWS_DATA_DIR: /data/aws
+      ASTRAQUOTE_LOCAL_MODE: "1"
+      ASTRAQUOTE_PYTHON: python3
+      ASTRAQUOTE_BACKEND_ROOT: /app/backend
+      ASTRAQUOTE_LOCAL_BRIDGE: /app/backend/scripts/local_mcp_bridge.py
       ASTRAQUOTE_V2_STATE_DIR: /data/v2-quotes
       ASTRAQUOTE_ARTIFACT_DIR: /data/v2-quotes/artifacts
+      ASTRAQUOTE_DELIVERY_MODE: local
+      ASTRAQUOTE_DOWNLOAD_DIR: /data/downloads
       ASTRAQUOTE_PUBLIC_BASE_URL: https://baojia.tontianit.com
-      ASTRAQUOTE_GPT_RELAY_DIR: /data/gpt-relay
-      ASTRAQUOTE_GPT_RELAY_UID: "1000"
-      ASTRAQUOTE_GPT_RELAY_GID: "1000"
       ASTRAQUOTE_MCP_HOST: 0.0.0.0
       ASTRAQUOTE_MCP_PORT: "8200"
       ASTRAQUOTE_BACKEND_TIMEOUT_MS: "120000"

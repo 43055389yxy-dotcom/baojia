@@ -8,8 +8,14 @@ baojia.tontianit.com {
         reverse_proxy astraquote:8001
     }
 
+    @astraquote_downloads {
+        path /downloads/*
+    }
+    handle @astraquote_downloads {
+        reverse_proxy astraquote:8200
+    }
+
     handle {
-        import tool_auth automated_quote
-        reverse_proxy astraquote:3000
+        respond "AstraQuote MCP" 200
     }
 }

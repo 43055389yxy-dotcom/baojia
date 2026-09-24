@@ -16,6 +16,7 @@ backend/.cache/
 deploy/runtime/
 deploy/astraquote-codex-agent/
 .run/
+.astraquote/
 
 # Local exports and test captures are not production source.
 /*.xlsx

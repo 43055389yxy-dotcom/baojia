@@ -1,27 +1,21 @@
-# AstraQuote 生产部署
+# AstraQuote 单 MCP 生产部署
 
-生产版本使用一个 MCP 汇聚十个云厂商的官方价目或询价接口：
+生产版不再启动销售前端、独立 HTTP 后端或远程 GPT/桌面中继。GPT 直接调用一个 AstraQuote MCP：
 
-- AWS Price List API
-- Microsoft Azure Retail Prices API
-- Oracle Cloud Infrastructure Price List API
-- Google Cloud Billing Catalog API
-- 腾讯云官方目录/询价 API
-- 阿里云官方目录/询价 API
-- 华为云官方目录/询价 API
-- 百度智能云官方目录/询价 API
-- 火山引擎官方目录/询价 API
-- 天翼云官方目录/询价 API
+- MCP 进程直接调用 Python 官方价目库，不经过另一个后端端口。
+- MCP 自己生成 Excel，保存到持久化数据目录，并返回带随机令牌的下载链接。
+- 仅 AWS 报价同时返回 Excel 和 AWS Pricing Calculator 公开分享链接。
+- Azure、OCI、GCP、腾讯云、阿里云、华为云、百度智能云、火山引擎和天翼云只返回 Excel，不调用也不返回官网报价链接。
 
-销售在报价页选择云厂商。GPT 负责理解需求、组织官网查询参数、选择官方价格项、换算用量和计算报价；MCP 只负责执行官方查询、保存原始证据、做 schema / 事实归属 / 金额加总一致性等机械校验，并交付页面结果或 Excel。程序不替 GPT 选型号、补业务参数或算钱。
+公网入口仍使用同容器内的 OAuth 边界程序，它只负责登录、令牌和转发，不参与报价。公网 MCP 地址为：
 
-官方 API 优先。AWS 商业区已在 `policies/aws-pricing-routes/aws-commercial/` 安装验证过的本地调用契约时，先从本地读取路由，再现场调用 AWS Price List；路由不含价格、SKU 选择、客户参数或凭据。该 API 未取得完整费率时只把当前组件转 AWS 官方价格页，不生成或回写 API 2，也不影响其他组件。没有本地路由的组件沿用 GPT 现场组织官方请求的路径。MCP 只校验尝试存在、计费归属、官方域名与价格上下文；权限/凭据失败仍由管理员修复，最近权限拒绝的五分钟预检保持不变。有可用 API 价格时禁止网页证据覆盖。
+```text
+https://baojia.tontianit.com/mcp
+```
 
-生产运行路径不包含 AWS Pricing Calculator、Calculator 浏览器、模板映射或创建后回读流程。
+## 配置
 
-## 配置文件
-
-服务器使用以下三个环境文件：
+服务器继续使用三个现有环境文件，以便保留云厂商凭据、MCP 内部令牌和 OAuth 客户端：
 
 ```text
 /home/ec2-user/astraquote/config/backend.env
@@ -29,96 +23,51 @@
 /home/ec2-user/astraquote/config/oauth.env
 ```
 
-额外 MCP 客户端只能在 `oauth.env` 中按完整 HTTPS 回调地址精确放行：
+`backend.env` 现在只被 MCP 内部的官方价格查询库读取，不会启动后端 Web 服务。AWS 使用服务器现有的 AWS 凭证链；Azure Retail Prices API 和 OCI Price List API 是公开价目接口；其他需要凭据的云厂商继续使用现有只读配置。
+
+Excel 和报价中间状态保存在宿主机：
 
 ```text
-OAUTH_EXACT_HTTPS_REDIRECT_URIS=https://oauth-client.example/its-exact-callback
+/home/ec2-user/astraquote/data/v2-quotes
+/home/ec2-user/astraquote/data/downloads
 ```
 
-多个地址使用英文逗号分隔。网关按完整字符串匹配，不得只填写或放行整个域名。
-
-AWS 查询使用服务器已有的 AWS 凭证链。Azure Retail Prices API 和 OCI Price List API 是公开价目接口，不要求把账号密钥写进 MCP。Google Cloud Billing Catalog API 需要在 `backend.env` 配置：
+OAuth 客户端和刷新令牌仍在：
 
 ```text
-GCP_BILLING_API_KEY=...
+/home/ec2-user/astraquote/data/oauth/oauth.db
 ```
 
-API Key 只用于访问官方目录，MCP 不接收也不向 GPT 返回密钥。
+## 运行结构
 
-腾讯云、阿里云、华为云、百度智能云、火山引擎和天翼云使用各自只读子账号的访问密钥。在 `backend.env` 配置以下变量；不要写入 Git：
+`astraquote:production` 一个容器内只启动：
 
-```text
-TENCENTCLOUD_SECRET_ID=...
-TENCENTCLOUD_SECRET_KEY=...
-ALIBABA_CLOUD_ACCESS_KEY_ID=...
-ALIBABA_CLOUD_ACCESS_KEY_SECRET=...
-ALIBABA_INTL_ACCESS_KEY_ID=...
-ALIBABA_INTL_ACCESS_KEY_SECRET=...
-HUAWEICLOUD_ACCESS_KEY=...
-HUAWEICLOUD_SECRET_KEY=...
-HUAWEICLOUD_INTL_ACCESS_KEY=...
-HUAWEICLOUD_INTL_SECRET_KEY=...
-BAIDUCLOUD_ACCESS_KEY_ID=...
-BAIDUCLOUD_SECRET_ACCESS_KEY=...
-VOLCENGINE_ACCESS_KEY=...
-VOLCENGINE_SECRET_KEY=...
-CTYUN_ACCESS_KEY=...
-CTYUN_SECRET_KEY=...
-```
+1. `node server.js`：AstraQuote MCP，内置官方价格查询桥接和 Excel 下载。
+2. `uvicorn app:app`：公网 MCP 的 OAuth 2.1 安全边界。
 
-这些密钥只由后端签名器读取。GPT 只提供官方 endpoint、查询动作、区域、精确参数和响应字段路径，不能读取或提交密钥。
+不启动 frontend、backend API、Codex relay、Gemini relay、VNC 或浏览器进程。
 
-Excel 交付需要配置私有 S3 和稳定下载入口；结果只回到销售页面，不发送企业微信：
+## 发布与检查
 
-```text
-ASTRAQUOTE_XLSX_BUCKET=...
-ASTRAQUOTE_XLSX_REGION=...
-ASTRAQUOTE_PUBLIC_BASE_URL=https://baojia.tontianit.com
-```
+Jenkins 使用 [`deploy/jenkins-shell.sh`](./jenkins-shell.sh) 构建并替换容器。脚本会：
 
-瞬时故障退避可按需调整；默认等待 0.25 秒和 0.75 秒：
+1. 事务性备份 OAuth 数据库并验证客户端数量未减少。
+2. 构建单 MCP 镜像并启动容器。
+3. 验证 MCP 就绪、OAuth 就绪和带内部令牌的 MCP `initialize`。
+4. 更新 Caddy 的 `/mcp` 和 `/downloads/*` 路由。
+5. 停用旧的远程 GPT、Gemini 和桌面中继。
 
-```text
-ASTRAQUOTE_PROVIDER_RETRY_DELAY_1=0.25
-ASTRAQUOTE_PROVIDER_RETRY_DELAY_2=0.75
-```
-
-不同报价之间不缓存单价；只有同一价格批次中已经保存的成功证据可供该报价断点续跑。客户 Excel 不展示维护、限流、连接或重试等技术故障。
-
-## MCP 工具
-
-生产 MCP 只公开七个工具：
-
-1. `describe_service`：优先返回匹配 AWS `service_code` 的紧凑本地路由摘要；没有本地路由时查询 AWS Price List 服务元数据。
-2. `get_attribute_values`：查询 AWS 官方属性值。
-3. `get_prices`：按 GPT 提供的精确参数查询所选云厂商的官方价目或询价接口。
-4. `get_price_results`：按需读取已保存的官方价格明细，不重复请求官网。
-5. `get_quote_job_status`：读取已保存的报价阶段和批次。
-6. `resume_quote_job`：只返回下一缺失步骤，不重跑已成功动作。
-7. `build_estimate`：验证 GPT 选中的官方 API 证据，或一次 API 未取得可用费率后的官方价格页证据及计算结果，然后生成 Excel 并返回销售页面。
-
-## 部署与检查
-
-Jenkins 使用 [`deploy/jenkins-shell.sh`](./jenkins-shell.sh) 构建并启动容器。上线前至少运行：
-
-该脚本还会把同一版本的 `backend`、`tools`、`policies` 同步到 Docker 宿主机
-`/home/ec2-user/astraquote/source`，然后通过临时的 Docker 宿主机命名空间调用
-已安装的 `astraquote-gpt-relay.service` 完成明确重启。Jenkins 本身运行在容器
-中，所以这里通过它已有的 Docker socket 完成宿主机文件同步和进程重启，不要求
-Jenkins 容器安装 `rsync`、`sudo` 或 `systemctl`。临时容器只执行固定的
-`systemctl restart astraquote-gpt-relay.service`，Docker 宿主机必须已经安装该
-systemd 服务。
+上线前运行：
 
 ```bash
 cd deploy/astraquote-mcp && npm test
-cd frontend && npm test && npm run build
-cd backend && pytest
+cd ../../backend && pytest
 ```
 
-部署完成后检查：
+容器上线后的核心检查：
 
 ```bash
-docker exec astraquote curl -fsS http://127.0.0.1:3000/api/backend/api/health
 docker exec astraquote curl -fsS http://127.0.0.1:8200/readyz
 docker exec astraquote curl -fsS http://127.0.0.1:8001/readyz
+curl -fsS https://baojia.tontianit.com/.well-known/oauth-protected-resource/mcp
 ```
