@@ -18,6 +18,7 @@ test('production runs one single-MCP container without a sales or backend server
   assert.match(compose, /ASTRAQUOTE_LOCAL_BRIDGE:\s*\/app\/backend\/scripts\/local_mcp_bridge\.py/);
   assert.match(compose, /ASTRAQUOTE_DELIVERY_MODE:\s*local/);
   assert.match(compose, /ASTRAQUOTE_DOWNLOAD_DIR:\s*\/data\/downloads/);
+  assert.match(compose, /PUBLIC_ORIGIN:\s*https:\/\/baojia\.tontianit\.com/);
   assert.match(compose, /DB_PATH:\s*\/data\/oauth\/oauth\.db/);
   assert.match(compose, /\/home\/ec2-user\/astraquote\/data:\/data/);
   assert.doesNotMatch(compose, /CALCULATOR|generate_calculator_link/i);

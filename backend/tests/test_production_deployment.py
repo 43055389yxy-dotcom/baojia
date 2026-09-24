@@ -46,6 +46,7 @@ def test_production_runs_local_pricing_inside_the_mcp() -> None:
     assert "ASTRAQUOTE_LOCAL_BRIDGE: /app/backend/scripts/local_mcp_bridge.py" in compose
     assert "ASTRAQUOTE_DELIVERY_MODE: local" in compose
     assert "ASTRAQUOTE_DOWNLOAD_DIR: /data/downloads" in compose
+    assert "PUBLIC_ORIGIN: https://baojia.tontianit.com" in compose
     assert "ASTRAQUOTE_BACKEND_URL" not in compose
     assert "BACKEND_API_URL" not in compose
     assert "local_mcp_bridge.py" in dockerfile
