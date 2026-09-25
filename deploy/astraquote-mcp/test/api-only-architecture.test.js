@@ -34,13 +34,13 @@ test('public MCP is an official-first twelve-site workflow with AWS-only calcula
     listed.tools.map((tool) => tool.name),
     ['describe_service', 'get_attribute_values', 'get_prices', 'get_price_results', 'get_quote_job_status', 'resume_quote_job', 'build_estimate'],
   );
-  assert.match(INSTRUCTIONS, /仅 AWS.*AWS Pricing Calculator/s);
-  assert.match(INSTRUCTIONS, /其他云只返回 Excel/);
+  assert.match(INSTRUCTIONS, /AWS.*Excel.*aws_calculator_url.*AWS Pricing Calculator/s);
+  assert.match(INSTRUCTIONS, /非 AWS.*只返回 Excel.*严禁返回/s);
   assert.doesNotMatch(INSTRUCTIONS, /模板指纹|模板搜索/i);
-  assert.match(INSTRUCTIONS, /AWS Price List API/);
-  assert.match(INSTRUCTIONS, /Azure Retail Prices API/);
-  assert.match(INSTRUCTIONS, /Oracle Cloud Price List API/);
-  assert.match(INSTRUCTIONS, /Google Cloud Billing Catalog API/);
+  assert.match(INSTRUCTIONS, /AWS.*Price List/s);
+  assert.match(INSTRUCTIONS, /Azure.*Retail Prices API/s);
+  assert.match(INSTRUCTIONS, /Oracle Cloud/);
+  assert.match(INSTRUCTIONS, /GCP.*Cloud Billing Catalog API/s);
   assert.match(INSTRUCTIONS, /腾讯云/);
   assert.match(INSTRUCTIONS, /阿里云/);
   assert.match(INSTRUCTIONS, /阿里云国际站/);
@@ -50,12 +50,12 @@ test('public MCP is an official-first twelve-site workflow with AWS-only calcula
   assert.match(INSTRUCTIONS, /火山引擎/);
   assert.match(INSTRUCTIONS, /天翼云/);
   assert.match(INSTRUCTIONS, /ASTRAQUOTE_STOP_CODE: AQ-QUOTE-FAILED/);
-  assert.match(INSTRUCTIONS, /needs_refinement.*安全补发预算/s);
-  assert.match(INSTRUCTIONS, /无真实进展.*唯一补发.*失败待处理/s);
-  assert.match(INSTRUCTIONS, /terminal=false.*不.*无限/s);
-  assert.match(INSTRUCTIONS, /首次官方 API.*官方价格页/s);
-  assert.match(INSTRUCTIONS, /权限或凭据拒绝.*禁止 API 重试/s);
-  assert.match(INSTRUCTIONS, /需求理解.*最终金额都由 GPT 完成/s);
+  assert.match(INSTRUCTIONS, /price_lookup.*queries=\[\].*不再请求云厂商/s);
+  assert.match(INSTRUCTIONS, /needs_refinement.*不是失败/s);
+  assert.match(INSTRUCTIONS, /只允许一次.*修正请求.*官方价格页/s);
+  assert.match(INSTRUCTIONS, /credentials.*authorization.*不得把权限拒绝说成无 SKU/s);
+  assert.match(INSTRUCTIONS, /GPT 负责理解需求.*计算金额/s);
+  assert.match(INSTRUCTIONS, /不需要销售前端.*远程桌面.*远程 GPT/s);
 });
 
 test('production and sales entry have no Calculator runtime or option', () => {

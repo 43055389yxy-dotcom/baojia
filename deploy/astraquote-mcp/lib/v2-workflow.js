@@ -1781,6 +1781,7 @@ class AstraQuoteV2Workflow {
   async getPrices(input) {
     const relayJobId = input.relay_job_id || null;
     const relayJob = relayJobId ? assertRelayIdentity(input) : null;
+    const requestedQueries = Array.isArray(input.queries) ? input.queries : [];
     const existing = input.price_batch_id
       ? tryGetPriceBatch(this.store, input.price_batch_id)
       : null;
@@ -1803,14 +1804,47 @@ class AstraQuoteV2Workflow {
       ? 'formal_quote'
       : 'price_lookup';
     const quoteMode = input.quote_mode || existing?.quote_mode || inferredQuoteMode;
-    if (existing?.quote_mode && existing.quote_mode !== quoteMode) {
+    const planOnlyRegistration = requestedQueries.length === 0;
+    if (planOnlyRegistration && !existing) {
+      const error = new Error(
+        'Registering a quote plan without new price queries requires an existing price_batch_id.',
+      );
+      error.code = 'quote_plan_registration_batch_required';
+      error.retryable = true;
+      error.details = {
+        next_action: 'retry_with_the_price_batch_id_returned_by_the_completed_price_lookup',
+      };
+      throw error;
+    }
+    if (planOnlyRegistration && relayJobId) {
+      const error = new Error('A legacy relay component call must include its current price queries.');
+      error.code = 'relay_price_queries_required';
+      error.retryable = true;
+      error.details = { next_action: 'retry_with_the_current_component_price_queries' };
+      throw error;
+    }
+    if (planOnlyRegistration && quoteMode !== 'formal_quote') {
+      const error = new Error('An empty query list is only valid when registering a formal quote plan.');
+      error.code = 'quote_plan_registration_mode_invalid';
+      error.retryable = true;
+      error.details = {
+        expected_quote_mode: 'formal_quote',
+        next_action: 'set_quote_mode_to_formal_quote_and_register_the_complete_plan',
+      };
+      throw error;
+    }
+    const directPlanUpgrade = planOnlyRegistration
+      && !relayJobId
+      && existing?.quote_mode === 'price_lookup'
+      && quoteMode === 'formal_quote';
+    if (existing?.quote_mode && existing.quote_mode !== quoteMode && !directPlanUpgrade) {
       const error = new Error('The saved price batch quote mode is immutable.');
       error.code = 'price_batch_quote_mode_mismatch';
       error.retryable = true;
       error.details = { expected: existing.quote_mode, received: quoteMode };
       throw error;
     }
-    const materializedQueries = input.queries.map(withOfficialApiBaseRoute);
+    const materializedQueries = requestedQueries.map(withOfficialApiBaseRoute);
     const preliminaryQueries = new Map(
       (existing?.request?.queries || []).map((item) => [item.query_id, item]),
     );
@@ -1823,7 +1857,9 @@ class AstraQuoteV2Workflow {
       quoteMode,
       relayJobId,
       quoteComponents,
-      queries: materializedQueries,
+      queries: planOnlyRegistration
+        ? [...preliminaryQueries.values()]
+        : materializedQueries,
       queryContexts: preliminaryContexts,
       existing,
     });
@@ -2244,6 +2280,8 @@ class AstraQuoteV2Workflow {
         quoteComponents: finalQuoteComponents,
         componentLifecycle: componentStatus.component_lifecycle,
       }),
+      plan_only_registration: planOnlyRegistration,
+      preserved_query_count: planOnlyRegistration ? finalQueries.size : undefined,
     }, this.resultByteBudget);
   }
 

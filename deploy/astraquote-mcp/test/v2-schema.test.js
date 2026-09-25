@@ -144,11 +144,12 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   const getPrices = listed.tools.find((tool) => tool.name === 'get_prices');
   const describeService = listed.tools.find((tool) => tool.name === 'describe_service');
   const buildEstimate = listed.tools.find((tool) => tool.name === 'build_estimate');
-  assert.ok(getPrices.inputSchema.required.includes('queries'));
+  assert.ok(!getPrices.inputSchema.required.includes('queries'));
   assert.ok(getPrices.inputSchema.required.includes('quote_mode'));
   assert.deepEqual(getPrices.inputSchema.properties.quote_mode.enum, ['price_lookup', 'formal_quote']);
   assert.equal(getPrices.inputSchema.properties.queries.type, 'array');
   assert.equal(getPrices.inputSchema.properties.queries.maxItems, 50);
+  assert.deepEqual(getPrices.inputSchema.properties.queries.default, []);
   assert.equal(getPrices.inputSchema.properties.relay_batch_index.type, 'integer');
   assert.equal(getPrices.inputSchema.properties.relay_batch_count.type, 'integer');
   assert.equal(getPrices.inputSchema.properties.official_page_price_evidence.type, 'array');
@@ -167,28 +168,44 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   assert.match(INSTRUCTIONS, /官方文档.*官方 SDK/s);
   assert.match(INSTRUCTIONS, /route_id/);
   assert.doesNotMatch(INSTRUCTIONS, /缓存道路|道路级错误/);
-  assert.match(INSTRUCTIONS, /第三方网页.*绝不能作为价格证据/s);
-  assert.match(INSTRUCTIONS, /工具入参校验.*可修正.*重试/s);
-  assert.match(INSTRUCTIONS, /queries.*非空/s);
-  assert.match(INSTRUCTIONS, /长报价.*动态.*小批/s);
-  assert.match(INSTRUCTIONS, /response_compacted.*get_price_results/s);
-  assert.match(INSTRUCTIONS, /同一个.*price_batch_id.*合并/s);
-  assert.match(INSTRUCTIONS, /created.*立即执行.*不得只汇报/s);
-  assert.match(getPrices.description, /formal quote.*relay_batch_index.*quote_components/is);
+  assert.match(INSTRUCTIONS, /第三方页面.*绝不能成为价格证据/s);
+  assert.match(INSTRUCTIONS, /request_schema_invalid.*details\.violations/s);
+  assert.match(INSTRUCTIONS, /price_lookup.*queries=\[\].*仅登记计划/s);
+  assert.match(INSTRUCTIONS, /get_price_results.*不重放已成功查询/s);
+  assert.match(INSTRUCTIONS, /原 `price_batch_id`.*不再请求云厂商/s);
+  assert.match(getPrices.description, /Recovery is supported.*queries omitted or \[\].*preserves all saved evidence/is);
   assert.match(getPrices.description, /must_continue.*final answer/is);
-  assert.match(getPrices.description, /官方错误.*修正请求.*官方价格页/is);
+  assert.match(getPrices.description, /Legacy relay fields.*relay_job_id/is);
   assert.equal(getPrices.inputSchema.properties.official_page_price_evidence.type, 'array');
   assert.match(buildEstimate.description, /official_page_price_evidence/i);
-  assert.match(buildEstimate.description, /save_component_batch.*最后一批.*Excel/is);
-  assert.match(INSTRUCTIONS, /统一执行策略版本：`2026-09-24-local-mcp-v1`/);
-  assert.match(INSTRUCTIONS, /一个顶层组件为一次进度写入单位/);
-  assert.match(INSTRUCTIONS, /不得把多个顶层组件合并到同一次价格调用/);
-  assert.match(INSTRUCTIONS, /每 5 个组件形成一轮.*每个对话最多 10 个组件/s);
-  assert.match(INSTRUCTIONS, /全局最多同时运行 4 个.*同一销售最多同时占用 3 个/s);
+  assert.match(buildEstimate.description, /directly to GPT.*Excel link/is);
+  assert.match(INSTRUCTIONS, /统一执行策略版本：`2026-09-25-direct-mcp-v2`/);
+  assert.match(INSTRUCTIONS, /不需要销售前端.*远程桌面.*远程 GPT/s);
+  assert.match(INSTRUCTIONS, /delivery_mode=deliver_quote/);
+  assert.match(INSTRUCTIONS, /relay_job_id.*兼容边界/s);
   assert.doesNotMatch(INSTRUCTIONS, /\{\{[A-Z0-9_]+\}\}/);
   assert.match(INSTRUCTIONS, /仅 AWS.*AWS Pricing Calculator/s);
   assert.match(INSTRUCTIONS, /非 AWS.*严禁返回/s);
   assert.doesNotMatch(INSTRUCTIONS, /import_estimate|模板映射/i);
+
+  const planOnly = await client.callTool({
+    name: 'get_prices',
+    arguments: {
+      quote_mode: 'formal_quote',
+      price_batch_id: `aqpb_${'0'.repeat(8)}-${'0'.repeat(4)}-${'0'.repeat(4)}-${'0'.repeat(4)}-${'0'.repeat(12)}`,
+      query_contexts: [{
+        query_id: 'saved-price', purpose: 'pricing',
+        component_key: 'cmp_ec2', billing_key: 'compute',
+      }],
+      quote_components: [{
+        component_key: 'cmp_ec2', customer_owned_source: '云服务器 1 台。',
+        billing_scopes: [{ billing_key: 'compute' }],
+      }],
+    },
+  });
+  assert.equal(planOnly.isError, undefined);
+  assert.deepEqual(planOnly.structuredContent.input.queries, []);
+  assert.equal(planOnly.structuredContent.input.quote_components[0].component_key, 'cmp_ec2');
 });
 
 test('get_prices accepts all twelve provider-site raw query shapes', async (t) => {

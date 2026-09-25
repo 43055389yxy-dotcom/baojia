@@ -1505,6 +1505,84 @@ test('a direct formal quote cannot silently fall back to untracked price lookup 
   assert.equal(officialCalls, 0);
 });
 
+test('a direct price lookup batch can register a formal quote plan without querying again', async (t) => {
+  const context = fixture({ rateCandidates: [{
+    rate_id: 'azure:item-1:payg', official_item_id: 'item-1',
+    unit_price: '0.10', currency: 'USD', unit: 'hour',
+  }] });
+  const { workflow, backend, directory } = context;
+  const originalGetPrices = backend.getPrices;
+  let officialCalls = 0;
+  backend.getPrices = async (input) => {
+    officialCalls += 1;
+    return originalGetPrices(input);
+  };
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+
+  const lookup = await workflow.getPrices({
+    quote_mode: 'price_lookup',
+    queries: [{ provider: 'azure', query_id: 'vm-price', filter: 'caller supplied query' }],
+  });
+  const registered = await workflow.getPrices({
+    quote_mode: 'formal_quote',
+    price_batch_id: lookup.price_batch_id,
+    queries: [],
+    query_contexts: [{
+      query_id: 'vm-price', purpose: 'pricing',
+      component_key: 'cmp_ec2', billing_key: 'compute',
+    }],
+    quote_components: [{
+      component_key: 'cmp_ec2',
+      customer_owned_source: '云服务器数量：1。',
+      billing_scopes: [{ billing_key: 'compute' }],
+    }],
+  });
+
+  assert.equal(officialCalls, 1);
+  assert.equal(registered.plan_only_registration, true);
+  assert.equal(registered.preserved_query_count, 1);
+  assert.equal(registered.status, 'completed');
+  assert.equal(registered.next_action, 'build_estimate');
+  assert.equal(registered.workflow_guard.mode, 'formal_quote');
+  assert.equal(registered.workflow_guard.quote_plan_registered, true);
+  const saved = workflow.store.getPriceBatch(lookup.price_batch_id);
+  assert.equal(saved.quote_mode, 'formal_quote');
+  assert.equal(saved.request.queries.length, 1);
+  assert.equal(saved.result.results.length, 1);
+  assert.equal(saved.quote_components[0].component_key, 'cmp_ec2');
+  assert.equal(saved.query_contexts[0].query_id, 'vm-price');
+
+  const estimateInput = quoteInput(lookup.price_batch_id, {
+    evidence: [{
+      query_id: 'vm-price', official_item_ids: ['item-1'],
+      official_rate_ids: ['azure:item-1:payg'],
+    }],
+  });
+  estimateInput.fact_ledger[0].component_key = 'cmp_ec2';
+  estimateInput.services[0].component_key = 'cmp_ec2';
+  const delivered = await workflow.buildEstimate(estimateInput);
+  assert.equal(delivered.status, 'displayed_on_page');
+  assert.equal(context.displayed.length, 1);
+});
+
+test('an empty get_prices call explains that a saved batch is required', async (t) => {
+  const { workflow, backend, directory } = fixture();
+  let officialCalls = 0;
+  backend.getPrices = async () => { officialCalls += 1; return { results: [] }; };
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+
+  await assert.rejects(workflow.getPrices({
+    quote_mode: 'formal_quote',
+    queries: [],
+    quote_components: [{
+      component_key: 'cmp_ec2', customer_owned_source: '云服务器 1 台。',
+      billing_scopes: [{ billing_key: 'compute' }],
+    }],
+  }), (error) => error.code === 'quote_plan_registration_batch_required'
+    && error.details.next_action.includes('price_batch_id'));
+  assert.equal(officialCalls, 0);
+});
+
 test('price lookup responses tell weaker clients that quote coverage is unknown and page fallback exists', async (t) => {
   const { workflow, directory } = fixture();
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -1514,7 +1592,7 @@ test('price lookup responses tell weaker clients that quote coverage is unknown 
   });
 
   assert.equal(result.workflow_guard.mode, 'price_lookup');
-  assert.equal(result.workflow_guard.policy_version, '2026-09-24-local-mcp-v1');
+  assert.equal(result.workflow_guard.policy_version, '2026-09-25-direct-mcp-v2');
   assert.equal(result.workflow_guard.quote_plan_registered, false);
   assert.equal(result.workflow_guard.quote_coverage_known, false);
   assert.equal(result.workflow_guard.formal_quote_final_response_allowed, false);

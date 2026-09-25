@@ -22,7 +22,7 @@ const {
   workflowPolicyVersion,
 } = require('./lib/quote-workflow-policy');
 
-const VERSION = '4.0.0';
+const VERSION = '4.1.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -80,7 +80,9 @@ const jsonValue = z.union([
 ]);
 const region = z.string().min(3).max(40);
 const serviceCode = z.string().min(2).max(120);
-const componentKey = z.string().regex(/^cmp_[A-Za-z0-9_-]{4,76}$/);
+const componentKey = z.string().regex(/^cmp_[A-Za-z0-9][A-Za-z0-9_-]{0,75}$/).describe(
+  'Stable internal component id beginning with cmp_, for example cmp_ec2 or cmp_database_01.',
+);
 const factId = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,79}$/);
 const cloudProvider = z.enum([
   'aws', 'azure', 'oci', 'gcp',
@@ -330,8 +332,8 @@ const getPricesInputSchema = z.object({
   quote_mode: z.enum(['price_lookup', 'formal_quote']).describe(
     'Required intent. Use formal_quote whenever the user asks for a formal quote, Excel, sales-page delivery, or a multi-component customer quote. Use price_lookup only when the user wants price facts without formal delivery. Never downgrade a formal quote because some prices are missing.',
   ),
-  queries: z.array(priceQuery).min(1).max(50).describe(
-    'Current incremental query group. For a long quote, GPT chooses a suitably small group from response complexity and continues the same price_batch_id; this is a transport ceiling, not a required batch size.',
+  queries: z.array(priceQuery).max(50).default([]).describe(
+    'Current incremental query group. Normally include one or more official price queries. After prices were looked up first, omit this field or send [] together with the same price_batch_id, quote_mode=formal_quote, complete quote_components, and query_contexts for every saved query to register the formal quote plan without repeating any official API request.',
   ),
   query_contexts: z.array(queryContext).max(500).optional().describe(
     'Task bookkeeping only, never sent to a cloud API. For a formal quote, provide one context for every query: discovery is explicit; pricing must bind component_key, billing_key and any scenario_key. Same scope shares a requirement, and successful replacement rates retire old failures without deleting history. Omit only for a one-off legacy price lookup.',
@@ -789,7 +791,7 @@ function buildServer(workflow) {
 
   server.registerTool('get_prices', {
     title: 'Batch query official cloud prices',
-    description: `Always set quote_mode; formal quotes and Excel delivery use formal_quote. Requires non-empty incremental queries and one query_contexts entry for each formal pricing query. For installed AWS components, discover and prefer a verified local route_id; GPT still supplies current validated route_inputs and performs product selection and calculation. A local route failure affects only that component and follows the existing same-site official price-page fallback. Preserve relay_batch_index, relay_batch_count, price_batch_id and the current quote_components batch. Full official results are persisted; use get_price_results only for required compacted details. needs_refinement, terminal=false or must_continue means continue the required action and do not give a final answer. GPT supplies current product parameters and response paths while AstraQuote enforces registered hosts and read-only operations. ${renderWorkflowPolicySlice('quote_context')}`,
+    description: `Always set quote_mode; formal quotes and Excel delivery use formal_quote. Prefer registering complete quote_components and query_contexts with the first official price queries. Recovery is supported when prices were queried first: call this tool again with the same price_batch_id, quote_mode=formal_quote, queries omitted or [], complete quote_components, and query_contexts for every saved query. That plan-only call performs no provider request and preserves all saved evidence. For installed AWS components, discover and prefer a verified local route_id; GPT still supplies current validated route_inputs and performs product selection and calculation. A local route failure affects only that component and follows the existing same-site official price-page fallback. Full official results are persisted; use get_price_results only for required compacted details. needs_refinement, terminal=false or must_continue means continue the required action and do not give a final answer. GPT supplies current product parameters and response paths while AstraQuote enforces registered hosts and read-only operations. Legacy relay fields are used only when the caller already supplies a relay_job_id. ${renderWorkflowPolicySlice('quote_context')}`,
     // Keep the JSON Schema visible to MCP clients. ZodEffects produced by
     // superRefine serializes as an empty object in the MCP SDK, so cross-field
     // checks run inside the guarded handler instead.

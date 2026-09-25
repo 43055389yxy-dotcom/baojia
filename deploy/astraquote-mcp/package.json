@@ -1,6 +1,6 @@
 {
   "name": "astraquote-mcp",
-  "version": "4.0.0",
+  "version": "4.1.0",
   "private": true,
   "description": "AstraQuote: one local MCP for official multi-cloud pricing and quote delivery",
   "main": "server.js",

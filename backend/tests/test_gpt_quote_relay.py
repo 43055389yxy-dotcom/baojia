@@ -227,7 +227,7 @@ def test_relay_queues_and_hides_raw_customer_text(tmp_path: Path) -> None:
     internal = store.get(public["job_id"])
     assert internal["customer_request"] == "东京 EC2 两台，按需。"
     assert internal["continuation_attempts"] == 0
-    assert internal["policy_version"] == "2026-09-24-local-mcp-v1"
+    assert internal["policy_version"] == "2026-09-25-direct-mcp-v2"
     assert internal["policy_snapshot"]["batching"]["components_per_wave"] == 5
     assert "prompt_directives" not in internal["policy_snapshot"]
     assert public["policy_version"] == internal["policy_version"]
@@ -933,7 +933,7 @@ def test_per_quote_prompt_contains_only_per_order_context() -> None:
     assert "quote_components" not in prompt
     assert "每 20 个组件" not in prompt
     assert "禁止为了满足目标而向上选择" not in prompt
-    assert "执行策略版本：2026-09-24-local-mcp-v1" in prompt
+    assert "执行策略版本：2026-09-25-direct-mcp-v2" in prompt
 
     plugin_instructions = (
         Path(__file__).resolve().parents[2]
@@ -941,8 +941,8 @@ def test_per_quote_prompt_contains_only_per_order_context() -> None:
         / "astraquote-mcp"
         / "instructions.zh-CN.md"
     ).read_text(encoding="utf-8")
-    assert "每 {{COMPONENTS_PER_WAVE}} 个组件一轮" in plugin_instructions
-    assert "每个对话 {{WAVES_PER_CHAT}} 轮" in plugin_instructions
+    assert "省略 `queries` 或传 `queries=[]`" in plugin_instructions
+    assert "不需要销售前端、远程桌面、远程 GPT 会话" in plugin_instructions
     assert "销售选择的是首选地域" in plugin_instructions
     assert "没有完全匹配时选最接近的小一档" in plugin_instructions
 
