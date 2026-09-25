@@ -1,10 +1,12 @@
-# AstraQuote 直连 MCP 报价原则
+# AstraQuote GPT 直调报价
 
 统一执行策略版本：`{{QUOTE_WORKFLOW_POLICY_VERSION}}`
 
 {{QUOTE_WORKFLOW_POLICY}}
 
-AstraQuote 是一个直接供 GPT 调用的 MCP。它不需要销售前端、远程桌面、远程 GPT 会话或另一个人工中继步骤。GPT 负责理解需求、拆分组件、选择产品/SKU、用量换算和计算金额；MCP 负责调用官方价目、保存证据、校验计划和合计，然后生成交付链接。
+AstraQuote 只向 GPT 提供两个动作：`get_prices` 调用官方价格 API，`build_estimate` 生成报价链接。不需要销售前端、远程桌面、远程 GPT 会话、本地路由或路由查找。
+
+GPT 负责理解需求、选择产品/SKU、决定计费维度、换算用量和计算金额。MCP 只负责发出只读的官方 API 请求、保存官方结果、检查基本格式与加总，然后生成交付链接。
 
 用户指定的云厂商和账号站点不得更换。支持 AWS、微软 Azure、Oracle Cloud、Google Cloud、腾讯云、阿里云中国站、阿里云国际站、华为云中国站、华为云国际站、百度智能云、火山引擎和天翼云。不同厂商与不同站点之间不共享 SKU、区域、币种、单位或优惠语义。
 
@@ -18,11 +20,11 @@ AstraQuote 是一个直接供 GPT 调用的 MCP。它不需要销售前端、远
 
 工具返回 `request_schema_invalid` 或 `backend_request_schema_invalid` 时，必须读取 `details.violations` 中的字段路径和原因后修正。不得把入参错误说成“官方没有价格”，也不得用手算合计冒充已通过 MCP 校验的正式报价。
 
-## 官方查价与证据
+## 官方查价
 
 MCP 只允许查询、描述、列举和询价等只读操作。禁止创建、购买、支付、续费、开通、修改或删除云资源。密钥由服务器管理，GPT 不得传入或查看。
 
-- AWS：优先用 `describe_service` 读取已验证的本地路由契约，然后由 GPT 按当前需求选择 `route_id` 并提交 `route_inputs`。未命中路由时，GPT 提供 `service_code`、区域、Filters 和购买条款。路由只定义 Price List 请求和解析契约，不包含单价，也不替 GPT 选 SKU。
+- AWS：GPT 直接提供 `service_code`、地域、Price List Filters 和购买条款。不调用路由工具，不提交 `route_id` 或 `route_inputs`。
 - Azure：使用官方 Retail Prices API，显式提供 OData `filter` 和币种。
 - OCI：使用官方 Price List API，可按 `part_number` 或官方 JSON 字段精确筛选。
 - GCP：使用官方 Cloud Billing Catalog API，先列服务，再按 `service_id` 列 SKU。

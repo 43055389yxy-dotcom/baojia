@@ -13,6 +13,8 @@ AWS 公开共享链接有效期为 1 年。链接中的数字是 AstraQuote 已�
 
 ## 工作方式
 
+GPT 只看到两个动作：查询官方价格和生成报价链接。AWS 查价由 GPT 直接提交 Price List API 参数，不先查找本地路由。
+
 ```text
 GPT/Codex 接收需求并拆分组件
     -> 本地 AstraQuote MCP

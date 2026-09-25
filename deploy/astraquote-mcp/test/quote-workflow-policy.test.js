@@ -16,7 +16,7 @@ test('workflow policy is one versioned machine-readable source', () => {
   const snapshot = workflowPolicySnapshot();
 
   assert.equal(policy.schema_version, 'astraquote-quote-workflow-policy/1');
-  assert.equal(workflowPolicyVersion(), '2026-09-25-direct-mcp-v2');
+  assert.equal(workflowPolicyVersion(), '2026-09-25-gpt-direct-api-v1');
   assert.equal(snapshot.policy_version, workflowPolicyVersion());
   assert.equal(snapshot.prompt_directives, undefined);
   assert.equal(snapshot.consumer_slices, undefined);
@@ -43,7 +43,7 @@ test('workflow policy shares batch and recovery limits with MCP', () => {
   assert.equal(workflowPolicyValue(
     'pricing', 'official_api_network_attempt_limit_per_scope',
   ), 2);
-  assert.equal(workflowPolicyValue('pricing', 'prefer_verified_local_aws_pricing_routes'), true);
+  assert.equal(workflowPolicyValue('pricing', 'prefer_verified_local_aws_pricing_routes'), false);
   assert.equal(workflowPolicyValue('pricing', 'local_aws_route_failure_is_component_scoped'), true);
   assert.equal(workflowPolicyValue('pricing', 'local_aws_route_fallback_to_official_page'), true);
   assert.equal(

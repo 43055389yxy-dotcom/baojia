@@ -22,7 +22,7 @@ const {
   workflowPolicyVersion,
 } = require('./lib/quote-workflow-policy');
 
-const VERSION = '4.1.0';
+const VERSION = '4.2.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
 
@@ -120,13 +120,6 @@ const awsPriceQuery = z.object({
   term_years: z.union([z.literal(1), z.literal(3)]).optional(),
   payment_option: z.enum(['no_upfront', 'partial_upfront', 'all_upfront']).optional(),
   offering_class: z.enum(['standard', 'convertible']).optional(),
-  route_id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{2,159}$/).optional().describe(
-    'Verified route id returned by describe_service. The route supplies only request and response contracts, never a price or product choice.',
-  ),
-  route_inputs: z.record(z.union([z.string(), z.number().int(), z.boolean()])).refine(
-    (value) => Object.keys(value).length <= 40,
-    'At most 40 local-route runtime inputs are allowed.',
-  ).default({}).describe('Current validated configuration values required by the selected local route.'),
 }).strict();
 
 const azurePriceQuery = z.object({
@@ -362,13 +355,6 @@ const getPricesInputSchema = z.object({
 
 const getPricesInput = getPricesInputSchema.superRefine((value, context) => {
   value.queries.forEach((query, index) => {
-    if (query.provider === 'aws' && Object.keys(query.route_inputs || {}).length && !query.route_id) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'AWS route_inputs require a route_id returned by describe_service.',
-        path: ['queries', index, 'route_id'],
-      });
-    }
     if (query.provider === 'gcp' && query.operation === 'list_skus' && !query.currency_code) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
@@ -775,23 +761,9 @@ function buildServer(workflow) {
     { instructions: INSTRUCTIONS },
   );
 
-  server.registerTool('describe_service', {
-    title: 'Discover AWS pricing routes or service attributes',
-    description: 'AWS-only discovery. It first reads compact verified local route contracts for the service code without network access; component_id and route_search narrow the result. If no local route exists it returns official Price List service attributes. It never chooses a product or value for GPT.',
-    inputSchema: describeServiceInput,
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, guarded((args) => workflow.describeService(args)));
-
-  server.registerTool('get_attribute_values', {
-    title: 'Get official AWS attribute values',
-    description: 'Returns official values of one Price List attribute. It never chooses a value for GPT.',
-    inputSchema: attributeValuesInput,
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, guarded((args) => workflow.getAttributeValues(args)));
-
   server.registerTool('get_prices', {
-    title: 'Batch query official cloud prices',
-    description: `Always set quote_mode; formal quotes and Excel delivery use formal_quote. Prefer registering complete quote_components and query_contexts with the first official price queries. Recovery is supported when prices were queried first: call this tool again with the same price_batch_id, quote_mode=formal_quote, queries omitted or [], complete quote_components, and query_contexts for every saved query. That plan-only call performs no provider request and preserves all saved evidence. For installed AWS components, discover and prefer a verified local route_id; GPT still supplies current validated route_inputs and performs product selection and calculation. A local route failure affects only that component and follows the existing same-site official price-page fallback. Full official results are persisted; use get_price_results only for required compacted details. needs_refinement, terminal=false or must_continue means continue the required action and do not give a final answer. GPT supplies current product parameters and response paths while AstraQuote enforces registered hosts and read-only operations. Legacy relay fields are used only when the caller already supplies a relay_job_id. ${renderWorkflowPolicySlice('quote_context')}`,
+    title: 'Call official cloud pricing APIs',
+    description: `This is the single price lookup entry point. GPT chooses the service, region, official API filters, product, rate, usage and calculation. For AWS, send service_code, region and Price List filters directly; route discovery and route_id are not used. Batch independent queries in one call. Use formal_quote when an Excel/link will be generated, otherwise price_lookup. ${renderWorkflowPolicySlice('quote_context')}`,
     // Keep the JSON Schema visible to MCP clients. ZodEffects produced by
     // superRefine serializes as an empty object in the MCP SDK, so cross-field
     // checks run inside the guarded handler instead.
@@ -799,30 +771,9 @@ function buildServer(workflow) {
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, guarded((args) => workflow.getPrices(parseGetPricesInput(args))));
 
-  server.registerTool('get_price_results', {
-    title: 'Read selected saved official price results',
-    description: 'Reads explicitly requested query IDs from a saved batch, with complete official evidence paged by detail_offset/detail_limit (default 20). Continue using each result.detail_page.next_offset until null. The text response includes every returned rate and official identity even in clients that hide structuredContent. Do not replay price queries or download a full cloud catalog to recover these details.',
-    inputSchema: getPriceResultsInput,
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, guarded((args) => workflow.getPriceResults(args)));
-
-  server.registerTool('get_quote_job_status', {
-    title: 'Read a resumable quote job checkpoint',
-    description: 'Returns only persisted stage, price batch and delivery state. It never reruns a completed step. If the saved state proves the job is permanently unrecoverable, follow the server final-state protocol and emit AQ-QUOTE-FAILED.',
-    inputSchema: quoteJobInput,
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, guarded((args) => workflow.getQuoteJobStatus(args)));
-
-  server.registerTool('resume_quote_job', {
-    title: 'Resume a quote job from its saved stage',
-    description: 'Returns the next missing action and saved identifiers. It does not restart price queries, files or delivery. If recovery is definitively impossible, follow the server final-state protocol and emit AQ-QUOTE-FAILED.',
-    inputSchema: quoteJobInput,
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, guarded((args) => workflow.resumeQuoteJob(args)));
-
   server.registerTool('build_estimate', {
-    title: 'Validate and return an official quote',
-    description: `Submit selected official evidence, official_page_price_evidence, Fact Ledger, component totals and selected scenarios. The result is returned directly to GPT with an Excel link. AWS quotes also include an AWS Pricing Calculator public link; every other cloud returns Excel only. ${renderWorkflowPolicySlice('component_batch')} ${renderWorkflowPolicySlice('official_page_finalize')}`,
+    title: 'Generate quote links',
+    description: 'GPT submits its selected official evidence and calculated component totals. AstraQuote checks the arithmetic and returns the Excel link. AWS also returns an AWS Pricing Calculator link; other clouds return Excel only.',
     inputSchema: buildEstimateInput,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, guarded((args) => workflow.buildEstimate(normalizeBuildEstimateInput(args))));

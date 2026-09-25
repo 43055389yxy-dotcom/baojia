@@ -1,6 +1,6 @@
 {
   "schema_version": "astraquote-quote-workflow-policy/1",
-  "policy_version": "2026-09-25-direct-mcp-v2",
+  "policy_version": "2026-09-25-gpt-direct-api-v1",
   "batching": {
     "components_per_wave": 5,
     "waves_per_chat": 2,
@@ -25,7 +25,7 @@
       "official_source_url"
     ],
     "use_on_demand_fallback_for_missing_long_term_price": true,
-    "prefer_verified_local_aws_pricing_routes": true,
+    "prefer_verified_local_aws_pricing_routes": false,
     "local_aws_route_failure_is_component_scoped": true,
     "local_aws_route_fallback_to_official_page": true
   },
@@ -51,7 +51,7 @@
   },
   "prompt_directives": {
     "missing_parameters": "客户未提供的参数，可省略且不影响正式查价时必须省略；缺少后无法正式查价时，由 GPT 从本次官方允许值中选择最小刚需、最低价的可计值继续并简短说明，不得因为缺少参数停止组件或整张报价。",
-    "official_pricing": "每个计费项先现场调用一次官方价格 API。AWS 已安装并验证本地报价路由的组件，必须先读取紧凑路由摘要，再把选中的 route_id 和当前清洗配置对应的 route_inputs 交给查价工具；本地路由只提供调用与解析契约，不包含单价，也不替 GPT 选择产品或参数。该 API 未取得完整费率时，只让当前组件立即查询 AWS 同站点官方价格页并保存证据，不生成或回写 API 2，不影响同批其他组件。没有本地路由的组件继续由 GPT 现场组织官方请求。非本地路由只有在官方错误明确给出可修正字段、操作或响应路径时，才允许再发出一次实质不同的修正请求；不得只更换 query_id 重复相同请求。仍未取得完整费率时，立即查询同一云厂商、同一账号站点的官方价格页并保存证据。官网证据按正式价格完成计费项；不得复用其他报价的历史单价。",
+    "official_pricing": "GPT 直接选择云厂商官方价格 API 的服务、地域和过滤条件，并把同一份报价的独立查询尽量一次批量提交。AWS 直接调用 Price List API，不先查找本地路由，不使用 route_id 或 route_inputs。产品选择、计费维度、单位换算和金额计算都由 GPT 完成；MCP 只执行只读官方请求、保存证据并做最基本的格式与合计校验。官方错误明确给出可修正字段时，只允许再提交一次实质不同的请求。官方 API 没有可用结果时，GPT 可查询同站点官方价格页作为证据；不得复用其他报价的历史单价。",
     "long_term_fallback": "某组件没有销售所选的长期购买价格时，不判整单失败，也不显示不适用；该长期方案使用组件按量月费，pricing_basis 标为 on_demand_fallback，月费与按量相同、预付为 0。",
     "component_checkpoint": "直连 GPT 必须在同一 price_batch_id 内保存每个组件的查价证据和归属；单个组件异常不得删除或覆盖其他已成功组件。只有旧任务已经显式带入 relay_job_id 时，才按兼容流程逐个组件处理，每个组件完成后立即写入后台进度。",
     "component_batch_save": "直连 GPT 完成全部证据和金额后，默认调用 build_estimate 的 deliver_quote 模式一次生成完整 Excel；仅 AWS 同时生成 AWS Pricing Calculator 链接，其他云不生成官网报价链接。只有调用方已显式提供 relay_job_id 时，才使用旧版 delivery_mode=save_component_batch 兼容流程。",

@@ -16,17 +16,12 @@ listing their complete HTTPS redirect URI in the comma-separated
 allowlist and does not trust the rest of the callback host. All clients use
 OAuth 2.1 authorization code flow with PKCE.
 
-The public MCP exposes exactly seven tools:
+The public MCP exposes exactly two tools:
 
-1. `describe_service`
-2. `get_attribute_values`
-3. `get_prices`
-4. `get_price_results`
-5. `get_quote_job_status`
-6. `resume_quote_job`
-7. `build_estimate`
+1. `get_prices`
+2. `build_estimate`
 
-The first six tools require `pricing:read`; `build_estimate` requires
+`get_prices` requires `pricing:read`; `build_estimate` requires
 `pricing:write`. Unknown future tools fail closed as writes.
 
 The runtime does not contain a calculator browser. `get_prices` dispatches only

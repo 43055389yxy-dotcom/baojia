@@ -32,7 +32,7 @@ test('public MCP is an official-first twelve-site workflow with AWS-only calcula
   const listed = await client.listTools();
   assert.deepEqual(
     listed.tools.map((tool) => tool.name),
-    ['describe_service', 'get_attribute_values', 'get_prices', 'get_price_results', 'get_quote_job_status', 'resume_quote_job', 'build_estimate'],
+    ['get_prices', 'build_estimate'],
   );
   assert.match(INSTRUCTIONS, /AWS.*Excel.*aws_calculator_url.*AWS Pricing Calculator/s);
   assert.match(INSTRUCTIONS, /非 AWS.*只返回 Excel.*严禁返回/s);
@@ -56,6 +56,8 @@ test('public MCP is an official-first twelve-site workflow with AWS-only calcula
   assert.match(INSTRUCTIONS, /credentials.*authorization.*不得把权限拒绝说成无 SKU/s);
   assert.match(INSTRUCTIONS, /GPT 负责理解需求.*计算金额/s);
   assert.match(INSTRUCTIONS, /不需要销售前端.*远程桌面.*远程 GPT/s);
+  assert.match(INSTRUCTIONS, /AWS.*直接提供.*service_code.*Price List Filters/s);
+  assert.match(INSTRUCTIONS, /不调用路由工具/);
 });
 
 test('production and sales entry have no Calculator runtime or option', () => {

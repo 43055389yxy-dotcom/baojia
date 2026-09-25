@@ -133,16 +133,10 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
 
   const listed = await client.listTools();
   assert.deepEqual(listed.tools.map((tool) => tool.name), [
-    'describe_service',
-    'get_attribute_values',
     'get_prices',
-    'get_price_results',
-    'get_quote_job_status',
-    'resume_quote_job',
     'build_estimate',
   ]);
   const getPrices = listed.tools.find((tool) => tool.name === 'get_prices');
-  const describeService = listed.tools.find((tool) => tool.name === 'describe_service');
   const buildEstimate = listed.tools.find((tool) => tool.name === 'build_estimate');
   assert.ok(!getPrices.inputSchema.required.includes('queries'));
   assert.ok(getPrices.inputSchema.required.includes('quote_mode'));
@@ -153,8 +147,6 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   assert.equal(getPrices.inputSchema.properties.relay_batch_index.type, 'integer');
   assert.equal(getPrices.inputSchema.properties.relay_batch_count.type, 'integer');
   assert.equal(getPrices.inputSchema.properties.official_page_price_evidence.type, 'array');
-  assert.equal(describeService.inputSchema.properties.component_id.type, 'string');
-  assert.equal(describeService.inputSchema.properties.route_limit.type, 'integer');
   assert.equal(buildEstimate.inputSchema.properties.services.maxItems, 200);
   assert.deepEqual(buildEstimate.inputSchema.properties.delivery_mode.enum, [
     'deliver_quote', 'save_component_batch',
@@ -166,20 +158,17 @@ test('MCP exposes only official catalog query and delivery tools', async (t) => 
   assert.match(INSTRUCTIONS, /GPT.*理解.*选择.*计算/s);
   assert.match(INSTRUCTIONS, /AWS.*Azure.*Oracle.*Google.*腾讯云.*阿里云.*华为云.*百度智能云.*火山引擎.*天翼云/s);
   assert.match(INSTRUCTIONS, /官方文档.*官方 SDK/s);
-  assert.match(INSTRUCTIONS, /route_id/);
+  assert.match(INSTRUCTIONS, /不调用路由工具/);
   assert.doesNotMatch(INSTRUCTIONS, /缓存道路|道路级错误/);
   assert.match(INSTRUCTIONS, /第三方页面.*绝不能成为价格证据/s);
   assert.match(INSTRUCTIONS, /request_schema_invalid.*details\.violations/s);
   assert.match(INSTRUCTIONS, /price_lookup.*queries=\[\].*仅登记计划/s);
-  assert.match(INSTRUCTIONS, /get_price_results.*不重放已成功查询/s);
   assert.match(INSTRUCTIONS, /原 `price_batch_id`.*不再请求云厂商/s);
-  assert.match(getPrices.description, /Recovery is supported.*queries omitted or \[\].*preserves all saved evidence/is);
-  assert.match(getPrices.description, /must_continue.*final answer/is);
-  assert.match(getPrices.description, /Legacy relay fields.*relay_job_id/is);
+  assert.match(getPrices.description, /single price lookup entry point/i);
+  assert.match(getPrices.description, /route discovery and route_id are not used/i);
   assert.equal(getPrices.inputSchema.properties.official_page_price_evidence.type, 'array');
-  assert.match(buildEstimate.description, /official_page_price_evidence/i);
-  assert.match(buildEstimate.description, /directly to GPT.*Excel link/is);
-  assert.match(INSTRUCTIONS, /统一执行策略版本：`2026-09-25-direct-mcp-v2`/);
+  assert.match(buildEstimate.description, /Excel link/i);
+  assert.match(INSTRUCTIONS, /统一执行策略版本：`2026-09-25-gpt-direct-api-v1`/);
   assert.match(INSTRUCTIONS, /不需要销售前端.*远程桌面.*远程 GPT/s);
   assert.match(INSTRUCTIONS, /delivery_mode=deliver_quote/);
   assert.match(INSTRUCTIONS, /relay_job_id.*兼容边界/s);
@@ -223,8 +212,6 @@ test('get_prices accepts all twelve provider-site raw query shapes', async (t) =
         {
           provider: 'aws', query_id: 'aws-1', service_code: 'AmazonEC2',
           region: 'ap-northeast-1', filters: { instanceType: 'm7g.large' },
-          route_id: 'aws-commercial-ec2-shared-instance-on-demand',
-          route_inputs: { operating_system: 'Linux', dedicated: false, vcpu: 2 },
         },
         {
           provider: 'azure', query_id: 'azure-1',
@@ -290,9 +277,8 @@ test('get_prices accepts all twelve provider-site raw query shapes', async (t) =
   });
   assert.equal(result.isError, undefined);
   assert.equal(result.structuredContent.input.queries.length, 12);
-  assert.equal(result.structuredContent.input.queries[0].route_id,
-    'aws-commercial-ec2-shared-instance-on-demand');
-  assert.equal(result.structuredContent.input.queries[0].route_inputs.vcpu, 2);
+  assert.deepEqual(result.structuredContent.input.queries[0].filters,
+    { instanceType: 'm7g.large' });
   assert.equal(result.structuredContent.input.queries[3].response_filters.displayName, 'Compute Engine');
 });
 
@@ -319,7 +305,7 @@ test('get_prices lets the verified base-route catalog supply a known authenticat
   assert.equal(result.structuredContent.input.queries[0].endpoint, undefined);
 
   const tool = (await client.listTools()).tools.find((item) => item.name === 'get_prices');
-  assert.match(JSON.stringify(tool.inputSchema.properties.queries), /route_id/);
+  assert.doesNotMatch(JSON.stringify(tool.inputSchema.properties.queries), /route_id/);
 });
 
 test('query lifecycle metadata is visible in the MCP schema and survives tool validation', async (t) => {

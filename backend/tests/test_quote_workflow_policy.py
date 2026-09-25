@@ -14,7 +14,7 @@ def test_workflow_policy_is_versioned_and_machine_snapshot_excludes_prompt_prose
     snapshot = workflow_policy_snapshot()
 
     assert policy["schema_version"] == "astraquote-quote-workflow-policy/1"
-    assert workflow_policy_version() == "2026-09-25-direct-mcp-v2"
+    assert workflow_policy_version() == "2026-09-25-gpt-direct-api-v1"
     assert snapshot["policy_version"] == workflow_policy_version()
     assert "prompt_directives" not in snapshot
     assert "consumer_slices" not in snapshot
@@ -42,7 +42,7 @@ def test_workflow_policy_contains_the_shared_batch_and_recovery_limits() -> None
     ) == 2
     assert workflow_policy_value(
         "pricing", "prefer_verified_local_aws_pricing_routes"
-    ) is True
+    ) is False
     assert workflow_policy_value(
         "pricing", "local_aws_route_failure_is_component_scoped"
     ) is True
