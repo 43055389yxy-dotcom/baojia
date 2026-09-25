@@ -16,6 +16,6 @@ baojia.tontianit.com {
     }
 
     handle {
-        respond "AstraQuote MCP 4.1.0" 200
+        respond "AstraQuote MCP 4.2.0" 200
     }
 }
