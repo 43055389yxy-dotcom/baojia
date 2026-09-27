@@ -71,7 +71,7 @@ verify_oauth_database_continuity() {
 
 update_caddy_route() {
   echo "Updating the AstraQuote MCP and download routes"
-  docker run --rm -i \
+  docker run --rm -i --user 0:0 \
     -v /home/ec2-user/caddy-gateway/managed:/host/caddy-managed \
     --entrypoint /bin/sh \
     astraquote:production -ceu '
@@ -89,7 +89,7 @@ update_caddy_route() {
 
   if ! docker exec caddy-gateway \
     caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile; then
-    docker run --rm \
+    docker run --rm --user 0:0 \
       -v /home/ec2-user/caddy-gateway/managed:/host/caddy-managed \
       --entrypoint /bin/sh \
       astraquote:production -ceu '
@@ -104,7 +104,7 @@ update_caddy_route() {
 
   docker exec caddy-gateway \
     caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
-  docker run --rm \
+  docker run --rm --user 0:0 \
     -v /home/ec2-user/caddy-gateway/managed:/host/caddy-managed \
     --entrypoint /bin/sh \
     astraquote:production -ceu \
@@ -113,7 +113,7 @@ update_caddy_route() {
 
 retire_legacy_quote_relays() {
   echo "Stopping the retired remote GPT and desktop quote relays"
-  docker run --rm --privileged --pid=host \
+  docker run --rm --privileged --pid=host --user 0:0 \
     --entrypoint /usr/bin/nsenter \
     astraquote:production \
     --target 1 \
@@ -164,6 +164,12 @@ tar -C "$APP_DIR" \
   --exclude='./**/*.pyc' \
   -cf - . \
   | docker build --pull -f deploy/Dockerfile -t astraquote:production -
+
+docker run --rm --user 0:0 \
+  -v /home/ec2-user/astraquote/data:/data \
+  --entrypoint /bin/chown \
+  astraquote:production \
+  -R 1000:1000 /data
 
 docker compose -p astraquote \
   -f "$APP_DIR/deploy/compose.production.yml" \

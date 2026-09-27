@@ -8,6 +8,10 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     env_file:
       - /home/ec2-user/astraquote/config/backend.env
       - /home/ec2-user/astraquote/config/mcp.env

@@ -13,6 +13,7 @@ LABEL com.astraquote.image="true"
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     NODE_ENV=production \
+    HOME=/home/astraquote \
     ASTRAQUOTE_LOCAL_MODE=1 \
     ASTRAQUOTE_PYTHON=python3 \
     ASTRAQUOTE_BACKEND_ROOT=/app/backend \
@@ -20,6 +21,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl tini util-linux \
+    && groupadd --gid 1000 astraquote \
+    && useradd --uid 1000 --gid 1000 --create-home --shell /usr/sbin/nologin astraquote \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
@@ -43,8 +46,10 @@ COPY deploy/astraquote-mcp-oauth/app.py /app/oauth/app.py
 COPY deploy/start-production.sh /usr/local/bin/start-production
 
 RUN chmod 0755 /usr/local/bin/start-production \
-    && mkdir -p /data/oauth /data/v2-quotes /data/downloads
+    && mkdir -p /data/oauth /data/v2-quotes /data/downloads \
+    && chown -R 1000:1000 /data
 
+USER 1000:1000
 EXPOSE 8001
 HEALTHCHECK --interval=30s --timeout=8s --start-period=30s --retries=3 \
   CMD curl -fsS http://127.0.0.1:8200/readyz >/dev/null \

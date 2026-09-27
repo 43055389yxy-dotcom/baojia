@@ -21,6 +21,8 @@ test('production runs one single-MCP container without a sales or backend server
   assert.match(compose, /PUBLIC_ORIGIN:\s*https:\/\/baojia\.tontianit\.com/);
   assert.match(compose, /DB_PATH:\s*\/data\/oauth\/oauth\.db/);
   assert.match(compose, /\/home\/ec2-user\/astraquote\/data:\/data/);
+  assert.match(compose, /no-new-privileges:true/);
+  assert.match(compose, /cap_drop:\s*\n\s*- ALL/);
   assert.doesNotMatch(compose, /CALCULATOR|generate_calculator_link/i);
   assert.doesNotMatch(compose, /ASTRAQUOTE_BACKEND_URL|BACKEND_API_URL|GPT_RELAY/);
 
@@ -32,8 +34,12 @@ test('production runs one single-MCP container without a sales or backend server
 
   const dockerfile = fs.readFileSync(path.resolve(__dirname, '..', '..', 'Dockerfile'), 'utf8');
   assert.match(dockerfile, /local_mcp_bridge\.py/);
+  assert.match(dockerfile, /USER 1000:1000/);
   assert.doesNotMatch(dockerfile, /frontend-builder|npm run build/);
   assert.doesNotMatch(dockerfile, /chromium|playwright|pricing-calculator|calculator-client/i);
   const mcpPackage = fs.readFileSync(path.resolve(__dirname, '..', 'package.json'), 'utf8');
   assert.doesNotMatch(mcpPackage, /playwright/);
+
+  const deployment = fs.readFileSync(path.resolve(__dirname, '..', '..', 'jenkins-shell.sh'), 'utf8');
+  assert.match(deployment, /chown[\s\S]*-R 1000:1000 \/data/);
 });
