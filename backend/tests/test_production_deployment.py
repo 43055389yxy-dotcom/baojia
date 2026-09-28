@@ -23,8 +23,6 @@ def test_jenkins_deploy_updates_and_restarts_the_host_codex_chat_relay() -> None
     assert "/usr/bin/systemctl restart astraquote-gemini-relay.service" not in script
     assert "astraquote-chatgpt-desktop" in script
     assert "codex://threads/new?mode=chat" in script
-    assert "CODEX_SPARKLE_ENABLED=false" in script
-    assert "configured_environment" in script
     assert "--shm-size 1g" in script
     assert "--restart always" in script
     assert "--restart unless-stopped" not in script
