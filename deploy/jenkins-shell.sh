@@ -169,12 +169,14 @@ ensure_host_codex_chat_desktop() {
     configured_restart="$(docker inspect "$CODEX_CONTAINER" --format '{{.HostConfig.RestartPolicy.Name}}')"
     configured_command="$(docker inspect "$CODEX_CONTAINER" --format '{{json .Config.Cmd}}')"
     configured_binds="$(docker inspect "$CODEX_CONTAINER" --format '{{json .HostConfig.Binds}}')"
+    configured_environment="$(docker inspect "$CODEX_CONTAINER" --format '{{json .Config.Env}}')"
     if test "$configured_image" != "$CODEX_IMAGE" \
       || test "$configured_shm" -lt 1073741824 \
       || test "$configured_network" != host \
       || test "$configured_restart" != always \
       || [[ "$configured_command" != *'codex://threads/new?mode=chat'* ]] \
       || [[ "$configured_command" != *'--remote-debugging-port=9222'* ]] \
+      || [[ "$configured_environment" != *'CODEX_SPARKLE_ENABLED=false'* ]] \
       || [[ "$configured_binds" != *'/home/ec2-user/.chatgpt-desktop-home:/home/chatgpt'* ]]; then
       recreate=1
     fi
@@ -200,6 +202,7 @@ ensure_host_codex_chat_desktop() {
       -e LANG=zh_CN.UTF-8 \
       -e LC_ALL=zh_CN.UTF-8 \
       -e LANGUAGE=zh_CN:zh \
+      -e CODEX_SPARKLE_ENABLED=false \
       -v /home/ec2-user/.chatgpt-desktop-home:/home/chatgpt \
       -v /home/ec2-user/.Xauthority:/home/chatgpt/.Xauthority:ro \
       -v /tmp/.X11-unix:/tmp/.X11-unix \
