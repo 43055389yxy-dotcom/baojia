@@ -60,7 +60,6 @@ class PendingPromptSubmissionError(RuntimeError):
 if RELAY_ENGINE == "gemini":
     from gemini_chat_browser import GeminiChatBrowser
 else:
-    from codex_cli_agent import CodexCliAgent
     from codex_chat_desktop import (
         CodexChatDesktop,
         is_pending_chat_reference,
@@ -1529,7 +1528,7 @@ def main() -> int:
             quote_timeout_seconds=QUOTE_TIMEOUT_SECONDS,
         )
         if RELAY_ENGINE == "gemini"
-        else CodexCliAgent(
+        else CodexChatDesktop(
             active_quote_factory=ActiveQuote,
             quote_timeout_seconds=QUOTE_TIMEOUT_SECONDS,
         )
