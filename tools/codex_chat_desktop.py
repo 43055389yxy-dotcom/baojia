@@ -157,14 +157,30 @@ class CodexChatDesktop:
         """Expose a usable Chat surface after CDP itself becomes available."""
 
         self.driver = self
-        if not self._chat_surface_ready():
-            if self._login_screen_visible():
-                return
-            self._open_deep_link(CODEX_NEW_CHAT_LINK)
-            self._wait_until(
-                lambda: self._chat_surface_ready() or self._login_screen_visible(),
-                timeout=CODEX_SURFACE_TIMEOUT_SECONDS,
-            )
+        if self._chat_surface_ready() or self._login_screen_visible():
+            return
+        # Recent Codex builds keep the renderer on a blank startup surface while
+        # the updater policy resolves (up to five minutes).  Opening a deep link
+        # during that window launches a second Electron process against the same
+        # profile, so wait for the real desktop surface first.
+        self._wait_until(
+            self._desktop_surface_loaded,
+            timeout=CODEX_SURFACE_TIMEOUT_SECONDS,
+        )
+        if self._chat_surface_ready() or self._login_screen_visible():
+            return
+        self._open_deep_link(CODEX_NEW_CHAT_LINK)
+        self._wait_until(
+            lambda: self._chat_surface_ready() or self._login_screen_visible(),
+            timeout=90,
+        )
+
+    def _desktop_surface_loaded(self) -> bool:
+        return bool(
+            self._chat_surface_ready()
+            or self._login_screen_visible()
+            or self._evaluate("Boolean(document.querySelector('main'))")
+        )
 
     def close(self) -> None:
         if self._websocket is not None:

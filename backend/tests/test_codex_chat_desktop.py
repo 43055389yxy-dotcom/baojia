@@ -543,7 +543,7 @@ def test_prepare_chat_surface_waits_through_startup_until_login_is_visible(
     observed = {}
 
     monkeypatch.setattr(desktop, "_chat_surface_ready", lambda: False)
-    login_checks = iter([False, True])
+    login_checks = iter([False, True, True])
     monkeypatch.setattr(
         desktop,
         "_login_screen_visible",
@@ -559,8 +559,42 @@ def test_prepare_chat_surface_waits_through_startup_until_login_is_visible(
 
     desktop._prepare_chat_surface()
 
-    assert opened == [desktop_module.CODEX_NEW_CHAT_LINK]
+    assert opened == []
     assert observed["timeout"] >= 300
+
+
+def test_prepare_chat_surface_opens_chat_only_after_desktop_has_loaded(
+    desktop_module, monkeypatch,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=60,
+    )
+    events = []
+    ready_checks = iter([False, False, True])
+
+    monkeypatch.setattr(desktop, "_chat_surface_ready", lambda: next(ready_checks))
+    monkeypatch.setattr(desktop, "_login_screen_visible", lambda: False)
+    monkeypatch.setattr(desktop, "_desktop_surface_loaded", lambda: True)
+    monkeypatch.setattr(
+        desktop,
+        "_open_deep_link",
+        lambda link: events.append(("open", link)),
+    )
+
+    def wait_until(check, *, timeout):
+        events.append(("wait", timeout))
+        assert check()
+
+    monkeypatch.setattr(desktop, "_wait_until", wait_until)
+
+    desktop._prepare_chat_surface()
+
+    assert events == [
+        ("wait", desktop_module.CODEX_SURFACE_TIMEOUT_SECONDS),
+        ("open", desktop_module.CODEX_NEW_CHAT_LINK),
+        ("wait", 90),
+    ]
 
 
 def test_unavailable_session_recovers_but_real_login_screen_is_left_for_admin(
