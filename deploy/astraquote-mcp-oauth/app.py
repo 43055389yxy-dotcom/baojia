@@ -83,6 +83,9 @@ if not MCP_PATH.startswith("/") or MCP_PATH.endswith("/"):
     raise RuntimeError("MCP_PATH must start with / and must not end with /")
 RESOURCE = f"{PUBLIC_ORIGIN}{MCP_PATH}"
 UPSTREAM = os.environ.get("UPSTREAM_MCP", "http://127.0.0.1:8200/v2/mcp")
+UPSTREAM_BEARER_TOKEN = os.environ["ASTRAQUOTE_INTERNAL_TOKEN"].strip()
+if not UPSTREAM_BEARER_TOKEN:
+    raise RuntimeError("ASTRAQUOTE_INTERNAL_TOKEN must not be empty")
 _upstream_parts = urlparse(UPSTREAM)
 UPSTREAM_READY_URL = os.environ.get(
     "UPSTREAM_READY_URL",
@@ -1182,10 +1185,12 @@ async def mcp_proxy(request: Request):
 
     client = httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=15.0))
     try:
+        headers = forwarded_headers(request)
+        headers["authorization"] = f"Bearer {UPSTREAM_BEARER_TOKEN}"
         upstream_request = client.build_request(
             request.method,
             UPSTREAM,
-            headers=forwarded_headers(request),
+            headers=headers,
             content=body,
         )
         upstream_response = await client.send(upstream_request, stream=True)

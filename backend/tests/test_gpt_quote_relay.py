@@ -227,7 +227,7 @@ def test_relay_queues_and_hides_raw_customer_text(tmp_path: Path) -> None:
     internal = store.get(public["job_id"])
     assert internal["customer_request"] == "东京 EC2 两台，按需。"
     assert internal["continuation_attempts"] == 0
-    assert internal["policy_version"] == "2026-09-14-aws-local-routes-v1"
+    assert internal["policy_version"] == "2026-09-28-api-first-compact-v1"
     assert internal["policy_snapshot"]["batching"]["components_per_wave"] == 5
     assert "prompt_directives" not in internal["policy_snapshot"]
     assert public["policy_version"] == internal["policy_version"]
@@ -561,7 +561,7 @@ def test_delivery_receipt_corrects_a_false_failed_browser_result(tmp_path: Path)
                 "quote_id": "aqv2_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
                 "status": "delivered",
                 "delivered_at": "2026-09-09T17:44:15.870Z",
-                "spreadsheet_url": "https://baojia.tontiancloud.com/api/backend/api/quote-artifacts/aqdl_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "spreadsheet_url": "https://baojia.tontianit.com/api/backend/api/quote-artifacts/aqdl_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "spreadsheet_filename": "quote.xlsx",
                 "page_result": {
                     "schema_version": "astraquote-page-result/1",
@@ -613,7 +613,7 @@ def test_page_result_receipt_completes_job_and_exposes_only_display_data(
                 "quote_id": "aqv2_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
                 "status": "page_result_ready",
                 "delivered_at": "2026-09-09T17:44:15.870Z",
-                "spreadsheet_url": "https://baojia.tontiancloud.com/api/backend/api/quote-artifacts/aqdl_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "spreadsheet_url": "https://baojia.tontianit.com/api/backend/api/quote-artifacts/aqdl_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 "spreadsheet_filename": "quote.xlsx",
                 "page_result": {
                     "schema_version": "astraquote-page-result/1",
@@ -697,7 +697,7 @@ def test_partial_receipt_returns_successful_rows_and_unpriced_components(tmp_pat
                 "quote_id": "aqv2_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
                 "status": "partial_page_result_ready",
                 "delivered_at": "2026-09-12T01:02:03.000Z",
-                "spreadsheet_url": "https://baojia.tontiancloud.com/api/backend/api/quote-artifacts/aqdl_"
+                "spreadsheet_url": "https://baojia.tontianit.com/api/backend/api/quote-artifacts/aqdl_"
                 + "c" * 48,
                 "page_result": {
                     "schema_version": "astraquote-page-result/1",
@@ -933,7 +933,7 @@ def test_per_quote_prompt_contains_only_per_order_context() -> None:
     assert "quote_components" not in prompt
     assert "每 20 个组件" not in prompt
     assert "禁止为了满足目标而向上选择" not in prompt
-    assert "执行策略版本：2026-09-14-aws-local-routes-v1" in prompt
+    assert "执行策略版本：2026-09-28-api-first-compact-v1" in prompt
 
     plugin_instructions = (
         Path(__file__).resolve().parents[2]

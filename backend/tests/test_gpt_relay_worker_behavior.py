@@ -636,11 +636,11 @@ def test_deferred_retry_is_never_sent_twice(worker, running_job, monkeypatch) ->
     assert store.get(job_id)["chat_sessions"][0]["status"] == "deferred_failed"
 
 
-def test_production_worker_constructs_codex_chat_adapter_not_firefox(worker):
+def test_production_worker_constructs_headless_codex_adapter_not_firefox(worker):
     source = Path(worker.__file__).read_text(encoding="utf-8")
     main_source = source[source.index("def main()") :]
 
-    assert "CodexChatDesktop(" in main_source
+    assert "CodexCliAgent(" in main_source
     assert "browser = ChatGptBrowser()" not in main_source
 
 

@@ -14,7 +14,7 @@ def test_workflow_policy_is_versioned_and_machine_snapshot_excludes_prompt_prose
     snapshot = workflow_policy_snapshot()
 
     assert policy["schema_version"] == "astraquote-quote-workflow-policy/1"
-    assert workflow_policy_version() == "2026-09-14-aws-local-routes-v1"
+    assert workflow_policy_version() == "2026-09-28-api-first-compact-v1"
     assert snapshot["policy_version"] == workflow_policy_version()
     assert "prompt_directives" not in snapshot
     assert "consumer_slices" not in snapshot
@@ -25,6 +25,8 @@ def test_workflow_policy_projects_only_the_rules_needed_by_one_consumer() -> Non
     component_batch = render_workflow_policy_slice("component_batch")
 
     assert "官方价格 API" in quote_context
+    assert "不要在回复中复述查价过程" in quote_context
+    assert "最小结构化价格记录" in quote_context
     assert "on_demand_fallback" in quote_context
     assert "回到原对话" not in quote_context
     assert "save_component_batch" in component_batch

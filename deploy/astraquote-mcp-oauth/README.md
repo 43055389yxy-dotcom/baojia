@@ -1,7 +1,7 @@
 # AstraQuote OAuth gateway
 
 The gateway is packaged inside the single AstraQuote production container. It
-publishes `https://pricing-mcp.tontiancloud.com/mcp` and proxies authenticated
+publishes `https://pricing-mcp.tontianit.com/mcp` and proxies authenticated
 requests to the loopback-only AstraQuote MCP process.
 
 The OAuth dynamic-registration boundary accepts the approved ChatGPT HTTPS

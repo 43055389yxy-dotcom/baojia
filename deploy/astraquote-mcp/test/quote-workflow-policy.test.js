@@ -16,7 +16,7 @@ test('workflow policy is one versioned machine-readable source', () => {
   const snapshot = workflowPolicySnapshot();
 
   assert.equal(policy.schema_version, 'astraquote-quote-workflow-policy/1');
-  assert.equal(workflowPolicyVersion(), '2026-09-14-aws-local-routes-v1');
+  assert.equal(workflowPolicyVersion(), '2026-09-28-api-first-compact-v1');
   assert.equal(snapshot.policy_version, workflowPolicyVersion());
   assert.equal(snapshot.prompt_directives, undefined);
   assert.equal(snapshot.consumer_slices, undefined);
@@ -27,6 +27,8 @@ test('workflow policy projects a small stage-specific prompt instead of the whol
   const componentBatch = renderWorkflowPolicySlice('component_batch');
 
   assert.match(quoteContext, /官方价格 API/);
+  assert.match(quoteContext, /不要在回复中复述查价过程/);
+  assert.match(quoteContext, /最小结构化价格记录/);
   assert.match(quoteContext, /on_demand_fallback/);
   assert.doesNotMatch(quoteContext, /回到原对话/);
   assert.match(componentBatch, /save_component_batch/);

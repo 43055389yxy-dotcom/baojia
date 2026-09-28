@@ -2,6 +2,7 @@
 'use strict';
 
 const express = require('express');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
@@ -23,6 +24,17 @@ const {
 const VERSION = '3.21.0';
 const PORT = Number(process.env.ASTRAQUOTE_MCP_PORT || process.env.PORT || 8200);
 const HOST = process.env.ASTRAQUOTE_MCP_HOST || process.env.HOST || '127.0.0.1';
+
+function validMcpBearer(headers, expectedToken) {
+  const expected = String(expectedToken || '').trim();
+  const authorization = String(headers?.authorization || '').trim();
+  if (!expected || !authorization.startsWith('Bearer ')) return false;
+  const supplied = authorization.slice('Bearer '.length).trim();
+  const expectedBytes = Buffer.from(expected);
+  const suppliedBytes = Buffer.from(supplied);
+  return expectedBytes.length === suppliedBytes.length
+    && crypto.timingSafeEqual(expectedBytes, suppliedBytes);
+}
 
 function renderInstructionsTemplate(template) {
   const componentsPerWave = workflowPolicyValue('batching', 'components_per_wave');
@@ -812,6 +824,7 @@ function buildServer(workflow) {
 }
 
 function createApp({ backend, store, deliverer } = {}) {
+  const transportToken = String(process.env.ASTRAQUOTE_INTERNAL_TOKEN || '').trim();
   const backendClient = backend || new AstraQuoteBackendClient();
   const quoteStore = store || new V2QuoteStore();
   const quoteDeliverer = deliverer || new QuoteDeliveryService();
@@ -861,7 +874,17 @@ function createApp({ backend, store, deliverer } = {}) {
       await closeRequest();
     }
   };
-  app.post('/v2/mcp', mcpHandler);
+  app.post('/v2/mcp', (req, res, next) => {
+    if (!transportToken) {
+      res.status(503).json({ error: 'mcp_transport_token_unavailable' });
+      return;
+    }
+    if (!validMcpBearer(req.headers, transportToken)) {
+      res.status(401).set('WWW-Authenticate', 'Bearer').json({ error: 'unauthorized' });
+      return;
+    }
+    next();
+  }, mcpHandler);
   app.get('/v2/mcp', (_req, res) => res.status(405).send('Method Not Allowed'));
   app.delete('/v2/mcp', (_req, res) => res.status(405).send('Method Not Allowed'));
   return app;
@@ -893,4 +916,5 @@ module.exports = {
   cloudProvider,
   officialPriceEvidence,
   pricedService,
+  validMcpBearer,
 };
