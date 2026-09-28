@@ -110,6 +110,7 @@ def test_public_proxy_keeps_oauth_and_mcp_outside_the_sales_site() -> None:
     root = Path(__file__).resolve().parents[2]
     caddyfile = (root / "deploy/caddy-astraquote.caddy").read_text(encoding="utf-8")
 
+    assert "baojia.tontiancloud.com, baojia.tontianit.com" in caddyfile
     assert "path /mcp /oauth/* /.well-known/oauth-authorization-server" in caddyfile
     assert "reverse_proxy astraquote:8001" in caddyfile
     assert "reverse_proxy astraquote:3000" in caddyfile
