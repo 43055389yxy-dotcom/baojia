@@ -175,6 +175,7 @@ ensure_host_codex_chat_desktop() {
       || test "$configured_restart" != always \
       || [[ "$configured_command" != *'codex://threads/new?mode=chat'* ]] \
       || [[ "$configured_command" != *'--remote-debugging-port=9222'* ]] \
+      || [[ "$configured_command" != *'--password-store=basic'* ]] \
       || [[ "$configured_binds" != *'/home/ec2-user/.chatgpt-desktop-home:/home/chatgpt'* ]]; then
       recreate=1
     fi
@@ -210,6 +211,7 @@ ensure_host_codex_chat_desktop() {
       --ozone-platform=x11 \
       --disable-gpu \
       --no-sandbox \
+      --password-store=basic \
       --lang=zh-CN \
       --remote-debugging-address=127.0.0.1 \
       --remote-debugging-port=9222 \
