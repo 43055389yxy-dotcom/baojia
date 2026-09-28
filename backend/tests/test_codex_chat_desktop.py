@@ -532,6 +532,37 @@ def test_start_revives_codex_when_renderer_opens_but_chat_surface_is_stuck(
     assert desktop.driver is desktop
 
 
+def test_prepare_chat_surface_waits_through_startup_until_login_is_visible(
+    desktop_module, monkeypatch,
+):
+    desktop = desktop_module.CodexChatDesktop(
+        active_quote_factory=dict,
+        quote_timeout_seconds=60,
+    )
+    opened = []
+    observed = {}
+
+    monkeypatch.setattr(desktop, "_chat_surface_ready", lambda: False)
+    login_checks = iter([False, True])
+    monkeypatch.setattr(
+        desktop,
+        "_login_screen_visible",
+        lambda: next(login_checks),
+    )
+    monkeypatch.setattr(desktop, "_open_deep_link", opened.append)
+
+    def wait_until(check, *, timeout):
+        observed["timeout"] = timeout
+        assert check()
+
+    monkeypatch.setattr(desktop, "_wait_until", wait_until)
+
+    desktop._prepare_chat_surface()
+
+    assert opened == [desktop_module.CODEX_NEW_CHAT_LINK]
+    assert observed["timeout"] >= 300
+
+
 def test_unavailable_session_recovers_but_real_login_screen_is_left_for_admin(
     desktop_module, monkeypatch,
 ):

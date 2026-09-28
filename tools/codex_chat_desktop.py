@@ -44,6 +44,9 @@ CODEX_STATE_PATH = Path(
 )
 CODEX_NEW_CHAT_LINK = "codex://threads/new?mode=chat"
 CODEX_PENDING_REFERENCE_PREFIX = "codex-chat://pending/"
+CODEX_SURFACE_TIMEOUT_SECONDS = int(
+    os.environ.get("ASTRAQUOTE_CODEX_SURFACE_TIMEOUT_SECONDS", "360")
+)
 COMPOSER_SELECTOR = (
     '[contenteditable="true"][aria-label="给 ChatGPT 发消息"],'
     '[contenteditable="true"][aria-label*="ChatGPT"],'
@@ -158,7 +161,10 @@ class CodexChatDesktop:
             if self._login_screen_visible():
                 return
             self._open_deep_link(CODEX_NEW_CHAT_LINK)
-            self._wait_until(self._chat_surface_ready, timeout=90)
+            self._wait_until(
+                lambda: self._chat_surface_ready() or self._login_screen_visible(),
+                timeout=CODEX_SURFACE_TIMEOUT_SECONDS,
+            )
 
     def close(self) -> None:
         if self._websocket is not None:
